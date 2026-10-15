@@ -47,8 +47,8 @@ Origen raíz 2: https://github.com/maxbry123-commits/frontend/tree/eff1bfe0ab5b4
 |---|---|---|---|---|
 | S5 | OA → core shark (code principal sin OSS + code Run + docs; readme arquitectura V2.1) | `Yaiwes/shark imput/imput shark core/` | motor_3 | **en curso** |
 | S6 | OA → componentes shark (lista blanca v3) | `Yaiwes/shark imput/componentes por integrar/` | motor_3 | **en curso** |
-| S7 | OA → core memoria orquestador | `Yaiwes/memoria/osquestador auditor memoria core/` | motor_3 | **en curso** |
-| S8 | OA → componentes memoria/almacenamiento (lista blanca v3) | `Yaiwes/memoria/componentes por integrar/` | motor_3 | **en curso** |
+| S7 | OA → core memoria orquestador | `Yaiwes/memoria/osquestador auditor memoria core/` | motor_3 | **hecho** (084eab5) |
+| S8 | OA → componentes memoria/almacenamiento (lista blanca v3) | `Yaiwes/memoria/componentes por integrar/` | motor_3 | **hecho** (4e84727; README 10d492b) |
 
 Árbol destino T3:
 
@@ -61,7 +61,7 @@ Yaiwes/
 ├── memoria/
 │   ├── osquestador auditor memoria core/
 │   ├── componentes por integrar/
-│   └── README TRASPASOS.md          ← pendiente
+│   └── README TRASPASOS.md          ← hecho (10d492b)
 ├── README-INDICE-TRASPASOS.md       ← este archivo
 └── HANDOFF-TRASPASOS.md
 ```
@@ -99,7 +99,7 @@ Un README TRASPASOS por destino de segmento. Estado al crear este índice:
 | ui-yaiwes | https://github.com/maxbry123-commits/ui-yaiwes/blob/main/README%20TRASPASOS.md | **pendiente** (aún no existe en main) |
 | yaiwes-factory-ui | https://github.com/maxbry123-commits/yaiwes-factory-ui/blob/main/README%20TRASPASOS.md | **pendiente** |
 | Yaiwes / shark imput | https://github.com/maxbry123-commits/Yaiwes/blob/main/shark%20imput/README%20TRASPASOS.md | **pendiente** |
-| Yaiwes / memoria | https://github.com/maxbry123-commits/Yaiwes/blob/main/memoria/README%20TRASPASOS.md | **pendiente** |
+| Yaiwes / memoria | https://github.com/maxbry123-commits/Yaiwes/blob/main/memoria/README%20TRASPASOS.md | **hecho** (10d492b; lotes 084eab5 + 4e84727) |
 
 Cada uno debe registrar: origen repo@sha+ruta, destino, manifiesto archivos/bytes, sha256 tree, commits de lote, verdict motor (`VERIFIED_CLOSED`, failed=0, pending=0), read-back de main, checklist GUIA §§1–10.
 
@@ -112,7 +112,39 @@ Cada uno debe registrar: origen repo@sha+ruta, destino, manifiesto archivos/byte
 | Método | motor_3 (copia); motor_1 solo si hay ZIP sin extraer en destino |
 | HF / LFS / Actions | no |
 | Borrado de origen | no (espera OK) |
-| Segmentos S1–S8 | **en curso** |
+| Segmentos S1–S6 | **en curso** |
+| Segmentos S7–S8 (memoria) | **hecho** (084eab5, 4e84727, 10d492b) |
+| T4 core componentes | **en planificación** |
 | Autoauditoría | obligatoria antes de marcar PASS |
 
 Handoff cableado (cómo reanudar / auditar): [HANDOFF-TRASPASOS.md](./HANDOFF-TRASPASOS.md)
+
+
+---
+
+## 6. core componentes
+
+Nueva tarea (T4) — descarga + extracción de **115** repos GitHub hacia:
+
+`Yaiwes/Yaiwes core/componentes integrar/`
+
+| Ítem | Valor |
+|---|---|
+| Destino | `Yaiwes core/componentes integrar/` (repo Yaiwes, main) |
+| Cantidad | 115 repos (lista canónica en box: `/workspace/descarga-115/lista.txt`) |
+| Rango | SoarGroup/SoarGroup.github.io … ctn-archive/spaun1.0 |
+| Sitios web resueltos a GitHub (9) | vespa.ai→vespa-engine/vespa; opensearch.org→opensearch-project/OpenSearch; solr.apache.org→apache/solr; elastic.co/elasticsearch→elastic/elasticsearch; qdrant.tech→qdrant/qdrant; milvus.io→milvus-io/milvus; weaviate.io→weaviate/weaviate; typesense.org→typesense/typesense; lucene.apache.org→apache/lucene |
+| Motores | **solo** `motor_2` (descarga) + **engine** + `motor_1` (extracción); **4 motores** en paralelo (lotes ~29 repos c/u) |
+| Prohibido | Hugging Face, Git LFS, GitHub Actions, force-push |
+| Estado | **en planificación** |
+
+Reparto previsto (4 motores / lotes):
+
+| Motor | Ítems lista.txt | Repos (aprox.) |
+|---|---|---|
+| M1 | 1–29 | SoarGroup … explosion/spaCy |
+| M2 | 30–58 | apache/uima-uimaj … usestrix/strix |
+| M3 | 59–87 | tree-sitter … ionic-team/capacitor |
+| M4 | 88–115 | pwa-builder/PWABuilder … ctn-archive/spaun1.0 |
+
+Handoff de reanudación / auditoría de esta tarea: [HANDOFF-TRASPASOS.md](./HANDOFF-TRASPASOS.md) § core componentes.

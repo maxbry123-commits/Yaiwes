@@ -36,8 +36,8 @@ Estado de trabajo en el box (fuera del árbol Git final): `/workspace/traspasos/
 | S4 | yaiwes-factory-ui/`T-3000…/00-ENTRADA` | `/workspace/traspasos/state/S4.json` | en curso |
 | S5 | Yaiwes/`shark imput/imput shark core` | `/workspace/traspasos/state/S5.json` | en curso |
 | S6 | Yaiwes/`shark imput/componentes por integrar` | `/workspace/traspasos/state/S6.json` | en curso |
-| S7 | Yaiwes/`memoria/osquestador auditor memoria core` | `/workspace/traspasos/state/S7.json` | en curso |
-| S8 | Yaiwes/`memoria/componentes por integrar` | `/workspace/traspasos/state/S8.json` | en curso |
+| S7 | Yaiwes/`memoria/osquestador auditor memoria core` | `/workspace/traspasos/state/S7.json` | **hecho** (084eab5) |
+| S8 | Yaiwes/`memoria/componentes por integrar` | `/workspace/traspasos/state/S8.json` | **hecho** (4e84727; README 10d492b) |
 
 Reanudar un segmento:
 
@@ -79,7 +79,7 @@ Por destino, el agente debe escribir/actualizar `README TRASPASOS.md` (origen@sh
 - https://github.com/maxbry123-commits/ui-yaiwes/blob/main/README%20TRASPASOS.md — **pendiente**
 - https://github.com/maxbry123-commits/yaiwes-factory-ui/blob/main/README%20TRASPASOS.md — **pendiente**
 - https://github.com/maxbry123-commits/Yaiwes/blob/main/shark%20imput/README%20TRASPASOS.md — **pendiente**
-- https://github.com/maxbry123-commits/Yaiwes/blob/main/memoria/README%20TRASPASOS.md — **pendiente**
+- https://github.com/maxbry123-commits/Yaiwes/blob/main/memoria/README%20TRASPASOS.md — **hecho** (10d492b; lotes 084eab5 + 4e84727)
 
 ---
 
@@ -113,3 +113,38 @@ Otros agentes empujan a `Yaiwes` main a la vez. Reglas:
 | yaiwes-factory-ui | https://github.com/maxbry123-commits/yaiwes-factory-ui |
 | frontend | https://github.com/maxbry123-commits/frontend |
 | osquestador-auditor | https://github.com/maxbry123-commits/osquestador-auditor |
+
+
+---
+
+## 7. core componentes (T4) — reanudar / auditar
+
+Descarga + extracción de **115** repos hacia `Yaiwes/Yaiwes core/componentes integrar/`.
+
+| Ítem | Valor |
+|---|---|
+| Lista | `/workspace/descarga-115/lista.txt` (115 líneas; sitios web ya resueltos a owner/repo) |
+| Destino | https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/componentes%20integrar |
+| Motores | **motor_2** (descarga ZIP) + **engine** + **motor_1** (extracción); partida en **4 motores** |
+| Estado | **en planificación** |
+| STATE_FILE sugeridos | `/workspace/descarga-115/state/M1.json` … `M4.json` (fuera del árbol Git) |
+
+Sitios → GitHub (9): vespa-engine/vespa, opensearch-project/OpenSearch, apache/solr, elastic/elasticsearch, qdrant/qdrant, milvus-io/milvus, weaviate/weaviate, typesense/typesense, apache/lucene.
+
+### Reanudar
+
+1. Leer `lista.txt` y el STATE_FILE del motor (M1–M4).
+2. Relanzar el **mismo** motor_2/engine/motor_1 con las **mismas** rutas absolutas y el mismo STATE_FILE.
+3. Un agente (o proceso) por motor; no mezclar lotes.
+4. Tras cada push a Yaiwes: `git fetch origin main` + `git rebase origin/main` (nunca force).
+5. Evidencias y STATE_FILE fuera del árbol final.
+
+### Auditar (antes de PASS)
+
+1. Cada repo de la lista existe bajo `Yaiwes core/componentes integrar/<nombre>/` (o convención acordada).
+2. Verdict motor_1: extracción limpia (CRC / tree hash según skill); sin `.partial` / `.tmp`.
+3. Recuento destino vs lista (115); read-back de main.
+4. Actualizar este handoff y el índice §6 cuando pase a **en curso** / **hecho**.
+5. Checklist GUIA §§1–10 (sin HF/LFS/Actions; sin secretos en markdown).
+
+Índice vivo: [README-INDICE-TRASPASOS.md](./README-INDICE-TRASPASOS.md) §6 core componentes.
