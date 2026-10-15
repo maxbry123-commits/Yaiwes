@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 2825335,
+  "bundle_sha256": "219aaa308f6cb8e1f3dcb866d87198981788b4934a219a599afbd148ea4605d1",
+  "extracted_tree": {
+    "bytes": 6844318,
+    "files": 733,
+    "sha256": "16244a6423f6e284ec12bd5e6deafc7269367f6498dcbe52940a227fc0fa68a0"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2825335,
+      "name": "grapesjs.bundle.zip.part-0001",
+      "sha256": "219aaa308f6cb8e1f3dcb866d87198981788b4934a219a599afbd148ea4605d1"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "LICENSE",
+    "README.md"
+  ],
+  "skipped_special_count": 2,
+  "slug": "grapesjs",
+  "source_bytes": 6844318,
+  "source_commit": "662a676f695cf71b900c3bce85b3ac3aa06cf4ee",
+  "source_files": 733,
+  "source_ref": "dev",
+  "source_repo": "GrapesJS/grapesjs",
+  "source_tree": {
+    "bytes": 6844318,
+    "files": 733,
+    "sha256": "16244a6423f6e284ec12bd5e6deafc7269367f6498dcbe52940a227fc0fa68a0"
+  }
+}
