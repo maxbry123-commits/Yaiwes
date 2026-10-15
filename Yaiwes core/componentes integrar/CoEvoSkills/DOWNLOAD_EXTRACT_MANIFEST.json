@@ -1,0 +1,205 @@
+{
+  "bundle_bytes": 436777322,
+  "bundle_sha256": "4786e22094734dc1c9b4776cee6a4bba11c94ec7381c33beb1be40a0138e124b",
+  "extracted_tree": {
+    "bytes": 599488792,
+    "files": 1680,
+    "sha256": "c2b92b97154b0a3c24531ec6e4ee4f0a1490985502610700a8cce4cab688b623"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0001",
+      "sha256": "64fa62446da52ad401b3548629086e4b7fc77afb1651d7564f74a37d4976a2b4"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0002",
+      "sha256": "16ba235c99a5ab4c48684765e29fc47bcffde5565a286471649893a20f4ab54a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0003",
+      "sha256": "859b2579a788f51120a71345c6b07a955b7d8fcf8d3e3fc469994570c13c8b9e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0004",
+      "sha256": "63cec4f446e919c55b9e1bbee82df0b5ad7bc3ac8a49c201d6ce87b2565d72dc"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0005",
+      "sha256": "fb2c242996eef77d3718a1ed1edca18ca348894ed2738f5bd4eed465f674c715"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0006",
+      "sha256": "561790e5203707bcbc11fc0331c11bbbdf74b11d92105afe699dce7c93820cfd"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0007",
+      "sha256": "3e816d29c490f9386212224c021c44e50540fce1ec5eac7eab59334e57d19f2e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0008",
+      "sha256": "d63ef36e2fd10f8514eb07c3b8b64a9f823e5fbc56686b4d63349d8dee5862ee"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0009",
+      "sha256": "8dd46755041f78efeea82e683134a634cb75c27c910a0067e95ba4f147dfed7c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0010",
+      "sha256": "c5f01e21eb31454aeb08ec90c50504d49b3705ff39bf8a340c8aa657317247b4"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0011",
+      "sha256": "f4a13171931fa97fe35ca6d5a0316008559a4f139ff7f88c82691ffd1abcbc92"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0012",
+      "sha256": "568065b695c80ba9c38e653a0a165e80fbd9fc747ef48c04f4c056a35d975e18"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0013",
+      "sha256": "3cddfd67de70257464c4273e30f6145af0d3f11b821ee604ea308c61acd791f3"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0014",
+      "sha256": "ba9b64d29c04a48e14c8af10dcf508b14b68596e6e7ab26ee960e6501bd880b3"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0015",
+      "sha256": "7a2b9a2ecde97a900f1b03a8ef3b2730860612485af0d0dab0665b381fff2658"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0016",
+      "sha256": "a415572a58ee5f84fadb2c8fa51d1a5cbc2800ba51f14bebe2982b0f8582a375"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0017",
+      "sha256": "73ab68f9bfe09f0f82bc0a89637da47f572e88b23c24f10f9de0f0f9865fbba2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0018",
+      "sha256": "c99240f05158eb6471d1213b5c0ec0a1575f6bc4159903fa64ab5e6a82ff8907"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0019",
+      "sha256": "b1808fd8721019506064ed9013df7230d7f679e4c129a16b27ae9ed86ab2dc66"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0020",
+      "sha256": "6c96b2e920ed9bea023ee10cf5015171caf24b0a57dc6abb2510672c6f28478a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0021",
+      "sha256": "5731cbcd1c06037273515590c07ec5f1bbeeeca5ef156a2ac116d94e2c8b4483"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0022",
+      "sha256": "de01ee047d28fd79e91a9b6650f0d216999287d50f37df655eb2a1a1da89f73d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0023",
+      "sha256": "ad55f4dc7df2779bb86a14e3c715cd03e8d7cc84406adcca4701dc21d5fc2731"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0024",
+      "sha256": "7dc3dac08929ef2a9a7e244e447b2033984d723a327043fe43bec7789fdfc01b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0025",
+      "sha256": "286525f3f63a174c676131752a062f04f8f744fdedab08e7657330672c787aa9"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0026",
+      "sha256": "523f776e293ab3d596ffe71c795bac9fb1956b36ae8630dea5d302df01eb56fe"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0027",
+      "sha256": "fb76c03ab92a4170bef6b782a56d458a4d902bad42af60e97048bf6f327a8c5c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0028",
+      "sha256": "6564dbe344de0a529a6c6cc659c08e4db3312effda931abe20210447bc9f6956"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0029",
+      "sha256": "d7c2d15c7341e8c01b0b22fc71840913b32cf0f0d0d1af638cf561a3d62919f7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0030",
+      "sha256": "6e7a0f1b36ee58cd5e751d7a3def4de92555b0bae4aae06b6be9db03bee3966c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0031",
+      "sha256": "f88923bea441235e917791926fbd5f4ad7df21f812af126edcfb25d570be38a7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0032",
+      "sha256": "70c6dfb4d619d76fdc1f0de57a1a28e1c8b8f32fb6b2da83ed04dabc2bf1ea45"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0033",
+      "sha256": "78cb3aabcec8f0cc10ce184b8ada8a79fb0b5a8293d4f714a7464f851e6c28b3"
+    },
+    {
+      "bytes": 12582912,
+      "name": "CoEvoSkills.bundle.zip.part-0034",
+      "sha256": "dcb3723164024d48d711aac10fb0b6bb7d70794b54c41fe6f1a16459886b5e74"
+    },
+    {
+      "bytes": 8958314,
+      "name": "CoEvoSkills.bundle.zip.part-0035",
+      "sha256": "692172885779e2b4b533302db3ddd6de9e0eb6f04fada64dbb75ee2f70f8ecdb"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "CoEvoSkills",
+  "source_bytes": 599488792,
+  "source_commit": "4380d4bff673dd6e1d58e5babeb2aaa0fe527119",
+  "source_files": 1680,
+  "source_ref": "main",
+  "source_repo": "Zhang-Henry/CoEvoSkills",
+  "source_tree": {
+    "bytes": 599488792,
+    "files": 1680,
+    "sha256": "c2b92b97154b0a3c24531ec6e4ee4f0a1490985502610700a8cce4cab688b623"
+  }
+}
