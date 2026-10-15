@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 17632063,
+  "bundle_sha256": "b2bbc7d1f677bb6a36cde9ae2ea275c890c6a8faf5e71684641beb01a9aa158f",
+  "extracted_tree": {
+    "bytes": 27145952,
+    "files": 335,
+    "sha256": "d08e7432f7ea312bd597357a3722db05f6927599f9e66c65db05d4937d81196b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "GPTCache.bundle.zip.part-0001",
+      "sha256": "a5ea3908e72754c7112f37acd28e7f90d3d3d7b4375886cd13774b1e914f8b79"
+    },
+    {
+      "bytes": 5049151,
+      "name": "GPTCache.bundle.zip.part-0002",
+      "sha256": "a0ad375c19f03eb2910b5a31edbf15c8b9fb113daa516bef367344b344d79b97"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "GPTCache",
+  "source_bytes": 27145952,
+  "source_commit": "a74ac654473f7bf4109118e8576945161616e17a",
+  "source_files": 335,
+  "source_ref": "main",
+  "source_repo": "zilliztech/GPTCache",
+  "source_tree": {
+    "bytes": 27145952,
+    "files": 335,
+    "sha256": "d08e7432f7ea312bd597357a3722db05f6927599f9e66c65db05d4937d81196b"
+  }
+}
