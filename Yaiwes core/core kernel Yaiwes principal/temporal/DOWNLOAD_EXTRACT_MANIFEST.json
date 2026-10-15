@@ -1,38 +1,27 @@
 {
-  "bundle_bytes": 9888898,
-  "bundle_sha256": "599b919f928009ae9a63a850f004d1e6a5e372111dadf90f8af8263fe138174d",
-  "extracted_tree": {
-    "bytes": 42454994,
-    "files": 3992,
-    "sha256": "e0f97c4489410f7b890b9d5cf5a3d03a73bd2e6aa5f583d2df71059101fb5444"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 9888898,
-      "name": "temporal.bundle.zip.part-0001",
-      "sha256": "599b919f928009ae9a63a850f004d1e6a5e372111dadf90f8af8263fe138174d"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [
-    "config/development.yaml",
-    "schema/elasticsearch/visibility/index_template_v7.json"
-  ],
-  "skipped_special_count": 2,
-  "slug": "temporal",
-  "source_bytes": 42454994,
-  "source_commit": "1872297dceb4f82309ef3ba0922c688212417e34",
-  "source_files": 3992,
-  "source_ref": "main",
-  "source_repo": "temporalio/temporal",
-  "source_tree": {
-    "bytes": 42454994,
-    "files": 3992,
-    "sha256": "e0f97c4489410f7b890b9d5cf5a3d03a73bd2e6aa5f583d2df71059101fb5444"
-  }
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
+ "source_repo": "temporalio/temporal",
+ "source_commit": "1872297dceb4f82309ef3ba0922c688212417e34",
+ "slug": "temporal",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 3991,
+  "sha256": "85b8f913ecc1e53c0b996e4acbd07c5ae057da320728d371c32fb1836d260dc9"
+ },
+ "extracted_tree": {
+  "files": 3991,
+  "sha256": "85b8f913ecc1e53c0b996e4acbd07c5ae057da320728d371c32fb1836d260dc9"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [],
+ "gitattributes_lfs_removed": [
+  ".gitattributes (archivo eliminado: solo tenía reglas LFS)"
+ ],
+ "excluded_non_lfs": {},
+ "skipped_symlinks": [
+  "config/development.yaml",
+  "schema/elasticsearch/visibility/index_template_v7.json"
+ ],
+ "no_lfs": true
 }
