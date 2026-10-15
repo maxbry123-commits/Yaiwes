@@ -1,0 +1,63 @@
+{
+  "bundle_bytes": 66243456,
+  "bundle_sha256": "227e6b124f4aac20af2bb229ac534af8cd7d7d6146d5aaf2d88e611dd3a4ea67",
+  "extracted_tree": {
+    "bytes": 224163790,
+    "files": 14015,
+    "sha256": "843043948b4ebca24289f30d142de3bdde35ecc8ee908bcbe6e1476062c6fa36"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "litellm.bundle.zip.part-0001",
+      "sha256": "bac7dabf51a0cf09a1682b1aefb15a8bf52d825e4c0fb1cda4ff2bd82006cebf"
+    },
+    {
+      "bytes": 12582912,
+      "name": "litellm.bundle.zip.part-0002",
+      "sha256": "b48093e7fdf64483cebaf1c36285712d59ea3d445953db94f9f15e2b1e4347a6"
+    },
+    {
+      "bytes": 12582912,
+      "name": "litellm.bundle.zip.part-0003",
+      "sha256": "e915a131f7580154b4dff5c59acf1048f68d592be49dd428c7e2d24a922e67f6"
+    },
+    {
+      "bytes": 12582912,
+      "name": "litellm.bundle.zip.part-0004",
+      "sha256": "dfcbe6fbc989c716ac1e2d6957ba1b20c38c43c46dce167df5cda687d6bb04b8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "litellm.bundle.zip.part-0005",
+      "sha256": "16e2a6326e1fea39314f0fef231cd0f41adac849ad6c50307dc18f6a707db639"
+    },
+    {
+      "bytes": 3328896,
+      "name": "litellm.bundle.zip.part-0006",
+      "sha256": "fca1a6240f49192da5984c4963f1ce23ec9cdf80e92f11c6eb7a6412e5c78f1c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "litellm/proxy/enterprise",
+    "scripts/trace_codegen/templates/pydantic_v2/types.jinja2"
+  ],
+  "skipped_special_count": 2,
+  "slug": "litellm",
+  "source_bytes": 224163790,
+  "source_commit": "f08840579ebc072b642573e72f5a11020a3c1bbf",
+  "source_files": 14015,
+  "source_ref": "main",
+  "source_repo": "BerriAI/litellm",
+  "source_tree": {
+    "bytes": 224163790,
+    "files": 14015,
+    "sha256": "843043948b4ebca24289f30d142de3bdde35ecc8ee908bcbe6e1476062c6fa36"
+  }
+}
