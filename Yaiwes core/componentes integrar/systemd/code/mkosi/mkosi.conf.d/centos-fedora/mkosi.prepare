@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
+set -e
+
+if [[ "$1" == "build" ]]; then
+    exit 0
+fi
+
+pkgdir=/usr/host-pkgs
+distrover=$(dnf repoquery --disablerepo mkosi --latest-limit=1 --queryformat='%{evr}' systemd)
+# Filter only noarch and arch packages otherwise on CentOS 9 we could end having i686 packages too
+distropkgs=$(dnf repoquery 'systemd*' | grep -F "$distrover" | grep -e noarch -e "$DISTRIBUTION_ARCHITECTURE" | grep -v -e -debuginfo -e -debugsource -e standalone)
+
+# shellcheck disable=SC2086
+dnf download --arch noarch --arch "$DISTRIBUTION_ARCHITECTURE" --destdir "$BUILDROOT$pkgdir/distro" $distropkgs
