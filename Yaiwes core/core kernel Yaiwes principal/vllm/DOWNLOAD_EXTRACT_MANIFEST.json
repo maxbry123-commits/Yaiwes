@@ -1,0 +1,60 @@
+{
+  "bundle_bytes": 48955992,
+  "bundle_sha256": "1c5331deba43a909251ad8d23369beb24ce7d1bc840e3b34ca0525696ee11d72",
+  "extracted_tree": {
+    "bytes": 126172913,
+    "files": 7773,
+    "sha256": "51988504a6eaa94252ab05eb7a58ddeb364e9227f6b29a44e06a110d270f9f95"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "vllm.bundle.zip.part-0001",
+      "sha256": "f079aa0b27f70a662fbc5e41631d7427cfe5f0f815c3c3c232c33030dd64c6ea"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vllm.bundle.zip.part-0002",
+      "sha256": "21d63c947a7325b5c968b23950ca5bf164ac87302a95cfdea9c619a116941061"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vllm.bundle.zip.part-0003",
+      "sha256": "aebe3424fe9d2b08c9fe24bcb589c7352646733bc2b3239c3bf8a4b6a371b3bf"
+    },
+    {
+      "bytes": 11207256,
+      "name": "vllm.bundle.zip.part-0004",
+      "sha256": "231000d40d73b6332d31e9f6903e7e2003a5d39187ab587f41dd5d1c2709ebf3"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".claude/skills/check-api-compat",
+    ".claude/skills/ci-fails-buildkite",
+    ".claude/skills/debug-ima",
+    ".claude/skills/kernel-microbenchmark",
+    ".claude/skills/model-microbenchmark",
+    ".claude/skills/model-recipes",
+    ".claude/skills/pr-checklist",
+    ".claude/skills/transformers-upgrade",
+    ".claude/skills/triton-kernel-writing"
+  ],
+  "skipped_special_count": 9,
+  "slug": "vllm",
+  "source_bytes": 126172913,
+  "source_commit": "a9fe30e9f6f73a982eab0730476df165484ad4d4",
+  "source_files": 7773,
+  "source_ref": "main",
+  "source_repo": "vllm-project/vllm",
+  "source_tree": {
+    "bytes": 126172913,
+    "files": 7773,
+    "sha256": "51988504a6eaa94252ab05eb7a58ddeb364e9227f6b29a44e06a110d270f9f95"
+  }
+}
