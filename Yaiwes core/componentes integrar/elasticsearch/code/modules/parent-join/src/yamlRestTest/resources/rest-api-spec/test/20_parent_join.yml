@@ -1,0 +1,288 @@
+setup:
+  - do:
+      indices.create:
+        index: test
+        body:
+          settings:
+            number_of_shards: 2 #Two shards proves that we route properly
+          mappings:
+            properties:
+              join_field: { "type": "join", "relations": { "parent": "child", "child": "grand_child" } }
+              id: { "type": "keyword" }
+
+  - do:
+      bulk:
+        index: test
+        refresh: true
+        body:
+          - '{ "index": {"_id": "1"}}'
+          - '{ "id": 1, "join_field": { "name": "parent" } }'
+          - '{ "index": {"_id": "2"}}'
+          - '{ "id": 2, "join_field": { "name": "parent" } }'
+          - '{ "index": {"_id": "3", "routing": "1"}}'
+          - '{ "id": 3, "join_field": { "name": "child", "parent": "1" } }'
+          - '{ "index": {"_id": "4", "routing": "1"}}'
+          - '{ "id": 4, "join_field": { "name": "child", "parent": "1" } }'
+          - '{ "index": {"_id": "5", "routing": "2"}}'
+          - '{ "id": 5, "join_field": { "name": "child", "parent": "2" } }'
+          - '{ "index": {"_id": "6", "routing": "1"}}'
+          - '{ "id": 6, "join_field": { "name": "grand_child", "parent": "5" } }'
+
+---
+teardown:
+  - requires:
+      cluster_features: ["gte_v7.7.0"]
+      reason: "implemented in 7.7.0"
+
+  - do:
+      cluster.put_settings:
+        body:
+          persistent:
+            search.allow_expensive_queries: null
+
+---
+"Test basic":
+    - do:
+        search:
+          rest_total_hits_as_int: true
+          body: { sort: ["join_field", "id"] }
+
+    - match: { hits.total: 6 }
+    - match: { hits.hits.0._index: "test" }
+    - match: { hits.hits.0._id: "3" }
+    - match: { hits.hits.0._source.join_field.name: "child" }
+    - match: { hits.hits.0._source.join_field.parent: "1" }
+    - is_false: hits.hits.0.fields.join_field#child }
+    - match: { hits.hits.1._index: "test" }
+    - match: { hits.hits.1._id: "4" }
+    - match: { hits.hits.1._source.join_field.name: "child" }
+    - match: { hits.hits.1._source.join_field.parent: "1" }
+    - is_false: hits.hits.1.fields.join_field#child }
+    - match: { hits.hits.2._index: "test" }
+    - match: { hits.hits.2._id: "5" }
+    - match: { hits.hits.2._source.join_field.name: "child" }
+    - match: { hits.hits.2._source.join_field.parent: "2" }
+    - is_false: hits.hits.2.fields.join_field#child }
+    - match: { hits.hits.3._index: "test" }
+    - match: { hits.hits.3._id: "6" }
+    - match: { hits.hits.3._source.join_field.name: "grand_child" }
+    - match: { hits.hits.3._source.join_field.parent: "5" }
+    - match: { hits.hits.4._index: "test" }
+    - match: { hits.hits.4._id: "1" }
+    - match: { hits.hits.4._source.join_field.name: "parent" }
+    - is_false: hits.hits.4._source.join_field.parent
+    - match: { hits.hits.5._index: "test" }
+    - match: { hits.hits.5._id: "2" }
+    - match: { hits.hits.5._source.join_field.name: "parent" }
+    - is_false: hits.hits.5._source.join_field.parent
+
+---
+"Test parent_id query":
+    - do:
+        search:
+          rest_total_hits_as_int: true
+          body:
+            sort: [ "id" ]
+            query:
+              parent_id:
+                type: child
+                id: "1"
+
+    - match: { hits.total: 2 }
+    - match: { hits.hits.0._index: "test" }
+    - match: { hits.hits.0._id: "3" }
+    - match: { hits.hits.0._source.join_field.name: "child" }
+    - match: { hits.hits.0._source.join_field.parent: "1" }
+    - match: { hits.hits.1._index: "test" }
+    - match: { hits.hits.1._id: "4" }
+    - match: { hits.hits.1._source.join_field.name: "child" }
+    - match: { hits.hits.1._source.join_field.parent: "1" }
+
+---
+"Test field retrieval":
+  - requires:
+      cluster_features: ["gte_v7.13.2"]
+      reason: bugfix was introduced in 7.13.2
+  - do:
+      search:
+        body:
+          sort: [ "id" ]
+          fields: ["*"]
+
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._index: "test" }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields.join_field.0.name: "parent" }
+  - match: { hits.hits.5._index: "test" }
+  - match: { hits.hits.5._id: "6" }
+  - match: { hits.hits.5.fields.join_field.0.name: "grand_child" }
+  - match: { hits.hits.5.fields.join_field.0.parent: "5" }
+
+
+---
+"HasChild disallow expensive queries":
+  - requires:
+      cluster_features: ["gte_v7.7.0"]
+      reason: "implemented in 7.7.0"
+
+  ### Update setting to false
+  - do:
+      cluster.put_settings:
+        body:
+          persistent:
+            search.allow_expensive_queries: "false"
+        flat_settings: true
+
+  - match: {persistent: {search.allow_expensive_queries: "false"}}
+
+  - do:
+      catch: /\[joining\] queries cannot be executed when \'search.allow_expensive_queries\' is set to false./
+      search:
+        body:
+          sort: [ "id" ]
+          query:
+            parent_id:
+              type: child
+              id: "1"
+
+---
+"deprecated use of multi-fields":
+  - requires:
+      cluster_features: ["gte_v8.14.0"]
+      reason: "deprecation added in 8.14"
+      test_runner_features: warnings
+
+  - do:
+      warnings:
+        - "Adding multifields to [join] mappers has no effect and will be forbidden in future"
+      indices.create:
+        index: join-multi-field
+        body:
+          mappings:
+            properties:
+              join_field: { "type": "join", "relations": { "parent": "child", "child": "grand_child" }, "fields": {"keyword": {"type": "keyword"}} }
+
+---
+"join field named _type is not returned as root metadata":
+  - requires:
+      cluster_features: ["search.fetch_fields.excludes_non_metadata_type"]
+      reason: "fix for user-mapped _type field appearing in hit root metadata"
+
+  - do:
+      indices.create:
+        index: type-join
+        body:
+          mappings:
+            properties:
+              text: { "type": "keyword" }
+              _type: { "type": "join", "relations": { "question": "answer" } }
+
+  - do:
+      bulk:
+        index: type-join
+        refresh: true
+        body:
+          - '{ "index": {"_id": "1"}}'
+          - '{ "text": "What species does chewbacca belong to?", "_type": { "name": "question" }}'
+          - '{ "index": {"_id": "2"}}'
+          - '{ "text": "How did Yoda die?", "_type": { "name": "question" }}'
+          - '{ "index": {"_id": "3", "routing": "1"}}'
+          - '{ "text": "Wookie", "_type": { "name": "answer", "parent": "1" }}'
+          - '{ "index": {"_id": "4", "routing": "2"}}'
+          - '{ "text": "Old age", "_type": { "name": "answer", "parent": "2" }}'
+
+  - do:
+      search:
+        index: type-join
+        body:
+          sort: [ "text" ]
+          query: { match_all: { } }
+
+  - match: { hits.total.value: 4 }
+
+  - match: { hits.hits.0._id: "2" }
+  - is_false: hits.hits.0._type
+  - match: { hits.hits.0._source._type.name: "question" }
+  - match: { hits.hits.0._source.text: "How did Yoda die?" }
+
+  - match: { hits.hits.1._id: "4" }
+  - is_false: hits.hits.1._type
+  - match: { hits.hits.1._source._type.name: "answer" }
+  - match: { hits.hits.1._source._type.parent: "2" }
+  - match: { hits.hits.1._source.text: "Old age" }
+
+  - match: { hits.hits.2._id: "1" }
+  - is_false: hits.hits.2._type
+  - match: { hits.hits.2._source._type.name: "question" }
+  - match: { hits.hits.2._source.text: "What species does chewbacca belong to?" }
+
+  - match: { hits.hits.3._id: "3" }
+  - is_false: hits.hits.3._type
+  - match: { hits.hits.3._source._type.name: "answer" }
+  - match: { hits.hits.3._source._type.parent: "1" }
+  - match: { hits.hits.3._source.text: "Wookie" }
+
+  - do:
+      search:
+        index: type-join
+        body:
+          sort: [ "text" ]
+          query: { ids: { values: [ "1", "3" ] } }
+          fields: [ "_type" ]
+
+  - match: { hits.total.value: 2 }
+  - is_false: hits.hits.0._type
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields._type.0.name: "question" }
+  - is_false: hits.hits.1._type
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.1.fields._type.0.name: "answer" }
+  - match: { hits.hits.1.fields._type.0.parent: "1" }
+
+---
+"keyword field named _type is not returned as root metadata":
+  - requires:
+      cluster_features: ["search.fetch_fields.excludes_non_metadata_type"]
+      reason: "fix applies to any mapper type named _type, not only join"
+
+  - do:
+      indices.create:
+        index: type-keyword
+        body:
+          mappings:
+            properties:
+              _type: { "type": "keyword" }
+
+  - do:
+      bulk:
+        index: type-keyword
+        refresh: true
+        body:
+          - '{ "index": {"_id": "1"}}'
+          - '{ "_type": "question" }'
+          - '{ "index": {"_id": "2"}}'
+          - '{ "_type": "answer" }'
+
+  - do:
+      search:
+        index: type-keyword
+        body:
+          sort: [ "_type" ]
+          query: { match_all: { } }
+
+  - match: { hits.total.value: 2 }
+  - is_false: hits.hits.0._type
+  - match: { hits.hits.0._source._type: "answer" }
+  - is_false: hits.hits.1._type
+  - match: { hits.hits.1._source._type: "question" }
+
+  - do:
+      search:
+        index: type-keyword
+        body:
+          query: { term: { _type: "question" } }
+          fields: [ "_type" ]
+
+  - match: { hits.total.value: 1 }
+  - is_false: hits.hits.0._type
+  - match: { hits.hits.0.fields._type.0: "question" }

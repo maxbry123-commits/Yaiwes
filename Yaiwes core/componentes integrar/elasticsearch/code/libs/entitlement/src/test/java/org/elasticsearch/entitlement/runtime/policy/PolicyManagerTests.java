@@ -1,0 +1,515 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.entitlement.runtime.policy;
+
+import org.elasticsearch.bootstrap.ScopeResolver;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.Strings;
+import org.elasticsearch.entitlement.runtime.policy.PolicyManager.ModuleEntitlements;
+import org.elasticsearch.entitlement.runtime.policy.PolicyManager.PolicyScope;
+import org.elasticsearch.entitlement.runtime.policy.entitlements.CreateClassLoaderEntitlement;
+import org.elasticsearch.entitlement.runtime.policy.entitlements.ExitVMEntitlement;
+import org.elasticsearch.entitlement.runtime.policy.entitlements.FilesEntitlement;
+import org.elasticsearch.entitlement.runtime.policy.entitlements.OutboundNetworkEntitlement;
+import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.compiler.InMemoryJavaCompiler;
+import org.junit.BeforeClass;
+
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.lang.StackWalker.StackFrame;
+import java.lang.module.Configuration;
+import java.lang.module.ModuleDescriptor;
+import java.lang.module.ModuleFinder;
+import java.lang.module.ModuleReader;
+import java.lang.module.ModuleReference;
+import java.net.URI;
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
+
+import static java.util.Map.entry;
+import static org.elasticsearch.entitlement.runtime.policy.PolicyManager.ComponentKind.SERVER;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.is;
+
+public class PolicyManagerTests extends ESTestCase {
+
+    /**
+     * A module you can use for test cases that don't actually care about the
+     * entitlement module.
+     */
+    static Module NO_ENTITLEMENTS_MODULE;
+
+    static PathLookup TEST_PATH_LOOKUP;
+
+    @BeforeClass
+    public static void beforeClass() {
+        try {
+            // Any old module will do for tests using NO_ENTITLEMENTS_MODULE
+            NO_ENTITLEMENTS_MODULE = makeClassInItsOwnModule().getModule();
+
+            Path baseDir = createTempDir().toAbsolutePath();
+            TEST_PATH_LOOKUP = new PathLookupImpl(
+                baseDir.resolve("/user/home"),
+                baseDir.resolve("/config"),
+                new Path[] { baseDir.resolve("/data1/"), baseDir.resolve("/data2") },
+                Path.of("/shareddata"),
+                new Path[] { baseDir.resolve("/shared1"), baseDir.resolve("/shared2") },
+                baseDir.resolve("/lib"),
+                baseDir.resolve("/modules"),
+                baseDir.resolve("/plugins"),
+                baseDir.resolve("/logs"),
+                baseDir.resolve("/tmp"),
+                null,
+                Settings.EMPTY::getValues
+            );
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public void testGetEntitlements() {
+        // A mutable policyScope we can use to program specific replies
+        AtomicReference<PolicyScope> policyScope = new AtomicReference<>();
+
+        // A common policy with a variety of entitlements to test
+        var plugin1SourcePaths = List.of(Path.of("modules", "plugin1"));
+        var policyManager = new PolicyManager(
+            new Policy("server", List.of(new Scope("org.example.httpclient", List.of(new OutboundNetworkEntitlement())))),
+            Map.of("plugin1", new Policy("plugin1", List.of(new Scope("plugin.module1", List.of(new ExitVMEntitlement()))))),
+            Map.of(),
+            c -> policyScope.get(),
+            Map.of("plugin1", plugin1SourcePaths)::get,
+            TEST_PATH_LOOKUP
+        );
+        Collection<Path> thisSourcePaths = policyManager.getComponentPathsFromClass(getClass());
+
+        // "Unspecified" below means that the module is not named in the policy
+
+        policyScope.set(PolicyScope.server("org.example.httpclient"));
+        resetAndCheckEntitlements(
+            "Specified entitlements for server",
+            getClass(),
+            policyManager.policyEntitlements(
+                SERVER.componentName,
+                thisSourcePaths,
+                "org.example.httpclient",
+                List.of(new OutboundNetworkEntitlement())
+            ),
+            policyManager
+        );
+
+        policyScope.set(PolicyScope.server("plugin.unspecifiedModule"));
+        resetAndCheckEntitlements(
+            "Default entitlements for unspecified module",
+            getClass(),
+            policyManager.defaultEntitlements(SERVER.componentName, thisSourcePaths, "plugin.unspecifiedModule"),
+            policyManager
+        );
+
+        policyScope.set(PolicyScope.plugin("plugin1", "plugin.module1"));
+        resetAndCheckEntitlements(
+            "Specified entitlements for plugin",
+            getClass(),
+            policyManager.policyEntitlements("plugin1", plugin1SourcePaths, "plugin.module1", List.of(new ExitVMEntitlement())),
+            policyManager
+        );
+
+        policyScope.set(PolicyScope.plugin("plugin1", "plugin.unspecifiedModule"));
+        resetAndCheckEntitlements(
+            "Default entitlements for plugin",
+            getClass(),
+            policyManager.defaultEntitlements("plugin1", plugin1SourcePaths, "plugin.unspecifiedModule"),
+            policyManager
+        );
+    }
+
+    private void resetAndCheckEntitlements(
+        String message,
+        Class<?> requestingClass,
+        ModuleEntitlements expectedEntitlements,
+        PolicyManager policyManager
+    ) {
+        policyManager.moduleEntitlementsMap.clear();
+        assertEquals(message, expectedEntitlements, policyManager.getEntitlements(requestingClass));
+        assertEquals(
+            "Map has precisely the one expected entry",
+            Map.of(requestingClass.getModule(), expectedEntitlements),
+            policyManager.moduleEntitlementsMap
+        );
+
+        // Fetch a second time and verify the map is unchanged
+        policyManager.getEntitlements(requestingClass);
+        assertEquals("Map is unchanged", Map.of(requestingClass.getModule(), expectedEntitlements), policyManager.moduleEntitlementsMap);
+    }
+
+    /**
+     * Full registration→lookup chain: the policy map must be keyed by the same descriptor name
+     * {@code ScopeResolver} resolves to, otherwise {@code getEntitlements} returns the empty set.
+     */
+    public void testGetEntitlementsForPluginWithDirectoryNameDifferentFromDescriptorName() {
+        String descriptorName = "myPlugin";
+        var pluginPolicy = new Policy(
+            descriptorName,
+            List.of(new Scope(PolicyManager.ALL_UNNAMED, List.of(new OutboundNetworkEntitlement())))
+        );
+
+        var correctlyKeyed = new PolicyManager(
+            createEmptyTestServerPolicy(),
+            Map.of(descriptorName, pluginPolicy),
+            Map.of(),
+            c -> PolicyScope.plugin(descriptorName, PolicyManager.ALL_UNNAMED),
+            name -> Collections.emptyList(),
+            TEST_PATH_LOOKUP
+        );
+        var entitlements = correctlyKeyed.getEntitlements(getClass());
+        assertThat(
+            "policy keyed by descriptor name must produce the granted entitlement at runtime lookup",
+            entitlements.hasEntitlement(OutboundNetworkEntitlement.class),
+            is(true)
+        );
+
+        // Inverse: with the map mis-keyed by directory name, ScopeResolver's descriptor-name lookup misses.
+        var directoryName = "my-plugin";
+        var misKeyed = new PolicyManager(
+            createEmptyTestServerPolicy(),
+            Map.of(directoryName, pluginPolicy),
+            Map.of(),
+            c -> PolicyScope.plugin(descriptorName, PolicyManager.ALL_UNNAMED),
+            name -> Collections.emptyList(),
+            TEST_PATH_LOOKUP
+        );
+        var misKeyedEntitlements = misKeyed.getEntitlements(getClass());
+        assertThat(
+            "policy keyed by anything other than descriptor name causes the runtime lookup to miss",
+            misKeyedEntitlements.hasEntitlement(OutboundNetworkEntitlement.class),
+            is(false)
+        );
+    }
+
+    public void testDuplicateEntitlements() {
+        IllegalArgumentException iae = expectThrows(
+            IllegalArgumentException.class,
+            () -> new PolicyManager(
+                new Policy(
+                    "server",
+                    List.of(new Scope("test", List.of(new CreateClassLoaderEntitlement(), new CreateClassLoaderEntitlement())))
+                ),
+                Map.of(),
+                Map.of(),
+                c -> PolicyScope.plugin("test", moduleName(c)),
+                name -> Collections.emptyList(),
+                TEST_PATH_LOOKUP
+            )
+        );
+        assertEquals(
+            "[(server)] using module [test] found duplicate entitlement " + "[" + CreateClassLoaderEntitlement.class.getName() + "]",
+            iae.getMessage()
+        );
+
+        iae = expectThrows(
+            IllegalArgumentException.class,
+            () -> new PolicyManager(
+                createEmptyTestServerPolicy(),
+                Map.of(
+                    "plugin1",
+                    new Policy(
+                        "test",
+                        List.of(
+                            new Scope(
+                                "test",
+                                List.of(
+                                    FilesEntitlement.EMPTY,
+                                    new CreateClassLoaderEntitlement(),
+                                    new FilesEntitlement(
+                                        List.of(FilesEntitlement.FileData.ofPath(Path.of("/tmp/test"), FilesEntitlement.Mode.READ))
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ),
+                Map.of(),
+                c -> PolicyScope.plugin("plugin1", moduleName(c)),
+                Map.of("plugin1", List.of(Path.of("modules", "plugin1")))::get,
+                TEST_PATH_LOOKUP
+            )
+        );
+        assertEquals(
+            "[plugin1] using module [test] found duplicate entitlement " + "[" + FilesEntitlement.class.getName() + "]",
+            iae.getMessage()
+        );
+    }
+
+    public void testFilesEntitlementsWithExclusive() {
+        var baseTestPath = Path.of("/base").toAbsolutePath();
+        var testPath1 = Path.of("/base/test").toAbsolutePath();
+        var testPath2 = Path.of("/base/test/foo").toAbsolutePath();
+        var iae = expectThrows(
+            IllegalArgumentException.class,
+            () -> new PolicyManager(
+                createEmptyTestServerPolicy(),
+                Map.of(
+                    "plugin1",
+                    new Policy(
+                        "test",
+                        List.of(
+                            new Scope(
+                                "test.module1",
+                                List.of(
+                                    new FilesEntitlement(
+                                        List.of(FilesEntitlement.FileData.ofPath(testPath1, FilesEntitlement.Mode.READ).withExclusive(true))
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                    "plugin2",
+                    new Policy(
+                        "test",
+                        List.of(
+                            new Scope(
+                                "test.module2",
+                                List.of(
+                                    new FilesEntitlement(
+                                        List.of(FilesEntitlement.FileData.ofPath(testPath1, FilesEntitlement.Mode.READ).withExclusive(true))
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ),
+                Map.of(),
+                c -> PolicyScope.plugin("", moduleName(c)),
+                Map.of("plugin1", List.of(Path.of("modules", "plugin1")), "plugin2", List.of(Path.of("modules", "plugin2")))::get,
+                TEST_PATH_LOOKUP
+            )
+        );
+        assertThat(
+            iae.getMessage(),
+            allOf(
+                containsString("Path [" + testPath1 + "] is already exclusive"),
+                containsString("[plugin1][test.module1]"),
+                containsString("[plugin2][test.module2]"),
+                containsString("cannot add exclusive access")
+            )
+        );
+
+        iae = expectThrows(
+            IllegalArgumentException.class,
+            () -> new PolicyManager(
+                new Policy(
+                    "test",
+                    List.of(
+                        new Scope(
+                            "test",
+                            List.of(
+                                new FilesEntitlement(
+                                    List.of(
+                                        FilesEntitlement.FileData.ofPath(testPath2, FilesEntitlement.Mode.READ).withExclusive(true),
+                                        FilesEntitlement.FileData.ofPath(baseTestPath, FilesEntitlement.Mode.READ)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ),
+                Map.of(
+                    "plugin1",
+                    new Policy(
+                        "test",
+                        List.of(
+                            new Scope(
+                                "test",
+                                List.of(
+                                    new FilesEntitlement(
+                                        List.of(FilesEntitlement.FileData.ofPath(testPath1, FilesEntitlement.Mode.READ).withExclusive(true))
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ),
+                Map.of(),
+                c -> PolicyScope.plugin("", moduleName(c)),
+                name -> Collections.emptyList(),
+                TEST_PATH_LOOKUP
+            )
+        );
+        assertEquals(
+            Strings.format(
+                "duplicate/overlapping exclusive paths found in files entitlements: "
+                    + "[[plugin1] [test] [%s]] and [[(server)] [test] [%s]]",
+                testPath1,
+                testPath2
+            ),
+            iae.getMessage()
+        );
+    }
+
+    static Class<?> makeClassInItsOwnModule() throws ClassNotFoundException {
+        ModuleReference ref = createMockModuleRef();
+        ModuleLayer layer = createLayer(ref, "org.example.plugin");
+        return layer.findLoader("org.example.plugin").loadClass("q.B");
+    }
+
+    static Policy createEmptyTestServerPolicy() {
+        return new Policy("server", List.of());
+    }
+
+    private static ClassLoader createUnnamedModuleClassLoader() {
+        var classBytes = InMemoryJavaCompiler.compile(Map.of("q.B", "package q; public class B { }"));
+        return new ClassLoader(PolicyManagerTests.class.getClassLoader()) {
+            @Override
+            protected Class<?> findClass(String name) throws ClassNotFoundException {
+                byte[] bytes = classBytes.get(name);
+                if (bytes != null) {
+                    return defineClass(name, bytes, 0, bytes.length);
+                }
+                throw new ClassNotFoundException(name);
+            }
+        };
+    }
+
+    private static ModuleReference createMockModuleRef() {
+        ModuleDescriptor descriptor = ModuleDescriptor.newModule("org.example.plugin").exports("q").build();
+        Map<String, CharSequence> sources = Map.ofEntries(
+            entry("module-info", "module org.example.plugin { exports q; }"),
+            entry("q.B", "package q; public class B { }")
+        );
+
+        var classToBytes = InMemoryJavaCompiler.compile(sources);
+        return new InMemoryModuleReference(descriptor, classToBytes);
+    }
+
+    private static ModuleLayer createLayer(ModuleReference moduleRef, String moduleName) {
+        Configuration cf = ModuleLayer.boot()
+            .configuration()
+            .resolve(new InMemoryModuleFinder(moduleRef), ModuleFinder.of(), Set.of(moduleName));
+        var moduleController = ModuleLayer.defineModulesWithOneLoader(
+            cf,
+            List.of(ModuleLayer.boot()),
+            ClassLoader.getPlatformClassLoader()
+        );
+        return moduleController.layer();
+    }
+
+    record MockFrame(Class<?> declaringClass) implements StackFrame {
+        @Override
+        public String getClassName() {
+            return getDeclaringClass().getName();
+        }
+
+        @Override
+        public String getMethodName() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Class<?> getDeclaringClass() {
+            return declaringClass;
+        }
+
+        @Override
+        public int getByteCodeIndex() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public String getFileName() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public int getLineNumber() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isNativeMethod() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public StackTraceElement toStackTraceElement() {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    static String moduleName(Class<?> c) {
+        return ScopeResolver.getScopeName(c.getModule());
+    }
+
+    private static class InMemoryModuleReference extends ModuleReference {
+        private final Map<String, byte[]> classBytes;
+
+        protected InMemoryModuleReference(ModuleDescriptor descriptor, Map<String, byte[]> classBytes) {
+            super(descriptor, null);
+            this.classBytes = classBytes;
+        }
+
+        @Override
+        public ModuleReader open() {
+            return new ModuleReader() {
+                @Override
+                public Optional<URI> find(String name) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<InputStream> open(String name) {
+                    // ModuleLayer's Loader requests resources as "q/B.class"; map back to "q.B"
+                    String key = name.endsWith(".class") ? name.substring(0, name.length() - 6).replace('/', '.') : name.replace('/', '.');
+                    byte[] bytes = classBytes.get(key);
+                    return bytes == null ? Optional.empty() : Optional.of(new ByteArrayInputStream(bytes));
+                }
+
+                @Override
+                public Stream<String> list() {
+                    return classBytes.keySet().stream();
+                }
+
+                @Override
+                public void close() {}
+            };
+        }
+    }
+
+    private static class InMemoryModuleFinder implements ModuleFinder {
+        private final ModuleReference ref;
+        private final String name;
+
+        private InMemoryModuleFinder(ModuleReference mref) {
+            this.ref = mref;
+            this.name = mref.descriptor().name();
+        }
+
+        @Override
+        public Optional<ModuleReference> find(String name) {
+            Objects.requireNonNull(name);
+            return Optional.ofNullable(this.name.equals(name) ? ref : null);
+        }
+
+        @Override
+        public Set<ModuleReference> findAll() {
+            return Set.of(ref);
+        }
+    }
+
+}

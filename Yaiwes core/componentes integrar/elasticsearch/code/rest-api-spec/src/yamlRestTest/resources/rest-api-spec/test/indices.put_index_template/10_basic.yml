@@ -1,0 +1,320 @@
+---
+"Put index template":
+  - requires:
+      cluster_features: ["gte_v7.8.0"]
+      reason: "index template v2 API unavailable before 7.8"
+      test_runner_features: allowed_warnings
+
+  - do:
+      allowed_warnings:
+        - "index template [test] has index patterns [test-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [test] will take precedence during new index creation"
+      indices.put_index_template:
+        name: test
+        body:
+          index_patterns: test-*
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+            mappings:
+              properties:
+                field:
+                  type: keyword
+
+  - do:
+      indices.get_index_template:
+        name: test
+
+  - match: {index_templates.0.name: "test"}
+  - match: {index_templates.0.index_template.index_patterns: ["test-*"]}
+  - match: {index_templates.0.index_template.template.settings.index: {number_of_shards: '1', number_of_replicas: '0'}}
+  - match: {index_templates.0.index_template.template.mappings: {properties: {field: {type: keyword}}}}
+
+---
+"Put multiple index templates":
+  - requires:
+      cluster_features: ["gte_v7.8.0"]
+      reason: "index template v2 API unavailable before 7.8"
+      test_runner_features: allowed_warnings
+
+  - do:
+      allowed_warnings:
+        - "index template [test] has index patterns [test-*, test2-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [test] will take precedence during new index creation"
+      indices.put_index_template:
+        name: test
+        body:
+          index_patterns: [test-*, test2-*]
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+            mappings:
+              properties:
+                field:
+                  type: text
+            aliases:
+              test_alias: {}
+              test_blias: { routing: b }
+              test_clias: { filter: { term: { user: kimchy }}}
+
+  - do:
+      indices.get_index_template:
+        name: test
+
+  - match: {index_templates.0.index_template.index_patterns: ["test-*", "test2-*"]}
+  - match: {index_templates.0.index_template.template.settings.index: {number_of_shards: '1', number_of_replicas: '0'}}
+  - match: {index_templates.0.index_template.template.mappings: {properties: {field: {type: text}}}}
+  - length: {index_templates.0.index_template.template.aliases: 3}
+  - is_true: index_templates.0.index_template.template.aliases.test_alias
+  - match: {index_templates.0.index_template.template.aliases.test_blias.index_routing: "b" }
+  - match: {index_templates.0.index_template.template.aliases.test_blias.search_routing: "b" }
+  - match: {index_templates.0.index_template.template.aliases.test_clias.filter.term.user: "kimchy" }
+
+---
+"Put index template with 'create' flag":
+  - requires:
+      cluster_features: ["gte_v7.8.0"]
+      reason: "index template v2 API unavailable before 7.8"
+      test_runner_features: allowed_warnings
+
+  - do:
+      allowed_warnings:
+        - "index template [test2] has index patterns [test-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [test2] will take precedence during new index creation"
+      indices.put_index_template:
+        name: test2
+        body:
+          index_patterns: test-*
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+
+  - do:
+      indices.get_index_template:
+        name: test2
+
+  - match: {index_templates.0.index_template.index_patterns: ["test-*"]}
+  - match: {index_templates.0.index_template.template.settings.index: {number_of_shards: '1', number_of_replicas: '0'}}
+
+  - do:
+      catch: bad_request
+      indices.put_index_template:
+        name: test2
+        create: true
+        body:
+          index_patterns: test-*
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+
+---
+"Put index template without index_patterns":
+  - requires:
+      cluster_features: ["gte_v7.8.0"]
+      reason: "index template v2 API unavailable before 7.8"
+
+  - do:
+      catch: bad_request
+      indices.put_index_template:
+        name: test
+        body: {}
+
+---
+"Delete multiple templates":
+  - requires:
+      cluster_features: ["gte_v8.0.0"]
+      reason: "not yet backported"
+      test_runner_features: allowed_warnings
+
+  - do:
+      allowed_warnings:
+        - "index template [foo] has index patterns [foo-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [foo] will take precedence during new index creation"
+      indices.put_index_template:
+        name: foo
+        body:
+          index_patterns: foo-*
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+
+  - do:
+      allowed_warnings:
+        - "index template [bar] has index patterns [bar-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [bar] will take precedence during new index creation"
+      indices.put_index_template:
+        name: bar
+        body:
+          index_patterns: bar-*
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+
+  - do:
+      allowed_warnings:
+        - "index template [baz] has index patterns [baz-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [baz] will take precedence during new index creation"
+      indices.put_index_template:
+        name: baz
+        body:
+          index_patterns: baz-*
+          template:
+            settings:
+              number_of_shards:   1
+              number_of_replicas: 0
+
+  - do:
+      indices.get_index_template:
+        name: 'bar'
+  - match: {index_templates.0.name: "bar"}
+
+  - do:
+      indices.get_index_template:
+        name: 'baz'
+  - match: {index_templates.0.name: "baz"}
+
+  - do:
+      indices.get_index_template:
+        name: 'foo'
+  - match: {index_templates.0.name: "foo"}
+
+  - do:
+      indices.delete_index_template:
+        name: foo,bar
+
+  - do:
+      catch: missing
+      indices.get_index_template:
+        name: foo
+
+  - do:
+      catch: missing
+      indices.get_index_template:
+        name: bar
+
+  - do:
+      indices.get_index_template:
+        name: baz
+
+  - match: {index_templates.0.name: baz}
+
+---
+"Add data stream lifecycle with downsampling":
+  - requires:
+      capabilities:
+        - method: PUT
+          path: /_index_template/{name}
+          capabilities: [ "dlm.downsampling_method" ]
+      test_runner_features: [ "capabilities" ]
+      reason: "Downsampling method was added to data stream lifecycle was available from 9.3"
+
+  - do:
+      indices.put_index_template:
+        name: test-lifecycle
+        body:
+          index_patterns: downsampling-*
+          data_stream: {}
+          template:
+            lifecycle:
+              data_retention: "10d"
+              downsampling_method: last_value
+              downsampling:
+                - {"after": "1d", "fixed_interval": "5m"}
+
+  - do:
+      indices.get_index_template:
+        name: test-lifecycle
+
+  - match: {index_templates.0.name: test-lifecycle}
+  - match: {index_templates.0.index_template.template.lifecycle.enabled: true}
+  - match: {index_templates.0.index_template.template.lifecycle.data_retention: "10d"}
+  - match: {index_templates.0.index_template.template.lifecycle.downsampling_method: "last_value"}
+  - match: {index_templates.0.index_template.template.lifecycle.downsampling.0.after: "1d"}
+  - match: {index_templates.0.index_template.template.lifecycle.downsampling.0.fixed_interval: "5m"}
+
+---
+"Add data stream lifecycle with frozen_after":
+  - requires:
+      capabilities:
+        - method: PUT
+          path: /_index_template/{name}
+          capabilities: [ "dlm.frozen_after" ]
+      test_runner_features: [ "capabilities", "allowed_warnings" ]
+      reason: "Frozen after added"
+
+  - do:
+      allowed_warnings:
+        - "Data stream lifecycle field [frozen_after] is not supported in serverless."
+      indices.put_index_template:
+        name: test-lifecycle
+        body:
+          index_patterns: frozen-*
+          data_stream: {}
+          template:
+            lifecycle:
+              data_retention: "30d"
+              frozen_after: "10d"
+
+  - do:
+      indices.get_index_template:
+        name: test-lifecycle
+
+  - match: {index_templates.0.name: test-lifecycle}
+  - match: {index_templates.0.index_template.template.lifecycle.enabled: true}
+  - match: {index_templates.0.index_template.template.lifecycle.data_retention: "30d"}
+  - match: {index_templates.0.index_template.template.lifecycle.frozen_after: "10d"}
+
+---
+"Setting frozen_after on failure store lifecycle in index template is rejected":
+  - requires:
+      capabilities:
+        - method: PUT
+          path: /_index_template/{name}
+          capabilities: [ "failure_store.lifecycle.frozen_after_rejected" ]
+      test_runner_features: [ "capabilities" ]
+      reason: "Failure store lifecycle rejecting frozen_after was added in 9.5.1+"
+
+  - do:
+      indices.put_index_template:
+        name: test-failure-lifecycle
+        body:
+          index_patterns: frozen-failure-*
+          data_stream: {}
+          template:
+            data_stream_options:
+              failure_store:
+                lifecycle:
+                  frozen_after: "30d"
+      catch: '/Failure store lifecycle does not support freezing/'
+
+---
+"PUT index template with duplicate dynamic template names emits a warning":
+  - requires:
+      cluster_features: [ "mapper.dynamic_template.warn_on_duplicate_names" ]
+      reason: duplicate dynamic template name warning was added
+      test_runner_features: ["allowed_warnings", "warnings"]
+
+  - do:
+      allowed_warnings:
+        - "index template [test-dup-dynamic-templates] has index patterns [test-dup-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [test-dup-dynamic-templates] will take precedence during new index creation"
+      warnings:
+        - "Dynamic template [my_template] in template [test-dup-dynamic-templates] is defined more than once. It is not defined which of the duplicate definitions takes effect. Defining multiple dynamic templates with the same name will be rejected in a future version."
+      indices.put_index_template:
+        name: test-dup-dynamic-templates
+        body:
+          index_patterns: test-dup-*
+          template:
+            mappings:
+              dynamic_templates:
+                - my_template:
+                    match: "foo_*"
+                    mapping:
+                      type: keyword
+                - my_template:
+                    match: "bar_*"
+                    mapping:
+                      type: text
+
+  - do:
+      indices.delete_index_template:
+        name: test-dup-dynamic-templates

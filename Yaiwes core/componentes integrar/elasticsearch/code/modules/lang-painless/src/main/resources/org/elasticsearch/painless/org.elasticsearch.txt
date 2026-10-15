@@ -1,0 +1,175 @@
+#
+ # Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ # or more contributor license agreements. Licensed under the "Elastic License
+ # 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ # Public License v 1"; you may not use this file except in compliance with, at
+ # your election, the "Elastic License 2.0", the "GNU Affero General Public
+ # License v3.0 only", or the "Server Side Public License, v 1".
+#
+
+#
+# Painless definition file. This defines the hierarchy of classes,
+# what methods and fields they have, etc.
+#
+
+#### Primitive types
+
+class void @no_import {
+}
+
+class boolean @no_import {
+}
+
+class byte @no_import {
+}
+
+class short @no_import {
+}
+
+class char @no_import {
+}
+
+class int @no_import {
+}
+
+class long @no_import {
+}
+
+class float @no_import {
+}
+
+class double @no_import {
+}
+
+#### Painless debugging API
+
+class org.elasticsearch.painless.api.Debug {
+  void explain(Object)
+}
+
+#### ES Scripting API
+
+class org.elasticsearch.common.geo.GeoPoint {
+  () @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointBytes"]
+  (double, double) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointBytes"]
+  double getLat()
+  double getLon()
+}
+
+class org.elasticsearch.common.geo.GeoBoundingBox {
+  org.elasticsearch.common.geo.GeoPoint topLeft()
+  org.elasticsearch.common.geo.GeoPoint bottomRight()
+}
+
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$Strings {
+  String org.elasticsearch.painless.api.Augmentation get(int) @script_aware
+  String org.elasticsearch.painless.api.Augmentation getValue() @script_aware
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$Longs {
+  Long get(int) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="boxedLongReadBytes"]
+  long getValue()
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$Dates {
+  ZonedDateTime get(int)
+  ZonedDateTime getValue()
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$Doubles {
+  Double get(int) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="boxedDoubleReadBytes"]
+  double getValue()
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$Geometry {
+  int getDimensionalType()
+  org.elasticsearch.common.geo.GeoPoint getCentroid()
+  org.elasticsearch.common.geo.GeoBoundingBox getBoundingBox()
+  org.elasticsearch.common.geo.GeoPoint getLabelPosition()
+  double getMercatorWidth()
+  double getMercatorHeight()
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$GeoPoints {
+  # Every read below copies the point into a new GeoPoint, the distance functions included.
+  org.elasticsearch.common.geo.GeoPoint get(int) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  org.elasticsearch.common.geo.GeoPoint getValue() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double getLat() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double getLon() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double[] getLats() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointsDoublesBytes"]
+  double[] getLons() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointsDoublesBytes"]
+
+  # geo distance functions
+  double arcDistance(double,double) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double arcDistanceWithDefault(double,double,double) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double planeDistance(double,double) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double planeDistanceWithDefault(double,double,double) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double geohashDistance(String) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+  double geohashDistanceWithDefault(String,double) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="geoPointReadBytes"]
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$Booleans {
+  # Boolean.valueOf returns a shared constant, so get(int) allocates nothing.
+  Boolean get(int)
+  boolean getValue()
+}
+
+class org.elasticsearch.index.fielddata.ScriptDocValues$BytesRefs {
+  BytesRef org.elasticsearch.painless.api.Augmentation get(int) @script_aware
+  BytesRef org.elasticsearch.painless.api.Augmentation getValue() @script_aware
+}
+
+class org.elasticsearch.index.mapper.vectors.DenseVectorScriptDocValues {
+    float[] getVectorValue()
+    float getMagnitude()
+}
+
+class org.elasticsearch.index.mapper.vectors.RankVectorsScriptDocValues {
+    Iterator getVectorValues() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="rankVectorsIteratorBytes"]
+    float[] getMagnitudes()
+}
+
+class org.apache.lucene.util.BytesRef {
+  byte[] bytes
+  int offset
+  int length
+  boolean bytesEquals(BytesRef)
+  String utf8ToString() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="utf8ToStringBytes"]
+}
+
+class org.elasticsearch.search.lookup.FieldLookup {
+  def getValue()
+  List getValues()
+  boolean isEmpty()
+}
+
+class org.elasticsearch.index.similarity.ScriptedSimilarity$Query {
+  float getBoost()
+}
+
+class org.elasticsearch.index.similarity.ScriptedSimilarity$Field {
+  long getDocCount()
+  long getSumDocFreq()
+  long getSumTotalTermFreq()
+}
+
+class org.elasticsearch.index.similarity.ScriptedSimilarity$Term {
+  long getDocFreq()
+  long getTotalTermFreq()
+}
+
+class org.elasticsearch.index.similarity.ScriptedSimilarity$Doc {
+  int getLength()
+  float getFreq()
+}
+
+class org.elasticsearch.index.query.IntervalFilterScript$Interval {
+  int getStart()
+  int getEnd()
+  int getGaps()
+}
+
+class org.elasticsearch.script.ScoreScript$ExplanationHolder {
+  void set(String)
+}

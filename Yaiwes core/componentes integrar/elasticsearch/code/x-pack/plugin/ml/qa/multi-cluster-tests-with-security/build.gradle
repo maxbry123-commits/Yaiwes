@@ -1,0 +1,30 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import org.elasticsearch.gradle.Version
+
+apply plugin: 'elasticsearch.internal-yaml-rest-test'
+
+dependencies {
+  yamlRestTestImplementation project(':x-pack:qa')
+}
+
+// The remote cluster runs on the minimum wire-compatible version to exercise cross-cluster search
+// compatibility, so a BWC distribution for that version is required in addition to the default one.
+Version ccsCompatVersion = buildParams.bwcVersions.minimumWireCompatibleVersion
+
+restResources {
+  restApi {
+    include '_common', 'bulk', 'indices', 'cluster', 'search', 'security', 'ml'
+  }
+}
+
+tasks.named("yamlRestTest").configure {
+  usesDefaultDistribution("ML cross-cluster tests require security and a trial license from the default distribution")
+  usesBwcDistribution(ccsCompatVersion)
+  systemProperty 'tests.ccs_compat_version', ccsCompatVersion.toString()
+}

@@ -1,0 +1,284 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.ingest;
+
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.cluster.Diff;
+import org.elasticsearch.cluster.SimpleDiffable;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.io.stream.CountingStreamOutput;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.util.CollectionUtils;
+import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.xcontent.ContextParser;
+import org.elasticsearch.xcontent.ObjectParser;
+import org.elasticsearch.xcontent.ParseField;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentType;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.elasticsearch.common.util.CollectionUtils.DeepCopyOption.LAX;
+import static org.elasticsearch.common.util.CollectionUtils.DeepCopyOption.ORDERED;
+import static org.elasticsearch.common.util.CollectionUtils.DeepCopyOption.UNMODIFIABLE;
+
+/**
+ * Encapsulates a pipeline's id and configuration as a loosely typed map -- see {@link Pipeline} for the
+ * parsed and processed object(s) that a pipeline configuration will become. This class is used for things
+ * like keeping track of pipelines in the cluster state (where a pipeline is 'just some json') whereas the
+ * {@link Pipeline} class is used in the actual processing of ingest documents through pipelines in the
+ * {@link IngestService}.
+ */
+public final class PipelineConfiguration implements SimpleDiffable<PipelineConfiguration>, ToXContentObject {
+
+    private static final ObjectParser<Builder, Void> PARSER = new ObjectParser<>("pipeline_config", true, Builder::new);
+    static {
+        PARSER.declareString(Builder::setId, new ParseField("id"));
+        PARSER.declareField(
+            (parser, builder, aVoid) -> builder.setConfig(parser.mapOrdered()),
+            new ParseField("config"),
+            ObjectParser.ValueType.OBJECT
+        );
+    }
+
+    public static ContextParser<Void, PipelineConfiguration> getParser() {
+        return (parser, context) -> PARSER.apply(parser, null).build();
+    }
+
+    private static class Builder {
+
+        private String id;
+        private Map<String, Object> config;
+
+        void setId(String id) {
+            this.id = id;
+        }
+
+        void setConfig(Map<String, Object> config) {
+            this.config = config;
+        }
+
+        PipelineConfiguration build() {
+            return new PipelineConfiguration(id, config);
+        }
+    }
+
+    private static final TransportVersion PIPELINE_TRACKING_INFO = TransportVersion.fromName("pipeline_tracking_info");
+
+    private final String id;
+    private final Map<String, Object> config;
+    // Lazily-computed serialized size. This class is immutable, so the size is stable once computed. Memoized because the size is summed
+    // across all pipelines on every pipeline creation, and recomputing it (which walks the whole config) on each request would burden the
+    // master.
+    private volatile long serializedSize = -1;
+
+    public PipelineConfiguration(String id, Map<String, Object> config) {
+        this.id = Objects.requireNonNull(id);
+        this.config = CollectionUtils.deepCopy(config, UNMODIFIABLE, ORDERED, LAX);
+    }
+
+    /**
+     * A convenience constructor that parses some bytes as a map representing a pipeline's config and then delegates to the
+     * conventional {@link #PipelineConfiguration(String, Map)} constructor.
+     *
+     * @param id the id of the pipeline
+     * @param config a parse-able bytes reference that will return a pipeline configuration
+     * @param xContentType the content-type to use while parsing the pipeline configuration
+     */
+    public PipelineConfiguration(String id, BytesReference config, XContentType xContentType) {
+        this(id, XContentHelper.convertToMap(config, true, xContentType).v2());
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    /**
+     * @return a reference to the unmodifiable configuration map for this pipeline
+     */
+    public Map<String, Object> getConfig() {
+        return getConfig(true);
+    }
+
+    /**
+     * @param unmodifiable whether the returned map should be unmodifiable or not
+     * @return a reference to the unmodifiable config map (if unmodifiable is true) or
+     * a reference to a freshly-created mutable deep copy of the config map (if unmodifiable is false)
+     */
+    public Map<String, Object> getConfig(boolean unmodifiable) {
+        if (unmodifiable) {
+            return config; // already unmodifiable
+        } else {
+            return CollectionUtils.deepCopy(config, ORDERED, LAX);
+        }
+    }
+
+    public Integer getVersion() {
+        Object o = config.get("version");
+        if (o == null) {
+            return null;
+        } else if (o instanceof Number number) {
+            return number.intValue();
+        } else {
+            throw new IllegalStateException("unexpected version type [" + o.getClass().getName() + "]");
+        }
+    }
+
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject();
+        builder.field("id", id);
+        builder.field("config", config);
+        builder.endObject();
+        return builder;
+    }
+
+    public static PipelineConfiguration readFrom(StreamInput in) throws IOException {
+        final String id = in.readString();
+        final Map<String, Object> config;
+        config = in.readGenericMap();
+        return new PipelineConfiguration(id, config);
+    }
+
+    public static Diff<PipelineConfiguration> readDiffFrom(StreamInput in) throws IOException {
+        return SimpleDiffable.readDiffFrom(PipelineConfiguration::readFrom, in);
+    }
+
+    @Override
+    public String toString() {
+        return Strings.toString(this);
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        final TransportVersion transportVersion = out.getTransportVersion();
+        writeTo(out, id, configForTransport(transportVersion));
+    }
+
+    /**
+     * The wire layout of a pipeline, kept in one place so that {@link #writeTo(StreamOutput)} and
+     * {@link #serializedSizeInBytes(String, Map)} cannot drift apart.
+     */
+    private static void writeTo(StreamOutput out, String id, Map<String, Object> config) throws IOException {
+        out.writeString(id);
+        out.writeGenericMap(config);
+    }
+
+    /**
+     * Returns the number of bytes this pipeline occupies when serialized at the current transport version. The size is measured without
+     * materializing the serialized form, so that even an oversized pipeline does not cause a large allocation here. The result is memoized
+     * (this class is immutable) so that summing the size across all pipelines on every pipeline creation does not repeatedly walk the whole
+     * config on the master. Used to bound both a single pipeline and the aggregate size of all stored pipelines in the cluster state.
+     * <p>
+     * This is a measure of how much cluster state a pipeline accounts for, not a prediction of what {@link #writeTo(StreamOutput)} will
+     * emit to a given peer: {@code configForTransport} drops the system properties that the peer's transport version does not understand,
+     * so a peer older than {@code pipeline_tracking_info} is sent fewer bytes than this reports. Don't reuse it for wire accounting.
+     */
+    public long serializedSizeInBytes() {
+        long size = serializedSize;
+        if (size == -1) {
+            try (CountingStreamOutput out = new CountingStreamOutput()) {
+                writeTo(out);
+                size = out.position();
+            } catch (IOException e) {
+                throw new IllegalStateException("unable to compute the size of ingest pipeline [" + id + "]", e);
+            }
+            serializedSize = size;
+        }
+        return size;
+    }
+
+    /**
+     * As {@link #serializedSizeInBytes()}, but measuring a pipeline id and a raw config map that have not been made into a
+     * {@link PipelineConfiguration}. This lets the put path size-check a pipeline straight off the map it already parsed, without paying
+     * for the defensive deep copy that constructing a {@link PipelineConfiguration} would perform. The map is only read, never retained.
+     * <p>
+     * The map is measured exactly as given, with no transport-version filtering applied. That is consistent with
+     * {@link #serializedSizeInBytes()}, which measures at the current transport version, where {@code configForTransport} is a no-op;
+     * filtering only comes into play when writing to an older peer.
+     */
+    static long serializedSizeInBytes(String id, Map<String, Object> config) {
+        try (CountingStreamOutput out = new CountingStreamOutput()) {
+            writeTo(out, id, config);
+            return out.position();
+        } catch (IOException e) {
+            throw new IllegalStateException("unable to compute the size of ingest pipeline [" + id + "]", e);
+        }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        PipelineConfiguration that = (PipelineConfiguration) o;
+
+        if (id.equals(that.id) == false) return false;
+        return config.equals(that.config);
+
+    }
+
+    @Override
+    public int hashCode() {
+        int result = id.hashCode();
+        result = 31 * result + config.hashCode();
+        return result;
+    }
+
+    /**
+     * Returns a copy of this object with processor upgrades applied, if necessary. Otherwise, returns this object.
+     *
+     * <p>The given upgrader is applied to the config map for any processor of the given type.
+     */
+    PipelineConfiguration maybeUpgradeProcessors(String type, IngestMetadata.ProcessorConfigUpgrader upgrader) {
+        Map<String, Object> mutableConfigMap = getConfig(false);
+        boolean changed = false;
+        // This should be a List of Maps, where the keys are processor types and the values are config maps.
+        // But we'll skip upgrading rather than fail if not.
+        if (mutableConfigMap.get(Pipeline.PROCESSORS_KEY) instanceof Iterable<?> processors) {
+            for (Object processor : processors) {
+                if (processor instanceof Map<?, ?> processorMap && processorMap.get(type) instanceof Map<?, ?> targetProcessor) {
+                    @SuppressWarnings("unchecked") // All XContent maps will be <String, Object>
+                    Map<String, Object> processorConfigMap = (Map<String, Object>) targetProcessor;
+                    if (upgrader.maybeUpgrade(processorConfigMap)) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) {
+            return new PipelineConfiguration(id, mutableConfigMap);
+        } else {
+            return this;
+        }
+    }
+
+    /** Remove system properties from config if they aren't supported by the transport version */
+    private Map<String, Object> configForTransport(final TransportVersion transportVersion) {
+        final boolean transportSupportsNewProperties = transportVersion.supports(PIPELINE_TRACKING_INFO);
+        final boolean noNewProperties = config.containsKey(Pipeline.CREATED_DATE_MILLIS) == false
+            && config.containsKey(Pipeline.MODIFIED_DATE_MILLIS) == false;
+
+        if (transportSupportsNewProperties || noNewProperties) {
+            return config;
+        }
+        final Map<String, Object> configWithoutNewSystemProperties = new HashMap<>(config);
+        configWithoutNewSystemProperties.remove(Pipeline.CREATED_DATE_MILLIS);
+        configWithoutNewSystemProperties.remove(Pipeline.MODIFIED_DATE_MILLIS);
+        return Collections.unmodifiableMap(configWithoutNewSystemProperties);
+    }
+}

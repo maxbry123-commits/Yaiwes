@@ -1,0 +1,100 @@
+{
+  "bundle_bytes": 172349168,
+  "bundle_sha256": "f541419bda8d644a617eae103e767ade3d413e8e4363420deef5af2507959fb4",
+  "extracted_tree": {
+    "bytes": 497836317,
+    "files": 50486,
+    "sha256": "6c8e77729656b683cb4aa275c755d10c495631aa5820dbf8b48a005119de696f"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0001",
+      "sha256": "f8c81c20eda723f4852487245925004e34166d54ed8d08eb83de2e02af40e703"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0002",
+      "sha256": "2c3fe0101af30df34fde9b4be1a4a827e0a3228a9eda9ef6f7a487fb90650c9f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0003",
+      "sha256": "ae177516fdaf54d11c4038955c2a616eaca7d0a9e2b1a87977644ce33369f30c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0004",
+      "sha256": "02e9b26054e3ce76e4d63c88c6ed558bc511aa8273b1d9934037a09d50490a01"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0005",
+      "sha256": "6dac3223f08b7389e6235892db11cd3982919c21fc0b30fd44f6e7c1b4d7aa86"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0006",
+      "sha256": "6d0c15cd10a854f501b859a46cc56529b0e39a62fc8d407e0a692f8794377d77"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0007",
+      "sha256": "cfd9fb8ace67efcfb7610e03080537ec7bca77a091aacba407102b11a5cbbd91"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0008",
+      "sha256": "385f87acd85e624ac59ddb4d8804e11b60e873d093bcbb0f6bbcd220cf8c86c5"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0009",
+      "sha256": "c8d00f46eda75a8e3435d50bc8cb55a5fe53c7e3ce52ebdc19a16c4e6273b0db"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0010",
+      "sha256": "a72103666a17e4fc6ac77832b9020f73dc99fb0b05c4a72ec7b753df1f729dab"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0011",
+      "sha256": "673e12261d6a9a3e8ccf9bbb1a691d3551f5b559e398f0176ccf8ae2978a7428"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0012",
+      "sha256": "93031b7c5e4c5f12fd098eb50c8512f80dfb36517d676f04f4bb1ea5107037d5"
+    },
+    {
+      "bytes": 12582912,
+      "name": "elasticsearch.bundle.zip.part-0013",
+      "sha256": "a7e5c1a0c551b56979c71bae6e7a4282c12af21785cccceb9199603fa74f51f0"
+    },
+    {
+      "bytes": 8771312,
+      "name": "elasticsearch.bundle.zip.part-0014",
+      "sha256": "3392efb8ef0625080031c84b37471a3386675b843def5690cda10bd09c0bce2a"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "elasticsearch",
+  "source_bytes": 497836317,
+  "source_commit": "ed901573c617d24837dde6dedda90c8d491dff92",
+  "source_files": 50486,
+  "source_ref": "main",
+  "source_repo": "elastic/elasticsearch",
+  "source_tree": {
+    "bytes": 497836317,
+    "files": 50486,
+    "sha256": "6c8e77729656b683cb4aa275c755d10c495631aa5820dbf8b48a005119de696f"
+  }
+}

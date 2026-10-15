@@ -1,0 +1,110 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.xpack.transform.checkpoint;
+
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.xpack.core.transform.transforms.TransformCheckpoint;
+import org.elasticsearch.xpack.core.transform.transforms.TransformCheckpointingInfo.TransformCheckpointingInfoBuilder;
+import org.elasticsearch.xpack.core.transform.transforms.TransformIndexerPosition;
+import org.elasticsearch.xpack.core.transform.transforms.TransformProgress;
+
+/**
+ * Interface for checkpoint creation, checking for changes and getting statistics about checkpoints
+ */
+public interface CheckpointProvider {
+
+    /** Starting GetCheckpoint timeout. Silent nodes should not wait the 12h walk bound. */
+    TimeValue MIN_GET_INDEX_CHECKPOINTS_TIMEOUT = TimeValue.timeValueSeconds(30);
+
+    /** Ceiling for huge searchable-snapshot sources. */
+    TimeValue MAX_GET_INDEX_CHECKPOINTS_TIMEOUT = TimeValue.timeValueHours(12);
+
+    /**
+     * {@code minTimeout * 2^failureCount}, capped at 12h. Null/non-positive {@code minTimeout} uses 30s.
+     */
+    static TimeValue getIndexCheckpointsTimeout(int failureCount) {
+        return getIndexCheckpointsTimeout(null, failureCount);
+    }
+
+    static TimeValue getIndexCheckpointsTimeout(TimeValue minTimeout, int failureCount) {
+        long maxMillis = MAX_GET_INDEX_CHECKPOINTS_TIMEOUT.millis();
+        long baseMillis = minTimeout == null || minTimeout.millis() <= 0 ? MIN_GET_INDEX_CHECKPOINTS_TIMEOUT.millis() : minTimeout.millis();
+        if (baseMillis >= maxMillis) {
+            return MAX_GET_INDEX_CHECKPOINTS_TIMEOUT;
+        }
+        // Cap the shift to avoid overflow (same bound as TransformSchedulingUtils).
+        int shift = Math.min(Math.max(failureCount, 0), 32);
+        if (shift > 0 && baseMillis > (maxMillis >> shift)) {
+            return MAX_GET_INDEX_CHECKPOINTS_TIMEOUT;
+        }
+        return TimeValue.timeValueMillis(Math.min(baseMillis << shift, maxMillis));
+    }
+
+    /**
+     * Create a new checkpoint
+     *
+     * @param lastCheckpoint the last checkpoint
+     * @param listener listener to call after inner request returned
+     */
+    void createNextCheckpoint(TransformCheckpoint lastCheckpoint, ActionListener<TransformCheckpoint> listener);
+
+    /**
+     * Create a checkpoint using {@code timeout} for the GetCheckpoint send and walk.
+     * Default ignores {@code timeout} so existing two-arg implementors keep working.
+     */
+    default void createNextCheckpoint(TransformCheckpoint lastCheckpoint, TimeValue timeout, ActionListener<TransformCheckpoint> listener) {
+        createNextCheckpoint(lastCheckpoint, listener);
+    }
+
+    /**
+     * Determines whether the transform needs updating
+     *
+     * @param lastCheckpoint the last checkpoint
+     * @param listener listener to send the result to
+     */
+    void sourceHasChanged(TransformCheckpoint lastCheckpoint, ActionListener<Boolean> listener);
+
+    /**
+     * Get checkpoint statistics for a running transform
+     *
+     * For running transforms most information is available in-memory.
+     *
+     * @param lastCheckpoint the last checkpoint
+     * @param nextCheckpoint the next checkpoint
+     * @param nextCheckpointPosition position for the next checkpoint
+     * @param nextCheckpointProgress progress for the next checkpoint
+     * @param listener listener to retrieve the result
+     */
+    void getCheckpointingInfo(
+        TransformCheckpoint lastCheckpoint,
+        TransformCheckpoint nextCheckpoint,
+        TransformIndexerPosition nextCheckpointPosition,
+        TransformProgress nextCheckpointProgress,
+        TimeValue timeout,
+        ActionListener<TransformCheckpointingInfoBuilder> listener
+    );
+
+    /**
+     * Get checkpoint statistics for a stopped transform
+     *
+     * For stopped transforms we need to do lookups in the internal index.
+     *
+     * @param lastCheckpointNumber the last checkpoint number
+     * @param nextCheckpointPosition position for the next checkpoint
+     * @param nextCheckpointProgress progress for the next checkpoint
+     * @param listener listener to retrieve the result
+     */
+    void getCheckpointingInfo(
+        long lastCheckpointNumber,
+        TransformIndexerPosition nextCheckpointPosition,
+        TransformProgress nextCheckpointProgress,
+        TimeValue timeout,
+        ActionListener<TransformCheckpointingInfoBuilder> listener
+    );
+}

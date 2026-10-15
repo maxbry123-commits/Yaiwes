@@ -1,0 +1,1761 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+package org.elasticsearch.xpack.core.ml.datafeed;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.ElasticsearchStatusException;
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.action.ActionRequestValidationException;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.support.IndicesOptions;
+import org.elasticsearch.cluster.SimpleDiffable;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Writeable;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.core.Releasable;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.core.Tuple;
+import org.elasticsearch.index.query.QueryBuilder;
+import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.search.aggregations.AggregationBuilder;
+import org.elasticsearch.search.aggregations.AggregatorFactories;
+import org.elasticsearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
+import org.elasticsearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
+import org.elasticsearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
+import org.elasticsearch.search.aggregations.metrics.MaxAggregationBuilder;
+import org.elasticsearch.search.aggregations.support.ValuesSourceAggregationBuilder;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.crossproject.CrossProjectModeDecider;
+import org.elasticsearch.search.sort.SortOrder;
+import org.elasticsearch.transport.RemoteClusterAware;
+import org.elasticsearch.xcontent.NamedXContentRegistry;
+import org.elasticsearch.xcontent.ObjectParser;
+import org.elasticsearch.xcontent.ParseField;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xpack.core.common.time.TimeUtils;
+import org.elasticsearch.xpack.core.ml.utils.ExceptionsHelper;
+import org.elasticsearch.xpack.core.ml.utils.MlStrings;
+import org.elasticsearch.xpack.core.ml.utils.QueryProvider;
+import org.elasticsearch.xpack.core.ml.utils.RuntimeMappingsValidator;
+import org.elasticsearch.xpack.core.ml.utils.ToXContentParams;
+import org.elasticsearch.xpack.core.ml.utils.XContentObjectTransformer;
+import org.elasticsearch.xpack.core.security.cloud.CloudCredentialsExtension;
+import org.elasticsearch.xpack.core.security.cloud.PersistedCloudCredential;
+import org.elasticsearch.xpack.core.security.xcontent.XContentUtils;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+
+import static org.elasticsearch.action.ValidateActions.addValidationError;
+import static org.elasticsearch.xpack.core.ClientHelper.assertNoAuthorizationHeader;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_COMPOSITE_AGG_DATE_HISTOGRAM_SORT;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_COMPOSITE_AGG_DATE_HISTOGRAM_SOURCE_MISSING_BUCKET;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_COMPOSITE_AGG_MUST_BE_TOP_LEVEL_AND_ALONE;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_COMPOSITE_AGG_MUST_HAVE_SINGLE_DATE_SOURCE;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_INTERVAL_MUST_BE_GREATER_THAN_ZERO;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_MAX_ONE_DATE_HISTOGRAM;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_AGGREGATIONS_REQUIRES_DATE_HISTOGRAM;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_CONFIG_AGG_BAD_FORMAT;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_CONFIG_CANNOT_USE_SCRIPT_FIELDS_WITH_AGGS;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_CONFIG_FIELD_REQUIRES_ESQL_QUERY;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_CONFIG_INVALID_OPTION_VALUE;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_CONFIG_QUERY_BAD_FORMAT;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_DATA_HISTOGRAM_MUST_HAVE_NESTED_MAX_AGGREGATION;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_ESQL_CHUNKING_MUST_NOT_BE_DISABLED;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_ESQL_REQUIRES_GROUPING_INTERVAL;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.DATAFEED_ESQL_REQUIRES_SOURCE_TIME_FIELD;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.INVALID_ID;
+import static org.elasticsearch.xpack.core.ml.job.messages.Messages.getMessage;
+import static org.elasticsearch.xpack.core.ml.utils.ToXContentParams.EXCLUDE_GENERATED;
+
+/**
+ * Datafeed configuration options. Describes where to proactively pull input
+ * data from.
+ * <p>
+ * If a value has not been set it will be <code>null</code>. Object wrappers are
+ * used around integral types and booleans so they can take <code>null</code>
+ * values.
+ */
+public class DatafeedConfig implements SimpleDiffable<DatafeedConfig>, ToXContentObject, Releasable {
+
+    public static final int DEFAULT_SCROLL_SIZE = 1000;
+
+    private static final int SECONDS_IN_MINUTE = 60;
+    private static final int TWO_MINS_SECONDS = 2 * SECONDS_IN_MINUTE;
+    private static final int TWENTY_MINS_SECONDS = 20 * SECONDS_IN_MINUTE;
+    private static final int HALF_DAY_SECONDS = 12 * 60 * SECONDS_IN_MINUTE;
+    public static final int DEFAULT_AGGREGATION_CHUNKING_BUCKETS = 1000;
+    public static final TransportVersion ML_DATAFEED_ESQL_QUERY = TransportVersion.fromName("ml_datafeed_esql_query");
+    private static final TimeValue MIN_DEFAULT_QUERY_DELAY = TimeValue.timeValueMinutes(1);
+    private static final TimeValue MAX_DEFAULT_QUERY_DELAY = TimeValue.timeValueMinutes(2);
+
+    private static final Logger logger = LogManager.getLogger(DatafeedConfig.class);
+
+    // Used for QueryPage
+    public static final ParseField RESULTS_FIELD = new ParseField("datafeeds");
+    public static final String TYPE = "datafeed";
+
+    /**
+     * The field name used to specify document counts in Elasticsearch
+     * aggregations
+     */
+    public static final String DOC_COUNT = "doc_count";
+
+    static final TransportVersion DATAFEED_PROJECT_ROUTING = TransportVersion.fromName("datafeed_project_routing");
+    public static final TransportVersion DATAFEED_CLOUD_INTERNAL_CREDENTIAL = TransportVersion.fromName(
+        "datafeed_cloud_internal_credential"
+    );
+    static final TransportVersion DATAFEED_FORCE_REKEYING = TransportVersion.fromName("datafeed_force_rekeying");
+    static final TransportVersion DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES = TransportVersion.fromName(
+        "datafeed_max_consecutive_extraction_failures"
+    );
+    static final TransportVersion DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED = TransportVersion.fromName(
+        "datafeed_max_consecutive_extraction_failures_removed"
+    );
+
+    /**
+     * Returns whether ML cross-project search (CPS) is allowed for datafeeds in the current environment.
+     * <p>
+     * Both the cluster-level {@code serverless.cross_project.enabled} setting and the ML CPS feature flag
+     * ({@link CloudCredentialsExtension#ML_CROSS_PROJECT}) must be enabled. Without this combined gate, every datafeed start on a
+     * CPS-enabled cluster — including ones targeting only local indices — would be promoted to cross-project mode,
+     * which violates the "off by default on main" contract of the ML CPS scaffolding.
+     */
+    public static boolean isCPSAllowed(CrossProjectModeDecider crossProjectModeDecider) {
+        return isCPSAllowed(crossProjectModeDecider, CloudCredentialsExtension.ML_CROSS_PROJECT.isEnabled());
+    }
+
+    // visible for testing — mirrors the withCrossProjectModeIfEnabled overload shape so unit tests
+    // can pin the flag value regardless of snapshot/release build.
+    static boolean isCPSAllowed(CrossProjectModeDecider crossProjectModeDecider, boolean featureEnabled) {
+        Objects.requireNonNull(crossProjectModeDecider, "crossProjectModeDecider must not be null");
+        if (featureEnabled == false) {
+            return false;
+        }
+        if (crossProjectModeDecider.crossProjectEnabled() == false) {
+            return false;
+        }
+        return true;
+    }
+
+    public static final String FORCE_REKEYING_REQUIRES_CPS_AND_CLOUD_AUTH_MESSAGE =
+        "_force_rekeying requires a cloud-authenticated caller and an environment that supports cross-project calls";
+
+    public static final String PROJECT_ROUTING_INERT_WITHOUT_CPS_MESSAGE =
+        "project_routing is stored but has no effect because cross-project search is not enabled in this environment; "
+            + "the datafeed will search local indices only";
+
+    public static ElasticsearchStatusException forceRekeyingRequiresCpsAndCloudAuthException() {
+        return new ElasticsearchStatusException(FORCE_REKEYING_REQUIRES_CPS_AND_CLOUD_AUTH_MESSAGE, RestStatus.BAD_REQUEST);
+    }
+
+    // Accessing `Job.ID` here causes an NPE in tests as a DatafeedConfig parser is referenced in the Job parser
+    public static final ParseField JOB_ID = new ParseField("job_id");
+    public static final ParseField ID = new ParseField("datafeed_id");
+    public static final ParseField CONFIG_TYPE = new ParseField("config_type");
+    public static final ParseField QUERY_DELAY = new ParseField("query_delay");
+    public static final ParseField FREQUENCY = new ParseField("frequency");
+    public static final ParseField INDEXES = new ParseField("indexes");
+    public static final ParseField INDICES = new ParseField("indices");
+    public static final ParseField QUERY = new ParseField("query");
+    public static final ParseField ESQL_QUERY = new ParseField("esql_query");
+    public static final ParseField SOURCE_TIME_FIELD = new ParseField("source_time_field");
+    public static final ParseField GROUPING_INTERVAL = new ParseField("grouping_interval");
+    public static final ParseField SCROLL_SIZE = new ParseField("scroll_size");
+    public static final ParseField AGGREGATIONS = new ParseField("aggregations");
+    public static final ParseField AGGS = new ParseField("aggs");
+    public static final ParseField SCRIPT_FIELDS = new ParseField("script_fields");
+    public static final ParseField CHUNKING_CONFIG = new ParseField("chunking_config");
+    public static final ParseField HEADERS = new ParseField("headers");
+    public static final ParseField DELAYED_DATA_CHECK_CONFIG = new ParseField("delayed_data_check_config");
+    public static final ParseField MAX_EMPTY_SEARCHES = new ParseField("max_empty_searches");
+    public static final ParseField INDICES_OPTIONS = new ParseField("indices_options");
+    public static final ParseField PROJECT_ROUTING = new ParseField("project_routing");
+    public static final ParseField CLOUD_INTERNAL_CREDENTIAL = new ParseField("cloud_internal_credential");
+
+    // These parsers follow the pattern that metadata is parsed leniently (to allow for enhancements), whilst config is parsed strictly
+    public static final ObjectParser<Builder, Void> LENIENT_PARSER = createParser(true);
+    public static final ObjectParser<Builder, Void> STRICT_PARSER = createParser(false);
+
+    public static void validateAggregations(AggregatorFactories.Builder aggregations) {
+        if (aggregations == null) {
+            return;
+        }
+        Collection<AggregationBuilder> aggregatorFactories = aggregations.getAggregatorFactories();
+        if (aggregatorFactories.isEmpty()) {
+            throw ExceptionsHelper.badRequestException(DATAFEED_AGGREGATIONS_REQUIRES_DATE_HISTOGRAM);
+        }
+
+        Builder.checkForOnlySingleTopLevelCompositeAggAndValidate(aggregations.getAggregatorFactories());
+        AggregationBuilder histogramAggregation = DatafeedConfigUtils.getHistogramAggregation(aggregatorFactories);
+        if (histogramAggregation instanceof CompositeAggregationBuilder
+            && aggregations.getPipelineAggregatorFactories().isEmpty() == false) {
+            throw ExceptionsHelper.badRequestException(
+                "when using composite aggregations, top level pipeline aggregations are not supported"
+            );
+        }
+        Builder.checkNoMoreHistogramAggregations(histogramAggregation.getSubAggregations());
+        Builder.checkNoMoreCompositeAggregations(histogramAggregation.getSubAggregations());
+        Builder.checkHistogramAggregationHasChildMaxTimeAgg(histogramAggregation);
+        Builder.checkHistogramIntervalIsPositive(histogramAggregation);
+    }
+
+    private static ObjectParser<Builder, Void> createParser(boolean ignoreUnknownFields) {
+        ObjectParser<Builder, Void> parser = new ObjectParser<>("datafeed_config", ignoreUnknownFields, Builder::new);
+
+        parser.declareString(Builder::setId, ID);
+        parser.declareString((c, s) -> {}, CONFIG_TYPE);
+        parser.declareString(Builder::setJobId, JOB_ID);
+        parser.declareStringArray(Builder::setIndices, INDEXES);
+        parser.declareStringArray(Builder::setIndices, INDICES);
+        parser.declareString(
+            (builder, val) -> builder.setQueryDelay(TimeValue.parseTimeValue(val, QUERY_DELAY.getPreferredName())),
+            QUERY_DELAY
+        );
+        parser.declareString(
+            (builder, val) -> builder.setFrequency(TimeValue.parseTimeValue(val, FREQUENCY.getPreferredName())),
+            FREQUENCY
+        );
+        parser.declareObject(
+            Builder::setQueryProvider,
+            (p, c) -> QueryProvider.fromXContent(p, ignoreUnknownFields, DATAFEED_CONFIG_QUERY_BAD_FORMAT),
+            QUERY
+        );
+        parser.declareString(Builder::setEsqlQuery, ESQL_QUERY);
+        parser.declareString(Builder::setSourceTimeField, SOURCE_TIME_FIELD);
+        parser.declareString((builder, val) -> builder.setGroupingInterval(Builder.parseFixedGroupingInterval(val)), GROUPING_INTERVAL);
+        parser.declareObject(Builder::setAggregationsSafe, (p, c) -> AggProvider.fromXContent(p, ignoreUnknownFields), AGGREGATIONS);
+        parser.declareObject(Builder::setAggregationsSafe, (p, c) -> AggProvider.fromXContent(p, ignoreUnknownFields), AGGS);
+        parser.declareObject(Builder::setScriptFields, (p, c) -> {
+            List<SearchSourceBuilder.ScriptField> parsedScriptFields = new ArrayList<>();
+            while (p.nextToken() != XContentParser.Token.END_OBJECT) {
+                parsedScriptFields.add(new SearchSourceBuilder.ScriptField(p));
+            }
+            parsedScriptFields.sort(Comparator.comparing(SearchSourceBuilder.ScriptField::fieldName));
+            return parsedScriptFields;
+        }, SCRIPT_FIELDS);
+        parser.declareInt(Builder::setScrollSize, SCROLL_SIZE);
+        parser.declareObject(
+            Builder::setChunkingConfig,
+            ignoreUnknownFields ? ChunkingConfig.LENIENT_PARSER : ChunkingConfig.STRICT_PARSER,
+            CHUNKING_CONFIG
+        );
+
+        if (ignoreUnknownFields) {
+            // Headers are not parsed by the strict (config) parser, so headers supplied in the _body_ of a REST request will be rejected.
+            // (For config, headers are explicitly transferred from the auth headers by code in the put/update datafeed actions.)
+            parser.declareObject(Builder::setHeaders, (p, c) -> p.mapStrings(), HEADERS);
+            // cloud_internal_credential is only parsed from internal storage (lenient parser), not from REST requests.
+            parser.declareObject(
+                Builder::setCloudInternalCredential,
+                (p, c) -> PersistedCloudCredential.fromXContent(p),
+                CLOUD_INTERNAL_CREDENTIAL
+            );
+        }
+        parser.declareObject(
+            Builder::setDelayedDataCheckConfig,
+            ignoreUnknownFields ? DelayedDataCheckConfig.LENIENT_PARSER : DelayedDataCheckConfig.STRICT_PARSER,
+            DELAYED_DATA_CHECK_CONFIG
+        );
+        parser.declareInt(Builder::setMaxEmptySearches, MAX_EMPTY_SEARCHES);
+        parser.declareObject(
+            Builder::setIndicesOptions,
+            (p, c) -> IndicesOptions.fromMap(p.map(), SearchRequest.DEFAULT_INDICES_OPTIONS),
+            INDICES_OPTIONS
+        );
+        parser.declareObject(Builder::setRuntimeMappings, (p, c) -> p.map(), SearchSourceBuilder.RUNTIME_MAPPINGS_FIELD);
+        parser.declareString(Builder::setProjectRouting, PROJECT_ROUTING);
+        return parser;
+    }
+
+    private final String id;
+    private final String jobId;
+
+    /**
+     * The delay before starting to query a period of time
+     */
+    private final TimeValue queryDelay;
+
+    /**
+     * The frequency with which queries are executed
+     */
+    private final TimeValue frequency;
+
+    private final List<String> indices;
+    private final QueryProvider queryProvider;
+    @Nullable
+    private final String esqlQuery;
+    @Nullable
+    private final String sourceTimeField;
+    @Nullable
+    private final TimeValue groupingInterval;
+    private final AggProvider aggProvider;
+    private final List<SearchSourceBuilder.ScriptField> scriptFields;
+    private final Integer scrollSize;
+    private final ChunkingConfig chunkingConfig;
+    private Map<String, String> headers;
+    private final DelayedDataCheckConfig delayedDataCheckConfig;
+    private final Integer maxEmptySearches;
+    private final IndicesOptions indicesOptions;
+    private final Map<String, Object> runtimeMappings;
+    @Nullable
+    private final String projectRouting;
+    @Nullable
+    private final PersistedCloudCredential cloudInternalCredential;
+
+    private DatafeedConfig(
+        String id,
+        String jobId,
+        TimeValue queryDelay,
+        TimeValue frequency,
+        List<String> indices,
+        QueryProvider queryProvider,
+        String esqlQuery,
+        String sourceTimeField,
+        TimeValue groupingInterval,
+        AggProvider aggProvider,
+        List<SearchSourceBuilder.ScriptField> scriptFields,
+        Integer scrollSize,
+        ChunkingConfig chunkingConfig,
+        Map<String, String> headers,
+        DelayedDataCheckConfig delayedDataCheckConfig,
+        Integer maxEmptySearches,
+        IndicesOptions indicesOptions,
+        Map<String, Object> runtimeMappings,
+        String projectRouting,
+        PersistedCloudCredential cloudInternalCredential
+    ) {
+        this.id = id;
+        this.jobId = jobId;
+        this.queryDelay = queryDelay;
+        this.frequency = frequency;
+        this.indices = indices == null ? null : Collections.unmodifiableList(indices);
+        this.queryProvider = queryProvider == null ? null : new QueryProvider(queryProvider);
+        this.esqlQuery = esqlQuery;
+        this.sourceTimeField = sourceTimeField;
+        this.groupingInterval = groupingInterval;
+        this.aggProvider = aggProvider == null ? null : new AggProvider(aggProvider);
+        this.scriptFields = scriptFields == null ? null : Collections.unmodifiableList(scriptFields);
+        this.scrollSize = scrollSize;
+        this.chunkingConfig = chunkingConfig;
+        setHeaders(headers);
+        this.delayedDataCheckConfig = delayedDataCheckConfig;
+        this.maxEmptySearches = maxEmptySearches;
+        this.indicesOptions = indicesOptions;
+        this.runtimeMappings = runtimeMappings == null ? null : Collections.unmodifiableMap(runtimeMappings);
+        this.projectRouting = projectRouting;
+        this.cloudInternalCredential = cloudInternalCredential;
+    }
+
+    public DatafeedConfig(StreamInput in) throws IOException {
+        this.id = in.readString();
+        this.jobId = in.readString();
+        this.queryDelay = in.readOptionalTimeValue();
+        this.frequency = in.readOptionalTimeValue();
+        if (in.readBoolean()) {
+            this.indices = in.readCollectionAsImmutableList(StreamInput::readString);
+        } else {
+            this.indices = null;
+        }
+        // each of these writables are version aware
+        if (in.getTransportVersion().supports(ML_DATAFEED_ESQL_QUERY)) {
+            this.queryProvider = in.readOptionalWriteable(QueryProvider::fromStream);
+            this.esqlQuery = in.readOptionalString();
+            this.sourceTimeField = in.readOptionalString();
+            this.groupingInterval = in.readOptionalTimeValue();
+        } else {
+            this.queryProvider = QueryProvider.fromStream(in);
+            this.esqlQuery = null;
+            this.sourceTimeField = null;
+            this.groupingInterval = null;
+        }
+        // This reads a boolean from the stream, if true, it sends the stream to the `fromStream` method
+        this.aggProvider = in.readOptionalWriteable(AggProvider::fromStream);
+
+        if (in.readBoolean()) {
+            this.scriptFields = in.readCollectionAsImmutableList(SearchSourceBuilder.ScriptField::new);
+        } else {
+            this.scriptFields = null;
+        }
+        this.scrollSize = in.readOptionalVInt();
+        this.chunkingConfig = in.readOptionalWriteable(ChunkingConfig::new);
+        this.headers = in.readImmutableMap(StreamInput::readString);
+        delayedDataCheckConfig = in.readOptionalWriteable(DelayedDataCheckConfig::new);
+        maxEmptySearches = in.readOptionalVInt();
+        if (in.getTransportVersion().supports(ML_DATAFEED_ESQL_QUERY)) {
+            // ES|QL datafeeds have no indices options, so they are optional from this version on
+            if (in.readBoolean()) {
+                indicesOptions = IndicesOptions.readIndicesOptions(in);
+            } else {
+                indicesOptions = null;
+            }
+        } else {
+            // Pre-ES|QL nodes write the indices options unconditionally, without a presence flag
+            indicesOptions = IndicesOptions.readIndicesOptions(in);
+        }
+        runtimeMappings = in.readGenericMap();
+        if (in.getTransportVersion().supports(DATAFEED_PROJECT_ROUTING)) {
+            this.projectRouting = in.readOptionalString();
+        } else {
+            this.projectRouting = null;
+        }
+        if (in.getTransportVersion().supports(DATAFEED_CLOUD_INTERNAL_CREDENTIAL)) {
+            this.cloudInternalCredential = in.readOptionalWriteable(PersistedCloudCredential::new);
+        } else {
+            this.cloudInternalCredential = null;
+        }
+        if (in.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES)
+            && in.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED) == false) {
+            // max_consecutive_extraction_failures was removed (#158426); drain the value sent by not-yet-reverted peers
+            in.readOptionalInt();
+        }
+    }
+
+    /**
+     * Returns an execution copy of the datafeed with cross-project search applied or stripped according to the
+     * current environment. When CPS is allowed <em>and</em> {@code crossProjectAllowed} is {@code true}, promotes
+     * {@link IndicesOptions} to cross-project mode and preserves {@code project_routing}. When CPS is not allowed,
+     * clears {@code project_routing} and forces cross-project index resolution off without mutating persisted config.
+     * When CPS is allowed but {@code crossProjectAllowed} is {@code false}, returns the datafeed unchanged
+     * (origin-only).
+     * <p>
+     * The caller supplies credential presence for {@code crossProjectAllowed}. A datafeed (or previewing
+     * caller) with no minted cloud credential runs under an identity that carries no cloud token, so
+     * issuing a CPS-shaped search would fail closed in the auth layer. Keeping such a datafeed origin-only
+     * mirrors the transform {@code SourceConfig.indicesOptions(boolean)} credential-scoping.
+     */
+    public static DatafeedConfig withCrossProjectModeIfEnabled(
+        DatafeedConfig datafeed,
+        CrossProjectModeDecider crossProjectModeDecider,
+        boolean crossProjectAllowed
+    ) {
+        return withCrossProjectModeIfEnabled(
+            datafeed,
+            crossProjectModeDecider,
+            crossProjectAllowed,
+            CloudCredentialsExtension.ML_CROSS_PROJECT.isEnabled()
+        );
+    }
+
+    // visible for testing
+    // remove the featureEnabled parameter and inline CloudCredentialsExtension.ML_CROSS_PROJECT.isEnabled() when the feature is launched
+    static DatafeedConfig withCrossProjectModeIfEnabled(
+        DatafeedConfig datafeed,
+        CrossProjectModeDecider crossProjectModeDecider,
+        boolean crossProjectAllowed,
+        boolean featureEnabled
+    ) {
+        Objects.requireNonNull(datafeed, "datafeed must not be null");
+        Objects.requireNonNull(crossProjectModeDecider, "crossProjectModeDecider must not be null");
+
+        if (isCPSAllowed(crossProjectModeDecider, featureEnabled) == false) {
+            return normalizeExecutionForLocalOnlySearch(datafeed);
+        }
+        if (crossProjectAllowed == false) {
+            // No minted credential to fan out with: keep the datafeed origin-only.
+            return datafeed;
+        }
+        IndicesOptions baseOptions = datafeed.getIndicesOptions();
+        if (baseOptions == null) {
+            return datafeed;
+        }
+        // Only rebuild if CPS mode is not already enabled to avoid unnecessary object creation
+        if (baseOptions.resolveCrossProjectIndexExpression()) {
+            return datafeed;
+        }
+        return new DatafeedConfig.Builder(datafeed).setIndicesOptions(
+            IndicesOptions.builder(baseOptions).crossProjectModeOptions(new IndicesOptions.CrossProjectModeOptions(true)).build()
+        ).build();
+    }
+
+    /**
+     * Strips CPS execution state from a datafeed copy while leaving persisted config untouched.
+     */
+    static DatafeedConfig normalizeExecutionForLocalOnlySearch(DatafeedConfig datafeed) {
+        boolean clearRouting = datafeed.getProjectRouting() != null;
+        IndicesOptions indicesOptions = datafeed.getIndicesOptions();
+        boolean demoteIndices = indicesOptions != null && indicesOptions.resolveCrossProjectIndexExpression();
+        if (clearRouting == false && demoteIndices == false) {
+            return datafeed;
+        }
+        DatafeedConfig.Builder builder = new DatafeedConfig.Builder(datafeed);
+        if (demoteIndices) {
+            IndicesOptions modifiedOptions = IndicesOptions.builder(indicesOptions)
+                .crossProjectModeOptions(new IndicesOptions.CrossProjectModeOptions(false))
+                .build();
+            builder.setIndicesOptions(modifiedOptions);
+        }
+        if (clearRouting) {
+            builder.setProjectRouting(null);
+        }
+        return builder.build();
+    }
+
+    /**
+     * The name of datafeed configuration document name from the datafeed ID.
+     *
+     * @param datafeedId The datafeed ID
+     * @return The ID of document the datafeed config is persisted in
+     */
+    public static String documentId(String datafeedId) {
+        return TYPE + "-" + datafeedId;
+    }
+
+    public ActionRequestValidationException validateNoCrossProjectWhenCrossProjectIsDisabled(
+        CrossProjectModeDecider crossProjectModeDecider,
+        ActionRequestValidationException validationException
+    ) {
+        // Only reject CPS-shaped config in the gap: cluster CPS on but ML feature flag off.
+        // If the cluster doesn't support CPS at all, the environment itself handles validation.
+        if (crossProjectModeDecider.crossProjectEnabled() && isCPSAllowed(crossProjectModeDecider) == false) {
+            return validateNoCrossProjectWhenCrossProjectFeatureIsDisabled(false, validationException);
+        }
+        return validationException;
+    }
+
+    // visible for testing
+    // remove both this and validateNoCrossProjectWhenCrossProjectIsDisabled when the feature is launched
+    ActionRequestValidationException validateNoCrossProjectWhenCrossProjectFeatureIsDisabled(
+        boolean featureEnabled,
+        ActionRequestValidationException validationException
+    ) {
+        if (featureEnabled == false) {
+            // verify there are no remote indices
+            var remoteIndices = RemoteClusterAware.getRemoteIndexExpressions(getIndices().toArray(new String[0]));
+            if (remoteIndices.isEmpty() == false) {
+                validationException = addValidationError(
+                    "Cross-project calls are not supported, but remote indices were requested: " + remoteIndices,
+                    validationException
+                );
+            }
+        }
+        return validationException;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public String getJobId() {
+        return jobId;
+    }
+
+    public String getConfigType() {
+        return TYPE;
+    }
+
+    public TimeValue getQueryDelay() {
+        return queryDelay;
+    }
+
+    public TimeValue getFrequency() {
+        return frequency;
+    }
+
+    public List<String> getIndices() {
+        return indices;
+    }
+
+    public Integer getScrollSize() {
+        return scrollSize;
+    }
+
+    public Optional<Tuple<TransportVersion, String>> minRequiredTransportVersion() {
+        return minRequiredTransportVersion(esqlQuery);
+    }
+
+    private static Optional<Tuple<TransportVersion, String>> minRequiredTransportVersion(@Nullable String esqlQuery) {
+        if (esqlQuery != null) {
+            return Optional.of(
+                new Tuple<>(ML_DATAFEED_ESQL_QUERY, "datafeed uses an ES|QL query, which requires support for ES|QL datafeeds")
+            );
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Get the fully parsed query from the semi-parsed stored {@code Map<String, Object>}
+     *
+     * @param namedXContentRegistry XContent registry to transform the lazily parsed query
+     * @return Fully parsed query
+     */
+    public QueryBuilder getParsedQuery(NamedXContentRegistry namedXContentRegistry) {
+        return queryProvider == null ? null : parseQuery(namedXContentRegistry, new ArrayList<>());
+    }
+
+    // TODO Remove in v8.0.0
+    // We only need this NamedXContentRegistry object if getParsedQuery() == null and getParsingException() == null
+    // This situation only occurs in past versions that contained the lazy parsing support but not the providers (6.6.x)
+    // We will still need `NamedXContentRegistry` for getting deprecations, but that is a special situation
+    private QueryBuilder parseQuery(NamedXContentRegistry namedXContentRegistry, List<String> deprecations) {
+        try {
+            return queryProvider == null || queryProvider.getQuery() == null
+                ? null
+                : XContentObjectTransformer.queryBuilderTransformer(namedXContentRegistry).fromMap(queryProvider.getQuery(), deprecations);
+        } catch (Exception exception) {
+            // Certain thrown exceptions wrap up the real Illegal argument making it hard to determine cause for the user
+            if (exception.getCause() instanceof IllegalArgumentException) {
+                exception = (Exception) exception.getCause();
+            }
+            throw ExceptionsHelper.badRequestException(DATAFEED_CONFIG_QUERY_BAD_FORMAT, exception);
+        }
+    }
+
+    Exception getQueryParsingException() {
+        return queryProvider == null ? null : queryProvider.getParsingException();
+    }
+
+    /**
+     * Calls the parser and returns any gathered deprecations
+     *
+     * @param namedXContentRegistry XContent registry to transform the lazily parsed query
+     * @return The deprecations from parsing the query
+     */
+    public List<String> getQueryDeprecations(NamedXContentRegistry namedXContentRegistry) {
+        List<String> deprecations = new ArrayList<>();
+        parseQuery(namedXContentRegistry, deprecations);
+        return deprecations;
+    }
+
+    public Map<String, Object> getQuery() {
+        return queryProvider == null ? null : queryProvider.getQuery();
+    }
+
+    public String getEsqlQuery() {
+        return esqlQuery;
+    }
+
+    @Nullable
+    public String getSourceTimeField() {
+        return sourceTimeField;
+    }
+
+    @Nullable
+    public TimeValue getGroupingInterval() {
+        return groupingInterval;
+    }
+
+    /**
+     * Fully parses the semi-parsed {@code Map<String, Object>} aggregations
+     *
+     * @param namedXContentRegistry XContent registry to transform the lazily parsed aggregations
+     * @return The fully parsed aggregations
+     */
+    public AggregatorFactories.Builder getParsedAggregations(NamedXContentRegistry namedXContentRegistry) {
+        return aggProvider == null ? null : parseAggregations(namedXContentRegistry, new ArrayList<>());
+    }
+
+    // TODO refactor in v8.0.0
+    // We only need this NamedXContentRegistry object if getParsedQuery() == null and getParsingException() == null
+    // This situation only occurs in past versions that contained the lazy parsing support but not the providers (6.6.x)
+    // We will still need `NamedXContentRegistry` for getting deprecations, but that is a special situation
+    private AggregatorFactories.Builder parseAggregations(NamedXContentRegistry namedXContentRegistry, List<String> deprecations) {
+        try {
+            return aggProvider == null || aggProvider.getAggs() == null
+                ? null
+                : XContentObjectTransformer.aggregatorTransformer(namedXContentRegistry).fromMap(aggProvider.getAggs(), deprecations);
+        } catch (Exception exception) {
+            // Certain thrown exceptions wrap up the real Illegal argument making it hard to determine cause for the user
+            if (exception.getCause() instanceof IllegalArgumentException) {
+                exception = (Exception) exception.getCause();
+            }
+            throw ExceptionsHelper.badRequestException(DATAFEED_CONFIG_AGG_BAD_FORMAT, exception);
+        }
+    }
+
+    Exception getAggParsingException() {
+        return aggProvider == null ? null : aggProvider.getParsingException();
+    }
+
+    /**
+     * Calls the parser and returns any gathered deprecations
+     *
+     * @param namedXContentRegistry XContent registry to transform the lazily parsed aggregations
+     * @return The deprecations from parsing the aggregations
+     */
+    public List<String> getAggDeprecations(NamedXContentRegistry namedXContentRegistry) {
+        List<String> deprecations = new ArrayList<>();
+        parseAggregations(namedXContentRegistry, deprecations);
+        return deprecations;
+    }
+
+    public Map<String, Object> getAggregations() {
+        return aggProvider == null ? null : aggProvider.getAggs();
+    }
+
+    /**
+     * Returns the histogram's interval as epoch millis.
+     *
+     * @param namedXContentRegistry XContent registry to transform the lazily parsed aggregations
+     */
+    public long getHistogramIntervalMillis(NamedXContentRegistry namedXContentRegistry) {
+        return DatafeedConfigUtils.getHistogramIntervalMillis(getParsedAggregations(namedXContentRegistry));
+    }
+
+    /**
+     * Indicates if the datafeed is using composite aggs.
+     * @param namedXContentRegistry XContent registry to transform the lazily parsed aggregations
+     * @return If the datafeed utilizes composite aggs or not
+     */
+    public boolean hasCompositeAgg(NamedXContentRegistry namedXContentRegistry) {
+        if (hasAggregations() == false) {
+            return false;
+        }
+        AggregationBuilder maybeComposite = DatafeedConfigUtils.getHistogramAggregation(
+            getParsedAggregations(namedXContentRegistry).getAggregatorFactories()
+        );
+        return maybeComposite instanceof CompositeAggregationBuilder;
+    }
+
+    /**
+     * @return {@code true} when there are non-empty aggregations, {@code false} otherwise
+     */
+    public boolean hasAggregations() {
+        return aggProvider != null && aggProvider.getAggs() != null && aggProvider.getAggs().size() > 0;
+    }
+
+    public boolean aggsRewritten() {
+        return aggProvider != null && aggProvider.isRewroteAggs();
+    }
+
+    public AggProvider getAggProvider() {
+        return aggProvider;
+    }
+
+    public List<SearchSourceBuilder.ScriptField> getScriptFields() {
+        return scriptFields == null ? Collections.emptyList() : scriptFields;
+    }
+
+    public ChunkingConfig getChunkingConfig() {
+        return chunkingConfig;
+    }
+
+    public Map<String, String> getHeaders() {
+        return headers;
+    }
+
+    public DatafeedConfig setHeaders(Map<String, String> headers) {
+        this.headers = headers == null ? Collections.emptyMap() : Collections.unmodifiableMap(headers);
+        return this;
+    }
+
+    public DelayedDataCheckConfig getDelayedDataCheckConfig() {
+        return delayedDataCheckConfig;
+    }
+
+    public Integer getMaxEmptySearches() {
+        return maxEmptySearches;
+    }
+
+    public IndicesOptions getIndicesOptions() {
+        return indicesOptions;
+    }
+
+    public Map<String, Object> getRuntimeMappings() {
+        return runtimeMappings;
+    }
+
+    @Nullable
+    public String getProjectRouting() {
+        return projectRouting;
+    }
+
+    @Nullable
+    public PersistedCloudCredential getCloudInternalCredential() {
+        return cloudInternalCredential;
+    }
+
+    /**
+     * Releases the underlying {@link PersistedCloudCredential} and its {@link org.elasticsearch.common.settings.SecureString}, if present.
+     * Idempotent: safe to call more than once.
+     */
+    @Override
+    public void close() {
+        if (cloudInternalCredential != null) {
+            cloudInternalCredential.close();
+        }
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeString(id);
+        out.writeString(jobId);
+        out.writeOptionalTimeValue(queryDelay);
+        out.writeOptionalTimeValue(frequency);
+        if (indices != null) {
+            out.writeBoolean(true);
+            out.writeStringCollection(indices);
+        } else {
+            out.writeBoolean(false);
+        }
+
+        // Each of these writables are version aware
+        if (out.getTransportVersion().supports(ML_DATAFEED_ESQL_QUERY)) {
+            out.writeOptionalWriteable(queryProvider);
+            out.writeOptionalString(esqlQuery);
+            out.writeOptionalString(sourceTimeField);
+            out.writeOptionalTimeValue(groupingInterval);
+        } else {
+            failIfEsqlDatafeedCannotBeSerialized();
+            // Pre-ESQL nodes assume a non-null query.
+            (queryProvider == null ? QueryProvider.defaultQuery() : queryProvider).writeTo(out);
+        }
+        // This writes a boolean to the stream, if true, it sends the stream to the `writeTo` method
+        out.writeOptionalWriteable(aggProvider);
+
+        if (scriptFields != null) {
+            out.writeBoolean(true);
+            out.writeCollection(scriptFields);
+        } else {
+            out.writeBoolean(false);
+        }
+        out.writeOptionalVInt(scrollSize);
+        out.writeOptionalWriteable(chunkingConfig);
+        out.writeMap(headers, StreamOutput::writeString);
+        out.writeOptionalWriteable(delayedDataCheckConfig);
+        out.writeOptionalVInt(maxEmptySearches);
+        if (out.getTransportVersion().supports(ML_DATAFEED_ESQL_QUERY)) {
+            out.writeBoolean(indicesOptions != null);
+            if (indicesOptions != null) {
+                indicesOptions.writeIndicesOptions(out);
+            }
+        } else {
+            // Pre-ES|QL nodes read the indices options unconditionally, without a presence flag. ES|QL datafeeds (the only
+            // ones without indices options) were already rejected above, so this default is purely defensive.
+            (indicesOptions == null ? IndicesOptions.STRICT_EXPAND_OPEN_HIDDEN_FORBID_CLOSED : indicesOptions).writeIndicesOptions(out);
+        }
+        out.writeGenericMap(runtimeMappings);
+        if (out.getTransportVersion().supports(DATAFEED_PROJECT_ROUTING)) {
+            out.writeOptionalString(projectRouting);
+        }
+        if (out.getTransportVersion().supports(DATAFEED_CLOUD_INTERNAL_CREDENTIAL)) {
+            out.writeOptionalWriteable(cloudInternalCredential);
+        }
+        if (out.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES)
+            && out.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED) == false) {
+            // keep the wire format aligned for not-yet-reverted peers that still read this field
+            out.writeOptionalInt(null);
+        }
+    }
+
+    private void failIfEsqlDatafeedCannotBeSerialized() throws IOException {
+        if (esqlQuery != null) {
+            throw new IOException(
+                "Cannot send ES|QL datafeed ["
+                    + id
+                    + "] to a node that does not support ES|QL datafeeds; upgrade every node before restoring or starting it."
+            );
+        }
+    }
+
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        final boolean forInternalStorage = params.paramAsBoolean(ToXContentParams.FOR_INTERNAL_STORAGE, false);
+        builder.startObject();
+        builder.field(ID.getPreferredName(), id);
+        builder.field(JOB_ID.getPreferredName(), jobId);
+        if (params.paramAsBoolean(EXCLUDE_GENERATED, false) == false) {
+            if (forInternalStorage) {
+                builder.field(CONFIG_TYPE.getPreferredName(), TYPE);
+            }
+            if (forInternalStorage) {
+                if (headers.isEmpty() == false) {
+                    assertNoAuthorizationHeader(headers);
+                    builder.field(HEADERS.getPreferredName(), headers);
+                }
+            } else if (cloudInternalCredential != null) {
+                XContentUtils.addCloudApiKeyAuthorization(builder, cloudInternalCredential.id());
+            } else if (headers.isEmpty() == false) {
+                XContentUtils.addAuthorizationInfo(builder, headers);
+            }
+            builder.field(QUERY_DELAY.getPreferredName(), queryDelay.getStringRep());
+            if (chunkingConfig != null) {
+                builder.field(CHUNKING_CONFIG.getPreferredName(), chunkingConfig);
+            }
+            if (indicesOptions != null) {
+                builder.startObject(INDICES_OPTIONS.getPreferredName());
+                indicesOptions.toXContent(builder, params);
+                builder.endObject();
+            }
+        } else { // Don't include random defaults or unnecessary defaults in export
+            if (queryDelay.equals(defaultRandomQueryDelay(jobId)) == false) {
+                builder.field(QUERY_DELAY.getPreferredName(), queryDelay.getStringRep());
+            }
+            // Indices options are a pretty advanced feature, better to not include them if they are just the default ones
+            if (indicesOptions != null && indicesOptions.equals(SearchRequest.DEFAULT_INDICES_OPTIONS) == false) {
+                builder.startObject(INDICES_OPTIONS.getPreferredName());
+                indicesOptions.toXContent(builder, params);
+                builder.endObject();
+            }
+            // Removing the default chunking config as it is determined by OTHER fields
+            if (chunkingConfig != null && chunkingConfig.equals(defaultChunkingConfig(aggProvider, esqlQuery)) == false) {
+                builder.field(CHUNKING_CONFIG.getPreferredName(), chunkingConfig);
+            }
+        }
+        if (queryProvider != null) {
+            builder.field(QUERY.getPreferredName(), queryProvider.getQuery());
+        }
+
+        if (esqlQuery != null) {
+            builder.field(ESQL_QUERY.getPreferredName(), esqlQuery);
+            builder.field(SOURCE_TIME_FIELD.getPreferredName(), sourceTimeField);
+            builder.field(GROUPING_INTERVAL.getPreferredName(), groupingInterval.getStringRep());
+        }
+
+        if (frequency != null) {
+            builder.field(FREQUENCY.getPreferredName(), frequency.getStringRep());
+        }
+        builder.field(INDICES.getPreferredName(), indices);
+        if (aggProvider != null) {
+            builder.field(AGGREGATIONS.getPreferredName(), aggProvider.getAggs());
+        }
+        if (scriptFields != null) {
+            builder.startObject(SCRIPT_FIELDS.getPreferredName());
+            for (SearchSourceBuilder.ScriptField scriptField : scriptFields) {
+                scriptField.toXContent(builder, params);
+            }
+            builder.endObject();
+        }
+        builder.field(SCROLL_SIZE.getPreferredName(), scrollSize);
+        if (delayedDataCheckConfig != null) {
+            builder.field(DELAYED_DATA_CHECK_CONFIG.getPreferredName(), delayedDataCheckConfig);
+        }
+        if (maxEmptySearches != null) {
+            builder.field(MAX_EMPTY_SEARCHES.getPreferredName(), maxEmptySearches);
+        }
+        if (runtimeMappings != null && runtimeMappings.isEmpty() == false) {
+            builder.field(SearchSourceBuilder.RUNTIME_MAPPINGS_FIELD.getPreferredName(), runtimeMappings);
+        }
+        if (projectRouting != null) {
+            builder.field(PROJECT_ROUTING.getPreferredName(), projectRouting);
+        }
+        if (forInternalStorage && cloudInternalCredential != null) {
+            builder.field(CLOUD_INTERNAL_CREDENTIAL.getPreferredName());
+            cloudInternalCredential.toXContent(builder, params);
+        }
+        builder.endObject();
+        return builder;
+    }
+
+    private static TimeValue defaultRandomQueryDelay(String jobId) {
+        Random random = new Random(jobId.hashCode());
+        long delayMillis = random.longs(MIN_DEFAULT_QUERY_DELAY.millis(), MAX_DEFAULT_QUERY_DELAY.millis()).findFirst().getAsLong();
+        return TimeValue.timeValueMillis(delayMillis);
+    }
+
+    private static ChunkingConfig defaultChunkingConfig(@Nullable AggProvider aggProvider, @Nullable String esqlQuery) {
+        if (esqlQuery != null) {
+            // ESQL responses are size-capped, so always chunk by default to avoid silently missing data on long lookbacks.
+            return ChunkingConfig.newAuto();
+        }
+        if (aggProvider == null || aggProvider.getParsedAggs() == null) {
+            return ChunkingConfig.newAuto();
+        } else {
+            AggregationBuilder histogram = DatafeedConfigUtils.getHistogramAggregation(
+                aggProvider.getParsedAggs().getAggregatorFactories()
+            );
+            if (histogram instanceof CompositeAggregationBuilder) {
+                // Allow composite aggs to handle the underlying chunking and searching
+                return ChunkingConfig.newOff();
+            }
+            long histogramIntervalMillis = DatafeedConfigUtils.getHistogramIntervalMillis(histogram);
+            if (histogramIntervalMillis <= 0) {
+                throw ExceptionsHelper.badRequestException(DATAFEED_AGGREGATIONS_INTERVAL_MUST_BE_GREATER_THAN_ZERO);
+            }
+            return ChunkingConfig.newManual(TimeValue.timeValueMillis(DEFAULT_AGGREGATION_CHUNKING_BUCKETS * histogramIntervalMillis));
+        }
+    }
+
+    /**
+     * The lists of indices and types are compared for equality but they are not
+     * sorted first so this test could fail simply because the indices and types
+     * lists are in different orders.
+     */
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+
+        if (other instanceof DatafeedConfig == false) {
+            return false;
+        }
+
+        DatafeedConfig that = (DatafeedConfig) other;
+
+        return Objects.equals(this.id, that.id)
+            && Objects.equals(this.jobId, that.jobId)
+            && Objects.equals(this.frequency, that.frequency)
+            && Objects.equals(this.queryDelay, that.queryDelay)
+            && Objects.equals(this.indices, that.indices)
+            && Objects.equals(this.queryProvider, that.queryProvider)
+            && Objects.equals(this.esqlQuery, that.esqlQuery)
+            && Objects.equals(this.sourceTimeField, that.sourceTimeField)
+            && Objects.equals(this.groupingInterval, that.groupingInterval)
+            && Objects.equals(this.scrollSize, that.scrollSize)
+            && Objects.equals(this.aggProvider, that.aggProvider)
+            && Objects.equals(this.scriptFields, that.scriptFields)
+            && Objects.equals(this.chunkingConfig, that.chunkingConfig)
+            && Objects.equals(this.headers, that.headers)
+            && Objects.equals(this.delayedDataCheckConfig, that.delayedDataCheckConfig)
+            && Objects.equals(this.maxEmptySearches, that.maxEmptySearches)
+            && Objects.equals(this.indicesOptions, that.indicesOptions)
+            && Objects.equals(this.runtimeMappings, that.runtimeMappings)
+            && Objects.equals(this.projectRouting, that.projectRouting)
+            && Objects.equals(this.cloudInternalCredential, that.cloudInternalCredential);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+            id,
+            jobId,
+            frequency,
+            queryDelay,
+            indices,
+            queryProvider,
+            esqlQuery,
+            sourceTimeField,
+            groupingInterval,
+            scrollSize,
+            aggProvider,
+            scriptFields,
+            chunkingConfig,
+            headers,
+            delayedDataCheckConfig,
+            maxEmptySearches,
+            indicesOptions,
+            runtimeMappings,
+            projectRouting,
+            cloudInternalCredential
+        );
+    }
+
+    @Override
+    public String toString() {
+        return Strings.toString(this);
+    }
+
+    /**
+     * Calculates a sensible default frequency for a given bucket span.
+     * <p>
+     * The default depends on the bucket span:
+     * <ul>
+     * <li> &lt;= 2 mins -&gt; 1 min</li>
+     * <li> &lt;= 20 mins -&gt; bucket span / 2</li>
+     * <li> &lt;= 12 hours -&gt; 10 mins</li>
+     * <li> &gt; 12 hours -&gt; 1 hour</li>
+     * </ul>
+     *
+     * If the datafeed has aggregations, the default frequency is the
+     * closest multiple of the histogram interval based on the rules above.
+     *
+     * @param bucketSpan the bucket span
+     * @return the default frequency
+     */
+    public TimeValue defaultFrequency(TimeValue bucketSpan, NamedXContentRegistry xContentRegistry) {
+        TimeValue defaultFrequency = defaultFrequencyTarget(bucketSpan);
+        if (hasAggregations()) {
+            long histogramIntervalMillis = getHistogramIntervalMillis(xContentRegistry);
+            long targetFrequencyMillis = defaultFrequency.millis();
+            long defaultFrequencyMillis = histogramIntervalMillis > targetFrequencyMillis
+                ? histogramIntervalMillis
+                : (targetFrequencyMillis / histogramIntervalMillis) * histogramIntervalMillis;
+            defaultFrequency = TimeValue.timeValueMillis(defaultFrequencyMillis);
+        }
+        return defaultFrequency;
+    }
+
+    private static TimeValue defaultFrequencyTarget(TimeValue bucketSpan) {
+        long bucketSpanSeconds = bucketSpan.seconds();
+        if (bucketSpanSeconds <= 0) {
+            throw new IllegalArgumentException("Bucket span has to be > 0");
+        }
+
+        if (bucketSpanSeconds <= TWO_MINS_SECONDS) {
+            return TimeValue.timeValueSeconds(SECONDS_IN_MINUTE);
+        }
+        if (bucketSpanSeconds <= TWENTY_MINS_SECONDS) {
+            return TimeValue.timeValueSeconds(bucketSpanSeconds / 2);
+        }
+        if (bucketSpanSeconds <= HALF_DAY_SECONDS) {
+            return TimeValue.timeValueMinutes(10);
+        }
+        return TimeValue.timeValueHours(1);
+    }
+
+    public static class Builder implements Writeable {
+
+        private String id;
+        private String jobId;
+        private TimeValue queryDelay;
+        private TimeValue frequency;
+        private List<String> indices = Collections.emptyList();
+        private QueryProvider queryProvider;
+        private String esqlQuery;
+        private String sourceTimeField;
+        private TimeValue groupingInterval;
+        private AggProvider aggProvider;
+        private List<SearchSourceBuilder.ScriptField> scriptFields;
+        private Integer scrollSize = DEFAULT_SCROLL_SIZE;
+        private ChunkingConfig chunkingConfig;
+        private Map<String, String> headers = Collections.emptyMap();
+        private DelayedDataCheckConfig delayedDataCheckConfig = DelayedDataCheckConfig.defaultDelayedDataCheckConfig();
+        private Integer maxEmptySearches;
+        private IndicesOptions indicesOptions;
+        private Map<String, Object> runtimeMappings;
+        private String projectRouting;
+        private PersistedCloudCredential cloudInternalCredential;
+
+        public Builder() {}
+
+        public Builder(String id, String jobId) {
+            this();
+            this.id = ExceptionsHelper.requireNonNull(id, ID.getPreferredName());
+            this.jobId = ExceptionsHelper.requireNonNull(jobId, JOB_ID.getPreferredName());
+        }
+
+        public Builder(DatafeedConfig config) {
+            this.id = config.id;
+            this.jobId = config.jobId;
+            this.queryDelay = config.queryDelay;
+            this.frequency = config.frequency;
+            this.indices = new ArrayList<>(config.indices);
+            this.queryProvider = config.queryProvider == null ? null : new QueryProvider(config.queryProvider);
+            this.esqlQuery = config.esqlQuery;
+            this.sourceTimeField = config.sourceTimeField;
+            this.groupingInterval = config.groupingInterval;
+            this.aggProvider = config.aggProvider == null ? null : new AggProvider(config.aggProvider);
+            this.scriptFields = config.scriptFields == null ? null : new ArrayList<>(config.scriptFields);
+            this.scrollSize = config.scrollSize;
+            this.chunkingConfig = config.chunkingConfig;
+            this.headers = new HashMap<>(config.headers);
+            this.delayedDataCheckConfig = config.getDelayedDataCheckConfig();
+            this.maxEmptySearches = config.getMaxEmptySearches();
+            this.indicesOptions = config.indicesOptions;
+            this.runtimeMappings = config.runtimeMappings == null ? null : new HashMap<>(config.runtimeMappings);
+            this.projectRouting = config.projectRouting;
+            this.cloudInternalCredential = config.cloudInternalCredential;
+        }
+
+        public Builder(StreamInput in) throws IOException {
+            this.id = in.readOptionalString();
+            this.jobId = in.readOptionalString();
+            this.queryDelay = in.readOptionalTimeValue();
+            this.frequency = in.readOptionalTimeValue();
+            if (in.readBoolean()) {
+                this.indices = in.readCollectionAsImmutableList(StreamInput::readString);
+            } else {
+                this.indices = null;
+            }
+            // each of these writables are version aware
+            if (in.getTransportVersion().supports(ML_DATAFEED_ESQL_QUERY)) {
+                this.queryProvider = in.readOptionalWriteable(QueryProvider::fromStream);
+                this.esqlQuery = in.readOptionalString();
+                this.sourceTimeField = in.readOptionalString();
+                this.groupingInterval = in.readOptionalTimeValue();
+            } else {
+                this.queryProvider = QueryProvider.fromStream(in);
+                this.esqlQuery = null;
+                this.sourceTimeField = null;
+                this.groupingInterval = null;
+            }
+            // This reads a boolean from the stream, if true, it sends the stream to the `fromStream` method
+            this.aggProvider = in.readOptionalWriteable(AggProvider::fromStream);
+
+            if (in.readBoolean()) {
+                this.scriptFields = in.readCollectionAsImmutableList(SearchSourceBuilder.ScriptField::new);
+            } else {
+                this.scriptFields = null;
+            }
+            this.scrollSize = in.readOptionalVInt();
+            this.chunkingConfig = in.readOptionalWriteable(ChunkingConfig::new);
+            this.headers = in.readImmutableMap(StreamInput::readString);
+            delayedDataCheckConfig = in.readOptionalWriteable(DelayedDataCheckConfig::new);
+            maxEmptySearches = in.readOptionalVInt();
+            if (in.readBoolean()) {
+                indicesOptions = IndicesOptions.readIndicesOptions(in);
+            }
+            runtimeMappings = in.readGenericMap();
+            if (in.getTransportVersion().supports(DATAFEED_PROJECT_ROUTING)) {
+                projectRouting = in.readOptionalString();
+            }
+            if (in.getTransportVersion().supports(DATAFEED_CLOUD_INTERNAL_CREDENTIAL)) {
+                cloudInternalCredential = in.readOptionalWriteable(PersistedCloudCredential::new);
+            }
+            if (in.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES)
+                && in.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED) == false) {
+                // max_consecutive_extraction_failures was removed (#158426); drain the value sent by not-yet-reverted peers
+                in.readOptionalInt();
+            }
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeOptionalString(id);
+            out.writeOptionalString(jobId);
+            out.writeOptionalTimeValue(queryDelay);
+            out.writeOptionalTimeValue(frequency);
+            if (indices != null) {
+                out.writeBoolean(true);
+                out.writeStringCollection(indices);
+            } else {
+                out.writeBoolean(false);
+            }
+
+            // Each of these writables are version aware
+            if (out.getTransportVersion().supports(ML_DATAFEED_ESQL_QUERY)) {
+                out.writeOptionalWriteable(queryProvider);
+                out.writeOptionalString(esqlQuery);
+                out.writeOptionalString(sourceTimeField);
+                out.writeOptionalTimeValue(groupingInterval);
+            } else {
+                failIfEsqlDatafeedCannotBeSerialized();
+                // Pre-ESQL nodes assume a non-null query.
+                (queryProvider == null ? QueryProvider.defaultQuery() : queryProvider).writeTo(out);
+            }
+            // This writes a boolean to the stream, if true, it sends the stream to the `writeTo` method
+            out.writeOptionalWriteable(aggProvider);
+
+            if (scriptFields != null) {
+                out.writeBoolean(true);
+                out.writeCollection(scriptFields);
+            } else {
+                out.writeBoolean(false);
+            }
+            out.writeOptionalVInt(scrollSize);
+            out.writeOptionalWriteable(chunkingConfig);
+            out.writeMap(headers, StreamOutput::writeString);
+            out.writeOptionalWriteable(delayedDataCheckConfig);
+            out.writeOptionalVInt(maxEmptySearches);
+            out.writeBoolean(indicesOptions != null);
+            if (indicesOptions != null) {
+                indicesOptions.writeIndicesOptions(out);
+            }
+            out.writeGenericMap(runtimeMappings);
+            if (out.getTransportVersion().supports(DATAFEED_PROJECT_ROUTING)) {
+                out.writeOptionalString(projectRouting);
+            }
+            if (out.getTransportVersion().supports(DATAFEED_CLOUD_INTERNAL_CREDENTIAL)) {
+                out.writeOptionalWriteable(cloudInternalCredential);
+            }
+            if (out.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES)
+                && out.getTransportVersion().supports(DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED) == false) {
+                // keep the wire format aligned for not-yet-reverted peers that still read this field
+                out.writeOptionalInt(null);
+            }
+        }
+
+        private void failIfEsqlDatafeedCannotBeSerialized() throws IOException {
+            if (esqlQuery != null) {
+                throw new IOException(
+                    "Cannot send ES|QL datafeed ["
+                        + id
+                        + "] to a node that does not support ES|QL datafeeds; upgrade every node before restoring or starting it."
+                );
+            }
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Builder builder = (Builder) o;
+            return Objects.equals(id, builder.id)
+                && Objects.equals(jobId, builder.jobId)
+                && Objects.equals(queryDelay, builder.queryDelay)
+                && Objects.equals(frequency, builder.frequency)
+                && Objects.equals(indices, builder.indices)
+                && Objects.equals(queryProvider, builder.queryProvider)
+                && Objects.equals(esqlQuery, builder.esqlQuery)
+                && Objects.equals(sourceTimeField, builder.sourceTimeField)
+                && Objects.equals(groupingInterval, builder.groupingInterval)
+                && Objects.equals(aggProvider, builder.aggProvider)
+                && Objects.equals(scriptFields, builder.scriptFields)
+                && Objects.equals(scrollSize, builder.scrollSize)
+                && Objects.equals(chunkingConfig, builder.chunkingConfig)
+                && Objects.equals(headers, builder.headers)
+                && Objects.equals(delayedDataCheckConfig, builder.delayedDataCheckConfig)
+                && Objects.equals(maxEmptySearches, builder.maxEmptySearches)
+                && Objects.equals(indicesOptions, builder.indicesOptions)
+                && Objects.equals(runtimeMappings, builder.runtimeMappings)
+                && Objects.equals(projectRouting, builder.projectRouting)
+                && Objects.equals(cloudInternalCredential, builder.cloudInternalCredential);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(
+                id,
+                jobId,
+                queryDelay,
+                frequency,
+                indices,
+                queryProvider,
+                esqlQuery,
+                sourceTimeField,
+                groupingInterval,
+                aggProvider,
+                scriptFields,
+                scrollSize,
+                chunkingConfig,
+                headers,
+                delayedDataCheckConfig,
+                maxEmptySearches,
+                indicesOptions,
+                runtimeMappings,
+                projectRouting,
+                cloudInternalCredential
+            );
+        }
+
+        public Builder setId(String datafeedId) {
+            id = ExceptionsHelper.requireNonNull(datafeedId, ID.getPreferredName());
+            return this;
+        }
+
+        public String getId() {
+            return id;
+        }
+
+        public Builder setJobId(String jobId) {
+            this.jobId = ExceptionsHelper.requireNonNull(jobId, JOB_ID.getPreferredName());
+            return this;
+        }
+
+        public String getJobId() {
+            return jobId;
+        }
+
+        public Builder setHeaders(Map<String, String> headers) {
+            this.headers = ExceptionsHelper.requireNonNull(headers, HEADERS.getPreferredName());
+            return this;
+        }
+
+        public Builder setIndices(List<String> indices) {
+            this.indices = ExceptionsHelper.requireNonNull(indices, INDICES.getPreferredName());
+            return this;
+        }
+
+        public Builder setQueryDelay(TimeValue queryDelay) {
+            TimeUtils.checkNonNegativeMultiple(queryDelay, TimeUnit.MILLISECONDS, QUERY_DELAY);
+            this.queryDelay = queryDelay;
+            return this;
+        }
+
+        public Builder setFrequency(TimeValue frequency) {
+            TimeUtils.checkPositiveMultiple(frequency, TimeUnit.SECONDS, FREQUENCY);
+            this.frequency = frequency;
+            return this;
+        }
+
+        public Builder setQueryProvider(QueryProvider queryProvider) {
+            this.queryProvider = ExceptionsHelper.requireNonNull(queryProvider, QUERY.getPreferredName());
+            return this;
+        }
+
+        public Builder setEsqlQuery(String esqlQuery) {
+            this.esqlQuery = esqlQuery;
+            return this;
+        }
+
+        public Builder setSourceTimeField(String sourceTimeField) {
+            this.sourceTimeField = sourceTimeField;
+            return this;
+        }
+
+        public Builder setGroupingInterval(TimeValue groupingInterval) {
+            this.groupingInterval = groupingInterval;
+            return this;
+        }
+
+        // For testing only
+        public Builder setParsedQuery(QueryBuilder queryBuilder) {
+            try {
+                this.queryProvider = ExceptionsHelper.requireNonNull(QueryProvider.fromParsedQuery(queryBuilder), QUERY.getPreferredName());
+            } catch (IOException exception) {
+                // eat exception as it should never happen
+                logger.error("Exception trying to setParsedQuery", exception);
+            }
+            return this;
+        }
+
+        // For testing only
+        public Builder setParsedAggregations(AggregatorFactories.Builder aggregations) {
+            try {
+                this.aggProvider = AggProvider.fromParsedAggs(aggregations);
+            } catch (IOException exception) {
+                // eat exception as it should never happen
+                logger.error("Exception trying to setParsedAggregations", exception);
+            }
+            return this;
+        }
+
+        private Builder setAggregationsSafe(AggProvider provider) {
+            if (this.aggProvider != null) {
+                throw ExceptionsHelper.badRequestException("Found two aggregation definitions: [aggs] and [aggregations]");
+            }
+            this.aggProvider = provider;
+            return this;
+        }
+
+        public Builder setAggProvider(AggProvider aggProvider) {
+            this.aggProvider = aggProvider;
+            return this;
+        }
+
+        public Builder setScriptFields(List<SearchSourceBuilder.ScriptField> scriptFields) {
+            List<SearchSourceBuilder.ScriptField> sorted = new ArrayList<>(scriptFields);
+            sorted.sort(Comparator.comparing(SearchSourceBuilder.ScriptField::fieldName));
+            this.scriptFields = sorted;
+            return this;
+        }
+
+        public Builder setScrollSize(int scrollSize) {
+            if (scrollSize < 0) {
+                String msg = getMessage(DATAFEED_CONFIG_INVALID_OPTION_VALUE, DatafeedConfig.SCROLL_SIZE.getPreferredName(), scrollSize);
+                throw ExceptionsHelper.badRequestException(msg);
+            }
+            this.scrollSize = scrollSize;
+            return this;
+        }
+
+        public Builder setChunkingConfig(ChunkingConfig chunkingConfig) {
+            this.chunkingConfig = chunkingConfig;
+            return this;
+        }
+
+        public Builder setDelayedDataCheckConfig(DelayedDataCheckConfig delayedDataCheckConfig) {
+            this.delayedDataCheckConfig = delayedDataCheckConfig;
+            return this;
+        }
+
+        public Builder setMaxEmptySearches(int maxEmptySearches) {
+            if (maxEmptySearches == -1) {
+                this.maxEmptySearches = null;
+            } else if (maxEmptySearches <= 0) {
+                String msg = getMessage(
+                    DATAFEED_CONFIG_INVALID_OPTION_VALUE,
+                    DatafeedConfig.MAX_EMPTY_SEARCHES.getPreferredName(),
+                    maxEmptySearches
+                );
+                throw ExceptionsHelper.badRequestException(msg);
+            } else {
+                this.maxEmptySearches = maxEmptySearches;
+            }
+            return this;
+        }
+
+        public Builder setIndicesOptions(IndicesOptions indicesOptions) {
+            this.indicesOptions = indicesOptions;
+            return this;
+        }
+
+        public IndicesOptions getIndicesOptions() {
+            return this.indicesOptions;
+        }
+
+        public String getEsqlQuery() {
+            return this.esqlQuery;
+        }
+
+        /**
+         * Same as {@link DatafeedConfig#minRequiredTransportVersion()}, for a config that has not been built yet.
+         */
+        public Optional<Tuple<TransportVersion, String>> minRequiredTransportVersion() {
+            return DatafeedConfig.minRequiredTransportVersion(esqlQuery);
+        }
+
+        public Builder setRuntimeMappings(Map<String, Object> runtimeMappings) {
+            this.runtimeMappings = ExceptionsHelper.requireNonNull(
+                runtimeMappings,
+                SearchSourceBuilder.RUNTIME_MAPPINGS_FIELD.getPreferredName()
+            );
+            return this;
+        }
+
+        public Builder setProjectRouting(String projectRouting) {
+            this.projectRouting = projectRouting;
+            return this;
+        }
+
+        public String getProjectRouting() {
+            return projectRouting;
+        }
+
+        public Builder setCloudInternalCredential(PersistedCloudCredential cloudInternalCredential) {
+            this.cloudInternalCredential = cloudInternalCredential;
+            return this;
+        }
+
+        @Nullable
+        public PersistedCloudCredential getCloudInternalCredential() {
+            return cloudInternalCredential;
+        }
+
+        public DatafeedConfig build() {
+            ExceptionsHelper.requireNonNull(id, ID.getPreferredName());
+            ExceptionsHelper.requireNonNull(jobId, JOB_ID.getPreferredName());
+            if (MlStrings.isValidId(id) == false) {
+                throw ExceptionsHelper.badRequestException(getMessage(INVALID_ID, ID.getPreferredName(), id));
+            }
+            if (esqlQuery == null && (indices == null || indices.isEmpty() || indices.contains(""))) {
+                throw invalidOptionValue(INDICES.getPreferredName(), indices);
+            }
+
+            validateScriptFields();
+            if (runtimeMappings == null && esqlQuery == null) {
+                runtimeMappings = Collections.emptyMap();
+            }
+            if (runtimeMappings != null) {
+                RuntimeMappingsValidator.validate(runtimeMappings);
+            }
+            validateEsqlQueryConflicts();
+            // Non-ES|QL datafeeds always carry a query; restore the historical match_all default when
+            // the caller did not set an explicit query. Must come after validateEsqlQueryConflicts()
+            // which rejects esqlQuery + non-null queryProvider together.
+            if (esqlQuery == null && queryProvider == null) {
+                queryProvider = QueryProvider.defaultQuery();
+            }
+            setDefaultChunkingConfig();
+
+            setDefaultQueryDelay();
+            if (indicesOptions == null && esqlQuery == null) {
+                indicesOptions = IndicesOptions.STRICT_EXPAND_OPEN_HIDDEN_FORBID_CLOSED;
+            }
+            return new DatafeedConfig(
+                id,
+                jobId,
+                queryDelay,
+                frequency,
+                indices,
+                queryProvider,
+                esqlQuery,
+                sourceTimeField,
+                groupingInterval,
+                aggProvider,
+                scriptFields,
+                scrollSize,
+                chunkingConfig,
+                headers,
+                delayedDataCheckConfig,
+                maxEmptySearches,
+                indicesOptions,
+                runtimeMappings,
+                projectRouting,
+                cloudInternalCredential
+            );
+        }
+
+        void validateScriptFields() {
+            if (aggProvider == null) {
+                return;
+            }
+            if (scriptFields != null && scriptFields.isEmpty() == false) {
+                throw ExceptionsHelper.badRequestException(getMessage(DATAFEED_CONFIG_CANNOT_USE_SCRIPT_FIELDS_WITH_AGGS));
+            }
+        }
+
+        void validateEsqlQueryConflicts() {
+            if (esqlQuery == null) {
+                if (sourceTimeField != null) {
+                    throw ExceptionsHelper.badRequestException(
+                        getMessage(DATAFEED_CONFIG_FIELD_REQUIRES_ESQL_QUERY, SOURCE_TIME_FIELD.getPreferredName())
+                    );
+                }
+                if (groupingInterval != null) {
+                    throw ExceptionsHelper.badRequestException(
+                        getMessage(DATAFEED_CONFIG_FIELD_REQUIRES_ESQL_QUERY, GROUPING_INTERVAL.getPreferredName())
+                    );
+                }
+                return;
+            }
+            if (Strings.isNullOrEmpty(sourceTimeField)) {
+                throw ExceptionsHelper.badRequestException(DATAFEED_ESQL_REQUIRES_SOURCE_TIME_FIELD);
+            }
+            if (groupingInterval == null) {
+                throw ExceptionsHelper.badRequestException(DATAFEED_ESQL_REQUIRES_GROUPING_INTERVAL);
+            }
+            if (queryProvider != null) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, QUERY.getPreferredName())
+                );
+            }
+            if (aggProvider != null) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, AGGREGATIONS.getPreferredName())
+                );
+            }
+            if (scriptFields != null && scriptFields.isEmpty() == false) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, SCRIPT_FIELDS.getPreferredName())
+                );
+            }
+            if (runtimeMappings != null && runtimeMappings.isEmpty() == false) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, SearchSourceBuilder.RUNTIME_MAPPINGS_FIELD.getPreferredName())
+                );
+            }
+            if (scrollSize != null && scrollSize != DEFAULT_SCROLL_SIZE) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, SCROLL_SIZE.getPreferredName())
+                );
+            }
+            if (indicesOptions != null) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, INDICES_OPTIONS.getPreferredName())
+                );
+            }
+            if (indices != null && indices.isEmpty() == false) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_CONFIG_ESQL_INCOMPATIBLE_WITH_FIELD, INDICES.getPreferredName())
+                );
+            }
+            if (chunkingConfig != null && chunkingConfig.isEnabled() == false) {
+                throw ExceptionsHelper.badRequestException(DATAFEED_ESQL_CHUNKING_MUST_NOT_BE_DISABLED);
+            }
+        }
+
+        private static void checkNoMoreHistogramAggregations(Collection<AggregationBuilder> aggregations) {
+            for (AggregationBuilder agg : aggregations) {
+                if (DatafeedConfigUtils.isHistogram(agg)) {
+                    throw ExceptionsHelper.badRequestException(DATAFEED_AGGREGATIONS_MAX_ONE_DATE_HISTOGRAM);
+                }
+                checkNoMoreHistogramAggregations(agg.getSubAggregations());
+            }
+        }
+
+        static void checkHistogramAggregationHasChildMaxTimeAgg(AggregationBuilder histogramAggregation) {
+            String timeField = null;
+            if (histogramAggregation instanceof ValuesSourceAggregationBuilder) {
+                timeField = ((ValuesSourceAggregationBuilder<?>) histogramAggregation).field();
+            }
+            if (histogramAggregation instanceof CompositeAggregationBuilder) {
+                DateHistogramValuesSourceBuilder valueSource = DatafeedConfigUtils.getDateHistogramValuesSource(
+                    (CompositeAggregationBuilder) histogramAggregation
+                );
+                timeField = valueSource.field();
+            }
+
+            for (AggregationBuilder agg : histogramAggregation.getSubAggregations()) {
+                if (agg instanceof MaxAggregationBuilder maxAgg) {
+                    if (maxAgg.field().equals(timeField)) {
+                        return;
+                    }
+                }
+            }
+
+            throw ExceptionsHelper.badRequestException(getMessage(DATAFEED_DATA_HISTOGRAM_MUST_HAVE_NESTED_MAX_AGGREGATION, timeField));
+        }
+
+        private static void checkHistogramIntervalIsPositive(AggregationBuilder histogramAggregation) {
+            long interval = DatafeedConfigUtils.getHistogramIntervalMillis(histogramAggregation);
+            if (interval <= 0) {
+                throw ExceptionsHelper.badRequestException(DATAFEED_AGGREGATIONS_INTERVAL_MUST_BE_GREATER_THAN_ZERO);
+            }
+        }
+
+        static void validateCompositeAggregationSources(CompositeAggregationBuilder histogramAggregation) {
+            boolean hasDateValueSource = false;
+            DateHistogramValuesSourceBuilder foundBuilder = null;
+            for (CompositeValuesSourceBuilder<?> valueSource : histogramAggregation.sources()) {
+                if (valueSource instanceof DateHistogramValuesSourceBuilder) {
+                    if (hasDateValueSource) {
+                        throw ExceptionsHelper.badRequestException(
+                            getMessage(DATAFEED_AGGREGATIONS_COMPOSITE_AGG_MUST_HAVE_SINGLE_DATE_SOURCE, histogramAggregation.getName())
+                        );
+                    }
+                    hasDateValueSource = true;
+                    foundBuilder = (DateHistogramValuesSourceBuilder) valueSource;
+                }
+            }
+            if (foundBuilder == null) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_AGGREGATIONS_COMPOSITE_AGG_MUST_HAVE_SINGLE_DATE_SOURCE, histogramAggregation.getName())
+                );
+            }
+            if (foundBuilder.missingBucket()) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(
+                        DATAFEED_AGGREGATIONS_COMPOSITE_AGG_DATE_HISTOGRAM_SOURCE_MISSING_BUCKET,
+                        histogramAggregation.getName(),
+                        foundBuilder.name()
+                    )
+                );
+            }
+            if (foundBuilder.order() != SortOrder.ASC) {
+                throw ExceptionsHelper.badRequestException(
+                    getMessage(DATAFEED_AGGREGATIONS_COMPOSITE_AGG_DATE_HISTOGRAM_SORT, histogramAggregation.getName(), foundBuilder.name())
+                );
+            }
+        }
+
+        private static void checkForOnlySingleTopLevelCompositeAggAndValidate(Collection<AggregationBuilder> aggregationBuilders) {
+            Optional<AggregationBuilder> maybeComposite = aggregationBuilders.stream()
+                .filter(agg -> agg instanceof CompositeAggregationBuilder)
+                .findFirst();
+            if (maybeComposite.isEmpty() == false) {
+                CompositeAggregationBuilder composite = (CompositeAggregationBuilder) maybeComposite.get();
+                if (aggregationBuilders.size() > 1) {
+                    throw ExceptionsHelper.badRequestException(
+                        getMessage(DATAFEED_AGGREGATIONS_COMPOSITE_AGG_MUST_BE_TOP_LEVEL_AND_ALONE, composite.getName())
+                    );
+                }
+                validateCompositeAggregationSources(composite);
+            }
+        }
+
+        private static void checkNoMoreCompositeAggregations(Collection<AggregationBuilder> aggregations) {
+            for (AggregationBuilder agg : aggregations) {
+                if (agg instanceof CompositeAggregationBuilder) {
+                    throw ExceptionsHelper.badRequestException(
+                        getMessage(DATAFEED_AGGREGATIONS_COMPOSITE_AGG_MUST_BE_TOP_LEVEL_AND_ALONE, agg.getName())
+                    );
+                }
+                checkNoMoreCompositeAggregations(agg.getSubAggregations());
+            }
+        }
+
+        private void setDefaultChunkingConfig() {
+            if (chunkingConfig == null) {
+                chunkingConfig = defaultChunkingConfig(aggProvider, esqlQuery);
+            }
+        }
+
+        private void setDefaultQueryDelay() {
+            if (queryDelay == null) {
+                queryDelay = defaultRandomQueryDelay(jobId);
+            }
+        }
+
+        private static ElasticsearchException invalidOptionValue(String fieldName, Object value) {
+            String msg = getMessage(DATAFEED_CONFIG_INVALID_OPTION_VALUE, fieldName, value);
+            throw ExceptionsHelper.badRequestException(msg);
+        }
+
+        static TimeValue parseFixedGroupingInterval(String rawValue) {
+            return TimeValue.parseTimeValue(rawValue, GROUPING_INTERVAL.getPreferredName());
+        }
+    }
+}

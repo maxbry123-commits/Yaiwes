@@ -1,0 +1,32 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import org.elasticsearch.gradle.testclusters.StandaloneRestIntegTestTask
+
+apply plugin: 'elasticsearch.internal-java-rest-test'
+apply plugin: 'elasticsearch.bwc-test'
+
+// Each suite is parameterized over the upgrade states and an earlier state sets up the cluster state a later one asserts on,
+// so a state that passed must still run when a later state is retried.
+smartRetry.pruneIndividualTests.set(false)
+
+dependencies {
+  javaRestTestImplementation project(':x-pack:qa')
+}
+
+buildParams.bwcVersions.withWireCompatible { bwcVersion, baseName ->
+  tasks.register(bwcTaskName(bwcVersion), StandaloneRestIntegTestTask) {
+    usesBwcDistribution(bwcVersion)
+    systemProperty("tests.upgrade_from_version", bwcVersion.toString().replace('-SNAPSHOT', ''))
+    maxParallelForks = 1
+  }
+}
+
+// Security is explicitly disabled, do not run tests in FIPS mode
+tasks.withType(Test).configureEach {
+  buildParams.withFipsEnabledOnly(it)
+}

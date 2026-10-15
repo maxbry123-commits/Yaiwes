@@ -1,0 +1,169 @@
+#
+ # Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ # or more contributor license agreements. Licensed under the "Elastic License
+ # 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ # Public License v 1"; you may not use this file except in compliance with, at
+ # your election, the "Elastic License 2.0", the "GNU Affero General Public
+ # License v3.0 only", or the "Server Side Public License, v 1".
+#
+
+# The whitelist for the fields api
+
+class org.elasticsearch.script.field.Field @dynamic_type {
+  String getName()
+  boolean isEmpty()
+  int size()
+}
+
+class org.elasticsearch.script.field.EmptyField @dynamic_type {
+  def get(def)
+  def get(int, def)
+}
+
+class org.elasticsearch.script.DocBasedScript {
+  org.elasticsearch.script.field.Field field(String)
+}
+
+class org.elasticsearch.script.field.DelegateDocValuesField @dynamic_type {
+}
+
+class org.elasticsearch.script.field.BinaryDocValuesField @dynamic_type {
+  ByteBuffer org.elasticsearch.painless.api.Augmentation get(ByteBuffer) @script_aware
+  ByteBuffer org.elasticsearch.painless.api.Augmentation get(int, ByteBuffer) @script_aware
+}
+
+class org.elasticsearch.script.field.BooleanDocValuesField @dynamic_type {
+  boolean get(boolean)
+  boolean get(int, boolean)
+}
+
+class org.elasticsearch.script.field.IntegerDocValuesField @dynamic_type {
+  int get(int)
+  int get(int, int)
+}
+
+class org.elasticsearch.script.field.LongDocValuesField @dynamic_type {
+  long get(long)
+  long get(int, long)
+}
+
+class org.elasticsearch.script.field.DoubleDocValuesField @dynamic_type {
+  double get(double)
+  double get(int, double)
+}
+
+class org.elasticsearch.script.field.FloatDocValuesField @dynamic_type {
+  float get(float)
+  float get(int, float)
+}
+
+class org.elasticsearch.script.field.ScaledFloatDocValuesField @dynamic_type {
+  double get(double)
+  double get(int, double)
+}
+
+# defaults are cast to float, taking an double facilitates resolution with constants without casting
+class org.elasticsearch.script.field.HalfFloatDocValuesField @dynamic_type {
+  float get(double)
+  float get(int, double)
+  List asDoubles() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="halfFloatDoublesBytes"]
+  double asDouble(double)
+  double asDouble(int, double)
+}
+
+# defaults are cast to byte, taking an int facilitates resolution with constants without casting
+class org.elasticsearch.script.field.ByteDocValuesField @dynamic_type {
+  byte get(int)
+  byte get(int, int)
+}
+
+# defaults are cast to short, taking an int facilitates resolution with constants without casting
+class org.elasticsearch.script.field.ShortDocValuesField @dynamic_type {
+  short get(int)
+  short get(int, int)
+}
+
+class org.elasticsearch.script.field.DateMillisDocValuesField @dynamic_type {
+  ZonedDateTime get(ZonedDateTime)
+  ZonedDateTime get(int, ZonedDateTime)
+}
+
+class org.elasticsearch.script.field.DateNanosDocValuesField @dynamic_type {
+  ZonedDateTime get(ZonedDateTime)
+  ZonedDateTime get(int, ZonedDateTime)
+}
+
+class org.elasticsearch.script.field.BaseKeywordDocValuesField @dynamic_type {
+  String org.elasticsearch.painless.api.Augmentation get(String) @script_aware
+  String org.elasticsearch.painless.api.Augmentation get(int, String) @script_aware
+}
+
+# subclass of BaseKeywordDocValuesField
+class org.elasticsearch.script.field.KeywordDocValuesField @dynamic_type {
+}
+
+# subclass of BaseKeywordDocValuesField
+class org.elasticsearch.script.field.FlattenedDocValuesField @dynamic_type {
+}
+
+class org.elasticsearch.script.field.GeoPointDocValuesField @dynamic_type {
+  GeoPoint get(GeoPoint)
+  GeoPoint get(int, GeoPoint)
+}
+
+class org.elasticsearch.script.field.IpDocValuesField @dynamic_type {
+  IPAddress get(IPAddress) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="ipAddressReadBytes"]
+  IPAddress get(int, IPAddress) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="ipAddressReadBytes"]
+  List asStrings() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="ipStringsBytes"]
+  String asString(String) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="ipStringBytes"]
+  String asString(int, String) @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="ipStringBytes"]
+}
+
+class org.elasticsearch.script.field.AbstractLongDocValuesField @dynamic_type {
+  long get(long)
+  long get(int, long)
+}
+
+# subclass of AbstractLongDocValuesField
+class org.elasticsearch.script.field.SeqNoDocValuesField @dynamic_type {
+}
+
+# subclass of AbstractLongDocValuesField
+class org.elasticsearch.script.field.VersionDocValuesField @dynamic_type {
+}
+
+class org.elasticsearch.script.field.vectors.RankVectors {
+    RankVectors EMPTY
+    float[] getMagnitudes()
+
+    Iterator getVectors() @allocates[class="org.elasticsearch.painless.AllocationEstimators", method="rankVectorsIteratorBytes"]
+    boolean isEmpty()
+    int getDims()
+    int size()
+}
+
+class org.elasticsearch.script.field.vectors.RankVectorsDocValuesField {
+    RankVectors get()
+    RankVectors get(RankVectors)
+}
+
+class org.elasticsearch.script.field.vectors.DenseVector {
+    DenseVector EMPTY
+    float getMagnitude()
+
+    # handle List<Number>, float[], and byte[] arguments
+    double dotProduct(Object)
+    double l1Norm(Object)
+    double l2Norm(Object)
+    double cosineSimilarity(Object)
+
+    float[] getVector()
+    boolean isEmpty()
+    int getDims()
+    int size()
+}
+
+class org.elasticsearch.script.field.vectors.DenseVectorDocValuesField {
+    DenseVector get()
+    DenseVector get(DenseVector)
+}

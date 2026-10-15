@@ -1,0 +1,43 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.gradle.internal;
+
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.ListMultimap;
+
+import org.gradle.api.GradleException;
+import org.gradle.api.Project;
+import org.gradle.api.provider.Property;
+import org.gradle.api.services.BuildService;
+import org.gradle.api.services.BuildServiceParameters;
+
+public abstract class RestrictedBuildApiService implements BuildService<RestrictedBuildApiService.Params> {
+
+    public static final String BUILD_API_RESTRICTIONS_SYS_PROPERTY = "org.elasticsearch.gradle.build-api-restriction.disabled";
+
+    private static ListMultimap<Class<?>, String> usageWhitelist = ArrayListMultimap.create(1, 200);
+
+    public void failOnUsageRestriction(Class<?> aClass, Project project) {
+        if (getParameters().getDisabled().getOrElse(false)) {
+            return;
+        }
+        if (isSupported(aClass, project.getPath()) == false) {
+            throw new GradleException("Usage of deprecated " + aClass.getName() + " in " + project.getPath());
+        }
+    }
+
+    private boolean isSupported(Class<?> aClass, String path) {
+        return usageWhitelist.get(aClass).contains(path);
+    }
+
+    public abstract static class Params implements BuildServiceParameters {
+        public abstract Property<Boolean> getDisabled();
+    }
+}

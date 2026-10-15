@@ -1,0 +1,155 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.xpack.ml.inference.pytorch.process;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
+import org.elasticsearch.core.IOUtils;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.env.Environment;
+import org.elasticsearch.xpack.core.ml.MachineLearningField;
+import org.elasticsearch.xpack.core.ml.utils.ExceptionsHelper;
+import org.elasticsearch.xpack.ml.MachineLearning;
+import org.elasticsearch.xpack.ml.inference.deployment.TrainedModelDeploymentTask;
+import org.elasticsearch.xpack.ml.process.NativeController;
+import org.elasticsearch.xpack.ml.process.ProcessPipes;
+import org.elasticsearch.xpack.ml.utils.NamedPipeHelper;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Consumer;
+
+public class NativePyTorchProcessFactory implements PyTorchProcessFactory {
+
+    private static final Logger logger = LogManager.getLogger(NativePyTorchProcessFactory.class);
+
+    private static final NamedPipeHelper NAMED_PIPE_HELPER = new NamedPipeHelper();
+
+    private final Environment env;
+    private final NativeController nativeController;
+    private final String nodeName;
+    private volatile Duration processConnectTimeout;
+    private volatile boolean modelGraphValidationEnabled;
+    private volatile boolean sandboxEnabled;
+
+    public NativePyTorchProcessFactory(Environment env, NativeController nativeController, ClusterService clusterService) {
+        this.env = Objects.requireNonNull(env);
+        this.nativeController = Objects.requireNonNull(nativeController);
+        this.nodeName = clusterService.getNodeName();
+        setProcessConnectTimeout(MachineLearning.PROCESS_CONNECT_TIMEOUT.get(env.settings()));
+        this.modelGraphValidationEnabled = MachineLearningField.MODEL_GRAPH_VALIDATION_ENABLED.get(env.settings());
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(MachineLearning.PROCESS_CONNECT_TIMEOUT, this::setProcessConnectTimeout);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(MachineLearningField.MODEL_GRAPH_VALIDATION_ENABLED, this::setModelGraphValidationEnabled);
+        this.sandboxEnabled = MachineLearningField.SANDBOX_ENABLED.get(env.settings());
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(MachineLearningField.SANDBOX_ENABLED, this::setSandboxEnabled);
+    }
+
+    void setProcessConnectTimeout(TimeValue processConnectTimeout) {
+        this.processConnectTimeout = processConnectTimeout.toDuration();
+    }
+
+    void setModelGraphValidationEnabled(boolean modelGraphValidationEnabled) {
+        this.modelGraphValidationEnabled = modelGraphValidationEnabled;
+    }
+
+    void setSandboxEnabled(boolean sandboxEnabled) {
+        this.sandboxEnabled = sandboxEnabled;
+    }
+
+    @Override
+    public NativePyTorchProcess createProcess(
+        TrainedModelDeploymentTask task,
+        ExecutorService executorService,
+        TimeoutRunnable afterInStreamClose,
+        Consumer<String> onProcessCrash
+    ) {
+        // Snapshot the volatile field once so the isolated-pipe-layout decision below and the
+        // --disableSandbox decision in executeProcess() agree, even if a dynamic cluster-settings
+        // update flips sandboxEnabled between the two reads.
+        boolean sandboxEnabledSnapshot = sandboxEnabled;
+        ProcessPipes processPipes = createProcessPipes(task, sandboxEnabledSnapshot);
+
+        executeProcess(processPipes, task, sandboxEnabledSnapshot);
+
+        NativePyTorchProcess process = new NativePyTorchProcess(
+            task.getDeploymentId(),
+            nativeController,
+            processPipes,
+            0,
+            Collections.emptyList(),
+            afterInStreamClose,
+            onProcessCrash
+        );
+
+        try {
+            process.start(executorService);
+        } catch (IOException | EsRejectedExecutionException e) {
+            String msg = "Failed to connect to pytorch process for job " + task.getDeploymentId();
+            logger.error(msg, e);
+            try {
+                IOUtils.close(process);
+            } catch (IOException ioe) {
+                logger.error("Can't close pytorch process", ioe);
+            }
+            throw ExceptionsHelper.serverError(msg, e);
+        }
+        return process;
+    }
+
+    // Package-private (rather than private) so NativePyTorchProcessFactoryTests can override this and executeProcess()
+    // to capture the sandboxEnabledSnapshot value each call site actually received, pinning that both call sites in
+    // createProcess() are fed from the same local snapshot.
+    ProcessPipes createProcessPipes(TrainedModelDeploymentTask task, boolean sandboxEnabledSnapshot) {
+        return new ProcessPipes(
+            env,
+            NAMED_PIPE_HELPER,
+            processConnectTimeout,
+            PyTorchBuilder.PROCESS_NAME,
+            task.getDeploymentId(),
+            null,
+            false,
+            true,
+            true,
+            true,
+            false, // We do not need a persist pipe. This is also why we use 3 threads per model assignment in the pytorch thread pool.
+            // Only isolate this process's IPC pipes in a per-deployment directory when sandboxing is enabled. Today's bundled
+            // ml-cpp controller does not create that directory at all when sandboxing is off, so requesting isolation
+            // unconditionally would break every PyTorch launch under the (currently default) disabled setting.
+            sandboxEnabledSnapshot
+        );
+    }
+
+    // Package-private (see createProcessPipes) so tests can override and capture sandboxEnabledSnapshot.
+    void executeProcess(ProcessPipes processPipes, TrainedModelDeploymentTask task, boolean sandboxEnabledSnapshot) {
+        PyTorchBuilder pyTorchBuilder = new PyTorchBuilder(
+            nativeController,
+            processPipes,
+            task.getParams(),
+            modelGraphValidationEnabled,
+            sandboxEnabledSnapshot
+        );
+        try {
+            pyTorchBuilder.build();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.warn("Interrupted while launching PyTorch process");
+        } catch (IOException e) {
+            String msg = "Failed to launch PyTorch process";
+            logger.error(msg);
+            throw ExceptionsHelper.serverError(msg + " on [" + nodeName + "]", e);
+        }
+    }
+
+}

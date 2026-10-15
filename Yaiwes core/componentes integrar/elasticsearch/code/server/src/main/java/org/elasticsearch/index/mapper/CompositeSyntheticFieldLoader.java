@@ -1,0 +1,345 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.index.mapper;
+
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.index.IndexVersion;
+import org.elasticsearch.index.IndexVersions;
+import org.elasticsearch.xcontent.XContentBuilder;
+
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import static java.util.Collections.emptyList;
+
+/**
+ * A {@link SourceLoader.SyntheticFieldLoader} that uses a set of sub-loaders
+ * to produce synthetic source for the field.
+ * Typical use case is to gather field values from doc_values and append malformed values
+ * stored in a different field in case of ignore_malformed being enabled.
+ */
+public class CompositeSyntheticFieldLoader implements SourceLoader.SyntheticFieldLoader {
+    private final String leafFieldName;
+    private final String fullFieldName;
+    private final Layer[] parts;
+    private boolean storedFieldLoadersHaveValues;
+    private boolean docValuesLoadersHaveValues;
+
+    public CompositeSyntheticFieldLoader(String leafFieldName, String fullFieldName, Collection<Layer> parts) {
+        this(leafFieldName, fullFieldName, parts.toArray(Layer[]::new));
+    }
+
+    public CompositeSyntheticFieldLoader(String leafFieldName, String fullFieldName, Layer... parts) {
+        this.leafFieldName = leafFieldName;
+        this.fullFieldName = fullFieldName;
+        this.parts = parts;
+        this.storedFieldLoadersHaveValues = false;
+        this.docValuesLoadersHaveValues = false;
+    }
+
+    @Override
+    public Stream<Map.Entry<String, StoredFieldLoader>> storedFieldLoaders() {
+        return Arrays.stream(parts).flatMap(Layer::storedFieldLoaders).map(e -> Map.entry(e.getKey(), newValues -> {
+            storedFieldLoadersHaveValues = true;
+            e.getValue().load(newValues);
+        }));
+    }
+
+    @Override
+    public DocValuesLoader docValuesLoader(LeafReader leafReader, int[] docIdsInLeaf) throws IOException {
+        int i = 0;
+        var loaders = new DocValuesLoader[parts.length];
+        for (var part : parts) {
+            var partLoader = part.docValuesLoader(leafReader, docIdsInLeaf);
+            if (partLoader != null) {
+                loaders[i++] = partLoader;
+            }
+        }
+
+        if (i == 0) {
+            return null;
+        }
+
+        int size = i;
+        return docId -> {
+            boolean hasDocs = false;
+            for (int j = 0; j < size; j++) {
+                var loader = loaders[j];
+                hasDocs |= loader.advanceToDoc(docId);
+            }
+
+            this.docValuesLoadersHaveValues = hasDocs;
+            return hasDocs;
+        };
+    }
+
+    @Override
+    public boolean hasValue() {
+        return storedFieldLoadersHaveValues || docValuesLoadersHaveValues;
+    }
+
+    @Override
+    public void write(XContentBuilder b) throws IOException {
+        long totalCount = 0;
+        for (Layer part : parts) {
+            totalCount += part.valueCount();
+        }
+
+        if (totalCount == 0) {
+            return;
+        }
+
+        if (totalCount == 1) {
+            b.field(leafFieldName);
+            for (var part : parts) {
+                part.write(b);
+            }
+            return;
+        }
+
+        b.startArray(leafFieldName);
+        for (var part : parts) {
+            part.write(b);
+        }
+        b.endArray();
+        softReset();
+    }
+
+    private void softReset() {
+        storedFieldLoadersHaveValues = false;
+        docValuesLoadersHaveValues = false;
+    }
+
+    @Override
+    public void reset() {
+        softReset();
+        for (Layer part : parts) {
+            part.reset();
+        }
+    }
+
+    @Override
+    public String fieldName() {
+        return this.fullFieldName;
+    }
+
+    /**
+     * Returns a new {@link CompositeSyntheticFieldLoader} that merges this field loader with the given one.
+     */
+    public CompositeSyntheticFieldLoader mergedWith(CompositeSyntheticFieldLoader other) {
+        if (other == null) {
+            return new CompositeSyntheticFieldLoader(leafFieldName, fullFieldName, parts);
+        }
+        Layer[] mergedParts = new Layer[parts.length + other.parts.length];
+        System.arraycopy(parts, 0, mergedParts, 0, parts.length);
+        System.arraycopy(other.parts, 0, mergedParts, parts.length, other.parts.length);
+        return new CompositeSyntheticFieldLoader(leafFieldName, fullFieldName, mergedParts);
+    }
+
+    /**
+     * Represents one layer of loading synthetic source values for a field
+     * as a part of {@link CompositeSyntheticFieldLoader}.
+     * <br>
+     * Note that the contract of {@link SourceLoader.SyntheticFieldLoader#write(XContentBuilder)}
+     * is slightly different here since it only needs to write field values without encompassing object or array.
+     */
+    public interface Layer extends SourceLoader.SyntheticFieldLoader {
+        /**
+         * Number of values that this loader will write for a given document.
+         * @return
+         */
+        long valueCount();
+    }
+
+    public interface DocValuesLayer extends Layer {
+        @Override
+        default Stream<Map.Entry<String, StoredFieldLoader>> storedFieldLoaders() {
+            return Stream.empty();
+        }
+
+        @Override
+        default void reset() {
+            // Not applicable to loaders using only doc values
+            // since DocValuesLoader#advanceToDoc will reset the state anyway.
+        }
+    }
+
+    /**
+     * Returns the appropriate malformed values layer for the given index version.
+     * Uses binary doc values for new indices and stored fields for old indices.
+     */
+    public static Layer malformedValuesLayer(String fieldName, IndexVersion indexVersion) {
+        if (indexVersion.onOrAfter(IndexVersions.STORE_IGNORED_MALFORMED_IN_BINARY_DOC_VALUES)) {
+            return new MalformedValuesBinaryDocValuesLayer(fieldName, indexVersion);
+        } else {
+            return new MalformedValuesStoredFieldLayer(fieldName);
+        }
+    }
+
+    /**
+     * Layer that loads malformed values from stored fields for synthetic source.
+     * @see IgnoreMalformedStoredValues
+     */
+    private static class MalformedValuesStoredFieldLayer extends StoredFieldLayer {
+        MalformedValuesStoredFieldLayer(String fieldName) {
+            super(IgnoreMalformedStoredValues.name(fieldName));
+        }
+
+        @Override
+        protected void writeValue(Object value, XContentBuilder b) throws IOException {
+            if (value instanceof BytesRef r) {
+                XContentDataHelper.decodeAndWrite(b, r);
+            } else {
+                b.value(value);
+            }
+        }
+    }
+
+    /**
+     * Layer that loads malformed values from binary doc values for synthetic source.
+     */
+    private static class MalformedValuesBinaryDocValuesLayer extends BinaryDocValuesSyntheticFieldLoaderLayer {
+        MalformedValuesBinaryDocValuesLayer(String fieldName, IndexVersion indexVersion) {
+            super(IgnoreMalformedStoredValues.name(fieldName), indexVersion);
+        }
+
+        @Override
+        protected void writeValue(XContentBuilder b, BytesRef value) throws IOException {
+            XContentDataHelper.decodeAndWrite(b, value);
+        }
+    }
+
+    /**
+     * Appends the appropriate fallback layers to {@code layers} for a field that supports {@code ignore_malformed} and/or
+     * {@code doc_values.on_failure=ignore}.
+     *
+     * <p>In strict-columnar index modes created on or after {@link IndexVersions#MALFORMED_VALUES_IN_ON_FAILURE_COLUMN},
+     * {@link FallbackPostMapper#route} sends {@link FallbackPostMapper.Reason#MALFORMED} values to the shared per-field
+     * {@code ._on_failure} sidecar column, so only the on-failure layer is added — adding both would double-emit every value
+     * when both constraints are active on the same field. Older strict-columnar indices (created before the version gate) keep
+     * using {@code ._ignore_malformed}; the version check here must match the write-path check in
+     * {@link FallbackPostMapper#malformedUsesOnFailureColumn}. Outside strict-columnar, the two columns are always independent.
+     *
+     * <p>The on-failure layer is always appended <em>last</em> so encounter order is preserved.
+     *
+     * @param layers         the list to append to
+     * @param mapper         the field mapper owning this synthetic-source loader
+     * @param indexSettings  index settings used to derive the index version and whether the index is strict-columnar
+     */
+    public static void addFallbackLayers(List<Layer> layers, FieldMapper mapper, IndexSettings indexSettings) {
+        IndexVersion indexVersion = indexSettings.getIndexVersionCreated();
+        boolean ignoreMalformed = mapper.ignoreMalformed();
+        boolean malformedInOnFailure = FallbackPostMapper.malformedUsesOnFailureColumn(indexSettings);
+        if (ignoreMalformed && malformedInOnFailure == false) {
+            layers.add(malformedValuesLayer(mapper.fullPath(), indexVersion));
+        }
+        if (mapper.onFailureColumnEnabled() || (ignoreMalformed && malformedInOnFailure)) {
+            layers.add(onFailureValuesLayer(mapper.fullPath(), indexVersion));
+        }
+    }
+
+    /**
+     * Returns the synthetic-source layer that reconstructs {@code ignore_malformed} values: the {@code ._on_failure} sidecar
+     * column when {@link FallbackPostMapper#malformedUsesOnFailureColumn} applies (strict-columnar index created on or after
+     * {@link IndexVersions#MALFORMED_VALUES_IN_ON_FAILURE_COLUMN}), otherwise the {@code ._ignore_malformed} column.
+     *
+     * @param mapper         the field mapper owning this synthetic-source layer
+     * @param indexSettings  index settings used to derive the index version and whether the index is strict-columnar
+     */
+    public static Layer malformedFallbackLayer(FieldMapper mapper, IndexSettings indexSettings) {
+        return FallbackPostMapper.malformedUsesOnFailureColumn(indexSettings)
+            ? onFailureValuesLayer(mapper.fullPath(), indexSettings.getIndexVersionCreated())
+            : malformedValuesLayer(mapper.fullPath(), indexSettings.getIndexVersionCreated());
+    }
+
+    /**
+     * Returns the layer that reconstructs values from the {@code ._on_failure} sidecar column for synthetic source.
+     * Append it <em>last</em> in the composite so values 2..N trail the primary column and encounter order is preserved.
+     */
+    public static Layer onFailureValuesLayer(String fieldName, IndexVersion indexVersion) {
+        return new OnFailureValuesBinaryDocValuesLayer(fieldName, indexVersion);
+    }
+
+    /**
+     * Layer that loads on-failure values from binary doc values for synthetic source.
+     */
+    private static class OnFailureValuesBinaryDocValuesLayer extends BinaryDocValuesSyntheticFieldLoaderLayer {
+        OnFailureValuesBinaryDocValuesLayer(String fieldName, IndexVersion indexVersion) {
+            super(OnFailureStoredValues.name(fieldName), indexVersion);
+        }
+
+        @Override
+        protected void writeValue(XContentBuilder b, BytesRef value) throws IOException {
+            XContentDataHelper.decodeAndWrite(b, value);
+        }
+    }
+
+    /**
+     * Layer that loads field values from a provided stored field.
+     */
+    public abstract static class StoredFieldLayer implements Layer {
+        private final String fieldName;
+        private List<Object> values;
+
+        public StoredFieldLayer(String fieldName) {
+            this.fieldName = fieldName;
+            this.values = emptyList();
+        }
+
+        @Override
+        public long valueCount() {
+            return values.size();
+        }
+
+        @Override
+        public Stream<Map.Entry<String, StoredFieldLoader>> storedFieldLoaders() {
+            return Stream.of(Map.entry(fieldName, newValues -> values = newValues));
+        }
+
+        @Override
+        public DocValuesLoader docValuesLoader(LeafReader leafReader, int[] docIdsInLeaf) throws IOException {
+            return null;
+        }
+
+        @Override
+        public boolean hasValue() {
+            return values.isEmpty() == false;
+        }
+
+        @Override
+        public void write(XContentBuilder b) throws IOException {
+            for (Object v : values) {
+                writeValue(v, b);
+            }
+            reset();
+        }
+
+        @Override
+        public void reset() {
+            values = emptyList();
+        }
+
+        /**
+         * Write a value read from stored field using appropriate format.
+         */
+        protected abstract void writeValue(Object value, XContentBuilder b) throws IOException;
+
+        @Override
+        public String fieldName() {
+            return fieldName;
+        }
+    }
+}

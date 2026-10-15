@@ -1,0 +1,111 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+
+import org.elasticsearch.gradle.VersionProperties
+import org.elasticsearch.gradle.testclusters.StandaloneRestIntegTestTask
+
+apply plugin: 'elasticsearch.internal-yaml-rest-test'
+apply plugin: 'elasticsearch.bwc-test'
+
+dependencies {
+  restTestConfig project(path: ':modules:aggregations', configuration: 'restTests')
+  restTestConfig project(path: ':modules:mapper-extras', configuration: 'restTests')
+}
+
+restResources {
+  restTests {
+    includeCore '*'
+  }
+}
+
+def excludeList = []
+// Excluding these cache aggregation tests from mixed cluster qa,
+// because we can't hit the same node reliable. The qa cluster
+// consists of 4 nodes. Two nodes are on old version and the
+// other two nodes on the current version. The node selector skips
+// the nodes on current version. The rest client then round robins
+// between the two nodes on old version. In order to unmute this,
+// we need a different node selector, that always consistently
+// selects the same node.
+excludeList.add('aggregations/adjacency_matrix/Terms lookup')
+excludeList.add('aggregations/filter/Standard queries get cached')
+excludeList.add('aggregations/filter/Terms lookup gets cached')
+excludeList.add('aggregations/filters_bucket/cache hits')
+
+// These tests check setting validations in the desired_node API.
+// Validation (and associated tests) are supposed to be skipped/have
+// different behaviour for versions before and after 8.10 but mixed
+// cluster tests may not respect that - see the comment above.
+// Same for node version, which has been deprecated (and made optional)
+// starting from 8.13
+excludeList.add('cluster.desired_nodes/11_old_format/Test settings are validated')
+excludeList.add('cluster.desired_nodes/11_old_format/Test unknown settings are forbidden in known versions')
+excludeList.add('cluster.desired_nodes/11_old_format/Test unknown settings are allowed in future versions')
+excludeList.add('cluster.desired_nodes/11_old_format/Test some settings can be overridden')
+excludeList.add('cluster.desired_nodes/11_old_format/Test node version must be at least the current master version')
+excludeList.add('cluster.desired_nodes/11_old_format/Test node version is required')
+excludeList.add('cluster.desired_nodes/11_old_format/Test node version must have content')
+excludeList.add('cluster.desired_nodes/11_old_format/Test node version can not be null')
+excludeList.add('cluster.desired_nodes/20_dry_run/Test validation works for dry run updates')
+
+// Excluded because they create dot-prefixed indices on older versions
+excludeList.add('indices.resolve_index/20_resolve_system_index/*')
+
+// Excluded because the error has changed
+excludeList.add('aggregations/percentiles_hdr_metric/Negative values test')
+
+// sync_id is removed in 9.0
+excludeList.add("cat.shards/10_basic/Help")
+
+// Pre-9.5 coordinators do not reserve REQUEST breaker bytes for buffered msearch sub-responses,
+// so the circuit breaker limit is never enforced and the whole request succeeds instead of
+// aborting with a top-level 429.
+excludeList.add('msearch/50_circuit_breaker/msearch circuit breaker trip aborts the whole request with a top-level 429')
+
+excludeList.add('search.highlight/70_number_of_fragments/number_of_fragments above the maximum should FAIL')
+excludeList.add('search.highlight/70_number_of_fragments/negative number_of_fragments should FAIL')
+excludeList.add('search.highlight/70_number_of_fragments/raising index.highlight.max_number_of_fragments should allow more fragments')
+excludeList.add(
+  'search.highlight/70_number_of_fragments/lowering index.highlight.max_number_of_fragments should reject the default number of fragments'
+)
+
+buildParams.bwcVersions.withWireCompatible { bwcVersion, baseName ->
+  if (bwcVersion != VersionProperties.getElasticsearchVersion()) {
+    /* This project runs the core REST tests against a 4 node cluster where two of
+     the nodes has a different minor. The cluster is built by
+     org.elasticsearch.backwards.Clusters in the yamlRestTest source set. */
+    def yamlRestTest = tasks.register("v${bwcVersion}#yamlRestTest", StandaloneRestIntegTestTask) {
+      // The full distribution is required both because the BWC nodes are only published as the default distribution and
+      // because the core REST tests exercise features aggregated from every bundled module.
+      usesDefaultDistribution("mixed-cluster BWC tests run the full core REST suite against the default distribution")
+      usesBwcDistribution(bwcVersion)
+      // Clusters#CLUSTER is declared shared(true) so all suites reuse one four-node cluster, as the legacy
+      // mixedClusterTest task did. Sharing is per-JVM, so a single fork is required to realise the saving.
+      maxParallelForks = 1
+      systemProperty("tests.old_cluster_version", bwcVersion.toString())
+      systemProperty("tests.bwc_nodes_version", bwcVersion.toString().replace('-SNAPSHOT', ''))
+      testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+      classpath = sourceSets.yamlRestTest.runtimeClasspath
+      if (excludeList.isEmpty() == false) {
+        systemProperty 'tests.rest.blacklist', excludeList.join(',')
+      }
+    }
+
+    tasks.register(bwcTaskName(bwcVersion)) {
+      dependsOn yamlRestTest
+    }
+  }
+}
+
+// The base (unversioned) yamlRestTest task cannot run: the cluster requires tests.old_cluster_version, which is only
+// supplied by the per-BWC-version tasks registered above.
+tasks.named("yamlRestTest") {
+  enabled = false
+}

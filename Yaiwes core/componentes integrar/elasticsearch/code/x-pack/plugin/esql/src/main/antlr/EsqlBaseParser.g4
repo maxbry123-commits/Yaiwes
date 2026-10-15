@@ -1,0 +1,468 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+parser grammar EsqlBaseParser;
+
+@header {
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
+}
+
+options {
+  superClass=ParserConfig;
+  tokenVocab=EsqlBaseLexer;
+}
+
+import Expression,
+       Join,
+       Promql;
+
+statements
+    : setCommand* singleStatement EOF
+    ;
+
+singleStatement
+    : query EOF
+    ;
+
+query
+    : sourceCommand                 #singleCommandQuery
+    | query PIPE processingCommand  #compositeQuery
+    ;
+
+sourceCommand
+    : fromCommand
+    | rowCommand
+    | showCommand
+    | timeSeriesCommand
+    | promqlCommand
+    // in development
+    | {this.isDevVersion()}? explainCommand
+    | {EsqlCapabilities.Cap.EXTERNAL_COMMAND.isEnabled()}? externalCommand
+    ;
+
+processingCommand
+    : evalCommand
+    | whereCommand
+    | keepCommand
+    | limitCommand
+    | statsCommand
+    | sortCommand
+    | dropCommand
+    | renameCommand
+    | dissectCommand
+    | grokCommand
+    | enrichCommand
+    | mvExpandCommand
+    | joinCommand
+    | changePointCommand
+    | completionCommand
+    | sampleCommand
+    | forkCommand
+    | rerankCommand
+    | inlineStatsCommand
+    | fuseCommand
+    | uriPartsCommand
+    | metricsInfoCommand
+    | registeredDomainCommand
+    | tsInfoCommand
+    | userAgentCommand
+    | tsCollapseCommand
+    | ipLocationCommand
+    | mmrCommand
+    | highlightCommand
+    | denseVectorCommand
+    // in development
+    | {this.isDevVersion()}? lookupCommand
+    | dedupCommand
+    | {this.isDevVersion()}? fillNullCommand
+    ;
+
+whereCommand
+    : WHERE booleanExpression
+    ;
+
+dataType
+    : identifier                                                                        #toDataType
+    ;
+
+rowCommand
+    : ROW fields
+    ;
+
+fields
+    : field (COMMA field)*
+    ;
+
+field
+    : (qualifiedName ASSIGN)? booleanExpression
+    ;
+
+fromCommand
+    : FROM indexPatternAndMetadataFields
+    ;
+
+timeSeriesCommand
+    : TS indexPatternAndMetadataFields
+    ;
+
+externalCommand
+    : DEV_EXTERNAL stringOrParameter commandNamedParameters
+    ;
+
+indexPatternAndMetadataFields
+    : indexPatternOrSubquery (COMMA indexPatternOrSubquery)* metadata?
+    ;
+
+indexPatternOrSubquery
+    : indexPattern
+    | subquery
+    ;
+
+subquery
+    : LP subquerySourceCommand (PIPE processingCommand)* RP
+    ;
+
+subquerySourceCommand
+    : fromCommand
+    | rowCommand
+    | timeSeriesCommand
+    ;
+
+indexPattern
+    : (clusterString COLON)? unquotedIndexString (CAST_OP selectorString)?
+    | indexString
+    ;
+
+clusterString
+    : UNQUOTED_SOURCE
+    ;
+
+selectorString
+    : UNQUOTED_SOURCE
+    ;
+
+unquotedIndexString
+    : UNQUOTED_SOURCE
+    ;
+
+indexString
+    : UNQUOTED_SOURCE
+    | QUOTED_STRING
+    ;
+
+metadata
+    : METADATA UNQUOTED_SOURCE (COMMA UNQUOTED_SOURCE)*
+    ;
+
+evalCommand
+    : EVAL fields
+    ;
+
+statsCommand
+    : STATS stats=aggFields? (BY grouping=fields)?
+    ;
+
+aggFields
+    : aggField (COMMA aggField)*
+    ;
+
+aggField
+    : field (WHERE booleanExpression)?
+    ;
+
+qualifiedName
+    : {this.isDevVersion()}? OPENING_BRACKET qualifier=UNQUOTED_IDENTIFIER? CLOSING_BRACKET DOT OPENING_BRACKET name=fieldName CLOSING_BRACKET
+    | name=fieldName
+    ;
+
+fieldName
+    : identifierOrParameter (DOT identifierOrParameter)*
+    ;
+
+qualifiedNamePattern
+    : {this.isDevVersion()}? OPENING_BRACKET qualifier=ID_PATTERN? CLOSING_BRACKET DOT OPENING_BRACKET name=fieldNamePattern CLOSING_BRACKET
+    | name=fieldNamePattern
+    ;
+
+fieldNamePattern
+    : (identifierPattern (DOT identifierPattern)*)
+    ;
+
+qualifiedNamePatterns
+    : qualifiedNamePattern (COMMA qualifiedNamePattern)*
+    ;
+
+identifier
+    : UNQUOTED_IDENTIFIER
+    | QUOTED_IDENTIFIER
+    ;
+
+identifierPattern
+    : ID_PATTERN
+    | expressionModeIdentifierPattern
+    | parameter
+    | doubleParameter
+    ;
+
+// HIGHLIGHT remains in EXPRESSION_MODE after ON, where identifier patterns are emitted as identifier/ASTERISK tokens.
+expressionModeIdentifierPattern
+    : identifier? ASTERISK (identifier | ASTERISK)*
+    | identifier
+    ;
+
+parameter
+    : PARAM                        #inputParam
+    | NAMED_OR_POSITIONAL_PARAM    #inputNamedOrPositionalParam
+    ;
+
+doubleParameter
+    : DOUBLE_PARAMS                        #inputDoubleParams
+    | NAMED_OR_POSITIONAL_DOUBLE_PARAMS    #inputNamedOrPositionalDoubleParams
+    ;
+
+identifierOrParameter
+    : identifier
+    | parameter
+    | doubleParameter
+    ;
+
+stringOrParameter
+    : string
+    | parameter
+    ;
+
+limitCommand
+    : LIMIT constant limitByGroupKey?
+    ;
+
+limitByGroupKey:
+    BY booleanExpression (COMMA booleanExpression)*
+    ;
+
+sortCommand
+    : SORT orderExpression (COMMA orderExpression)*
+    ;
+
+orderExpression
+    : booleanExpression ordering=(ASC | DESC)? (NULLS nullOrdering=(FIRST | LAST))?
+    ;
+
+keepCommand
+    :  KEEP qualifiedNamePatterns
+    ;
+
+dropCommand
+    : DROP qualifiedNamePatterns
+    ;
+
+renameCommand
+    : RENAME renameClause (COMMA renameClause)*
+    ;
+
+renameClause:
+    oldName=qualifiedNamePattern AS newName=qualifiedNamePattern
+    | newName=qualifiedNamePattern ASSIGN oldName=qualifiedNamePattern
+    ;
+
+dissectCommand
+    : DISSECT primaryExpression string dissectCommandOptions?
+    ;
+
+dissectCommandOptions
+    : dissectCommandOption (COMMA dissectCommandOption)*
+    ;
+
+dissectCommandOption
+    : identifier ASSIGN constant
+    ;
+
+
+commandNamedParameters
+    : (WITH mapExpression)?
+    ;
+
+grokCommand
+    : GROK primaryExpression string (COMMA string)*
+    ;
+
+mvExpandCommand
+    : MV_EXPAND qualifiedName
+    ;
+
+explainCommand
+    : DEV_EXPLAIN subqueryExpression
+    ;
+
+subqueryExpression
+    : LP query RP
+    ;
+
+showCommand
+    : SHOW INFO                                                           #showInfo
+    ;
+
+enrichCommand
+    : ENRICH policyName=enrichPolicyName (ON matchField=qualifiedNamePattern)? (WITH enrichWithClause (COMMA enrichWithClause)*)?
+    ;
+
+enrichPolicyName
+    : ENRICH_POLICY_NAME
+    | QUOTED_STRING
+    ;
+
+enrichWithClause
+    : (newName=qualifiedNamePattern ASSIGN)? enrichField=qualifiedNamePattern
+    ;
+
+sampleCommand
+    : SAMPLE probability=constant
+    ;
+
+changePointCommand
+    : CHANGE_POINT value=qualifiedName (ON key=qualifiedName)? (AS targetType=qualifiedName COMMA targetPvalue=qualifiedName)? (BY groupings+=booleanExpression (COMMA groupings+=booleanExpression)*)?
+    ;
+
+forkCommand
+    : FORK forkSubQueries
+    ;
+
+forkSubQueries
+    : (forkSubQuery)+
+    ;
+
+forkSubQuery
+    : LP forkSubQueryCommand RP
+    ;
+
+forkSubQueryCommand
+    : forkSubQueryProcessingCommand                             #singleForkSubQueryCommand
+    | forkSubQueryCommand PIPE forkSubQueryProcessingCommand    #compositeForkSubQuery
+    ;
+
+forkSubQueryProcessingCommand
+    : processingCommand
+    ;
+
+rerankCommand
+    : RERANK (targetField=qualifiedName ASSIGN)? queryText=constant ON rerankFields=fields commandNamedParameters
+    ;
+
+completionCommand
+    : COMPLETION (targetField=qualifiedName ASSIGN)? prompt=primaryExpression commandNamedParameters
+    ;
+
+inlineStatsCommand
+    : INLINE INLINE_STATS stats=aggFields (BY grouping=fields)?
+    // TODO: drop after next minor release
+    | INLINESTATS stats=aggFields (BY grouping=fields)?
+    ;
+
+fuseCommand
+    : FUSE (fuseType=identifier)? (fuseConfiguration)*
+    ;
+
+fuseConfiguration
+    : SCORE BY score=qualifiedName
+    | KEY BY key=fuseKeyByFields
+    | GROUP BY group=qualifiedName
+    | WITH options=mapExpression
+    ;
+
+fuseKeyByFields
+   : qualifiedName (COMMA qualifiedName)*
+   ;
+
+metricsInfoCommand
+    : METRICS_INFO
+    ;
+
+tsInfoCommand
+    : TS_INFO
+    ;
+
+tsCollapseCommand
+    : TS_COLLAPSE
+    ;
+
+//
+// In development
+//
+lookupCommand
+    : DEV_LOOKUP tableName=indexPattern ON matchFields=qualifiedNamePatterns
+    ;
+
+dedupCommand
+    : DEDUP
+    ;
+
+highlightCommand
+    : HIGHLIGHT (prefixKeyword=identifier ASSIGN prefix=string)? queryExpression=booleanExpression? (ON highlightFields=qualifiedNamePatterns)? commandNamedParameters
+    ;
+
+qualifiedNames
+    : qualifiedName (COMMA qualifiedName)*
+    ;
+
+fillNullCommand
+    : DEV_FILLNULL fillNullValue ON qualifiedNamePatterns
+    ;
+
+fillNullValue
+    : NULL | DEFAULT | integerValue | decimalValue | booleanValue | string | parameter
+    ;
+
+uriPartsCommand
+    : URI_PARTS qualifiedName ASSIGN primaryExpression
+    ;
+
+registeredDomainCommand
+    : REGISTERED_DOMAIN qualifiedName ASSIGN primaryExpression
+    ;
+
+userAgentCommand
+    : USER_AGENT qualifiedName ASSIGN primaryExpression commandNamedParameters
+    ;
+
+ipLocationCommand
+    : IP_LOCATION qualifiedName ASSIGN primaryExpression commandNamedParameters
+    ;
+
+setCommand
+    : SET setField SEMICOLON
+    ;
+
+setField
+    : identifier ASSIGN ( constant | mapExpression )
+    ;
+
+mmrCommand
+    :  MMR (queryVector=mmrQueryVectorParams)? ON diversifyField=qualifiedName MMR_LIMIT limitValue=integerValue commandNamedParameters
+    ;
+
+mmrQueryVectorParams
+    : parameter                           # mmrQueryVectorParameter
+    | primaryExpression                   # mmrQueryVectorExpression
+    ;
+
+// The field list is optional in the grammar only so the command can report its own errors: an absent list and a
+// literal input both parse here and are rejected in the builder, where the message can name the actual problem.
+denseVectorCommand
+    : DENSE_VECTOR denseVectorNaming? qualifiedNames? commandNamedParameters
+    ;
+
+// `ON` closes the suffix clause instead of separating two operands, so it sits inside the optional
+// group: without it, `DENSE_VECTOR title, description` would have to spell a bare `ON`.
+denseVectorNaming
+    : targetField=qualifiedName ASSIGN                      # denseVectorTargetName
+    | suffixKeyword=identifier ASSIGN suffix=string ON      # denseVectorSuffix
+    | (targetField=qualifiedName ASSIGN)? literalInput=string  # denseVectorLiteralInput
+    ;

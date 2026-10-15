@@ -1,0 +1,384 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.index.mapper;
+
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.util.IOFunction;
+import org.elasticsearch.common.breaker.CircuitBreaker;
+import org.elasticsearch.index.fielddata.MultiValuedSortableBinaryDocValues;
+import org.elasticsearch.search.fetch.StoredFieldsSpec;
+import org.elasticsearch.search.lookup.SourceFilter;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentParserConfiguration;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+
+import static org.elasticsearch.index.mapper.BlockSourceReader.ESTIMATED_SIZE;
+
+/**
+ * Block loader for fields that use fallback synthetic source implementation.
+ * <br>
+ * Usually fields have doc_values or stored fields and block loaders use them directly. In some cases neither is available
+ * and we would fall back to (potentially synthetic) _source. However, in case of synthetic source, there is actually no need to
+ * construct the entire _source. We know that there is no doc_values and stored fields, and therefore we will be using fallback synthetic
+ * source. That is equivalent to just reading _ignored_source stored field directly and doing an in-place synthetic source just
+ * for this field.
+ * <br>
+ * See {@link IgnoredSourceFieldMapper}.
+ */
+public abstract class FallbackSyntheticSourceBlockLoader implements BlockLoader {
+    private final Reader<?> reader;
+    private final String fieldName;
+    private final SourceFilter sourceFilter;
+    private final IgnoredSourceFieldMapper.IgnoredSourceFormat ignoredSourceFormat;
+
+    protected FallbackSyntheticSourceBlockLoader(
+        Reader<?> reader,
+        String fieldName,
+        IgnoredSourceFieldMapper.IgnoredSourceFormat ignoredSourceFormat
+    ) {
+        assert ignoredSourceFormat != IgnoredSourceFieldMapper.IgnoredSourceFormat.NO_IGNORED_SOURCE;
+        this.reader = reader;
+        this.fieldName = fieldName;
+        this.ignoredSourceFormat = ignoredSourceFormat;
+        this.sourceFilter = new SourceFilter(new String[] { fieldName }, null);
+    }
+
+    /**
+     * Returns the ignored source format used by this loader.
+     */
+    public IgnoredSourceFieldMapper.IgnoredSourceFormat ignoredSourceFormat() {
+        return ignoredSourceFormat;
+    }
+
+    @Override
+    public IOFunction<CircuitBreaker, ColumnAtATimeReader> columnAtATimeReader(LeafReaderContext context) {
+        return null;
+    }
+
+    @Override
+    public RowStrideReader rowStrideReader(CircuitBreaker breaker, LeafReaderContext context) throws IOException {
+        return new IgnoredSourceRowStrideReader<>(breaker, fieldName, sourceFilter, reader, ignoredSourceFormat, context.reader());
+    }
+
+    @Override
+    public StoredFieldsSpec rowStrideStoredFieldSpec() {
+        return StoredFieldsSpec.withSourcePaths(ignoredSourceFormat, Set.of(fieldName));
+    }
+
+    @Override
+    public boolean supportsOrdinals() {
+        return false;
+    }
+
+    @Override
+    public SortedSetDocValues ordinals(LeafReaderContext context) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public String toString() {
+        return "FallbackToSource[" + reader + "]";
+    }
+
+    public static Set<String> splitIntoFieldPaths(String fieldName) {
+        var paths = new HashSet<String>();
+        paths.add("_doc");
+        var current = new StringBuilder();
+        for (var part : fieldName.split("\\.")) {
+            if (current.isEmpty() == false) {
+                current.append('.');
+            }
+            current.append(part);
+            paths.add(current.toString());
+        }
+        return paths;
+    }
+
+    private static class IgnoredSourceRowStrideReader<T> implements RowStrideReader {
+        private final CircuitBreaker breaker;
+        private final String fieldName;
+        private final SourceFilter sourceFilter;
+        private final Reader<T> reader;
+        private final IgnoredSourceFieldMapper.IgnoredSourceFormat ignoredSourceFormat;
+        /**
+         * Only set for {@link IgnoredSourceFieldMapper.IgnoredSourceFormat#DOC_VALUES_IGNORED_SOURCE}. Unlike the stored field formats,
+         * this is a forward-only iterator, so it is what makes this reader unable to revisit a document. See {@link #canReuse}.
+         */
+        private final MultiValuedSortableBinaryDocValues ignoredSourceDocValues;
+        private final Thread creationThread;
+        /** What this reader has accounted for on the breaker, released by {@link #close}. */
+        private final long accountedBytes;
+        private int docId = -1;
+
+        /**
+         * Besides the flat {@link BlockSourceReader#ESTIMATED_SIZE}, a reader on the doc values format also accounts for the block buffer
+         * of its private {@link MultiValuedSortableBinaryDocValues}. The buffer is allocated lazily, once the reader decodes a block, and
+         * can be as large as the segment's largest block, so a query that reads many fields would otherwise hold one copy per field while
+         * the breaker only sees the flat estimate. What it accounts for is the upper bound the doc values report, added before any block is
+         * decompressed. It does not break the reader that has just opened its doc values, but it leaves the breaker over its limit when it
+         * does not fit, so the next reader fails while accounting for its flat estimate with a
+         * {@link org.elasticsearch.common.breaker.CircuitBreakingException} rather than the query running out of memory. Everything is
+         * released if opening the doc values fails, as {@code TrackingBinaryDocValues#get} does.
+         */
+        IgnoredSourceRowStrideReader(
+            CircuitBreaker breaker,
+            String fieldName,
+            SourceFilter sourceFilter,
+            Reader<T> reader,
+            IgnoredSourceFieldMapper.IgnoredSourceFormat ignoredSourceFormat,
+            LeafReader leafReader
+        ) throws IOException {
+            breaker.addEstimateBytesAndMaybeBreak(ESTIMATED_SIZE, "account for ignored source block estimation");
+            long accounted = ESTIMATED_SIZE;
+            MultiValuedSortableBinaryDocValues docValues = null;
+            boolean success = false;
+            try {
+                if (ignoredSourceFormat == IgnoredSourceFieldMapper.IgnoredSourceFormat.DOC_VALUES_IGNORED_SOURCE) {
+                    docValues = Objects.requireNonNull(
+                        MultiValuedSortableBinaryDocValues.fromMultiValued(leafReader, IgnoredSourceFieldMapper.NAME)
+                    );
+                    // 0 means no buffer beyond a value's own bytes and -1 means no estimate, so neither adds to what is accounted for
+                    long retained = docValues.maxDecodeBytes();
+                    if (retained > 0) {
+                        // No breaking here, we managed to create docValues instance.
+                        // The next reader will do the first breaker check and this would then break.
+                        breaker.addWithoutBreaking(retained, "account for ignored source block estimation based on max decode bytes");
+                        accounted += retained;
+                    }
+                }
+                success = true;
+            } finally {
+                if (success == false) {
+                    breaker.addWithoutBreaking(-accounted);
+                }
+            }
+            this.breaker = breaker;
+            this.creationThread = Thread.currentThread();
+            this.fieldName = fieldName;
+            this.sourceFilter = sourceFilter;
+            this.reader = reader;
+            this.ignoredSourceFormat = ignoredSourceFormat;
+            this.ignoredSourceDocValues = docValues;
+            this.accountedBytes = accounted;
+        }
+
+        @Override
+        public void read(int docId, StoredFields storedFields, Builder builder) throws IOException {
+            assert ignoredSourceDocValues == null || docId >= this.docId
+                : "docs must be read in order, got [" + docId + "] after [" + this.docId + "]";
+            this.docId = docId;
+            Map<String, List<IgnoredSourceFieldMapper.NameValue>> valuesGroupedByParent = ignoredSourceFormat.loadIgnoredFields(
+                sourceFilter,
+                storedFields.storedFields(),
+                docId,
+                ignoredSourceDocValues
+            );
+
+            if (valuesGroupedByParent.isEmpty()) {
+                builder.appendNull();
+                return;
+            }
+
+            assert valuesGroupedByParent.size() == 1 : "expected single parent key but got " + valuesGroupedByParent.keySet();
+
+            // TODO figure out how to handle XContentDataHelper#voidValue()
+
+            // The map has at most one key: the source filter is scoped to a single field, so all entries share the same name
+            // (either the field itself or one ancestor object).
+            var blockValues = new ArrayList<T>();
+            for (var entries : valuesGroupedByParent.values()) {
+                for (var nv : entries) {
+                    if (nv.name().equals(fieldName)) {
+                        readFromFieldValue(nv, blockValues);
+                    } else {
+                        parseFieldFromParent(nv, blockValues);
+                    }
+                }
+            }
+
+            if (blockValues.isEmpty() == false) {
+                if (blockValues.size() > 1) {
+                    builder.beginPositionEntry();
+                }
+
+                reader.writeToBlock(blockValues, builder);
+
+                if (blockValues.size() > 1) {
+                    builder.endPositionEntry();
+                }
+            } else {
+                builder.appendNull();
+            }
+        }
+
+        private void readFromFieldValue(IgnoredSourceFieldMapper.NameValue nameValue, List<T> blockValues) throws IOException {
+            // the leaf field is stored directly (not as a part of a parent object), so try to decode it.
+            Optional<Object> singleValue = XContentDataHelper.decode(nameValue.value());
+            if (singleValue.isPresent()) {
+                reader.convertValue(singleValue.get(), blockValues);
+                return;
+            }
+
+            // We have a value for this field, but its an array or an object
+            var type = XContentDataHelper.decodeType(nameValue.value());
+            assert type.isPresent();
+
+            try (
+                XContentParser parser = type.get()
+                    .xContent()
+                    .createParser(
+                        XContentParserConfiguration.EMPTY,
+                        nameValue.value().bytes,
+                        nameValue.value().offset + 1,
+                        nameValue.value().length - 1
+                    )
+            ) {
+                parser.nextToken();
+                parseWithReader(parser, blockValues);
+            }
+        }
+
+        private void parseFieldFromParent(IgnoredSourceFieldMapper.NameValue nameValue, List<T> blockValues) throws IOException {
+            var type = XContentDataHelper.decodeType(nameValue.value());
+            assert type.isPresent();
+
+            try (
+                XContentParser parser = type.get()
+                    .xContent()
+                    .createParser(
+                        XContentParserConfiguration.EMPTY,
+                        nameValue.value().bytes,
+                        nameValue.value().offset + 1,
+                        nameValue.value().length - 1
+                    )
+            ) {
+                if (parser.nextToken() != null) {
+                    parseFieldAtPath(parser, nameValue.name(), blockValues);
+                }
+            }
+        }
+
+        private void parseFieldAtPath(XContentParser parser, String path, List<T> blockValues) throws IOException {
+            assert fieldName.startsWith(path) && path.length() < fieldName.length() : "[" + path + "] not prefix of [" + fieldName + "]";
+            XContentParser.Token token = parser.currentToken();
+            if (token == XContentParser.Token.START_OBJECT) {
+                while (parser.nextToken() == XContentParser.Token.FIELD_NAME) {
+                    String childPath = path + "." + parser.currentName();
+                    parser.nextToken();
+                    if (fieldName.startsWith(childPath)) {
+                        if (childPath.length() == fieldName.length()) {
+                            parseWithReader(parser, blockValues);
+                        } else if (fieldName.charAt(childPath.length()) == '.') {
+                            parseFieldAtPath(parser, childPath, blockValues);
+                        } else {
+                            parser.skipChildren();
+                        }
+                    } else {
+                        parser.skipChildren();
+                    }
+                }
+            } else if (token == XContentParser.Token.START_ARRAY) {
+                for (token = parser.nextToken(); token != null && token != XContentParser.Token.END_ARRAY; token = parser.nextToken()) {
+                    parseFieldAtPath(parser, path, blockValues);
+                }
+            }
+        }
+
+        private void parseWithReader(XContentParser parser, List<T> blockValues) throws IOException {
+            reader.parse(parser, blockValues);
+        }
+
+        @Override
+        public boolean canReuse(int startingDocID) {
+            if (ignoredSourceDocValues == null) {
+                // The stored field formats read _ignored_source through the shared StoredFields, which the caller repositions per
+                // document, so this reader keeps no position of its own.
+                return true;
+            }
+            return creationThread == Thread.currentThread() && docId <= startingDocID;
+        }
+
+        @Override
+        public void close() {
+            breaker.addWithoutBreaking(-accountedBytes);
+        }
+
+        @Override
+        public String toString() {
+            return "FallbackToSource[" + reader + "]";
+        }
+    }
+
+    /**
+     * Field-specific implementation that converts data stored in _ignored_source field to block loader values.
+     * @param <T>
+     */
+    public interface Reader<T> {
+        /**
+         * Converts a raw stored value for this field to a value in a format suitable for block loader and adds it to the provided
+         * accumulator.
+         * @param value raw decoded value from _ignored_source field (synthetic _source value)
+         * @param accumulator list containing the result of conversion
+         */
+        void convertValue(Object value, List<T> accumulator);
+
+        /**
+         * Parses one or more complex values using a provided parser and adds them to the provided accumulator.
+         * @param parser parser of a value from _ignored_source field (synthetic _source value)
+         * @param accumulator list containing the results of parsing
+         */
+        void parse(XContentParser parser, List<T> accumulator) throws IOException;
+
+        void writeToBlock(List<T> values, Builder blockBuilder);
+    }
+
+    /**
+     * Reader for field types that don't parse arrays (arrays are always treated as multiple values)
+     * as opposed to field types that treat arrays as special cases (for example point).
+     * @param <T>
+     */
+    public abstract static class SingleValueReader<T> implements Reader<T> {
+        private final Object nullValue;
+
+        public SingleValueReader(Object nullValue) {
+            this.nullValue = nullValue;
+        }
+
+        @Override
+        public void parse(XContentParser parser, List<T> accumulator) throws IOException {
+            if (parser.currentToken() == XContentParser.Token.VALUE_NULL) {
+                if (nullValue != null) {
+                    convertValue(nullValue, accumulator);
+                }
+                return;
+            }
+            if (parser.currentToken() == XContentParser.Token.START_ARRAY) {
+                for (var token = parser.nextToken(); token != null && token != XContentParser.Token.END_ARRAY; token = parser.nextToken()) {
+                    parse(parser, accumulator);
+                }
+                return;
+            }
+
+            parseNonNullValue(parser, accumulator);
+        }
+
+        protected abstract void parseNonNullValue(XContentParser parser, List<T> accumulator) throws IOException;
+    }
+}

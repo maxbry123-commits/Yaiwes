@@ -1,0 +1,37 @@
+---
+"Routing":
+ - requires:
+    test_runner_features: [ "allowed_warnings" ]
+
+ - do:
+     indices.create:
+       index:    test_1
+       body:
+         settings:
+           index:
+             number_of_shards: 5
+             number_of_routing_shards: 5
+     allowed_warnings:
+       - "[index.number_of_routing_shards] setting was deprecated in Elasticsearch and will be removed in a future release. See the deprecation documentation for the next major version."
+
+ - do:
+      index:
+          index:   test_1
+          id:      "1"
+          routing: "5"
+          body:    { foo: bar }
+
+ - do:
+      exists:
+          index:   test_1
+          id:      "1"
+          routing: "5"
+
+ - is_true: ''
+
+ - do:
+      exists:
+          index:   test_1
+          id:      "1"
+
+ - is_false: ''

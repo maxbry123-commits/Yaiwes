@@ -1,0 +1,91 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.xpack.inference.external.http.sender;
+
+import org.apache.lucene.util.RamUsageEstimator;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.inference.InferenceString;
+import org.elasticsearch.inference.RerankRequest;
+
+import java.util.List;
+import java.util.Objects;
+
+import static org.elasticsearch.inference.InferenceString.textValue;
+import static org.elasticsearch.inference.InferenceString.toStringList;
+
+public class QueryAndDocsInputs extends InferenceInputs {
+
+    private static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(QueryAndDocsInputs.class);
+    private static final long BOOLEAN_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(Boolean.class);
+
+    public static QueryAndDocsInputs fromRerankRequest(RerankRequest request) {
+        return new QueryAndDocsInputs(request.query(), request.inputs(), request.returnDocuments(), request.topN(), false);
+    }
+
+    private final InferenceString query;
+    private final List<InferenceString> docs;
+    private final Boolean returnDocuments;
+    private final Integer topN;
+
+    public QueryAndDocsInputs(
+        InferenceString query,
+        List<InferenceString> docs,
+        @Nullable Boolean returnDocuments,
+        @Nullable Integer topN,
+        boolean stream
+    ) {
+        super(stream);
+        this.query = Objects.requireNonNull(query);
+        this.docs = Objects.requireNonNull(docs);
+        this.returnDocuments = returnDocuments;
+        this.topN = topN;
+    }
+
+    public QueryAndDocsInputs(InferenceString query, List<InferenceString> docs) {
+        this(query, docs, null, null, false);
+    }
+
+    public InferenceString getQuery() {
+        return query;
+    }
+
+    public String getQueryAsString() {
+        return textValue(query);
+    }
+
+    public List<InferenceString> getDocs() {
+        return docs;
+    }
+
+    public List<String> getDocsAsStrings() {
+        return toStringList(docs);
+    }
+
+    public Boolean getReturnDocuments() {
+        return returnDocuments;
+    }
+
+    public Integer getTopN() {
+        return topN;
+    }
+
+    @Override
+    public boolean isSingleInput() {
+        return docs.size() == 1;
+    }
+
+    @Override
+    public long ramBytesUsed() {
+        var docsRamBytesUsed = RamUsageEstimator.sizeOfCollection(docs);
+        var queryRamBytesUsed = query.ramBytesUsed();
+        var returnDocumentsRamBytesUsed = returnDocuments == null ? 0L : BOOLEAN_SHALLOW_SIZE;
+        var topNRamBytesUsed = topN == null ? 0L : RamUsageEstimator.sizeOf(topN);
+
+        return SHALLOW_SIZE + docsRamBytesUsed + queryRamBytesUsed + returnDocumentsRamBytesUsed + topNRamBytesUsed;
+    }
+}

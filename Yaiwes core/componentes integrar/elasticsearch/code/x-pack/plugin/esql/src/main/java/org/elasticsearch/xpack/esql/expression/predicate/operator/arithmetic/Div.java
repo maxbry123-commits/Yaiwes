@@ -1,0 +1,236 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.xpack.esql.expression.predicate.operator.arithmetic;
+
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.compute.ann.Evaluator;
+import org.elasticsearch.compute.ann.Fixed;
+import org.elasticsearch.compute.expression.ExpressionEvaluator;
+import org.elasticsearch.xpack.esql.capabilities.NonFiniteSupport;
+import org.elasticsearch.xpack.esql.core.expression.AnyNullIsNull;
+import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
+import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.NumericUtils;
+import org.elasticsearch.xpack.esql.expression.function.FunctionInfo;
+import org.elasticsearch.xpack.esql.expression.function.Param;
+import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
+
+import java.io.IOException;
+
+import static org.elasticsearch.xpack.esql.expression.predicate.operator.arithmetic.EsqlArithmeticOperation.OperationSymbol.DIV;
+import static org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter.longToUnsignedLong;
+
+public class Div extends DenseVectorArithmeticOperation implements BinaryComparisonInversible, AnyNullIsNull, NonFiniteSupport {
+    public static final NamedWriteableRegistry.Entry ENTRY = new NamedWriteableRegistry.Entry(Expression.class, "Div", Div::new);
+    public static final String OP_NAME = "Div";
+
+    private DataType type;
+
+    /**
+     * When {@code true}, the scalar double division follows IEEE-754: division by zero yields {@code ±Inf} (or
+     * {@code NaN} for {@code 0/0}) and other non-finite results are returned as-is, instead of being rejected to
+     * {@code null}. Set only by the PromQL translation, where Prometheus defines {@code x / 0} as {@code ±Inf}/{@code NaN}
+     * with the series kept. The default is {@code false}, preserving ES|QL's divide-by-zero error and finite-only contract.
+     * Only the scalar double path honors this flag.
+     */
+    private final boolean allowNonFinite;
+
+    @FunctionInfo(operator = "/", returnType = { "double", "integer", "long", "unsigned_long", "dense_vector" }, description = """
+        Divide one value by another. For numeric operands, if either field is <<esql-multivalued-fields,multivalued>>
+        then the result is `null`.""", note = """
+        Division of two integer types will yield an integer result, rounding towards 0. "
+        If you need floating point division, <<esql-cast-operator>> one of the arguments to a `DOUBLE`.
+        For dense_vector operations, both arguments should be dense_vectors. Inequal vector dimensions generate null result.
+        """)
+    public Div(
+        Source source,
+        @Param(name = "lhs", description = "A numeric value.", type = { "double", "integer", "long", "unsigned_long" }) Expression left,
+        @Param(name = "rhs", description = "A numeric value.", type = { "double", "integer", "long", "unsigned_long" }) Expression right
+    ) {
+        this(source, left, right, null);
+    }
+
+    public Div(Source source, Expression left, Expression right, DataType type) {
+        this(source, left, right, type, false);
+    }
+
+    public Div(Source source, Expression left, Expression right, DataType type, boolean allowNonFinite) {
+        super(
+            source,
+            left,
+            right,
+            DIV,
+            DivIntsEvaluator.Factory::new,
+            DivLongsEvaluator.Factory::new,
+            DivUnsignedLongsEvaluator.Factory::new,
+            (s, lhs, rhs) -> new DivDoublesEvaluator.Factory(s, lhs, rhs, allowNonFinite),
+            DIV_DENSE_VECTOR_EVALUATOR,
+            // Integer division cannot produce a non-finite value, so both integer fast paths apply either way. Double
+            // division can, so the lenient path needs the variant that surfaces ±Inf/NaN instead of rejecting it.
+            DivIntsByConstantEvaluator.Factory::new,
+            DivLongsByConstantEvaluator.Factory::new,
+            allowNonFinite ? DivNonFiniteDoublesByConstantEvaluator.Factory::new : DivDoublesByConstantEvaluator.Factory::new,
+            /* excludeZeroRhs */ true
+        );
+        this.type = type;
+        this.allowNonFinite = allowNonFinite;
+    }
+
+    private Div(StreamInput in) throws IOException {
+        // Children are serialized by BinaryScalarFunction#writeTo (source, left, right); the non-finite flag, when
+        // present, follows them, so read it last to match. The lazily-computed result type is not serialized.
+        // Bypassing the base StreamInput constructor lets the flag reach the double-evaluator factories.
+        this(
+            Source.readFrom((PlanStreamInput) in),
+            in.readNamedWriteable(Expression.class),
+            in.readNamedWriteable(Expression.class),
+            null,
+            NonFiniteSupport.readNonFinite(in, NonFiniteSupport.ESQL_PROMQL_NON_FINITE_ARITHMETIC)
+        );
+    }
+
+    @Override
+    public TransportVersion nonFiniteTransportVersion() {
+        return NonFiniteSupport.ESQL_PROMQL_NON_FINITE_ARITHMETIC;
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        super.writeTo(out);
+        writeNonFinite(out);
+    }
+
+    @Override
+    public String getWriteableName() {
+        return ENTRY.name;
+    }
+
+    @Override
+    public DataType dataType() {
+        if (type == null) {
+            type = super.dataType();
+        }
+        return type;
+    }
+
+    @Override
+    protected NodeInfo<Div> info() {
+        return NodeInfo.create(this, Div::new, left(), right(), type, allowNonFinite);
+    }
+
+    @Override
+    public boolean allowNonFinite() {
+        return allowNonFinite;
+    }
+
+    @Override
+    public Expression toStrictVariant() {
+        return new Div(source(), left(), right(), type, false);
+    }
+
+    protected Div replaceChildren(Expression newLeft, Expression newRight) {
+        return new Div(source(), newLeft, newRight, type, allowNonFinite);
+    }
+
+    @Override
+    public ArithmeticOperationFactory binaryComparisonInverse() {
+        return Mul::new;
+    }
+
+    @Evaluator(extraName = "Ints", warnExceptions = { ArithmeticException.class })
+    static int processInts(int lhs, int rhs) {
+        if (rhs == 0) {
+            throw new ArithmeticException("/ by zero");
+        }
+        return lhs / rhs;
+    }
+
+    @Evaluator(extraName = "Longs", warnExceptions = { ArithmeticException.class })
+    static long processLongs(long lhs, long rhs) {
+        if (rhs == 0L) {
+            throw new ArithmeticException("/ by zero");
+        }
+        return lhs / rhs;
+    }
+
+    @Evaluator(extraName = "UnsignedLongs", warnExceptions = { ArithmeticException.class })
+    static long processUnsignedLongs(long lhs, long rhs) {
+        if (rhs == NumericUtils.ZERO_AS_UNSIGNED_LONG) {
+            throw new ArithmeticException("/ by zero");
+        }
+        return longToUnsignedLong(Long.divideUnsigned(longToUnsignedLong(lhs, true), longToUnsignedLong(rhs, true)), true);
+    }
+
+    @Evaluator(extraName = "Doubles", warnExceptions = { ArithmeticException.class })
+    static double processDoubles(double lhs, double rhs, @Fixed(includeInToString = false) boolean allowNonFinite) {
+        if (allowNonFinite) {
+            // Prometheus defines x / 0 as ±Inf (NaN for 0/0) with the series kept, so skip both the divide-by-zero
+            // guard and the finite-number check and let IEEE-754 division produce the result.
+            return lhs / rhs;
+        }
+        if (rhs == 0.0) {
+            throw new ArithmeticException("/ by zero");
+        }
+
+        return NumericUtils.asFiniteNumber(lhs / rhs);
+    }
+
+    @Evaluator(extraName = "IntsByConstant")
+    static int processIntsByConstant(int lhs, @Fixed(jitConstant = true) int rhs) {
+        return lhs / rhs;
+    }
+
+    @Evaluator(extraName = "LongsByConstant")
+    static long processLongsByConstant(long lhs, @Fixed(jitConstant = true) long rhs) {
+        return lhs / rhs;
+    }
+
+    @Evaluator(extraName = "DoublesByConstant", warnExceptions = { ArithmeticException.class })
+    static double processDoublesByConstant(double lhs, @Fixed(jitConstant = true) double rhs) {
+        return NumericUtils.asFiniteNumber(lhs / rhs);
+    }
+
+    @Evaluator(extraName = "NonFiniteDoublesByConstant")
+    static double processNonFiniteDoublesByConstant(double lhs, @Fixed(jitConstant = true) double rhs) {
+        return lhs / rhs;
+    }
+
+    private static float divDenseVectorElements(float lhs, float rhs) {
+        float value = lhs / rhs;
+        if (Float.isNaN(value) || Float.isInfinite(value)) {
+            throw new ArithmeticException("/ by zero");
+        }
+        return value;
+    }
+
+    private static final DenseVectorBinaryEvaluator DIV_DENSE_VECTOR_EVALUATOR = new DenseVectorBinaryEvaluator() {
+        @Override
+        public ExpressionEvaluator.Factory vectorsOperation(
+            Source source,
+            ExpressionEvaluator.Factory lhs,
+            ExpressionEvaluator.Factory rhs
+        ) {
+            return new DenseVectorsEvaluator.Factory(source, lhs, rhs, Div::divDenseVectorElements, OP_NAME);
+        }
+
+        @Override
+        public ExpressionEvaluator.Factory scalarVectorOperation(Source source, float lhs, ExpressionEvaluator.Factory rhs) {
+            return new DenseVectorScalarEvaluator.Factory(source, lhs, rhs, Div::divDenseVectorElements, OP_NAME);
+        }
+
+        @Override
+        public ExpressionEvaluator.Factory vectorScalarOperation(Source source, ExpressionEvaluator.Factory lhs, float rhs) {
+            return new DenseVectorScalarEvaluator.Factory(source, lhs, rhs, Div::divDenseVectorElements, OP_NAME);
+        }
+    };
+}

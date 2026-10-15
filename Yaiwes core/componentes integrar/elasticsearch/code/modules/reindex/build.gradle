@@ -1,0 +1,80 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+apply plugin: 'elasticsearch.test-with-dependencies'
+apply plugin: 'elasticsearch.internal-yaml-rest-test'
+apply plugin: 'elasticsearch.internal-java-rest-test'
+apply plugin: 'elasticsearch.yaml-rest-compat-test'
+apply plugin: 'elasticsearch.internal-cluster-test'
+
+esplugin {
+  description = 'The Reindex module adds APIs to reindex from one index to another or update documents in place.'
+  classname = 'org.elasticsearch.reindex.ReindexPlugin'
+}
+
+dependencies {
+  api project(":client:rest")
+  api project(":libs:ssl-config")
+  // for parent/child testing
+  testImplementation project(':modules:parent-join')
+  testImplementation project(':modules:rest-root')
+  // for data stream integration tests
+  internalClusterTestImplementation project(':modules:data-streams')
+  // registers reindex relocation and pit search node features
+  internalClusterTestImplementation project(':modules:reindex-management')
+
+  clusterModules project(':modules:lang-painless')
+  clusterModules project(':modules:parent-join')
+  clusterModules project(":modules:rest-root")
+  clusterModules project(':modules:reindex-management')
+
+  // Testcontainers-backed old Elasticsearch fixtures for reindex-from-remote (see javaRestTest)
+  javaRestTestImplementation project(':test:fixtures:old-elasticsearch')
+  javaRestTestImplementation project(':test:fixtures:testcontainer-utils')
+  javaRestTestRuntimeOnly "org.slf4j:slf4j-simple:${versions.slf4j}"
+}
+
+restResources {
+  restApi {
+    include '_common', 'cluster', 'nodes', 'indices', 'index', 'get', 'search', 'mget', 'count',
+                'update_by_query', 'delete_by_query', 'reindex_rethrottle', 'tasks', 'reindex', 'put_script', 'bulk', 'info'
+  }
+}
+
+configurations {
+  restTests {
+    attributes {
+      attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, ArtifactTypeDefinition.DIRECTORY_TYPE)
+    }
+  }
+}
+
+artifacts {
+  restTests(new File(projectDir, "src/yamlRestTest/resources/rest-api-spec/test"))
+}
+
+tasks.named("thirdPartyAudit").configure {
+  ignoreMissingClasses(
+          // Commons logging
+          'javax.servlet.ServletContextEvent',
+          'javax.servlet.ServletContextListener',
+          'org.apache.avalon.framework.logger.Logger',
+          'org.apache.log.Hierarchy',
+          'org.apache.log.Logger',
+  )
+}
+
+tasks.named("forbiddenPatterns").configure {
+  // PKCS#12 file are not UTF-8
+  exclude '**/*.p12'
+}
+
+tasks.named("yamlRestCompatTestTransform").configure { task ->
+  task.skipTest("reindex/20_validation/specifying size fails", "size is rejected in 9.0")
+}

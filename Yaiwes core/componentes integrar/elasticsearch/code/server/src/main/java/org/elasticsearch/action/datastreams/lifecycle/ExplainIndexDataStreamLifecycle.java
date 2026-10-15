@@ -1,0 +1,385 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.action.datastreams.lifecycle;
+
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.action.admin.indices.rollover.RolloverConfiguration;
+import org.elasticsearch.cluster.metadata.DataStreamGlobalRetention;
+import org.elasticsearch.cluster.metadata.DataStreamLifecycle;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Writeable;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.xcontent.ParseField;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
+
+import java.io.IOException;
+import java.util.Objects;
+import java.util.function.Supplier;
+
+/**
+ * Encapsulates the information that describes an index from its data stream lifecycle perspective.
+ */
+public class ExplainIndexDataStreamLifecycle implements Writeable, ToXContentObject {
+    private static final ParseField INDEX_FIELD = new ParseField("index");
+    private static final ParseField MANAGED_BY_LIFECYCLE_FIELD = new ParseField("managed_by_lifecycle");
+    private static final ParseField INDEX_CREATION_DATE_MILLIS_FIELD = new ParseField("index_creation_date_millis");
+    private static final ParseField INDEX_CREATION_DATE_FIELD = new ParseField("index_creation_date");
+    private static final ParseField ROLLOVER_DATE_MILLIS_FIELD = new ParseField("rollover_date_millis");
+    private static final ParseField ROLLOVER_DATE_FIELD = new ParseField("rollover_date");
+    private static final ParseField TIME_SINCE_INDEX_CREATION_FIELD = new ParseField("time_since_index_creation");
+    private static final ParseField TIME_SINCE_ROLLOVER_FIELD = new ParseField("time_since_rollover");
+    private static final ParseField GENERATION_TIME = new ParseField("generation_time");
+    private static final ParseField LIFECYCLE_FIELD = new ParseField("lifecycle");
+    private static final ParseField MINIMUM_LIFECYCLE_ENABLED_FIELD = new ParseField("minimum_lifecycle_enabled");
+    private static final ParseField ERROR_FIELD = new ParseField("error");
+    private static final ParseField FROZEN_TRANSITION_STATUS_FIELD = new ParseField("frozen_transition_status");
+    private static final ParseField UNMANAGED_REASON_FIELD = new ParseField("unmanaged_reason");
+    private static final ParseField TAIL_MERGE_DATE_MILLIS_FIELD = new ParseField("tail_merge_date_millis");
+    private static final ParseField TAIL_MERGE_DATE_FIELD = new ParseField("tail_merge_date");
+
+    static final TransportVersion EXPLAIN_INDEX_FROZEN_TRANSITION = TransportVersion.fromName("explain_index_frozen_transition");
+    public static final TransportVersion EXPLAIN_INDEX_UNMANAGED_REASON = TransportVersion.fromName("explain_index_unmanaged_reason");
+    static final TransportVersion EXPLAIN_INDEX_MINIMUM_LIFECYCLE = TransportVersion.fromName("explain_index_minimum_lifecycle");
+    static final TransportVersion EXPLAIN_INDEX_TAIL_MERGE_DATE = TransportVersion.fromName("explain_index_tail_merge_date");
+
+    private final String index;
+    private final boolean managedByLifecycle;
+    private final boolean isInternalDataStream;
+    @Nullable
+    private final Long indexCreationDate;
+    @Nullable
+    private final Long rolloverDate;
+    @Nullable
+    private final Long generationDateMillis;
+    @Nullable
+    private final DataStreamLifecycle lifecycle;
+    @Nullable
+    private final ErrorEntry error;
+    @Nullable
+    private final FrozenTransitionStatus frozenTransitionStatus;
+    @Nullable
+    private final String unmanagedReason;
+    private final boolean minimumLifecycleEnabled;
+    @Nullable
+    private final Long tailMergeDate;
+    private Supplier<Long> nowSupplier = System::currentTimeMillis;
+
+    private ExplainIndexDataStreamLifecycle(
+        String index,
+        boolean managedByLifecycle,
+        boolean isInternalDataStream,
+        @Nullable Long indexCreationDate,
+        @Nullable Long rolloverDate,
+        @Nullable TimeValue generationDate,
+        @Nullable DataStreamLifecycle lifecycle,
+        @Nullable ErrorEntry error,
+        @Nullable FrozenTransitionStatus frozenTransitionStatus,
+        boolean minimumLifecycleEnabled,
+        @Nullable Long tailMergeDate,
+        @Nullable String unmanagedReason
+    ) {
+        this.index = index;
+        this.managedByLifecycle = managedByLifecycle;
+        this.isInternalDataStream = isInternalDataStream;
+        this.indexCreationDate = indexCreationDate;
+        this.rolloverDate = rolloverDate;
+        this.generationDateMillis = generationDate == null ? null : generationDate.millis();
+        this.lifecycle = lifecycle;
+        this.error = error;
+        this.frozenTransitionStatus = frozenTransitionStatus;
+        this.minimumLifecycleEnabled = minimumLifecycleEnabled;
+        this.tailMergeDate = tailMergeDate;
+        this.unmanagedReason = unmanagedReason;
+    }
+
+    public ExplainIndexDataStreamLifecycle(StreamInput in) throws IOException {
+        this.index = in.readString();
+        this.managedByLifecycle = in.readBoolean();
+        this.isInternalDataStream = in.readBoolean();
+        if (managedByLifecycle) {
+            this.indexCreationDate = in.readOptionalLong();
+            this.rolloverDate = in.readOptionalLong();
+            this.generationDateMillis = in.readOptionalLong();
+            this.lifecycle = in.readOptionalWriteable(DataStreamLifecycle::new);
+            this.error = in.readOptionalWriteable(ErrorEntry::new);
+            this.frozenTransitionStatus = in.getTransportVersion().supports(EXPLAIN_INDEX_FROZEN_TRANSITION)
+                ? in.readOptionalEnum(FrozenTransitionStatus.class)
+                : null;
+            this.minimumLifecycleEnabled = in.getTransportVersion().supports(EXPLAIN_INDEX_MINIMUM_LIFECYCLE) && in.readBoolean();
+            this.tailMergeDate = in.getTransportVersion().supports(EXPLAIN_INDEX_TAIL_MERGE_DATE) ? in.readOptionalLong() : null;
+            this.unmanagedReason = null;
+        } else {
+            this.unmanagedReason = in.getTransportVersion().supports(EXPLAIN_INDEX_UNMANAGED_REASON) ? in.readOptionalString() : null;
+            this.indexCreationDate = null;
+            this.rolloverDate = null;
+            this.generationDateMillis = null;
+            this.lifecycle = null;
+            this.error = null;
+            this.frozenTransitionStatus = null;
+            this.minimumLifecycleEnabled = false;
+            this.tailMergeDate = null;
+        }
+    }
+
+    public static ExplainIndexDataStreamLifecycle unmanagedIndexResponse(String indexName, @Nullable String reason) {
+        return new ExplainIndexDataStreamLifecycle(indexName, false, false, null, null, null, null, null, null, false, null, reason);
+    }
+
+    public static ExplainIndexDataStreamLifecycle managedIndexResponse(
+        String index,
+        boolean isInternalDataStream,
+        @Nullable Long indexCreationDate,
+        @Nullable Long rolloverDate,
+        @Nullable TimeValue generationDate,
+        @Nullable DataStreamLifecycle lifecycle,
+        @Nullable ErrorEntry error,
+        @Nullable FrozenTransitionStatus frozenTransitionStatus,
+        boolean minimumLifecycleEnabled,
+        @Nullable Long tailMergeDate
+    ) {
+        return new ExplainIndexDataStreamLifecycle(
+            index,
+            true,
+            isInternalDataStream,
+            indexCreationDate,
+            rolloverDate,
+            generationDate,
+            lifecycle,
+            error,
+            frozenTransitionStatus,
+            minimumLifecycleEnabled,
+            tailMergeDate,
+            null
+        );
+    }
+
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        return toXContent(builder, params, null, null);
+    }
+
+    public XContentBuilder toXContent(
+        XContentBuilder builder,
+        Params params,
+        @Nullable RolloverConfiguration rolloverConfiguration,
+        @Nullable DataStreamGlobalRetention globalRetention
+    ) throws IOException {
+        builder.startObject();
+        builder.field(INDEX_FIELD.getPreferredName(), index);
+        builder.field(MANAGED_BY_LIFECYCLE_FIELD.getPreferredName(), managedByLifecycle);
+        if (managedByLifecycle) {
+            if (indexCreationDate != null) {
+                builder.timestampFieldsFromUnixEpochMillis(
+                    INDEX_CREATION_DATE_MILLIS_FIELD.getPreferredName(),
+                    INDEX_CREATION_DATE_FIELD.getPreferredName(),
+                    indexCreationDate
+                );
+                builder.field(
+                    TIME_SINCE_INDEX_CREATION_FIELD.getPreferredName(),
+                    getTimeSinceIndexCreation(nowSupplier).toHumanReadableString(2)
+                );
+            }
+            if (rolloverDate != null) {
+                builder.timestampFieldsFromUnixEpochMillis(
+                    ROLLOVER_DATE_MILLIS_FIELD.getPreferredName(),
+                    ROLLOVER_DATE_FIELD.getPreferredName(),
+                    rolloverDate
+                );
+                builder.field(TIME_SINCE_ROLLOVER_FIELD.getPreferredName(), getTimeSinceRollover(nowSupplier).toHumanReadableString(2));
+            }
+            if (generationDateMillis != null) {
+                builder.field(GENERATION_TIME.getPreferredName(), getGenerationTime(nowSupplier).toHumanReadableString(2));
+            }
+            if (this.lifecycle != null) {
+                builder.field(LIFECYCLE_FIELD.getPreferredName());
+                lifecycle.toXContent(builder, params, rolloverConfiguration, globalRetention, isInternalDataStream);
+            } else if (minimumLifecycleEnabled) {
+                builder.field(MINIMUM_LIFECYCLE_ENABLED_FIELD.getPreferredName(), minimumLifecycleEnabled);
+            }
+            if (this.error != null) {
+                if (error.firstOccurrenceTimestamp() != -1L && error.recordedTimestamp() != -1L && error.retryCount() != -1) {
+                    builder.field(ERROR_FIELD.getPreferredName(), error);
+                } else {
+                    // bwc for error field being a string
+                    builder.field(ERROR_FIELD.getPreferredName(), error.error());
+                }
+            }
+            if (this.frozenTransitionStatus != null) {
+                builder.field(FROZEN_TRANSITION_STATUS_FIELD.getPreferredName(), frozenTransitionStatus.toString());
+            }
+            if (this.tailMergeDate != null) {
+                builder.timestampFieldsFromUnixEpochMillis(
+                    TAIL_MERGE_DATE_MILLIS_FIELD.getPreferredName(),
+                    TAIL_MERGE_DATE_FIELD.getPreferredName(),
+                    tailMergeDate
+                );
+            }
+        } else if (unmanagedReason != null) {
+            builder.field(UNMANAGED_REASON_FIELD.getPreferredName(), unmanagedReason);
+        }
+        builder.endObject();
+        return builder;
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeString(index);
+        out.writeBoolean(managedByLifecycle);
+        out.writeBoolean(isInternalDataStream);
+        if (managedByLifecycle) {
+            out.writeOptionalLong(indexCreationDate);
+            out.writeOptionalLong(rolloverDate);
+            out.writeOptionalLong(generationDateMillis);
+            out.writeOptionalWriteable(lifecycle);
+            out.writeOptionalWriteable(error);
+            if (out.getTransportVersion().supports(EXPLAIN_INDEX_FROZEN_TRANSITION)) {
+                out.writeOptionalEnum(frozenTransitionStatus);
+            }
+            if (out.getTransportVersion().supports(EXPLAIN_INDEX_MINIMUM_LIFECYCLE)) {
+                out.writeBoolean(minimumLifecycleEnabled);
+            }
+            if (out.getTransportVersion().supports(EXPLAIN_INDEX_TAIL_MERGE_DATE)) {
+                out.writeOptionalLong(tailMergeDate);
+            }
+        } else if (out.getTransportVersion().supports(EXPLAIN_INDEX_UNMANAGED_REASON)) {
+            out.writeOptionalString(unmanagedReason);
+        }
+    }
+
+    /**
+     * Calculates the time since this index started progressing towards the remaining of its lifecycle past rollover.
+     * Every index will either have to wait to be rolled over before progressing towards its retention part of its lifecycle,
+     * or be added to the datastream manually.
+     * If the index is the write index this will return null.
+     */
+    @Nullable
+    public TimeValue getGenerationTime(Supplier<Long> now) {
+        if (generationDateMillis == null) {
+            return null;
+        }
+        return TimeValue.timeValueMillis(Math.max(0L, now.get() - generationDateMillis));
+    }
+
+    /**
+     * Calculates the time lapsed since the index was created.
+     * It can be null as we don't serialise the index creation field for un-managed indices.
+     */
+    @Nullable
+    public TimeValue getTimeSinceIndexCreation(Supplier<Long> now) {
+        if (indexCreationDate == null) {
+            // unmanaged index
+            return null;
+        }
+        return TimeValue.timeValueMillis(Math.max(0L, now.get() - indexCreationDate));
+    }
+
+    /**
+     * Calculates the time lapsed since the index was rolled over.
+     * It can be null if the index was not rolled over or for un-managed indecs as we don't serialise the rollover data field.
+     */
+    @Nullable
+    public TimeValue getTimeSinceRollover(Supplier<Long> now) {
+        if (rolloverDate == null) {
+            return null;
+        }
+        return TimeValue.timeValueMillis(Math.max(0L, now.get() - rolloverDate));
+    }
+
+    public String getIndex() {
+        return index;
+    }
+
+    public boolean isManagedByLifecycle() {
+        return managedByLifecycle;
+    }
+
+    public Long getIndexCreationDate() {
+        return indexCreationDate;
+    }
+
+    public Long getRolloverDate() {
+        return rolloverDate;
+    }
+
+    public DataStreamLifecycle getLifecycle() {
+        return lifecycle;
+    }
+
+    public ErrorEntry getError() {
+        return error;
+    }
+
+    @Nullable
+    public FrozenTransitionStatus getFrozenTransitionStatus() {
+        return frozenTransitionStatus;
+    }
+
+    @Nullable
+    public String getUnmanagedReason() {
+        return unmanagedReason;
+    }
+
+    /**
+     * @return true if the index is managed by the minimum data stream lifecycle.
+     */
+    public boolean isMinimumLifecycleEnabled() {
+        return minimumLifecycleEnabled;
+    }
+
+    @Nullable
+    public Long getTailMergeDate() {
+        return tailMergeDate;
+    }
+
+    // public for testing purposes only
+    public void setNowSupplier(Supplier<Long> nowSupplier) {
+        this.nowSupplier = nowSupplier;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        ExplainIndexDataStreamLifecycle that = (ExplainIndexDataStreamLifecycle) o;
+        return managedByLifecycle == that.managedByLifecycle
+            && Objects.equals(index, that.index)
+            && Objects.equals(indexCreationDate, that.indexCreationDate)
+            && Objects.equals(rolloverDate, that.rolloverDate)
+            && Objects.equals(lifecycle, that.lifecycle)
+            && Objects.equals(error, that.error)
+            && Objects.equals(frozenTransitionStatus, that.frozenTransitionStatus)
+            && Objects.equals(unmanagedReason, that.unmanagedReason)
+            && minimumLifecycleEnabled == that.minimumLifecycleEnabled
+            && Objects.equals(tailMergeDate, that.tailMergeDate);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+            index,
+            managedByLifecycle,
+            indexCreationDate,
+            rolloverDate,
+            lifecycle,
+            error,
+            frozenTransitionStatus,
+            unmanagedReason,
+            minimumLifecycleEnabled,
+            tailMergeDate
+        );
+    }
+}

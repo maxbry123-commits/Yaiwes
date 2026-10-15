@@ -1,0 +1,23 @@
+apply plugin: 'elasticsearch.internal-java-rest-test'
+apply plugin: 'elasticsearch.internal-yaml-rest-test'
+apply plugin: 'elasticsearch.yaml-rest-compat-test'
+
+dependencies {
+  javaRestTestImplementation(testArtifact(project(xpackModule('searchable-snapshots'))))
+}
+
+restResources {
+  restApi {
+    include 'indices', 'search', 'bulk', 'index', 'snapshot', 'nodes', '_common', 'searchable_snapshots', 'cluster', 'open_point_in_time', 'close_point_in_time', 'security'
+  }
+}
+
+tasks.named('javaRestTest') {
+  usesDefaultDistribution("uses the security and searchable-snapshots x-pack features")
+}
+tasks.named('yamlRestTest') {
+  usesDefaultDistribution("uses the security and searchable-snapshots x-pack features")
+}
+tasks.named('yamlRestCompatTest') {
+  usesDefaultDistribution("uses the security and searchable-snapshots x-pack features")
+}

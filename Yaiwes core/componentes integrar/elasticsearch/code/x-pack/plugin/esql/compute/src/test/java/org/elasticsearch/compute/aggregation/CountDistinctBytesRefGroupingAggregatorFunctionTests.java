@@ -1,0 +1,87 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.compute.aggregation;
+
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.compute.data.Block;
+import org.elasticsearch.compute.data.BlockFactory;
+import org.elasticsearch.compute.data.ElementType;
+import org.elasticsearch.compute.data.LongBlock;
+import org.elasticsearch.compute.data.LongVector;
+import org.elasticsearch.compute.data.Page;
+import org.elasticsearch.compute.operator.SourceOperator;
+import org.elasticsearch.compute.test.TestDriverRunner;
+import org.elasticsearch.compute.test.operator.blocksource.LongBytesRefTupleBlockSourceOperator;
+import org.elasticsearch.core.Tuple;
+
+import java.util.List;
+import java.util.stream.LongStream;
+
+import static org.hamcrest.Matchers.equalTo;
+
+public class CountDistinctBytesRefGroupingAggregatorFunctionTests extends GroupingAggregatorFunctionTestCase {
+
+    @Override
+    protected AggregatorFunctionSupplier aggregatorFunction() {
+        return new CountDistinctBytesRefAggregatorFunctionSupplier(CountDistinctTestUtils.PRECISION);
+    }
+
+    @Override
+    protected String expectedDescriptionOfAggregator() {
+        return "count_distinct of bytes";
+    }
+
+    @Override
+    protected SourceOperator simpleInput(BlockFactory blockFactory, int size) {
+        return new LongBytesRefTupleBlockSourceOperator(
+            blockFactory,
+            LongStream.range(0, size).mapToObj(l -> Tuple.tuple(randomGroupId(size), new BytesRef(String.valueOf(between(1, 10000)))))
+        );
+    }
+
+    @Override
+    protected void assertSimpleGroup(List<Page> input, Block result, int position, Long group) {
+        CountDistinctTestUtils.assertCount(
+            ((LongBlock) result).getLong(position),
+            input.stream().flatMap(p -> allBytesRefs(p, group)).distinct().mapToLong(CountDistinctTestUtils::hash)
+        );
+    }
+
+    /**
+     * {@code "338"} and {@code "2351"} share the top 25 bits of their hash, so linear counting stores them as one entry
+     * and counts this group as 1. {@link #assertSimpleGroup} must accept that as a hash collision.
+     */
+    public void testHashCollisionInSmallGroup() {
+        var runner = new TestDriverRunner().builder(driverContext()).collectDeepCopy();
+        runner.input(
+            new LongBytesRefTupleBlockSourceOperator(
+                runner.blockFactory(),
+                List.of(Tuple.tuple(0L, new BytesRef("338")), Tuple.tuple(0L, new BytesRef("2351")))
+            )
+        );
+        List<Page> results = runner.run(simple());
+        assertSimpleOutput(runner.deepCopy(), results);
+        assertThat(((LongBlock) results.getFirst().getBlock(1)).getLong(0), equalTo(1L));
+    }
+
+    @Override
+    protected void assertOutputFromNullOnly(Block b, int position) {
+        assertThat(b.isNull(position), equalTo(false));
+        assertThat(b.getValueCount(position), equalTo(1));
+        assertThat(((LongBlock) b).getLong(b.getFirstValueIndex(position)), equalTo(0L));
+    }
+
+    @Override
+    protected void assertOutputFromAllFiltered(Block b) {
+        assertThat(b.elementType(), equalTo(ElementType.LONG));
+        LongVector v = (LongVector) b.asVector();
+        for (int p = 0; p < v.getPositionCount(); p++) {
+            assertThat(v.getLong(p), equalTo(0L));
+        }
+    }
+}

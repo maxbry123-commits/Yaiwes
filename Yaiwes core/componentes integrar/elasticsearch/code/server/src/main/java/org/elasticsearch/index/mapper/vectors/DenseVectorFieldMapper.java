@@ -1,0 +1,4809 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.index.mapper.vectors;
+
+import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.codecs.KnnVectorsReader;
+import org.apache.lucene.codecs.KnnVectorsWriter;
+import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
+import org.apache.lucene.document.BinaryDocValuesField;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.FloatDocValuesField;
+import org.apache.lucene.document.KnnByteVectorField;
+import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.index.ByteVectorValues;
+import org.apache.lucene.index.FilterLeafReader;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.VectorEncoding;
+import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.search.MatchNoDocsQuery;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.join.BitSetProducer;
+import org.apache.lucene.search.knn.KnnSearchStrategy;
+import org.apache.lucene.util.BitUtil;
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.Build;
+import org.elasticsearch.ElasticsearchSecurityException;
+import org.elasticsearch.common.ParsingException;
+import org.elasticsearch.common.logging.DeprecationCategory;
+import org.elasticsearch.common.settings.Setting;
+import org.elasticsearch.common.xcontent.support.XContentMapValues;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.index.IndexMode;
+import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.index.IndexVersion;
+import org.elasticsearch.index.IndexVersions;
+import org.elasticsearch.index.SliceIndexing;
+import org.elasticsearch.index.SliceSelection;
+import org.elasticsearch.index.codec.vectors.BFloat16;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfAutoCalibration;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfAutoCalibrationProfile;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfQueryConfigResolver;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
+import org.elasticsearch.index.codec.vectors.diskbbq.es94.ES940DiskBBQVectorsFormat;
+import org.elasticsearch.index.codec.vectors.diskbbq.es95.ES950DiskBBQVectorsFormat;
+import org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskASHVectorsFormat;
+import org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat;
+import org.elasticsearch.index.codec.vectors.es93.ES93BinaryQuantizedVectorsFormat;
+import org.elasticsearch.index.codec.vectors.es93.ES93FlatVectorFormat;
+import org.elasticsearch.index.codec.vectors.es93.ES93HnswBinaryQuantizedVectorsFormat;
+import org.elasticsearch.index.codec.vectors.es93.ES93HnswVectorsFormat;
+import org.elasticsearch.index.codec.vectors.es94.ES94HnswScalarQuantizedVectorsFormat;
+import org.elasticsearch.index.codec.vectors.es94.ES94ScalarQuantizedVectorsFormat;
+import org.elasticsearch.index.fielddata.FieldDataContext;
+import org.elasticsearch.index.fielddata.IndexFieldData;
+import org.elasticsearch.index.mapper.BlockLoader;
+import org.elasticsearch.index.mapper.BlockSourceReader;
+import org.elasticsearch.index.mapper.DocumentParserContext;
+import org.elasticsearch.index.mapper.FieldMapper;
+import org.elasticsearch.index.mapper.IndexType;
+import org.elasticsearch.index.mapper.MappedFieldType;
+import org.elasticsearch.index.mapper.MapperBuilderContext;
+import org.elasticsearch.index.mapper.MapperParsingException;
+import org.elasticsearch.index.mapper.MappingParser;
+import org.elasticsearch.index.mapper.MappingParserContext;
+import org.elasticsearch.index.mapper.SimpleMappedFieldType;
+import org.elasticsearch.index.mapper.SourceLoader;
+import org.elasticsearch.index.mapper.ValueFetcher;
+import org.elasticsearch.index.mapper.blockloader.BlockLoaderFunctionConfig;
+import org.elasticsearch.index.mapper.blockloader.ConstantNull;
+import org.elasticsearch.index.mapper.blockloader.docvalues.DenseVectorBlockLoader;
+import org.elasticsearch.index.mapper.blockloader.docvalues.DenseVectorBlockLoaderProcessor;
+import org.elasticsearch.index.mapper.blockloader.docvalues.DenseVectorFromBinaryBlockLoader;
+import org.elasticsearch.index.query.SearchExecutionContext;
+import org.elasticsearch.inference.VectorType;
+import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.search.DocValueFormat;
+import org.elasticsearch.search.aggregations.support.CoreValuesSourceType;
+import org.elasticsearch.search.fetch.subphase.FieldAndFormat;
+import org.elasticsearch.search.vectors.CachingEnableFilterQuery;
+import org.elasticsearch.search.vectors.DenseVectorQuery;
+import org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnByteSlicedVectorQuery;
+import org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnByteVectorQuery;
+import org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQuery;
+import org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatVectorQuery;
+import org.elasticsearch.search.vectors.DiversifyingParentBlockQuery;
+import org.elasticsearch.search.vectors.ESDiversifyingChildrenByteKnnVectorQuery;
+import org.elasticsearch.search.vectors.ESDiversifyingChildrenFloatKnnVectorQuery;
+import org.elasticsearch.search.vectors.ESKnnByteVectorQuery;
+import org.elasticsearch.search.vectors.ESKnnFloatVectorQuery;
+import org.elasticsearch.search.vectors.IVFKnnByteSlicedVectorQuery;
+import org.elasticsearch.search.vectors.IVFKnnByteVectorQuery;
+import org.elasticsearch.search.vectors.IVFKnnFloatSlicedVectorQuery;
+import org.elasticsearch.search.vectors.IVFKnnFloatVectorQuery;
+import org.elasticsearch.search.vectors.PostFilterKnnQuery;
+import org.elasticsearch.search.vectors.PostFilterableKnnQuery;
+import org.elasticsearch.search.vectors.RescoreKnnVectorQuery;
+import org.elasticsearch.search.vectors.VectorData;
+import org.elasticsearch.search.vectors.VectorSimilarityQuery;
+import org.elasticsearch.simdvec.ESVectorUtil;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentParser.Token;
+import org.elasticsearch.xcontent.XContentString;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
+import java.util.stream.Stream;
+
+import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN;
+import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_INDEX_VERSION_CREATED;
+import static org.elasticsearch.common.Strings.format;
+import static org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
+import static org.elasticsearch.index.IndexSettings.INDEX_MAPPING_EXCLUDE_SOURCE_VECTORS_SETTING;
+import static org.elasticsearch.index.codec.vectors.diskbbq.es94.ES940DiskBBQVectorsFormat.MAX_VECTORS_PER_CLUSTER;
+import static org.elasticsearch.index.codec.vectors.diskbbq.es94.ES940DiskBBQVectorsFormat.MIN_VECTORS_PER_CLUSTER;
+
+/**
+ * A {@link FieldMapper} for indexing a dense vector of floats.
+ */
+public class DenseVectorFieldMapper extends FieldMapper {
+    public static final String COSINE_MAGNITUDE_FIELD_SUFFIX = "._magnitude";
+    public static final int BBQ_MIN_DIMS = 64;
+    public static final String CONFIDENCE_INTERVAL_DEPRECATION_MESSAGE =
+        "Parameter [confidence_interval] in [index_options] for dense_vector field [{}] "
+            + "is deprecated and will be removed in a future version";
+
+    private static final int DEFAULT_BBQ_IVF_QUANTIZE_BITS = 1;
+    private static final int DEFAULT_ASH_IVF_QUANTIZE_BITS = 2;
+
+    /**
+     * The heuristic to utilize when executing a filtered search against vectors indexed in an HNSW graph.
+     */
+    public enum FilterHeuristic {
+        /**
+         * This heuristic searches the entire graph, doing vector comparisons in all immediate neighbors
+         * but only collects vectors that match the filtering criteria.
+         */
+        FANOUT {
+            static final KnnSearchStrategy FANOUT_STRATEGY = new KnnSearchStrategy.Hnsw(0);
+
+            @Override
+            public KnnSearchStrategy getKnnSearchStrategy() {
+                return FANOUT_STRATEGY;
+            }
+        },
+        /**
+         * This heuristic will only compare vectors that match the filtering criteria.
+         */
+        ACORN {
+            static final KnnSearchStrategy ACORN_STRATEGY = new KnnSearchStrategy.Hnsw(60);
+
+            @Override
+            public KnnSearchStrategy getKnnSearchStrategy() {
+                return ACORN_STRATEGY;
+            }
+        };
+
+        public abstract KnnSearchStrategy getKnnSearchStrategy();
+    }
+
+    public static final Setting<FilterHeuristic> HNSW_FILTER_HEURISTIC = Setting.enumSetting(FilterHeuristic.class, s -> {
+        IndexVersion version = SETTING_INDEX_VERSION_CREATED.get(s);
+        if (version.onOrAfter(IndexVersions.DEFAULT_TO_ACORN_HNSW_FILTER_HEURISTIC)) {
+            return FilterHeuristic.ACORN.toString();
+        }
+        return FilterHeuristic.FANOUT.toString();
+    },
+        "index.dense_vector.hnsw_filter_heuristic",
+        fh -> {},
+        Setting.Property.IndexScope,
+        Setting.Property.ServerlessPublic,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Boolean> HNSW_EARLY_TERMINATION = Setting.boolSetting(
+        "index.dense_vector.hnsw_enable_early_termination",
+        s -> {
+            IndexVersion version = SETTING_INDEX_VERSION_CREATED.get(s);
+            return String.valueOf(version.onOrAfter(IndexVersions.DEFAULT_HNSW_EARLY_TERMINATION));
+        },
+        Setting.Property.IndexScope,
+        Setting.Property.ServerlessPublic,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Selectivity threshold above which a filtered knn query is routed through the post-filter
+     * pipeline: the vector search runs unfiltered, the filter is applied to the raw candidate set, and a
+     * single retry round runs if the candidate pool is not filled (HNSW seeds that retry from its
+     * round-0 matches; IVF just excludes the docs it already saw). Below this threshold the query stays
+     * on the pre-filter path. Applies to both HNSW and {@code bbq_disk} (IVF) fields. The default
+     * is {@link PostFilterKnnQuery#DEFAULT_POST_FILTERING_THRESHOLD}.
+     */
+    public static final Setting<Float> POST_FILTER_SELECTIVITY_THRESHOLD = new Setting<>(
+        "index.dense_vector.post_filter_selectivity_threshold",
+        Float.toString(PostFilterKnnQuery.DEFAULT_POST_FILTERING_THRESHOLD),
+        s -> {
+            float value = Float.parseFloat(s);
+            if (value < 0.0f || value > 1.0f) {
+                throw new IllegalArgumentException(
+                    "Failed to parse value ["
+                        + s
+                        + "] for setting [index.dense_vector.post_filter_selectivity_threshold] must be in [0.0, 1.0]"
+                );
+            }
+            return value;
+        },
+        Setting.Property.IndexScope,
+        Setting.Property.PrivateIndex
+    );
+
+    private static boolean hasRescoreIndexVersion(IndexVersion version) {
+        return version.onOrAfter(IndexVersions.ADD_RESCORE_PARAMS_TO_QUANTIZED_VECTORS)
+            || version.between(IndexVersions.ADD_RESCORE_PARAMS_TO_QUANTIZED_VECTORS_BACKPORT_8_X, IndexVersions.UPGRADE_TO_LUCENE_10_0_0);
+    }
+
+    private static boolean allowsZeroRescore(IndexVersion version) {
+        return version.onOrAfter(IndexVersions.RESCORE_PARAMS_ALLOW_ZERO_TO_QUANTIZED_VECTORS)
+            || version.between(
+                IndexVersions.RESCORE_PARAMS_ALLOW_ZERO_TO_QUANTIZED_VECTORS_BACKPORT_8_X,
+                IndexVersions.UPGRADE_TO_LUCENE_10_0_0
+            );
+    }
+
+    private static boolean defaultOversampleForBBQ(IndexVersion version) {
+        return version.onOrAfter(IndexVersions.DEFAULT_OVERSAMPLE_VALUE_FOR_BBQ)
+            || version.between(IndexVersions.DEFAULT_OVERSAMPLE_VALUE_FOR_BBQ_BACKPORT_8_X, IndexVersions.UPGRADE_TO_LUCENE_10_0_0);
+    }
+
+    public static final IndexVersion MAGNITUDE_STORED_INDEX_VERSION = IndexVersions.V_7_5_0;
+    public static final IndexVersion INDEXED_BY_DEFAULT_INDEX_VERSION = IndexVersions.FIRST_DETACHED_INDEX_VERSION;
+    public static final IndexVersion NORMALIZE_COSINE = IndexVersions.NORMALIZED_VECTOR_COSINE;
+    public static final IndexVersion DEFAULT_TO_INT8 = IndexVersions.DEFAULT_DENSE_VECTOR_TO_INT8_HNSW;
+    public static final IndexVersion DEFAULT_TO_BBQ = IndexVersions.DEFAULT_DENSE_VECTOR_TO_BBQ_HNSW;
+    public static final IndexVersion DEFAULT_TO_BBQ_DISK = IndexVersions.DEFAULT_DENSE_VECTOR_TO_BBQ_DISK;
+    public static final IndexVersion LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION = IndexVersions.V_8_9_0;
+    public static final IndexVersion BFLOAT16_DEFAULT_INDEX_OPTIONS = IndexVersions.DENSE_VECTOR_BFLOAT16_DEFAULT_INDEX_OPTIONS;
+    public static final IndexVersion BFLOAT16_DEFAULT_INDEX_OPTIONS_BACKPORT =
+        IndexVersions.DENSE_VECTOR_BFLOAT16_DEFAULT_INDEX_OPTIONS_BACKPORT;
+    public static final IndexVersion ES_VERSION_94 = IndexVersions.KEYWORD_FIELDS_KEEP_DUPLICATES_IN_BINARY_DOC_VALUES;
+
+    public static final String CONTENT_TYPE = "dense_vector";
+    public static final short MAX_DIMS_COUNT = 4096; // maximum allowed number of dimensions
+    public static final int MAX_DIMS_COUNT_BIT = 4096 * Byte.SIZE; // maximum allowed number of dimensions
+
+    // minimum number of dims for floats to be dynamically mapped to vector
+    public static final short MIN_DIMS_FOR_DYNAMIC_FLOAT_MAPPING = 128;
+    // lower threshold used for vectordb index mode
+    public static final short MIN_DIMS_FOR_DYNAMIC_FLOAT_MAPPING_VECTORDB = 32;
+    public static final int MAGNITUDE_BYTES = 4;
+    public static final int OVERSAMPLE_LIMIT = 10_000; // Max oversample allowed
+    public static final float DEFAULT_OVERSAMPLE = 3.0F; // Default oversample value
+    public static final int BBQ_DIMS_DEFAULT_THRESHOLD = 384; // Lower bound for dimensions for using bbq_hnsw as default index options
+
+    private static DenseVectorFieldMapper toType(FieldMapper in) {
+        return (DenseVectorFieldMapper) in;
+    }
+
+    public static class Builder extends FieldMapper.Builder {
+
+        private final Parameter<ElementType> elementType;
+        private final Parameter<Integer> dims;
+        private final Parameter<VectorSimilarity> similarity;
+
+        private final Parameter<DenseVectorIndexOptions> indexOptions;
+
+        private final Parameter<Boolean> indexed;
+        private final Parameter<Map<String, String>> meta = Parameter.metaParam();
+
+        final IndexVersion indexVersionCreated;
+        final IndexMode indexMode;
+        final boolean isExcludeSourceVectors;
+        final boolean experimentalFeaturesEnabled;
+        private final List<VectorsFormatProvider> vectorsFormatProviders;
+
+        private final boolean indexDisabledByDefault;
+        private final float postFilterSelectivityThreshold;
+
+        public Builder(
+            String name,
+            IndexVersion indexVersionCreated,
+            IndexMode indexMode,
+            boolean isExcludeSourceVectors,
+            boolean experimentalFeaturesEnabled,
+            List<VectorsFormatProvider> vectorsFormatProviders,
+            boolean indexDisabledByDefault
+        ) {
+            this(
+                name,
+                indexVersionCreated,
+                indexMode,
+                isExcludeSourceVectors,
+                experimentalFeaturesEnabled,
+                vectorsFormatProviders,
+                indexDisabledByDefault,
+                PostFilterKnnQuery.DEFAULT_POST_FILTERING_THRESHOLD
+            );
+        }
+
+        public Builder(
+            String name,
+            IndexVersion indexVersionCreated,
+            IndexMode indexMode,
+            boolean isExcludeSourceVectors,
+            boolean experimentalFeaturesEnabled,
+            List<VectorsFormatProvider> vectorsFormatProviders,
+            boolean indexDisabledByDefault,
+            float postFilterSelectivityThreshold
+        ) {
+            super(name);
+            this.indexVersionCreated = indexVersionCreated;
+            this.indexMode = indexMode == null ? IndexMode.STANDARD : indexMode;
+            this.experimentalFeaturesEnabled = experimentalFeaturesEnabled;
+            this.vectorsFormatProviders = vectorsFormatProviders;
+            this.postFilterSelectivityThreshold = postFilterSelectivityThreshold;
+            final ElementType defaultElementType = this.indexMode.isVectorDb() ? ElementType.BFLOAT16 : ElementType.FLOAT;
+            this.elementType = new Parameter<>("element_type", false, () -> defaultElementType, (n, c, o) -> {
+                ElementType elementType = namesToElementType.get((String) o);
+                if (elementType == null) {
+                    throw new MapperParsingException(
+                        "invalid element_type [" + o + "]; available types are " + namesToElementType.keySet()
+                    );
+                }
+                return elementType;
+            }, m -> toType(m).fieldType().element.elementType(), XContentBuilder::field, Objects::toString);
+            if (this.indexMode.isVectorDb()) {
+                this.elementType.alwaysSerialize();
+            }
+            // This is defined as updatable because it can be updated once, from [null] to a valid dim size,
+            // by a dynamic mapping update. Once it has been set, however, the value cannot be changed.
+            this.dims = new Parameter<>("dims", true, () -> null, (n, c, o) -> {
+                if (o instanceof Integer == false) {
+                    throw new MapperParsingException("Property [dims] on field [" + n + "] must be an integer but got [" + o + "]");
+                }
+
+                return XContentMapValues.nodeIntegerValue(o);
+            }, m -> toType(m).fieldType().dims, XContentBuilder::field, Objects::toString).setSerializerCheck((id, ic, v) -> v != null)
+                .setMergeValidator((previous, current, c) -> previous == null || Objects.equals(previous, current))
+                .addValidator(dims -> {
+                    if (dims == null) {
+                        return;
+                    }
+                    int maxDims = elementType.getValue() == ElementType.BIT ? MAX_DIMS_COUNT_BIT : MAX_DIMS_COUNT;
+                    int minDims = elementType.getValue() == ElementType.BIT ? Byte.SIZE : 1;
+                    if (dims < minDims || dims > maxDims) {
+                        throw new MapperParsingException(
+                            "The number of dimensions should be in the range [" + minDims + ", " + maxDims + "] but was [" + dims + "]"
+                        );
+                    }
+                    if (elementType.getValue() == ElementType.BIT) {
+                        if (dims % Byte.SIZE != 0) {
+                            throw new MapperParsingException(
+                                "The number of dimensions for should be a multiple of 8 but was [" + dims + "]"
+                            );
+                        }
+                    }
+                });
+            this.isExcludeSourceVectors = isExcludeSourceVectors;
+            final boolean indexedByDefaultVersionCheck = indexVersionCreated.onOrAfter(INDEXED_BY_DEFAULT_INDEX_VERSION);
+            final boolean defaultInt8Hnsw = indexVersionCreated.onOrAfter(IndexVersions.DEFAULT_DENSE_VECTOR_TO_INT8_HNSW);
+            final boolean defaultBBQHnsw = indexVersionCreated.onOrAfter(IndexVersions.DEFAULT_DENSE_VECTOR_TO_BBQ_HNSW);
+            final boolean defaultBBQDisk = indexVersionCreated.onOrAfter(IndexVersions.DEFAULT_DENSE_VECTOR_TO_BBQ_DISK);
+            this.indexed = Parameter.indexParam(
+                m -> toType(m).fieldType().indexed,
+                indexedByDefaultVersionCheck && (indexDisabledByDefault == false || this.indexMode.isSearchOptimizedColumnar())
+            );
+            if (indexedByDefaultVersionCheck) {
+                // Only serialize on newer index versions to prevent breaking existing indices when upgrading
+                this.indexed.alwaysSerialize();
+            }
+            this.similarity = Parameter.enumParam(
+                "similarity",
+                false,
+                m -> toType(m).fieldType().similarity,
+                (Supplier<VectorSimilarity>) () -> {
+                    if (indexedByDefaultVersionCheck && indexed.getValue()) {
+                        return elementType.getValue().defaultSimilarity();
+                    }
+                    return null;
+                },
+                VectorSimilarity.class
+            ).acceptsNull().setSerializerCheck((id, ic, v) -> v != null).addValidator(vectorSim -> {
+                if (vectorSim == null) {
+                    return;
+                }
+                if (elementType.getValue() == ElementType.BIT && vectorSim != VectorSimilarity.L2_NORM) {
+                    throw new IllegalArgumentException(
+                        "The [" + VectorSimilarity.L2_NORM + "] similarity is the only supported similarity for bit vectors"
+                    );
+                }
+            });
+            this.indexOptions = new Parameter<>(
+                "index_options",
+                true,
+                () -> defaultIndexOptions(defaultInt8Hnsw, defaultBBQHnsw, defaultBBQDisk),
+                (n, c, o) -> o == null ? null : parseIndexOptions(n, o, c, experimentalFeaturesEnabled),
+                m -> toType(m).indexOptions,
+                (b, n, v) -> {
+                    if (v != null) {
+                        b.field(n, v);
+                    }
+                },
+                Objects::toString
+            ).setSerializerCheck((id, ic, v) -> v != null).addValidator(v -> {
+                if (v != null && dims.isConfigured() && dims.get() != null) {
+                    v.validateDimension(dims.get());
+                }
+                if (v != null) {
+                    v.validateElementType(elementType.getValue());
+                }
+            })
+                .acceptsNull()
+                .setMergeValidator(
+                    (previous, current, c) -> previous == null
+                        || current == null
+                        || Objects.equals(previous, current)
+                        || previous.updatableTo(current)
+                );
+            if (defaultBBQDisk) {
+                this.indexOptions.alwaysSerialize();
+            } else if (defaultInt8Hnsw || defaultBBQHnsw) {
+                if (defaultBBQHnsw == false || (dims != null && dims.isConfigured())) {
+                    this.indexOptions.alwaysSerialize();
+                }
+            }
+            this.indexed.addValidator(v -> {
+                if (v) {
+                    if (similarity.getValue() == null) {
+                        throw new IllegalArgumentException("Field [index] requires field [similarity] to be configured and not null");
+                    }
+                } else {
+                    if (similarity.isConfigured() && similarity.getValue() != null) {
+                        throw new IllegalArgumentException(
+                            "Field [similarity] can only be specified for a field of type [dense_vector] when it is indexed"
+                        );
+                    }
+                    if (indexOptions.isConfigured() && indexOptions.getValue() != null) {
+                        throw new IllegalArgumentException(
+                            "Field [index_options] can only be specified for a field of type [dense_vector] when it is indexed"
+                        );
+                    }
+                }
+            });
+
+            this.indexDisabledByDefault = indexDisabledByDefault;
+        }
+
+        private boolean isVectorIndexTypeAllowedByProviders(VectorIndexType indexType) {
+            // null or empty implies not licensed for DiskBBQ, so return false
+            if (vectorsFormatProviders == null || vectorsFormatProviders.isEmpty()) {
+                return false;
+            }
+            for (VectorsFormatProvider vectorsFormatProvider : vectorsFormatProviders) {
+                if (vectorsFormatProvider.isVectorIndexTypeAllowed(indexVersionCreated, indexType)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private DenseVectorIndexOptions defaultIndexOptions(boolean defaultInt8Hnsw, boolean defaultBBQHnsw, boolean defaultBBQDisk) {
+            if (elementTypesWithDefaultIndexOptions().contains(elementType.getValue()) == false || indexed.getValue() == false) {
+                return null;
+            }
+
+            boolean dimIsConfigured = dims != null && dims.isConfigured();
+            if ((defaultBBQHnsw || defaultBBQDisk) && dimIsConfigured == false) {
+                // Delay selecting the default index options until dimensions are configured.
+                // This applies only to indices that are eligible to use BBQ as the default,
+                // since prior to this change, the default was selected eagerly.
+                return null;
+            }
+            if (defaultBBQDisk && isVectorIndexTypeAllowedByProviders(VectorIndexType.BBQ_DISK)) {
+                int bits = dims.getValue() < BBQ_DIMS_DEFAULT_THRESHOLD ? 4 : 1;
+                return new BBQIVFIndexOptions(
+                    ES940DiskBBQVectorsFormat.DEFAULT_VECTORS_PER_CLUSTER,
+                    -1,
+                    0d,
+                    false,
+                    new RescoreVector(DEFAULT_OVERSAMPLE),
+                    indexVersionCreated,
+                    false,
+                    bits,
+                    experimentalFeaturesEnabled,
+                    null,
+                    BBQIVFIndexOptions.QuantizationType.OSQ,
+                    false
+                );
+            }
+
+            if (defaultBBQHnsw && dims.getValue() >= BBQ_DIMS_DEFAULT_THRESHOLD) {
+                return new BBQHnswIndexOptions(
+                    Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN,
+                    Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH,
+                    false,
+                    new RescoreVector(DEFAULT_OVERSAMPLE),
+                    -1,
+                    false
+                );
+            }
+            if (defaultInt8Hnsw) {
+                return new Int8HnswIndexOptions(
+                    Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN,
+                    Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH,
+                    false,
+                    null,
+                    -1,
+                    false
+                );
+            }
+            return null;
+        }
+
+        private Set<ElementType> elementTypesWithDefaultIndexOptions() {
+            if (indexVersionCreated.onOrAfter(BFLOAT16_DEFAULT_INDEX_OPTIONS)
+                || indexVersionCreated.between(BFLOAT16_DEFAULT_INDEX_OPTIONS_BACKPORT, ES_VERSION_94)) {
+                return Set.of(ElementType.FLOAT, ElementType.BFLOAT16);
+            } else {
+                return Set.of(ElementType.FLOAT);
+            }
+        }
+
+        @Override
+        protected Parameter<?>[] getParameters() {
+            return new Parameter<?>[] { elementType, dims, indexed, similarity, indexOptions, meta };
+        }
+
+        public Builder similarity(VectorSimilarity vectorSimilarity) {
+            similarity.setValue(vectorSimilarity);
+            return this;
+        }
+
+        public Builder dimensions(int dimensions) {
+            this.dims.setValue(dimensions);
+            return this;
+        }
+
+        public Builder elementType(ElementType elementType) {
+            this.elementType.setValue(elementType);
+            return this;
+        }
+
+        public Builder indexOptions(DenseVectorIndexOptions indexOptions) {
+            this.indexOptions.setValue(indexOptions);
+            return this;
+        }
+
+        @Override
+        public String contentType() {
+            return CONTENT_TYPE;
+        }
+
+        @Override
+        public DenseVectorFieldMapper build(MapperBuilderContext context) {
+            // Validate again here because the dimensions or element type could have been set programmatically,
+            // which affects index option validity
+            validate();
+            boolean isExcludeSourceVectorsFinal = isExcludeSourceVectors && (context.isSourceStored() || context.isSourceColumnarStored());
+            return new DenseVectorFieldMapper(
+                leafName(),
+                new DenseVectorFieldType(
+                    context.buildFullName(leafName()),
+                    indexVersionCreated,
+                    elementType.getValue(),
+                    dims.getValue(),
+                    indexed.getValue(),
+                    similarity.getValue(),
+                    indexOptions.getValue(),
+                    meta.getValue(),
+                    context.isSourceSynthetic(),
+                    postFilterSelectivityThreshold
+                ),
+                builderParams(this, context),
+                indexOptions.getValue(),
+                indexVersionCreated,
+                indexMode,
+                isExcludeSourceVectors,
+                isExcludeSourceVectorsFinal,
+                experimentalFeaturesEnabled,
+                vectorsFormatProviders,
+                indexDisabledByDefault
+            );
+        }
+    }
+
+    public enum VectorFormat {
+        ARRAY,
+        BINARY;
+
+        public static Optional<VectorFormat> fromString(String name) {
+            return Arrays.stream(values()).filter(f -> f.toString().equals(name)).findFirst();
+        }
+
+        @Override
+        public String toString() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    public enum ElementType {
+        BYTE(VectorSimilarity.COSINE),
+        FLOAT(VectorSimilarity.COSINE),
+        BFLOAT16(VectorSimilarity.COSINE),
+        BIT(VectorSimilarity.L2_NORM);
+
+        private final VectorSimilarity defaultSimilarity;
+
+        ElementType(VectorSimilarity defaultSimilarity) {
+            this.defaultSimilarity = defaultSimilarity;
+        }
+
+        final VectorSimilarity defaultSimilarity() {
+            return defaultSimilarity;
+        }
+
+        /**
+         * Calculate the vector length. Vector length is the number of distinct components in the vector, usually measured via the
+         * size/length of the vector array/list.
+         *
+         * @param dims Dimension count
+         * @return The vector length
+         */
+        public final int vectorLength(int dims) {
+            return switch (this) {
+                case FLOAT, BFLOAT16, BYTE -> dims;
+                case BIT -> {
+                    assert dims % Byte.SIZE == 0;
+                    yield dims / Byte.SIZE;
+                }
+            };
+        }
+
+        /**
+         * Calculate the dimension count given a vector length. Vector length is the number of distinct components in the vector,
+         * usually measured via the size/length of the vector array/list.
+         *
+         * @param vectorLength The vector length
+         * @return The dimension count
+         */
+        public final int dims(int vectorLength) {
+            return switch (this) {
+                case FLOAT, BFLOAT16, BYTE -> vectorLength;
+                case BIT -> vectorLength * Byte.SIZE;
+            };
+        }
+
+        public static ElementType fromString(String name) {
+            return valueOf(name.toUpperCase(Locale.ROOT));
+        }
+
+        @Override
+        public String toString() {
+            return super.toString().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    public static final Element BYTE_ELEMENT = new ByteElement();
+    public static final Element FLOAT_ELEMENT = new FloatElement();
+    public static final Element BFLOAT16_ELEMENT = new BFloat16Element();
+    public static final Element BIT_ELEMENT = new BitElement();
+
+    public static final Map<String, ElementType> namesToElementType = Map.of(
+        ElementType.BYTE.toString(),
+        ElementType.BYTE,
+        ElementType.FLOAT.toString(),
+        ElementType.FLOAT,
+        ElementType.BFLOAT16.toString(),
+        ElementType.BFLOAT16,
+        ElementType.BIT.toString(),
+        ElementType.BIT
+    );
+
+    /**
+     * A query vector already known to be a float or byte array.
+     *
+     * <p>{@code denormalize} is {@code true} when a non-cosine similarity override is used against cosine; see
+     * {@link DenseVectorQuery.Floats#rawScored}.
+     */
+    sealed interface ResolvedVector permits ResolvedVector.Floats, ResolvedVector.Bytes, ResolvedVector.Bits {
+
+        /** Builds the indexed exact-KNN query: codec-bound when {@code useQuantized}, else raw-scored. */
+        Query createExactKnnQuery(String field, VectorSimilarityFunction function, boolean useQuantized);
+
+        /** Builds the exact-KNN query for a non-indexed (index:false) field, scored from binary doc values. */
+        Query createDocValuesExactKnnQuery(
+            String field,
+            VectorSimilarityFunction function,
+            ElementType elementType,
+            IndexVersion indexVersion
+        );
+
+        record Floats(float[] values, boolean denormalize) implements ResolvedVector {
+            @Override
+            public Query createExactKnnQuery(String field, VectorSimilarityFunction function, boolean useQuantized) {
+                return useQuantized
+                    ? DenseVectorQuery.Floats.codecScored(values, field)
+                    : DenseVectorQuery.Floats.rawScored(values, field, function, denormalize);
+            }
+
+            @Override
+            public Query createDocValuesExactKnnQuery(
+                String field,
+                VectorSimilarityFunction function,
+                ElementType elementType,
+                IndexVersion indexVersion
+            ) {
+                return new DenseVectorQuery.DocValuesFloats(values, field, function, elementType, indexVersion);
+            }
+        }
+
+        record Bytes(byte[] values) implements ResolvedVector {
+            @Override
+            public Query createExactKnnQuery(String field, VectorSimilarityFunction function, boolean useQuantized) {
+                return useQuantized
+                    ? DenseVectorQuery.Bytes.codecScored(values, field)
+                    : DenseVectorQuery.Bytes.rawScored(values, field, function);
+            }
+
+            @Override
+            public Query createDocValuesExactKnnQuery(
+                String field,
+                VectorSimilarityFunction function,
+                ElementType elementType,
+                IndexVersion indexVersion
+            ) {
+                return new DenseVectorQuery.DocValuesBytes(values, field, function, false);
+            }
+        }
+
+        record Bits(byte[] values) implements ResolvedVector {
+            @Override
+            public Query createExactKnnQuery(String field, VectorSimilarityFunction function, boolean useQuantized) {
+                return DenseVectorQuery.Bytes.codecScored(values, field);
+            }
+
+            @Override
+            public Query createDocValuesExactKnnQuery(
+                String field,
+                VectorSimilarityFunction function,
+                ElementType elementType,
+                IndexVersion indexVersion
+            ) {
+                return new DenseVectorQuery.DocValuesBytes(values, field, function, true);
+            }
+        }
+    }
+
+    public abstract static class Element {
+
+        public static Element getElement(ElementType elementType) {
+            return switch (elementType) {
+                case FLOAT -> FLOAT_ELEMENT;
+                case BFLOAT16 -> BFLOAT16_ELEMENT;
+                case BYTE -> BYTE_ELEMENT;
+                case BIT -> BIT_ELEMENT;
+            };
+        }
+
+        /**
+         * Checks the input {@code vector} is one of the {@code possibleTypes},
+         * and returns the first type that it matches
+         */
+        public static ElementType checkValidVector(float[] vector, ElementType... possibleTypes) {
+            assert possibleTypes.length != 0;
+            // we're looking for one valid allowed type
+            // assume the types are in order of specificity
+            StringBuilder[] errors = new StringBuilder[possibleTypes.length];
+            for (int i = 0; i < possibleTypes.length; i++) {
+                StringBuilder error = getElement(possibleTypes[i]).checkVectorErrors(vector);
+                if (error == null) {
+                    // this one works - use it
+                    return possibleTypes[i];
+                } else {
+                    errors[i] = error;
+                }
+            }
+
+            // oh dear, none of the possible types work with this vector. Generate the error message and throw.
+            StringBuilder message = new StringBuilder();
+            for (int i = 0; i < possibleTypes.length; i++) {
+                if (i > 0) {
+                    message.append(" ");
+                }
+                message.append("Vector is not a ").append(possibleTypes[i]).append(" vector: ").append(errors[i]);
+            }
+            throw new IllegalArgumentException(FloatElement.appendErrorElements(message, vector).toString());
+        }
+
+        public abstract ElementType elementType();
+
+        abstract ResolvedVector resolveAndValidate(
+            VectorData queryVector,
+            Integer dims,
+            VectorSimilarity effectiveSimilarity,
+            boolean isOverridden,
+            boolean isNormalized
+        );
+
+        Query createDocValuesExactKnnQuery(
+            VectorData queryVector,
+            Integer dims,
+            VectorSimilarity effectiveSimilarity,
+            String field,
+            IndexVersion indexVersion
+        ) {
+            return resolveAndValidate(queryVector, dims, effectiveSimilarity, false, false).createDocValuesExactKnnQuery(
+                field,
+                effectiveSimilarity.defaultVectorSimilarityFunction(),
+                elementType(),
+                indexVersion
+            );
+        }
+
+        public abstract void writeValues(ByteBuffer byteBuffer, float[] values);
+
+        public abstract void readAndWriteValue(ByteBuffer byteBuffer, XContentBuilder b) throws IOException;
+
+        /**
+         * Reads a single element from {@code byteBuffer}, advancing its position, and returns it boxed. Used to rebuild a
+         * vector held in binary doc values as a list.
+         */
+        public abstract Number readValue(ByteBuffer byteBuffer);
+
+        abstract IndexFieldData.Builder fielddataBuilder(DenseVectorFieldType denseVectorFieldType, FieldDataContext fieldDataContext);
+
+        abstract void parseKnnVectorAndIndex(DocumentParserContext context, DenseVectorFieldMapper fieldMapper) throws IOException;
+
+        public abstract VectorData parseKnnVector(
+            DocumentParserContext context,
+            int dims,
+            IntBooleanConsumer dimChecker,
+            VectorSimilarity similarity
+        ) throws IOException;
+
+        public abstract int getNumBytes(int dimensions);
+
+        public abstract ByteBuffer createByteBuffer(IndexVersion indexVersion, int numBytes);
+
+        public boolean isUnitVector(float squaredMagnitude) {
+            return Math.abs(squaredMagnitude - 1.0f) < 1e-3f;
+        }
+
+        public void checkVectorBounds(float[] vector) {
+            StringBuilder errors = checkVectorErrors(vector);
+            if (errors != null) {
+                throw new IllegalArgumentException(FloatElement.appendErrorElements(errors, vector).toString());
+            }
+        }
+
+        StringBuilder checkVectorErrors(float[] vector) {
+            return checkNanAndInfinite(vector);
+        }
+
+        abstract void checkVectorMagnitude(VectorSimilarity similarity, UnaryOperator<StringBuilder> appender, float squaredMagnitude);
+
+        public abstract double computeSquaredMagnitude(VectorData vectorData);
+
+        public void checkDimensions(Integer dvDims, int qvDims) {
+            if (dvDims != null && dvDims != qvDims) {
+                throw new IllegalArgumentException(
+                    "The query vector has a different number of dimensions [" + qvDims + "] than the document vectors [" + dvDims + "]."
+                );
+            }
+        }
+
+        public int parseDimensionCount(DocumentParserContext context) throws IOException {
+            int index = 0;
+            for (Token token = context.parser().nextToken(); token != Token.END_ARRAY; token = context.parser().nextToken()) {
+                index++;
+            }
+            return index;
+        }
+
+        StringBuilder checkNanAndInfinite(float[] vector) {
+            StringBuilder errorBuilder = null;
+
+            for (int index = 0; index < vector.length; ++index) {
+                float value = vector[index];
+
+                if (Float.isNaN(value)) {
+                    errorBuilder = new StringBuilder(
+                        "element_type ["
+                            + elementType()
+                            + "] vectors do not support NaN values but found ["
+                            + value
+                            + "] at dim ["
+                            + index
+                            + "];"
+                    );
+                    break;
+                }
+
+                if (Float.isInfinite(value)) {
+                    errorBuilder = new StringBuilder(
+                        "element_type ["
+                            + elementType()
+                            + "] vectors do not support infinite values but found ["
+                            + value
+                            + "] at dim ["
+                            + index
+                            + "];"
+                    );
+                    break;
+                }
+            }
+
+            return errorBuilder;
+        }
+    }
+
+    private static class ByteElement extends Element {
+
+        @Override
+        public ElementType elementType() {
+            return ElementType.BYTE;
+        }
+
+        @Override
+        ResolvedVector resolveAndValidate(
+            VectorData queryVector,
+            Integer dims,
+            VectorSimilarity effectiveSimilarity,
+            boolean isOverridden,
+            boolean isNormalized
+        ) {
+            byte[] vector = queryVector.asByteVector();
+            checkDimensions(dims, vector.length);
+            if (effectiveSimilarity == VectorSimilarity.DOT_PRODUCT || effectiveSimilarity == VectorSimilarity.COSINE) {
+                float squaredMagnitude = ESVectorUtil.dotProduct(vector, vector);
+                checkVectorMagnitude(effectiveSimilarity, errorElementsAppender(vector), squaredMagnitude);
+            }
+            return new ResolvedVector.Bytes(vector);
+        }
+
+        @Override
+        public void writeValues(ByteBuffer byteBuffer, float[] values) {
+            for (float f : values) {
+                byteBuffer.put((byte) f);
+            }
+        }
+
+        @Override
+        public void readAndWriteValue(ByteBuffer byteBuffer, XContentBuilder b) throws IOException {
+            b.value(byteBuffer.get());
+        }
+
+        @Override
+        public Number readValue(ByteBuffer byteBuffer) {
+            return byteBuffer.get();
+        }
+
+        private KnnByteVectorField createKnnVectorField(String name, byte[] vector, VectorSimilarityFunction function) {
+            if (vector == null) {
+                throw new IllegalArgumentException("vector value must not be null");
+            }
+            FieldType denseVectorFieldType = new FieldType();
+            denseVectorFieldType.setVectorAttributes(vector.length, VectorEncoding.BYTE, function);
+            denseVectorFieldType.freeze();
+            return new KnnByteVectorField(name, vector, denseVectorFieldType);
+        }
+
+        @Override
+        IndexFieldData.Builder fielddataBuilder(DenseVectorFieldType denseVectorFieldType, FieldDataContext fieldDataContext) {
+            return new VectorIndexFieldData.Builder(
+                denseVectorFieldType.name(),
+                CoreValuesSourceType.KEYWORD,
+                denseVectorFieldType.indexVersionCreated,
+                elementType(),
+                denseVectorFieldType.dims,
+                denseVectorFieldType.indexed,
+                r -> r
+            );
+        }
+
+        @Override
+        StringBuilder checkVectorErrors(float[] vector) {
+            StringBuilder errors = super.checkNanAndInfinite(vector);
+            if (errors != null) {
+                return errors;
+            }
+
+            for (int index = 0; index < vector.length; ++index) {
+                float value = vector[index];
+
+                if (value % 1.0f != 0.0f) {
+                    errors = new StringBuilder(
+                        "element_type ["
+                            + elementType()
+                            + "] vectors only support non-decimal values but found decimal value ["
+                            + value
+                            + "] at dim ["
+                            + index
+                            + "];"
+                    );
+                    break;
+                }
+
+                if (value < Byte.MIN_VALUE || value > Byte.MAX_VALUE) {
+                    errors = new StringBuilder(
+                        "element_type ["
+                            + elementType()
+                            + "] vectors only support integers between ["
+                            + Byte.MIN_VALUE
+                            + ", "
+                            + Byte.MAX_VALUE
+                            + "] but found ["
+                            + value
+                            + "] at dim ["
+                            + index
+                            + "];"
+                    );
+                    break;
+                }
+            }
+
+            return errors;
+        }
+
+        @Override
+        void checkVectorMagnitude(VectorSimilarity similarity, UnaryOperator<StringBuilder> appender, float squaredMagnitude) {
+            StringBuilder errorBuilder = null;
+
+            if (similarity == VectorSimilarity.COSINE && Math.sqrt(squaredMagnitude) == 0.0f) {
+                errorBuilder = new StringBuilder(
+                    "The [" + VectorSimilarity.COSINE + "] similarity does not support vectors with zero magnitude."
+                );
+            }
+
+            if (errorBuilder != null) {
+                throw new IllegalArgumentException(appender.apply(errorBuilder).toString());
+            }
+        }
+
+        @Override
+        public double computeSquaredMagnitude(VectorData vectorData) {
+            return ESVectorUtil.dotProduct(vectorData.asByteVector(), vectorData.asByteVector());
+        }
+
+        @Override
+        public void parseKnnVectorAndIndex(DocumentParserContext context, DenseVectorFieldMapper fieldMapper) throws IOException {
+            VectorData vectorData = parseKnnVector(context, fieldMapper.fieldType().dims, (i, end) -> {
+                if (end) {
+                    fieldMapper.checkDimensionMatches(i, context);
+                } else {
+                    fieldMapper.checkDimensionExceeded(i, context);
+                }
+            }, fieldMapper.fieldType().similarity);
+            Field field = createKnnVectorField(
+                fieldMapper.fieldType().name(),
+                vectorData.asByteVector(),
+                fieldMapper.fieldType().similarity.vectorSimilarityFunction(fieldMapper.indexCreatedVersion, elementType())
+            );
+            context.doc().addWithKey(fieldMapper.fieldType().name(), field);
+        }
+
+        VectorData parseVectorArray(DocumentParserContext context, int dims, IntBooleanConsumer dimChecker, VectorSimilarity similarity)
+            throws IOException {
+            int index = 0;
+            byte[] vector = new byte[dims];
+            float squaredMagnitude = 0;
+            for (XContentParser.Token token = context.parser().nextToken(); token != Token.END_ARRAY; token = context.parser()
+                .nextToken()) {
+                dimChecker.accept(index, false);
+                ensureExpectedToken(Token.VALUE_NUMBER, token, context.parser());
+                final int value;
+                if (context.parser().numberType() != XContentParser.NumberType.INT) {
+                    float floatValue = context.parser().floatValue(true);
+                    if (floatValue % 1.0f != 0.0f) {
+                        throw new IllegalArgumentException(
+                            "element_type ["
+                                + elementType()
+                                + "] vectors only support non-decimal values but found decimal value ["
+                                + floatValue
+                                + "] at dim ["
+                                + index
+                                + "];"
+                        );
+                    }
+                    value = (int) floatValue;
+                } else {
+                    value = context.parser().intValue(true);
+                }
+                if (value < Byte.MIN_VALUE || value > Byte.MAX_VALUE) {
+                    throw new IllegalArgumentException(
+                        "element_type ["
+                            + elementType()
+                            + "] vectors only support integers between ["
+                            + Byte.MIN_VALUE
+                            + ", "
+                            + Byte.MAX_VALUE
+                            + "] but found ["
+                            + value
+                            + "] at dim ["
+                            + index
+                            + "];"
+                    );
+                }
+                vector[index++] = (byte) value;
+                squaredMagnitude += value * value;
+            }
+            dimChecker.accept(index, true);
+            checkVectorMagnitude(similarity, errorElementsAppender(vector), squaredMagnitude);
+            return VectorData.fromBytes(vector);
+        }
+
+        VectorData parseEncodedVector(DocumentParserContext context, int dims, VectorSimilarity similarity) throws IOException {
+            XContentString.UTF8Bytes utfBytes = context.parser().optimizedText().bytes();
+            byte[] decoded;
+            try {
+                decoded = DecodedVector.decode(utfBytes, elementType(), dims).bytes();
+            } catch (IllegalArgumentException e) {
+                throw new ParsingException(context.parser().getTokenLocation(), e.getMessage());
+            }
+
+            VectorData vectorData = VectorData.fromBytes(decoded);
+            checkVectorMagnitude(similarity, errorElementsAppender(decoded), (float) computeSquaredMagnitude(vectorData));
+            return vectorData;
+        }
+
+        @Override
+        public VectorData parseKnnVector(
+            DocumentParserContext context,
+            int dims,
+            IntBooleanConsumer dimChecker,
+            VectorSimilarity similarity
+        ) throws IOException {
+            XContentParser.Token token = context.parser().currentToken();
+            return switch (token) {
+                case START_ARRAY -> parseVectorArray(context, dims, dimChecker, similarity);
+                case VALUE_STRING -> parseEncodedVector(context, dims, similarity);
+                default -> throw new ParsingException(
+                    context.parser().getTokenLocation(),
+                    format("Unsupported type [%s] for provided value [%s]", token, context.parser().text())
+                );
+            };
+        }
+
+        @Override
+        public int getNumBytes(int dimensions) {
+            return dimensions;
+        }
+
+        @Override
+        public ByteBuffer createByteBuffer(IndexVersion indexVersion, int numBytes) {
+            return ByteBuffer.wrap(new byte[numBytes]);
+        }
+
+        @Override
+        public int parseDimensionCount(DocumentParserContext context) throws IOException {
+            XContentParser.Token currentToken = context.parser().currentToken();
+            return switch (currentToken) {
+                case START_ARRAY -> {
+                    int index = 0;
+                    for (Token token = context.parser().nextToken(); token != Token.END_ARRAY; token = context.parser().nextToken()) {
+                        index++;
+                    }
+                    yield index;
+                }
+                case VALUE_STRING -> {
+                    String v = context.parser().text();
+                    // Base64 is always divisible by 4, so if it's not try hex
+                    if (v.length() % 4 != 0) {
+                        try {
+                            yield HexFormat.of().parseHex(v).length;
+                        } catch (IllegalArgumentException e) {
+                            yield Base64.getDecoder().decode(v).length;
+                        }
+                    } else {
+                        try {
+                            yield Base64.getDecoder().decode(v).length;
+                        } catch (IllegalArgumentException e) {
+                            yield HexFormat.of().parseHex(v).length;
+                        }
+                    }
+                }
+                default -> throw new ParsingException(
+                    context.parser().getTokenLocation(),
+                    format("Unsupported type [%s] for provided value [%s]", currentToken, context.parser().text())
+                );
+            };
+        }
+
+        static StringBuilder appendErrorElements(StringBuilder errorBuilder, byte[] vector) {
+            // Include the first five elements of the invalid vector in the error message
+            errorBuilder.append(" Preview of invalid vector: [");
+            for (int i = 0; i < Math.min(5, vector.length); i++) {
+                if (i > 0) {
+                    errorBuilder.append(", ");
+                }
+                errorBuilder.append(vector[i]);
+            }
+            if (vector.length >= 5) {
+                errorBuilder.append(", ...");
+            }
+            errorBuilder.append("]");
+            return errorBuilder;
+        }
+
+        static UnaryOperator<StringBuilder> errorElementsAppender(byte[] vector) {
+            return sb -> appendErrorElements(sb, vector);
+        }
+    }
+
+    private static class FloatElement extends Element {
+
+        @Override
+        public ElementType elementType() {
+            return ElementType.FLOAT;
+        }
+
+        @Override
+        ResolvedVector resolveAndValidate(
+            VectorData queryVector,
+            Integer dims,
+            VectorSimilarity effectiveSimilarity,
+            boolean isOverridden,
+            boolean isNormalized
+        ) {
+            float[] vector = queryVector.asFloatVector();
+            checkDimensions(dims, vector.length);
+            checkVectorBounds(vector);
+            if (effectiveSimilarity == VectorSimilarity.DOT_PRODUCT || effectiveSimilarity == VectorSimilarity.COSINE) {
+                float squaredMagnitude = ESVectorUtil.dotProduct(vector, vector);
+                checkVectorMagnitude(effectiveSimilarity, errorElementsAppender(vector), squaredMagnitude);
+                // Normalize the query only on the non-override path: a normalized-cosine field is scored with
+                // DOT_PRODUCT against unit-stored vectors, so the query must be unit-length too. An override uses
+                // the literal function, which normalizes both operands itself, so normalizing here would be wrong.
+                if (isOverridden == false && isNormalized && isUnitVector(squaredMagnitude) == false) {
+                    vector = DenseVectorFieldType.normalizeQueryVector(vector, squaredMagnitude);
+                }
+            }
+            // A non-cosine override on a normalized-cosine field must score against the original (denormalized) vectors.
+            boolean denormalize = isOverridden && isNormalized && effectiveSimilarity != VectorSimilarity.COSINE;
+            return new ResolvedVector.Floats(vector, denormalize);
+        }
+
+        @Override
+        public void writeValues(ByteBuffer byteBuffer, float[] values) {
+            byteBuffer.asFloatBuffer().put(values);
+            byteBuffer.position(byteBuffer.position() + (values.length * Float.BYTES));
+        }
+
+        @Override
+        public void readAndWriteValue(ByteBuffer byteBuffer, XContentBuilder b) throws IOException {
+            b.value(byteBuffer.getFloat());
+        }
+
+        @Override
+        public Number readValue(ByteBuffer byteBuffer) {
+            return byteBuffer.getFloat();
+        }
+
+        private KnnFloatVectorField createKnnVectorField(String name, float[] vector, VectorSimilarityFunction function) {
+            if (vector == null) {
+                throw new IllegalArgumentException("vector value must not be null");
+            }
+            FieldType denseVectorFieldType = new FieldType();
+            denseVectorFieldType.setVectorAttributes(vector.length, VectorEncoding.FLOAT32, function);
+            denseVectorFieldType.freeze();
+            return new KnnFloatVectorField(name, vector, denseVectorFieldType);
+        }
+
+        @Override
+        IndexFieldData.Builder fielddataBuilder(DenseVectorFieldType denseVectorFieldType, FieldDataContext fieldDataContext) {
+            return new VectorIndexFieldData.Builder(
+                denseVectorFieldType.name(),
+                CoreValuesSourceType.KEYWORD,
+                denseVectorFieldType.indexVersionCreated,
+                elementType(),
+                denseVectorFieldType.dims,
+                denseVectorFieldType.indexed,
+                denseVectorFieldType.isNormalized() && denseVectorFieldType.indexed ? r -> new FilterLeafReader(r) {
+                    @Override
+                    public CacheHelper getCoreCacheHelper() {
+                        return r.getCoreCacheHelper();
+                    }
+
+                    @Override
+                    public CacheHelper getReaderCacheHelper() {
+                        return r.getReaderCacheHelper();
+                    }
+
+                    @Override
+                    public FloatVectorValues getFloatVectorValues(String fieldName) throws IOException {
+                        FloatVectorValues values = in.getFloatVectorValues(fieldName);
+                        if (values == null) {
+                            return null;
+                        }
+                        return new DenormalizedCosineFloatVectorValues(
+                            values,
+                            in.getNumericDocValues(fieldName + COSINE_MAGNITUDE_FIELD_SUFFIX)
+                        );
+                    }
+                } : r -> r
+            );
+        }
+
+        @Override
+        void checkVectorMagnitude(VectorSimilarity similarity, UnaryOperator<StringBuilder> appender, float squaredMagnitude) {
+            StringBuilder errorBuilder = null;
+
+            if (Float.isNaN(squaredMagnitude) || Float.isInfinite(squaredMagnitude)) {
+                errorBuilder = new StringBuilder(
+                    "NaN or Infinite magnitude detected, this usually means the vector values are too extreme to fit within a float."
+                );
+            }
+            if (errorBuilder != null) {
+                throw new IllegalArgumentException(appender.apply(errorBuilder).toString());
+            }
+
+            if (similarity == VectorSimilarity.DOT_PRODUCT && isUnitVector(squaredMagnitude) == false) {
+                errorBuilder = new StringBuilder(
+                    "The [" + VectorSimilarity.DOT_PRODUCT + "] similarity can only be used with unit-length vectors."
+                );
+            } else if (similarity == VectorSimilarity.COSINE && Math.sqrt(squaredMagnitude) == 0.0f) {
+                errorBuilder = new StringBuilder(
+                    "The [" + VectorSimilarity.COSINE + "] similarity does not support vectors with zero magnitude."
+                );
+            }
+
+            if (errorBuilder != null) {
+                throw new IllegalArgumentException(appender.apply(errorBuilder).toString());
+            }
+        }
+
+        @Override
+        public double computeSquaredMagnitude(VectorData vectorData) {
+            return ESVectorUtil.dotProduct(vectorData.asFloatVector(), vectorData.asFloatVector());
+        }
+
+        @Override
+        public int parseDimensionCount(DocumentParserContext context) throws IOException {
+            XContentParser.Token currentToken = context.parser().currentToken();
+            return switch (currentToken) {
+                case START_ARRAY -> {
+                    int index = 0;
+                    for (Token token = context.parser().nextToken(); token != Token.END_ARRAY; token = context.parser().nextToken()) {
+                        index++;
+                    }
+                    yield index;
+                }
+                case VALUE_STRING -> {
+                    byte[] decodedVectorBytes = Base64.getDecoder().decode(context.parser().text());
+                    if (decodedVectorBytes.length % Float.BYTES != 0) {
+                        throw new ParsingException(
+                            context.parser().getTokenLocation(),
+                            "Failed to parse object: Base64 decoded vector byte length ["
+                                + decodedVectorBytes.length
+                                + "] is not a multiple of ["
+                                + Float.BYTES
+                                + "]"
+                        );
+                    }
+                    yield decodedVectorBytes.length / Float.BYTES;
+                }
+                default -> throw new ParsingException(
+                    context.parser().getTokenLocation(),
+                    format("Unsupported type [%s] for provided value [%s]", currentToken, context.parser().text())
+                );
+            };
+        }
+
+        @Override
+        public void parseKnnVectorAndIndex(DocumentParserContext context, DenseVectorFieldMapper fieldMapper) throws IOException {
+            var vandm = parseFloatVectorInput(context, fieldMapper.fieldType().dims, (i, end) -> {
+                if (end) {
+                    fieldMapper.checkDimensionMatches(i, context);
+                } else {
+                    fieldMapper.checkDimensionExceeded(i, context);
+                }
+            });
+            checkVectorBounds(vandm.vectorData.asFloatVector());
+            checkVectorMagnitude(
+                fieldMapper.fieldType().similarity,
+                errorElementsAppender(vandm.vectorData().floatVector()),
+                vandm.squaredMagnitude
+            );
+            float[] vector = vandm.vectorData.asFloatVector();
+            if (fieldMapper.fieldType().isNormalized() && isUnitVector(vandm.squaredMagnitude) == false) {
+                float length = (float) Math.sqrt(vandm.squaredMagnitude);
+                for (int i = 0; i < vector.length; i++) {
+                    vector[i] /= length;
+                }
+                final String fieldName = fieldMapper.fieldType().name() + COSINE_MAGNITUDE_FIELD_SUFFIX;
+                Field magnitudeField = new FloatDocValuesField(fieldName, length);
+                context.doc().addWithKey(fieldName, magnitudeField);
+            }
+            Field field = createKnnVectorField(
+                fieldMapper.fieldType().name(),
+                vector,
+                fieldMapper.fieldType().similarity.vectorSimilarityFunction(fieldMapper.indexCreatedVersion, elementType())
+            );
+            context.doc().addWithKey(fieldMapper.fieldType().name(), field);
+        }
+
+        @Override
+        public VectorData parseKnnVector(
+            DocumentParserContext context,
+            int dims,
+            IntBooleanConsumer dimChecker,
+            VectorSimilarity similarity
+        ) throws IOException {
+            var v = parseFloatVectorInput(context, dims, (i, end) -> {
+                if (end) {
+                    dimChecker.accept(i, true);
+                } else {
+                    dimChecker.accept(i, false);
+                }
+            });
+            checkVectorBounds(v.vectorData.asFloatVector());
+            checkVectorMagnitude(similarity, errorElementsAppender(v.vectorData.asFloatVector()), v.squaredMagnitude);
+            return v.vectorData;
+        }
+
+        VectorDataAndMagnitude parseFloatVectorInput(DocumentParserContext context, int dims, IntBooleanConsumer dimChecker)
+            throws IOException {
+            XContentParser.Token token = context.parser().currentToken();
+            return switch (token) {
+                case START_ARRAY -> parseVectorArray(context, dimChecker, dims);
+                case VALUE_STRING -> parseBase64EncodedVector(context, dims);
+                default -> throw new ParsingException(
+                    context.parser().getTokenLocation(),
+                    format("Unsupported type [%s] for provided value [%s]", token, context.parser().text())
+                );
+            };
+        }
+
+        VectorDataAndMagnitude parseVectorArray(DocumentParserContext context, IntBooleanConsumer dimChecker, int dims) throws IOException {
+            int index = 0;
+            float[] vector = new float[dims];
+            float squaredMagnitude = 0;
+            for (XContentParser.Token token = context.parser().nextToken(); token != Token.END_ARRAY; token = context.parser()
+                .nextToken()) {
+                dimChecker.accept(index, false);
+                ensureExpectedToken(Token.VALUE_NUMBER, token, context.parser());
+                float value = context.parser().floatValue(true);
+                vector[index++] = value;
+                squaredMagnitude += value * value;
+            }
+            dimChecker.accept(index, true);
+            return new VectorDataAndMagnitude(VectorData.fromFloats(vector), squaredMagnitude);
+        }
+
+        VectorDataAndMagnitude parseBase64EncodedVector(DocumentParserContext context, int dims) throws IOException {
+            XContentString.UTF8Bytes utfBytes = context.parser().optimizedText().bytes();
+            float[] decodedVector;
+            try {
+                decodedVector = DecodedVector.decode(utfBytes, elementType(), dims, false).toFloatArray();
+            } catch (IllegalArgumentException e) {
+                throw new ParsingException(context.parser().getTokenLocation(), e.getMessage());
+            }
+
+            VectorData vectorData = VectorData.fromFloats(decodedVector);
+            return new VectorDataAndMagnitude(vectorData, (float) computeSquaredMagnitude(vectorData));
+        }
+
+        record VectorDataAndMagnitude(VectorData vectorData, float squaredMagnitude) {}
+
+        @Override
+        public int getNumBytes(int dimensions) {
+            return dimensions * Float.BYTES;
+        }
+
+        @Override
+        public ByteBuffer createByteBuffer(IndexVersion indexVersion, int numBytes) {
+            return indexVersion.onOrAfter(LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION)
+                ? ByteBuffer.wrap(new byte[numBytes]).order(ByteOrder.LITTLE_ENDIAN)
+                : ByteBuffer.wrap(new byte[numBytes]);
+        }
+
+        static StringBuilder appendErrorElements(StringBuilder errorBuilder, float[] vector) {
+            // Include the first five elements of the invalid vector in the error message
+            errorBuilder.append(" Preview of invalid vector: [");
+            for (int i = 0; i < Math.min(5, vector.length); i++) {
+                if (i > 0) {
+                    errorBuilder.append(", ");
+                }
+                errorBuilder.append(vector[i]);
+            }
+            if (vector.length >= 5) {
+                errorBuilder.append(", ...");
+            }
+            errorBuilder.append("]");
+            return errorBuilder;
+        }
+
+        static UnaryOperator<StringBuilder> errorElementsAppender(float[] vector) {
+            return sb -> appendErrorElements(sb, vector);
+        }
+    }
+
+    private static class BFloat16Element extends FloatElement {
+
+        @Override
+        public ElementType elementType() {
+            return ElementType.BFLOAT16;
+        }
+
+        @Override
+        public void writeValues(ByteBuffer byteBuffer, float[] values) {
+            // ByteBuffer created by FloatElement.createByteBuffer, so will always wrap an array
+            BFloat16.floatToBFloat16(values, 0, byteBuffer.array(), byteBuffer.position(), values.length, byteBuffer.order());
+            byteBuffer.position(byteBuffer.position() + (values.length * BFloat16.BYTES));
+        }
+
+        @Override
+        public void readAndWriteValue(ByteBuffer byteBuffer, XContentBuilder b) throws IOException {
+            b.value(BFloat16.bFloat16ToFloat(byteBuffer.getShort()));
+        }
+
+        @Override
+        public Number readValue(ByteBuffer byteBuffer) {
+            return BFloat16.bFloat16ToFloat(byteBuffer.getShort());
+        }
+
+        @Override
+        public boolean isUnitVector(float squaredMagnitude) {
+            // bfloat16 needs to be more lenient
+            return Math.abs(squaredMagnitude - 1.0f) < 0.02f;
+        }
+
+        @Override
+        public int getNumBytes(int dimensions) {
+            return dimensions * BFloat16.BYTES;
+        }
+    }
+
+    private static class BitElement extends ByteElement {
+
+        @Override
+        public ElementType elementType() {
+            return ElementType.BIT;
+        }
+
+        @Override
+        public ResolvedVector resolveAndValidate(
+            VectorData queryVector,
+            Integer dims,
+            VectorSimilarity effectiveSimilarity,
+            boolean isOverridden,
+            boolean isNormalized
+        ) {
+            byte[] vector = queryVector.asByteVector();
+            checkDimensions(dims, vector.length);
+            return new ResolvedVector.Bits(vector);
+        }
+
+        @Override
+        void checkVectorMagnitude(VectorSimilarity similarity, UnaryOperator<StringBuilder> appender, float squaredMagnitude) {}
+
+        @Override
+        public double computeSquaredMagnitude(VectorData vectorData) {
+            int count = 0;
+            int i = 0;
+            byte[] byteBits = vectorData.asByteVector();
+            for (int upperBound = byteBits.length & -8; i < upperBound; i += 8) {
+                count += Long.bitCount((long) BitUtil.VH_NATIVE_LONG.get(byteBits, i));
+            }
+
+            while (i < byteBits.length) {
+                count += Integer.bitCount(byteBits[i] & 255);
+                ++i;
+            }
+            return count;
+        }
+
+        @Override
+        VectorData parseVectorArray(DocumentParserContext context, int dims, IntBooleanConsumer dimChecker, VectorSimilarity similarity)
+            throws IOException {
+            return super.parseVectorArray(
+                context,
+                dims / Byte.SIZE,
+                (value, isComplete) -> dimChecker.accept(value * Byte.SIZE, isComplete),
+                similarity
+            );
+        }
+
+        @Override
+        public int getNumBytes(int dimensions) {
+            assert dimensions % Byte.SIZE == 0;
+            return dimensions / Byte.SIZE;
+        }
+
+        @Override
+        public int parseDimensionCount(DocumentParserContext context) throws IOException {
+            return super.parseDimensionCount(context) * Byte.SIZE;
+        }
+
+        @Override
+        public void checkDimensions(Integer dvDims, int qvDims) {
+            super.checkDimensions(dvDims, qvDims * Byte.SIZE);
+        }
+    }
+
+    public enum VectorSimilarity {
+        L2_NORM {
+            @Override
+            float score(float similarity, ElementType elementType, int dim) {
+                return switch (elementType) {
+                    case BYTE, FLOAT, BFLOAT16 -> 1f / (1f + similarity * similarity);
+                    case BIT -> (dim - similarity) / dim;
+                };
+            }
+
+            @Override
+            public VectorSimilarityFunction vectorSimilarityFunction(IndexVersion indexVersion, ElementType elementType) {
+                return VectorSimilarityFunction.EUCLIDEAN;
+            }
+
+            @Override
+            public VectorSimilarityFunction defaultVectorSimilarityFunction() {
+                return VectorSimilarityFunction.EUCLIDEAN;
+            }
+        },
+        COSINE {
+            @Override
+            float score(float similarity, ElementType elementType, int dim) {
+                assert elementType != ElementType.BIT;
+                return switch (elementType) {
+                    case BYTE, FLOAT, BFLOAT16 -> (1 + similarity) / 2f;
+                    default -> throw new IllegalArgumentException("Unsupported element type [" + elementType + "]");
+                };
+            }
+
+            @Override
+            public VectorSimilarityFunction vectorSimilarityFunction(IndexVersion indexVersion, ElementType elementType) {
+                return indexVersion.onOrAfter(NORMALIZE_COSINE) && (elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16)
+                    ? VectorSimilarityFunction.DOT_PRODUCT
+                    : VectorSimilarityFunction.COSINE;
+            }
+
+            @Override
+            public VectorSimilarityFunction defaultVectorSimilarityFunction() {
+                return VectorSimilarityFunction.COSINE;
+            }
+        },
+        DOT_PRODUCT {
+            @Override
+            float score(float similarity, ElementType elementType, int dim) {
+                return switch (elementType) {
+                    case BYTE -> 0.5f + similarity / (float) (dim * (1 << 15));
+                    case FLOAT, BFLOAT16 -> (1 + similarity) / 2f;
+                    default -> throw new IllegalArgumentException("Unsupported element type [" + elementType + "]");
+                };
+            }
+
+            @Override
+            public VectorSimilarityFunction vectorSimilarityFunction(IndexVersion indexVersion, ElementType elementType) {
+                return VectorSimilarityFunction.DOT_PRODUCT;
+            }
+
+            @Override
+            public VectorSimilarityFunction defaultVectorSimilarityFunction() {
+                return VectorSimilarityFunction.DOT_PRODUCT;
+            }
+        },
+        MAX_INNER_PRODUCT {
+            @Override
+            float score(float similarity, ElementType elementType, int dim) {
+                return switch (elementType) {
+                    case BYTE, FLOAT, BFLOAT16 -> similarity < 0 ? 1 / (1 + -1 * similarity) : similarity + 1;
+                    default -> throw new IllegalArgumentException("Unsupported element type [" + elementType + "]");
+                };
+            }
+
+            @Override
+            public VectorSimilarityFunction vectorSimilarityFunction(IndexVersion indexVersion, ElementType elementType) {
+                return VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT;
+            }
+
+            @Override
+            public VectorSimilarityFunction defaultVectorSimilarityFunction() {
+                return VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT;
+            }
+        };
+
+        @Override
+        public final String toString() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+
+        abstract float score(float similarity, ElementType elementType, int dim);
+
+        public abstract VectorSimilarityFunction vectorSimilarityFunction(IndexVersion indexVersion, ElementType elementType);
+
+        /** Used for raw scoring where there is no index to consult, e.g. per-query overrides or non-indexed fields. */
+        public abstract VectorSimilarityFunction defaultVectorSimilarityFunction();
+    }
+
+    public abstract static class DenseVectorIndexOptions extends IndexOptions {
+        final VectorIndexType type;
+        /** whether merges use direct I/O for this field's raw vectors (the {@code on_disk_merge} option) */
+        final boolean onDiskMerge;
+
+        DenseVectorIndexOptions(VectorIndexType type, boolean onDiskMerge) {
+            this.type = type;
+            this.onDiskMerge = onDiskMerge;
+        }
+
+        public boolean isOnDiskMerge() {
+            return onDiskMerge;
+        }
+
+        abstract KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        );
+
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService,
+            @Nullable String sliceField
+        ) {
+            return getVectorsFormat(elementType, mergingExecutorService, numMergeWorkers, quantizerExecutorService);
+        }
+
+        public boolean validate(ElementType elementType, int dim, boolean throwOnError) {
+            return validateElementType(elementType, throwOnError) && validateDimension(dim, throwOnError);
+        }
+
+        public boolean validateElementType(ElementType elementType) {
+            return validateElementType(elementType, true);
+        }
+
+        final boolean validateElementType(ElementType elementType, boolean throwOnError) {
+            boolean validElementType = type.supportsElementType(elementType);
+            if (throwOnError && validElementType == false) {
+                throw new IllegalArgumentException(
+                    "[element_type] cannot be [" + elementType.toString() + "] when using index type [" + type + "]"
+                );
+            }
+            return validElementType;
+        }
+
+        public abstract boolean updatableTo(DenseVectorIndexOptions update);
+
+        public boolean validateDimension(int dim) {
+            return validateDimension(dim, true);
+        }
+
+        public boolean validateDimension(int dim, boolean throwOnError) {
+            boolean supportsDimension = type.supportsDimension(dim);
+            if (throwOnError && supportsDimension == false) {
+                throw new IllegalArgumentException(type.name + " only supports even dimensions; provided=" + dim);
+            }
+            return supportsDimension;
+        }
+
+        abstract boolean doEquals(DenseVectorIndexOptions other);
+
+        abstract int doHashCode();
+
+        abstract void doXContentFragment(XContentBuilder builder, Params params) throws IOException;
+
+        @Override
+        public final void toXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            doXContentFragment(builder, params);
+            if (onDiskMerge) {
+                builder.field("on_disk_merge", true);
+            }
+        }
+
+        public VectorIndexType getType() {
+            return type;
+        }
+
+        @Override
+        public final boolean equals(Object other) {
+            if (other == this) {
+                return true;
+            }
+            if (other == null || other.getClass() != getClass()) {
+                return false;
+            }
+            DenseVectorIndexOptions otherOptions = (DenseVectorIndexOptions) other;
+            return Objects.equals(type, otherOptions.type) && onDiskMerge == otherOptions.onDiskMerge && doEquals(otherOptions);
+        }
+
+        @Override
+        public final int hashCode() {
+            return Objects.hash(type, onDiskMerge, doHashCode());
+        }
+
+        /**
+         * Indicates whether the underlying vector search is performed using a flat (exhaustive) approach.
+         * <p>
+         * When {@code true}, it means the search does not use any approximate nearest neighbor (ANN)
+         * acceleration structures such as HNSW or IVF. Instead, it performs a brute-force comparison
+         * against all candidate vectors. This information can be used by higher-level components
+         * to decide whether additional acceleration or optimization is necessary.
+         *
+         * @return {@code true} if the vector search is flat (exhaustive), {@code false} if it uses ANN structures
+         */
+        public abstract boolean isFlat();
+    }
+
+    abstract static class QuantizedIndexOptions extends DenseVectorIndexOptions {
+        final RescoreVector rescoreVector;
+        final Float confidenceInterval;
+
+        QuantizedIndexOptions(VectorIndexType type, RescoreVector rescoreVector, boolean onDiskMerge) {
+            this(type, rescoreVector, null, onDiskMerge);
+        }
+
+        QuantizedIndexOptions(VectorIndexType type, RescoreVector rescoreVector, Float confidenceInterval, boolean onDiskMerge) {
+            super(type, onDiskMerge);
+            this.rescoreVector = rescoreVector;
+            this.confidenceInterval = confidenceInterval;
+        }
+
+        public Float confidenceInterval() {
+            return confidenceInterval;
+        }
+
+        public RescoreVector rescoreVector() {
+            return rescoreVector;
+        }
+    }
+
+    public enum VectorIndexType {
+        HNSW("hnsw", false) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object mNode = indexOptionsMap.remove("m");
+                Object efConstructionNode = indexOptionsMap.remove("ef_construction");
+                Object flatIndexThresholdNode = indexOptionsMap.remove("flat_index_threshold");
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+
+                int m = XContentMapValues.nodeIntegerValue(mNode, Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN);
+                int efConstruction = XContentMapValues.nodeIntegerValue(efConstructionNode, Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH);
+                int flatIndexThreshold = XContentMapValues.nodeIntegerValue(flatIndexThresholdNode, -1);
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                if (onDiskRescore) {
+                    throw new IllegalArgumentException("on_disk_rescore is only supported for indexed and quantized vector types");
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+
+                return new HnswIndexOptions(m, efConstruction, flatIndexThreshold, onDiskMerge);
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return true;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return true;
+            }
+        },
+        INT8_HNSW("int8_hnsw", true) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object mNode = indexOptionsMap.remove("m");
+                Object efConstructionNode = indexOptionsMap.remove("ef_construction");
+                Float confidenceInterval = parseConfidenceInterval(fieldName, indexOptionsMap, indexVersion);
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                Object flatIndexThresholdNode = indexOptionsMap.remove("flat_index_threshold");
+
+                int m = XContentMapValues.nodeIntegerValue(mNode, Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN);
+                int efConstruction = XContentMapValues.nodeIntegerValue(efConstructionNode, Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH);
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                int flatIndexThreshold = XContentMapValues.nodeIntegerValue(flatIndexThresholdNode, -1);
+
+                RescoreVector rescoreVector = null;
+                if (hasRescoreIndexVersion(indexVersion)) {
+                    rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new Int8HnswIndexOptions(
+                    m,
+                    efConstruction,
+                    onDiskRescore,
+                    rescoreVector,
+                    flatIndexThreshold,
+                    confidenceInterval,
+                    onDiskMerge
+                );
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return true;
+            }
+        },
+        INT4_HNSW("int4_hnsw", true) {
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object mNode = indexOptionsMap.remove("m");
+                Object efConstructionNode = indexOptionsMap.remove("ef_construction");
+                Float confidenceInterval = parseConfidenceInterval(fieldName, indexOptionsMap, indexVersion);
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                Object flatIndexThresholdNode = indexOptionsMap.remove("flat_index_threshold");
+
+                int m = XContentMapValues.nodeIntegerValue(mNode, Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN);
+                int efConstruction = XContentMapValues.nodeIntegerValue(efConstructionNode, Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH);
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                int flatIndexThreshold = XContentMapValues.nodeIntegerValue(flatIndexThresholdNode, -1);
+
+                RescoreVector rescoreVector = null;
+                if (hasRescoreIndexVersion(indexVersion)) {
+                    rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+
+                return new Int4HnswIndexOptions(
+                    m,
+                    efConstruction,
+                    onDiskRescore,
+                    rescoreVector,
+                    flatIndexThreshold,
+                    confidenceInterval,
+                    onDiskMerge
+                );
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return dims % 2 == 0;
+            }
+        },
+        FLAT("flat", false) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                if (onDiskRescore) {
+                    throw new IllegalArgumentException("on_disk_rescore is only supported for indexed and quantized vector types");
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new FlatIndexOptions(onDiskMerge);
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return true;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return true;
+            }
+        },
+        INT8_FLAT("int8_flat", true) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                Float confidenceInterval = parseConfidenceInterval(fieldName, indexOptionsMap, indexVersion);
+                RescoreVector rescoreVector = null;
+                if (hasRescoreIndexVersion(indexVersion)) {
+                    rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+                }
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                if (onDiskRescore) {
+                    throw new IllegalArgumentException("on_disk_rescore is only supported for indexed and quantized vector types");
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new Int8FlatIndexOptions(rescoreVector, confidenceInterval, onDiskMerge);
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return true;
+            }
+        },
+        INT4_FLAT("int4_flat", true) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                Float confidenceInterval = parseConfidenceInterval(fieldName, indexOptionsMap, indexVersion);
+                RescoreVector rescoreVector = null;
+                if (hasRescoreIndexVersion(indexVersion)) {
+                    rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+                }
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                if (onDiskRescore) {
+                    throw new IllegalArgumentException("on_disk_rescore is only supported for indexed and quantized vector types");
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new Int4FlatIndexOptions(rescoreVector, confidenceInterval, onDiskMerge);
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return dims % 2 == 0;
+            }
+        },
+        BBQ_HNSW("bbq_hnsw", true) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object mNode = indexOptionsMap.remove("m");
+                Object efConstructionNode = indexOptionsMap.remove("ef_construction");
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                Object flatIndexThresholdNode = indexOptionsMap.remove("flat_index_threshold");
+
+                int m = XContentMapValues.nodeIntegerValue(mNode, Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN);
+                int efConstruction = XContentMapValues.nodeIntegerValue(efConstructionNode, Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH);
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                int flatIndexThreshold = XContentMapValues.nodeIntegerValue(flatIndexThresholdNode, -1);
+
+                RescoreVector rescoreVector = null;
+                if (hasRescoreIndexVersion(indexVersion)) {
+                    rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+                    if (rescoreVector == null && defaultOversampleForBBQ(indexVersion)) {
+                        rescoreVector = new RescoreVector(DEFAULT_OVERSAMPLE);
+                    }
+                }
+
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new BBQHnswIndexOptions(m, efConstruction, onDiskRescore, rescoreVector, flatIndexThreshold, onDiskMerge);
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return dims >= BBQ_MIN_DIMS;
+            }
+        },
+        BBQ_FLAT("bbq_flat", true) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                RescoreVector rescoreVector = null;
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                if (hasRescoreIndexVersion(indexVersion)) {
+                    rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+                    if (rescoreVector == null && defaultOversampleForBBQ(indexVersion)) {
+                        rescoreVector = new RescoreVector(DEFAULT_OVERSAMPLE);
+                    }
+                }
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+                if (onDiskRescore) {
+                    throw new IllegalArgumentException("on_disk_rescore is only supported for indexed and quantized vector types");
+                }
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new BBQFlatIndexOptions(rescoreVector, onDiskMerge);
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return dims >= BBQ_MIN_DIMS;
+            }
+        },
+        BBQ_DISK("bbq_disk", true) {
+            @Override
+            public DenseVectorIndexOptions parseIndexOptions(
+                String fieldName,
+                Map<String, ?> indexOptionsMap,
+                MappingParserContext context,
+                boolean experimentalFeaturesEnabled
+            ) {
+                IndexVersion indexVersion = context.indexVersionCreated();
+                boolean onDiskMerge = parseOnDiskMerge(indexOptionsMap);
+                Object clusterSizeNode = indexOptionsMap.remove("cluster_size");
+                int clusterSize = ES940DiskBBQVectorsFormat.DEFAULT_VECTORS_PER_CLUSTER;
+                if (clusterSizeNode != null) {
+                    clusterSize = XContentMapValues.nodeIntegerValue(clusterSizeNode);
+                    if (clusterSize < MIN_VECTORS_PER_CLUSTER || clusterSize > MAX_VECTORS_PER_CLUSTER) {
+                        throw new IllegalArgumentException(
+                            "cluster_size must be between "
+                                + MIN_VECTORS_PER_CLUSTER
+                                + " and "
+                                + MAX_VECTORS_PER_CLUSTER
+                                + ", got: "
+                                + clusterSize
+                        );
+                    }
+                }
+
+                RescoreVector rescoreVector = RescoreVector.fromIndexOptions(indexOptionsMap, indexVersion);
+
+                Object flatIndexBuildThresholdNode = indexOptionsMap.remove("flat_index_threshold");
+                int flatIndexThreshold = -1;
+                if (flatIndexBuildThresholdNode != null) {
+                    flatIndexThreshold = XContentMapValues.nodeIntegerValue(flatIndexBuildThresholdNode);
+                    if (flatIndexThreshold < -1) {
+                        throw new IllegalArgumentException(
+                            "flat_index_threshold must be -1 (dynamic), 0 (disabled), or > 0, got: "
+                                + flatIndexThreshold
+                                + " for field ["
+                                + fieldName
+                                + "]"
+                        );
+                    }
+                }
+
+                Object visitPercentageNode = indexOptionsMap.remove("default_visit_percentage");
+                double visitPercentage = 0d;
+                if (visitPercentageNode != null) {
+                    visitPercentage = (float) XContentMapValues.nodeDoubleValue(visitPercentageNode);
+                    if (visitPercentage < 0d || visitPercentage > 100d) {
+                        throw new IllegalArgumentException(
+                            "default_visit_percentage must be between 0.0 and 100.0, got: "
+                                + visitPercentage
+                                + " for field ["
+                                + fieldName
+                                + "]"
+                        );
+                    }
+                }
+
+                Object onDiskRescoreNode = indexOptionsMap.remove("on_disk_rescore");
+                boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
+
+                BBQIVFIndexOptions.QuantizationType quantizationType;
+                if (Build.current().isSnapshot()) {
+                    // Parse quantization_type before bits so we can set the correct default
+                    String quantizationTypeString = XContentMapValues.nodeStringValue(indexOptionsMap.remove("quantization_type"), "osq");
+                    quantizationType = BBQIVFIndexOptions.QuantizationType.fromString(quantizationTypeString);
+                } else {
+                    quantizationType = BBQIVFIndexOptions.QuantizationType.OSQ;
+                }
+
+                boolean isAsh = quantizationType == BBQIVFIndexOptions.QuantizationType.ASH;
+                Object quantizeBitsNode = indexOptionsMap.remove("bits");
+                int defaultBits = isAsh ? DEFAULT_ASH_IVF_QUANTIZE_BITS : DEFAULT_BBQ_IVF_QUANTIZE_BITS;
+                int quantizeBits = XContentMapValues.nodeIntegerValue(quantizeBitsNode, defaultBits);
+                if (isAsh) {
+                    if (IvfSegmentConfig.AshConfig.isValidBitsPerDim(quantizeBits) == false) {
+                        throw new IllegalArgumentException(
+                            "'bits' must be 1, 2, 3, 4 or 8 for ASH quantization, got: " + quantizeBits + " for field [" + fieldName + "]"
+                        );
+                    }
+                } else {
+                    if (QuantEncoding.isValidBits((byte) quantizeBits) == false) {
+                        throw new IllegalArgumentException(
+                            "'bits' must be 1, 2, 4 or 7, got: " + quantizeBits + " for field [" + fieldName + "]"
+                        );
+                    }
+                }
+                if (rescoreVector == null) {
+                    // adjust the oversampling factor based on quantization scheme
+                    // no oversampling with 4 bits
+                    if (quantizeBits == 2) {
+                        rescoreVector = new RescoreVector(1.5f);
+                    } else if (quantizeBits == 1) {
+                        rescoreVector = new RescoreVector(DEFAULT_OVERSAMPLE);
+                    }
+                }
+
+                boolean doPrecondition = XContentMapValues.nodeBooleanValue(indexOptionsMap.remove("precondition"), false);
+                DenseVectorAutoCalibrate autoCalibrate = DenseVectorAutoCalibrate.parse(
+                    indexOptionsMap.remove(DenseVectorAutoCalibrate.NAME),
+                    indexVersion,
+                    context::clusterHasFeature,
+                    fieldName
+                );
+                if (isAsh && autoCalibrate.enabled()) {
+                    throw new IllegalArgumentException(
+                        "'auto_calibrate' is not supported with 'quantization_type' 'ash' for field [" + fieldName + "]"
+                    );
+                }
+
+                MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
+                return new BBQIVFIndexOptions(
+                    clusterSize,
+                    flatIndexThreshold,
+                    visitPercentage,
+                    onDiskRescore,
+                    rescoreVector,
+                    indexVersion,
+                    doPrecondition,
+                    quantizeBits,
+                    experimentalFeaturesEnabled,
+                    autoCalibrate,
+                    quantizationType,
+                    onDiskMerge
+                );
+            }
+
+            @Override
+            public boolean supportsElementType(ElementType elementType) {
+                return elementType == ElementType.FLOAT
+                    || elementType == ElementType.BFLOAT16
+                    || (elementType == ElementType.BYTE && Build.current().isSnapshot());
+            }
+
+            @Override
+            public boolean supportsDimension(int dims) {
+                return true;
+            }
+        };
+
+        public static Optional<VectorIndexType> fromString(String type) {
+            return Stream.of(VectorIndexType.values()).filter(vectorIndexType -> vectorIndexType.name.equals(type)).findFirst();
+        }
+
+        private final String name;
+        private final boolean quantized;
+
+        VectorIndexType(String name, boolean quantized) {
+            this.name = name;
+            this.quantized = quantized;
+        }
+
+        public abstract DenseVectorIndexOptions parseIndexOptions(
+            String fieldName,
+            Map<String, ?> indexOptionsMap,
+            MappingParserContext context,
+            boolean experimentalFeaturesEnabled
+        );
+
+        public abstract boolean supportsElementType(ElementType elementType);
+
+        public abstract boolean supportsDimension(int dims);
+
+        public boolean isQuantized() {
+            return quantized;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
+    static class Int8FlatIndexOptions extends QuantizedIndexOptions {
+        Int8FlatIndexOptions(RescoreVector rescoreVector, boolean onDiskMerge) {
+            this(rescoreVector, null, onDiskMerge);
+        }
+
+        Int8FlatIndexOptions(RescoreVector rescoreVector, Float confidenceInterval, boolean onDiskMerge) {
+            super(VectorIndexType.INT8_FLAT, rescoreVector, confidenceInterval, onDiskMerge);
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            if (confidenceInterval != null) {
+                builder.field("confidence_interval", confidenceInterval);
+            }
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+        }
+
+        @Override
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            return new ES94ScalarQuantizedVectorsFormat(elementType, 7, false, onDiskMerge);
+        }
+
+        @Override
+        boolean doEquals(DenseVectorIndexOptions o) {
+            Int8FlatIndexOptions that = (Int8FlatIndexOptions) o;
+            return Objects.equals(rescoreVector, that.rescoreVector) && Objects.equals(confidenceInterval, that.confidenceInterval);
+        }
+
+        @Override
+        int doHashCode() {
+            return Objects.hash(rescoreVector, confidenceInterval);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return true;
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            return update.type.equals(this.type)
+                || update.type.equals(VectorIndexType.HNSW)
+                || update.type.equals(VectorIndexType.INT8_HNSW)
+                || update.type.equals(VectorIndexType.INT4_HNSW)
+                || update.type.equals(VectorIndexType.BBQ_HNSW)
+                || update.type.equals(VectorIndexType.INT4_FLAT)
+                || update.type.equals(VectorIndexType.BBQ_FLAT);
+        }
+    }
+
+    static class FlatIndexOptions extends DenseVectorIndexOptions {
+
+        FlatIndexOptions(boolean onDiskMerge) {
+            super(VectorIndexType.FLAT, onDiskMerge);
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+        }
+
+        @Override
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            return new ES93FlatVectorFormat(elementType, onDiskMerge);
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            return true;
+        }
+
+        @Override
+        public boolean doEquals(DenseVectorIndexOptions o) {
+            return o instanceof FlatIndexOptions;
+        }
+
+        @Override
+        public int doHashCode() {
+            return Objects.hash(type);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return true;
+        }
+    }
+
+    public static class Int4HnswIndexOptions extends QuantizedIndexOptions {
+        private final int m;
+        private final int efConstruction;
+        private final boolean onDiskRescore;
+        private final int flatIndexThreshold;
+
+        public Int4HnswIndexOptions(
+            int m,
+            int efConstruction,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            int flatIndexThreshold,
+            boolean onDiskMerge
+        ) {
+            this(m, efConstruction, onDiskRescore, rescoreVector, flatIndexThreshold, null, onDiskMerge);
+        }
+
+        public Int4HnswIndexOptions(
+            int m,
+            int efConstruction,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            int flatIndexThreshold,
+            Float confidenceInterval,
+            boolean onDiskMerge
+        ) {
+            super(VectorIndexType.INT4_HNSW, rescoreVector, confidenceInterval, onDiskMerge);
+            this.m = m;
+            this.efConstruction = efConstruction;
+            this.onDiskRescore = onDiskRescore;
+            this.flatIndexThreshold = flatIndexThreshold;
+        }
+
+        @Override
+        public KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            return new ES94HnswScalarQuantizedVectorsFormat(
+                m,
+                efConstruction,
+                elementType,
+                4,
+                onDiskRescore,
+                numMergeWorkers,
+                mergingExecutorService,
+                flatIndexThreshold,
+                onDiskMerge
+            );
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            builder.field("m", m);
+            builder.field("ef_construction", efConstruction);
+            if (confidenceInterval != null) {
+                builder.field("confidence_interval", confidenceInterval);
+            }
+            if (onDiskRescore) {
+                builder.field("on_disk_rescore", true);
+            }
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+            if (flatIndexThreshold >= 0) {
+                builder.field("flat_index_threshold", flatIndexThreshold);
+            }
+        }
+
+        @Override
+        public boolean doEquals(DenseVectorIndexOptions o) {
+            Int4HnswIndexOptions that = (Int4HnswIndexOptions) o;
+            return m == that.m
+                && efConstruction == that.efConstruction
+                && onDiskRescore == that.onDiskRescore
+                && Objects.equals(rescoreVector, that.rescoreVector)
+                && Objects.equals(confidenceInterval, that.confidenceInterval)
+                && flatIndexThreshold == that.flatIndexThreshold;
+        }
+
+        @Override
+        public int doHashCode() {
+            return Objects.hash(m, efConstruction, onDiskRescore, rescoreVector, confidenceInterval, flatIndexThreshold);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return false;
+        }
+
+        public int flatIndexThreshold() {
+            return flatIndexThreshold;
+        }
+
+        @Override
+        public String toString() {
+            return "{type="
+                + type
+                + ", m="
+                + m
+                + ", ef_construction="
+                + efConstruction
+                + ", on_disk_rescore="
+                + onDiskRescore
+                + ", rescore_vector="
+                + (rescoreVector == null ? "none" : rescoreVector)
+                + ", flat_index_threshold="
+                + flatIndexThreshold
+                + ", on_disk_merge="
+                + onDiskMerge
+                + "}";
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            boolean updatable = false;
+            if (update.type.equals(VectorIndexType.INT4_HNSW)) {
+                Int4HnswIndexOptions int4HnswIndexOptions = (Int4HnswIndexOptions) update;
+                // fewer connections would break assumptions on max number of connections (based on largest previous graph) during merge
+                updatable = int4HnswIndexOptions.m >= this.m;
+            } else if (update.type.equals(VectorIndexType.BBQ_HNSW)) {
+                updatable = ((BBQHnswIndexOptions) update).m >= m;
+            }
+            return updatable;
+        }
+    }
+
+    static class Int4FlatIndexOptions extends QuantizedIndexOptions {
+        Int4FlatIndexOptions(RescoreVector rescoreVector, boolean onDiskMerge) {
+            this(rescoreVector, null, onDiskMerge);
+        }
+
+        Int4FlatIndexOptions(RescoreVector rescoreVector, Float confidenceInterval, boolean onDiskMerge) {
+            super(VectorIndexType.INT4_FLAT, rescoreVector, confidenceInterval, onDiskMerge);
+        }
+
+        @Override
+        public KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            return new ES94ScalarQuantizedVectorsFormat(elementType, 4, false, onDiskMerge);
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            if (confidenceInterval != null) {
+                builder.field("confidence_interval", confidenceInterval);
+            }
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+        }
+
+        @Override
+        public boolean doEquals(DenseVectorIndexOptions o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Int4FlatIndexOptions that = (Int4FlatIndexOptions) o;
+            return Objects.equals(rescoreVector, that.rescoreVector) && Objects.equals(confidenceInterval, that.confidenceInterval);
+        }
+
+        @Override
+        public int doHashCode() {
+            return Objects.hash(rescoreVector, confidenceInterval);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return true;
+        }
+
+        @Override
+        public String toString() {
+            return "{type=" + type + ", rescore_vector=" + rescoreVector + ", on_disk_merge=" + onDiskMerge + "}";
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            // TODO: add support for updating from flat, hnsw, and int8_hnsw and updating params
+            return update.type.equals(this.type)
+                || update.type.equals(VectorIndexType.HNSW)
+                || update.type.equals(VectorIndexType.INT8_HNSW)
+                || update.type.equals(VectorIndexType.INT4_HNSW)
+                || update.type.equals(VectorIndexType.BBQ_HNSW)
+                || update.type.equals(VectorIndexType.BBQ_FLAT);
+        }
+    }
+
+    public static class Int8HnswIndexOptions extends QuantizedIndexOptions {
+        private final int m;
+        private final int efConstruction;
+        private final boolean onDiskRescore;
+        private final int flatIndexThreshold;
+
+        public Int8HnswIndexOptions(
+            int m,
+            int efConstruction,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            int flatIndexThreshold,
+            boolean onDiskMerge
+        ) {
+            this(m, efConstruction, onDiskRescore, rescoreVector, flatIndexThreshold, null, onDiskMerge);
+        }
+
+        public Int8HnswIndexOptions(
+            int m,
+            int efConstruction,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            int flatIndexThreshold,
+            Float confidenceInterval,
+            boolean onDiskMerge
+        ) {
+            super(VectorIndexType.INT8_HNSW, rescoreVector, confidenceInterval, onDiskMerge);
+            this.m = m;
+            this.efConstruction = efConstruction;
+            this.onDiskRescore = onDiskRescore;
+            this.flatIndexThreshold = flatIndexThreshold;
+        }
+
+        @Override
+        public KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            return new ES94HnswScalarQuantizedVectorsFormat(
+                m,
+                efConstruction,
+                elementType,
+                7,
+                onDiskRescore,
+                numMergeWorkers,
+                mergingExecutorService,
+                flatIndexThreshold,
+                onDiskMerge
+            );
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            builder.field("m", m);
+            builder.field("ef_construction", efConstruction);
+            if (confidenceInterval != null) {
+                builder.field("confidence_interval", confidenceInterval);
+            }
+            if (onDiskRescore) {
+                builder.field("on_disk_rescore", true);
+            }
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+            if (flatIndexThreshold >= 0) {
+                builder.field("flat_index_threshold", flatIndexThreshold);
+            }
+        }
+
+        @Override
+        public boolean doEquals(DenseVectorIndexOptions o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Int8HnswIndexOptions that = (Int8HnswIndexOptions) o;
+            return m == that.m
+                && efConstruction == that.efConstruction
+                && onDiskRescore == that.onDiskRescore
+                && Objects.equals(rescoreVector, that.rescoreVector)
+                && Objects.equals(confidenceInterval, that.confidenceInterval)
+                && flatIndexThreshold == that.flatIndexThreshold;
+        }
+
+        @Override
+        public int doHashCode() {
+            return Objects.hash(m, efConstruction, onDiskRescore, rescoreVector, confidenceInterval, flatIndexThreshold);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return false;
+        }
+
+        public int m() {
+            return m;
+        }
+
+        public int efConstruction() {
+            return efConstruction;
+        }
+
+        public int flatIndexThreshold() {
+            return flatIndexThreshold;
+        }
+
+        public Float confidenceInterval() {
+            return confidenceInterval;
+        }
+
+        @Override
+        public String toString() {
+            return "{type="
+                + type
+                + ", m="
+                + m
+                + ", ef_construction="
+                + efConstruction
+                + ", on_disk_rescore="
+                + onDiskRescore
+                + ", rescore_vector="
+                + (rescoreVector == null ? "none" : rescoreVector)
+                + ", flat_index_threshold="
+                + flatIndexThreshold
+                + ", on_disk_merge="
+                + onDiskMerge
+                + "}";
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            boolean updatable;
+            if (update.type.equals(this.type)) {
+                Int8HnswIndexOptions int8HnswIndexOptions = (Int8HnswIndexOptions) update;
+                // fewer connections would break assumptions on max number of connections (based on largest previous graph) during merge
+                updatable = int8HnswIndexOptions.m >= this.m;
+            } else {
+                updatable = update.type.equals(VectorIndexType.INT4_HNSW) && ((Int4HnswIndexOptions) update).m >= this.m
+                    || (update.type.equals(VectorIndexType.BBQ_HNSW) && ((BBQHnswIndexOptions) update).m >= m);
+            }
+            return updatable;
+        }
+    }
+
+    public static class HnswIndexOptions extends DenseVectorIndexOptions {
+        private final int m;
+        private final int efConstruction;
+        private final int flatIndexThreshold;
+
+        HnswIndexOptions(int m, int efConstruction, int flatIndexThreshold, boolean onDiskMerge) {
+            super(VectorIndexType.HNSW, onDiskMerge);
+            this.m = m;
+            this.efConstruction = efConstruction;
+            this.flatIndexThreshold = flatIndexThreshold;
+        }
+
+        @Override
+        public KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            return new ES93HnswVectorsFormat(
+                m,
+                efConstruction,
+                elementType,
+                numMergeWorkers,
+                mergingExecutorService,
+                flatIndexThreshold,
+                onDiskMerge
+            );
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            boolean updatable = update.type.equals(this.type);
+            if (updatable) {
+                // fewer connections would break assumptions on max number of connections (based on largest previous graph) during merge
+                HnswIndexOptions hnswIndexOptions = (HnswIndexOptions) update;
+                updatable = hnswIndexOptions.m >= this.m;
+            }
+            return updatable
+                || (update.type.equals(VectorIndexType.INT8_HNSW) && ((Int8HnswIndexOptions) update).m >= m)
+                || (update.type.equals(VectorIndexType.INT4_HNSW) && ((Int4HnswIndexOptions) update).m >= m)
+                || (update.type.equals(VectorIndexType.BBQ_HNSW) && ((BBQHnswIndexOptions) update).m >= m);
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            builder.field("m", m);
+            builder.field("ef_construction", efConstruction);
+            if (flatIndexThreshold >= 0) {
+                builder.field("flat_index_threshold", flatIndexThreshold);
+            }
+        }
+
+        @Override
+        public boolean doEquals(DenseVectorIndexOptions o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            HnswIndexOptions that = (HnswIndexOptions) o;
+            return m == that.m && efConstruction == that.efConstruction && flatIndexThreshold == that.flatIndexThreshold;
+        }
+
+        @Override
+        public int doHashCode() {
+            return Objects.hash(m, efConstruction, flatIndexThreshold);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return false;
+        }
+
+        public int m() {
+            return m;
+        }
+
+        public int efConstruction() {
+            return efConstruction;
+        }
+
+        public int flatIndexThreshold() {
+            return flatIndexThreshold;
+        }
+
+        @Override
+        public String toString() {
+            return "{type="
+                + type
+                + ", m="
+                + m
+                + ", ef_construction="
+                + efConstruction
+                + ", flat_index_threshold="
+                + flatIndexThreshold
+                + ", on_disk_merge="
+                + onDiskMerge
+                + "}";
+        }
+    }
+
+    public static class BBQHnswIndexOptions extends QuantizedIndexOptions {
+        private final int m;
+        private final int efConstruction;
+        private final boolean onDiskRescore;
+        private final int flatIndexThreshold;
+
+        public BBQHnswIndexOptions(
+            int m,
+            int efConstruction,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            int flatIndexThreshold,
+            boolean onDiskMerge
+        ) {
+            super(VectorIndexType.BBQ_HNSW, rescoreVector, onDiskMerge);
+            this.m = m;
+            this.efConstruction = efConstruction;
+            this.onDiskRescore = onDiskRescore;
+            this.flatIndexThreshold = flatIndexThreshold;
+        }
+
+        @Override
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            return new ES93HnswBinaryQuantizedVectorsFormat(
+                m,
+                efConstruction,
+                elementType,
+                onDiskRescore,
+                numMergeWorkers,
+                mergingExecutorService,
+                flatIndexThreshold,
+                onDiskMerge
+            );
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            return update.type.equals(this.type) && ((BBQHnswIndexOptions) update).m >= this.m;
+        }
+
+        @Override
+        boolean doEquals(DenseVectorIndexOptions other) {
+            BBQHnswIndexOptions that = (BBQHnswIndexOptions) other;
+            return m == that.m
+                && efConstruction == that.efConstruction
+                && onDiskRescore == that.onDiskRescore
+                && Objects.equals(rescoreVector, that.rescoreVector)
+                && flatIndexThreshold == that.flatIndexThreshold;
+        }
+
+        @Override
+        int doHashCode() {
+            return Objects.hash(m, efConstruction, onDiskRescore, rescoreVector, flatIndexThreshold);
+        }
+
+        @Override
+        public boolean isFlat() {
+            return false;
+        }
+
+        public int flatIndexThreshold() {
+            return flatIndexThreshold;
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            builder.field("m", m);
+            builder.field("ef_construction", efConstruction);
+            if (onDiskRescore) {
+                builder.field("on_disk_rescore", true);
+            }
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+            if (flatIndexThreshold >= 0) {
+                builder.field("flat_index_threshold", flatIndexThreshold);
+            }
+        }
+
+        @Override
+        public boolean validateDimension(int dim, boolean throwOnError) {
+            boolean supportsDimension = type.supportsDimension(dim);
+            if (throwOnError && supportsDimension == false) {
+                throw new IllegalArgumentException(
+                    type.name + " does not support dimensions fewer than " + BBQ_MIN_DIMS + "; provided=" + dim
+                );
+            }
+            return supportsDimension;
+        }
+    }
+
+    static class BBQFlatIndexOptions extends QuantizedIndexOptions {
+        private final int CLASS_NAME_HASH = this.getClass().getName().hashCode();
+
+        BBQFlatIndexOptions(RescoreVector rescoreVector, boolean onDiskMerge) {
+            super(VectorIndexType.BBQ_FLAT, rescoreVector, onDiskMerge);
+        }
+
+        @Override
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            return new ES93BinaryQuantizedVectorsFormat(elementType, false, onDiskMerge);
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            return update.type.equals(this.type) || update.type.equals(VectorIndexType.BBQ_HNSW);
+        }
+
+        @Override
+        boolean doEquals(DenseVectorIndexOptions other) {
+            return other instanceof BBQFlatIndexOptions;
+        }
+
+        @Override
+        int doHashCode() {
+            return CLASS_NAME_HASH;
+        }
+
+        @Override
+        public boolean isFlat() {
+            return true;
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+        }
+
+        @Override
+        public boolean validateDimension(int dim, boolean throwOnError) {
+            boolean supportsDimension = type.supportsDimension(dim);
+            if (throwOnError && supportsDimension == false) {
+                throw new IllegalArgumentException(
+                    type.name + " does not support dimensions fewer than " + BBQ_MIN_DIMS + "; provided=" + dim
+                );
+            }
+            return supportsDimension;
+        }
+
+    }
+
+    public static class BBQIVFIndexOptions extends QuantizedIndexOptions {
+        final int clusterSize;
+        final int flatIndexThreshold;
+        final double defaultVisitPercentage;
+        final boolean onDiskRescore;
+        final IndexVersion indexVersionCreated;
+        final int bits;
+        final boolean doPrecondition;
+        final boolean experimentalFeaturesEnabled;
+        final DenseVectorAutoCalibrate autoCalibrate;
+        final QuantizationType quantizationType;
+
+        public enum QuantizationType {
+            OSQ("osq"),
+            ASH("ash");
+
+            private final String name;
+
+            QuantizationType(String name) {
+                this.name = name;
+            }
+
+            @Override
+            public String toString() {
+                return name;
+            }
+
+            public static QuantizationType fromString(String name) {
+                for (QuantizationType type : QuantizationType.values()) {
+                    if (type.name.equalsIgnoreCase(name)) {
+                        return type;
+                    }
+                }
+                throw new IllegalArgumentException(
+                    "Unknown quantization type: " + name + " must be one of " + Arrays.toString(QuantizationType.values())
+                );
+            }
+        }
+
+        public BBQIVFIndexOptions(
+            int clusterSize,
+            int flatIndexThreshold,
+            double defaultVisitPercentage,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            IndexVersion indexVersionCreated,
+            boolean doPrecondition,
+            int bits,
+            boolean experimentalFeaturesEnabled,
+            @Nullable DenseVectorAutoCalibrate autoCalibrate,
+            QuantizationType quantizationType,
+            boolean onDiskMerge
+        ) {
+            super(VectorIndexType.BBQ_DISK, rescoreVector, onDiskMerge);
+            this.clusterSize = clusterSize;
+            this.flatIndexThreshold = flatIndexThreshold;
+            this.defaultVisitPercentage = defaultVisitPercentage;
+            this.onDiskRescore = onDiskRescore;
+            this.indexVersionCreated = indexVersionCreated;
+            this.bits = bits;
+            this.doPrecondition = doPrecondition;
+            this.experimentalFeaturesEnabled = experimentalFeaturesEnabled;
+            this.autoCalibrate = autoCalibrate == null ? DenseVectorAutoCalibrate.defaultAutoCalibrate(indexVersionCreated) : autoCalibrate;
+            this.quantizationType = quantizationType;
+        }
+
+        @Override
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService
+        ) {
+            return getVectorsFormat(elementType, mergingExecutorService, numMergeWorkers, quantizerExecutorService, null);
+        }
+
+        @Override
+        KnnVectorsFormat getVectorsFormat(
+            ElementType elementType,
+            ExecutorService mergingExecutorService,
+            int numMergeWorkers,
+            ExecutorService quantizerExecutorService,
+            @Nullable String sliceField
+        ) {
+            assert elementType == ElementType.FLOAT || elementType == ElementType.BFLOAT16;
+            if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_LICENSE_ENFORCEMENT)) {
+                // if we got here, this means we didn't get the plugin installed, so we should throw an exception
+                throw new ElasticsearchSecurityException(
+                    "current license is non-compliant for [{}]",
+                    RestStatus.FORBIDDEN,
+                    VectorIndexType.BBQ_DISK.name
+                );
+            }
+            if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE) && experimentalFeaturesEnabled) {
+                if (quantizationType == QuantizationType.ASH && !Build.current().isSnapshot()) {
+                    throw new IllegalArgumentException("quantization_type 'ash' is only available in snapshot builds");
+                }
+                if (quantizationType == QuantizationType.ASH && Build.current().isSnapshot()) {
+                    var ashConfig = IvfSegmentConfig.AshConfig.of(
+                        bits,
+                        IvfSegmentConfig.AshConfig.DEFAULT_QUERY_BITS_PER_DIM,
+                        IvfSegmentConfig.AshConfig.DEFAULT_PROJECTED_DIMS_FRACTION
+                    );
+                    return new ESNextDiskASHVectorsFormat(
+                        ashConfig,
+                        clusterSize,
+                        ESNextDiskASHVectorsFormat.DEFAULT_CENTROIDS_PER_PARENT_CLUSTER,
+                        elementType,
+                        onDiskRescore,
+                        mergingExecutorService,
+                        numMergeWorkers,
+                        quantizerExecutorService,
+                        flatIndexThreshold,
+                        sliceField,
+                        IvfFlushConfigSource.empty(),
+                        IvfMergeConfigResolver.useCodecDefault(),
+                        onDiskMerge
+                    );
+                } else {
+                    IvfMergeConfigResolver mergeConfigResolver = autoCalibrate()
+                        ? IvfAutoCalibration.mergeConfigResolver(clusterSize, autoCalibrationProfile())
+                        : IvfMergeConfigResolver.useCodecDefault();
+                    return new ESNextDiskBBQVectorsFormat(
+                        QuantEncoding.fromBits((byte) bits),
+                        clusterSize,
+                        ESNextDiskBBQVectorsFormat.DEFAULT_CENTROIDS_PER_PARENT_CLUSTER,
+                        elementType,
+                        onDiskRescore,
+                        mergingExecutorService,
+                        numMergeWorkers,
+                        doPrecondition,
+                        ESNextDiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+                        flatIndexThreshold,
+                        sliceField,
+                        IvfFlushConfigSource.empty(),
+                        mergeConfigResolver,
+                        onDiskMerge
+                    );
+                }
+            } else if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE)) {
+                IvfMergeConfigResolver mergeConfigResolver = autoCalibrate()
+                    ? IvfAutoCalibration.mergeConfigResolver(clusterSize, autoCalibrationProfile())
+                    : IvfMergeConfigResolver.useCodecDefault();
+                return new ES950DiskBBQVectorsFormat(
+                    QuantEncoding.fromBits((byte) bits),
+                    clusterSize,
+                    ES950DiskBBQVectorsFormat.DEFAULT_CENTROIDS_PER_PARENT_CLUSTER,
+                    elementType,
+                    onDiskRescore,
+                    mergingExecutorService,
+                    numMergeWorkers,
+                    doPrecondition,
+                    ES950DiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+                    flatIndexThreshold,
+                    IvfFlushConfigSource.empty(),
+                    mergeConfigResolver,
+                    onDiskMerge
+                );
+            } else {
+                return new ES940DiskBBQVectorsFormat(
+                    ES940DiskBBQVectorsFormat.QuantEncoding.fromBits((byte) bits),
+                    clusterSize,
+                    ES940DiskBBQVectorsFormat.DEFAULT_CENTROIDS_PER_PARENT_CLUSTER,
+                    elementType,
+                    onDiskRescore,
+                    mergingExecutorService,
+                    numMergeWorkers,
+                    doPrecondition,
+                    ES940DiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+                    flatIndexThreshold,
+                    ES940DiskBBQVectorsFormat.VERSION_CURRENT,
+                    onDiskMerge
+                );
+            }
+        }
+
+        @Override
+        public boolean updatableTo(DenseVectorIndexOptions update) {
+            if (update.type.equals(this.type) == false) {
+                return false;
+            }
+            BBQIVFIndexOptions that = (BBQIVFIndexOptions) update;
+            return this.doPrecondition == that.doPrecondition
+                && this.autoCalibrationProfile() == that.autoCalibrationProfile()
+                && Objects.equals(this.quantizationType, that.quantizationType);
+        }
+
+        @Override
+        boolean doEquals(DenseVectorIndexOptions other) {
+            BBQIVFIndexOptions that = (BBQIVFIndexOptions) other;
+            return clusterSize == that.clusterSize
+                && flatIndexThreshold == that.flatIndexThreshold
+                && defaultVisitPercentage == that.defaultVisitPercentage
+                && onDiskRescore == that.onDiskRescore
+                && bits == that.bits
+                && doPrecondition == that.doPrecondition
+                && Objects.equals(autoCalibrate, that.autoCalibrate)
+                && Objects.equals(quantizationType, that.quantizationType)
+                && Objects.equals(rescoreVector, that.rescoreVector);
+        }
+
+        @Override
+        int doHashCode() {
+            return Objects.hash(
+                clusterSize,
+                flatIndexThreshold,
+                defaultVisitPercentage,
+                onDiskRescore,
+                bits,
+                doPrecondition,
+                autoCalibrate,
+                quantizationType,
+                rescoreVector
+            );
+        }
+
+        @Override
+        public boolean isFlat() {
+            return false;
+        }
+
+        @Override
+        void doXContentFragment(XContentBuilder builder, Params params) throws IOException {
+            builder.field("type", type);
+            builder.field("cluster_size", clusterSize);
+            builder.field("flat_index_threshold", flatIndexThreshold);
+            builder.field("default_visit_percentage", defaultVisitPercentage);
+            if (onDiskRescore) {
+                builder.field("on_disk_rescore", true);
+            }
+            if (rescoreVector != null) {
+                rescoreVector.toXContent(builder, params);
+            }
+            builder.field("bits", bits);
+            if (doPrecondition) {
+                builder.field("precondition", doPrecondition);
+            }
+            autoCalibrate.toXContent(builder, params);
+            if (quantizationType == QuantizationType.ASH) {
+                builder.field("quantization_type", quantizationType);
+            }
+        }
+
+        public int getClusterSize() {
+            return clusterSize;
+        }
+
+        public int getFlatIndexThreshold() {
+            return flatIndexThreshold;
+        }
+
+        public double getDefaultVisitPercentage() {
+            return defaultVisitPercentage;
+        }
+
+        public boolean isOnDiskRescore() {
+            return onDiskRescore;
+        }
+
+        public boolean doPrecondition() {
+            return doPrecondition;
+        }
+
+        public boolean autoCalibrate() {
+            return autoCalibrate.enabled();
+        }
+
+        public IvfAutoCalibrationProfile autoCalibrationProfile() {
+            return autoCalibrate.profile();
+        }
+
+        public int getBits() {
+            return bits;
+        }
+
+        public QuantizationType getQuantizationType() {
+            return quantizationType;
+        }
+
+        @Override
+        public String toString() {
+            return "{type="
+                + type
+                + ", cluster_size="
+                + clusterSize
+                + ", flat_index_threshold="
+                + flatIndexThreshold
+                + ", default_visit_percentage="
+                + defaultVisitPercentage
+                + ", on_disk_rescore="
+                + onDiskRescore
+                + ", rescore_vector="
+                + (rescoreVector == null ? "none" : rescoreVector)
+                + ", precondition="
+                + doPrecondition
+                + ", bits="
+                + bits
+                + ", auto_calibrate="
+                + autoCalibrate
+                + ", on_disk_merge="
+                + onDiskMerge
+                + "}";
+        }
+    }
+
+    public record RescoreVector(float oversample) implements ToXContentObject {
+        static final String NAME = "rescore_vector";
+        static final String OVERSAMPLE = "oversample";
+
+        static RescoreVector fromIndexOptions(Map<String, ?> indexOptionsMap, IndexVersion indexVersion) {
+            Object rescoreVectorNode = indexOptionsMap.remove(NAME);
+            if (rescoreVectorNode == null) {
+                return null;
+            }
+            Map<String, Object> mappedNode = XContentMapValues.nodeMapValue(rescoreVectorNode, NAME);
+            Object oversampleNode = mappedNode.get(OVERSAMPLE);
+            if (oversampleNode == null) {
+                throw new IllegalArgumentException("Invalid rescore_vector value. Missing required field " + OVERSAMPLE);
+            }
+            float oversampleValue = (float) XContentMapValues.nodeDoubleValue(oversampleNode);
+            if (oversampleValue == 0 && allowsZeroRescore(indexVersion) == false) {
+                throw new IllegalArgumentException("oversample must be greater than 1");
+            }
+            if (oversampleValue < 1 && oversampleValue != 0) {
+                throw new IllegalArgumentException("oversample must be greater than 1 or exactly 0");
+            } else if (oversampleValue > 10) {
+                throw new IllegalArgumentException("oversample must be less than or equal to 10");
+            }
+            return new RescoreVector(oversampleValue);
+        }
+
+        @Override
+        public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+            builder.startObject(NAME);
+            builder.field(OVERSAMPLE, oversample);
+            builder.endObject();
+            return builder;
+        }
+    }
+
+    public static final TypeParser PARSER = new TypeParser(
+        (n, c) -> new Builder(
+            n,
+            c.getIndexSettings().getIndexVersionCreated(),
+            c.getIndexSettings().getMode(),
+            INDEX_MAPPING_EXCLUDE_SOURCE_VECTORS_SETTING.get(c.getIndexSettings().getSettings()),
+            IndexSettings.DENSE_VECTOR_EXPERIMENTAL_FEATURES_SETTING.get(c.getIndexSettings().getSettings()),
+            c.getVectorsFormatProviders(),
+            c.getIndexSettings().isIndexDisabledByDefault(),
+            c.getIndexSettings().getPostFilterSelectivityThreshold()
+        ),
+        notInMultiFields(CONTENT_TYPE)
+    );
+
+    public static final class DenseVectorFieldType extends SimpleMappedFieldType {
+        private final Element element;
+        private final Integer dims;
+        private final boolean indexed;
+        private final VectorSimilarity similarity;
+        private final IndexVersion indexVersionCreated;
+        private final DenseVectorIndexOptions indexOptions;
+        private final boolean isSyntheticSource;
+        // The post-filter selectivity threshold is an index-scoped setting, so it is captured here at mapping
+        // time rather than threaded in per query. If it is ever promoted to a Search API parameter it should
+        // instead be passed through createKnnQuery so it can vary per request.
+        private final float postFilterSelectivityThreshold;
+
+        public DenseVectorFieldType(
+            String name,
+            IndexVersion indexVersionCreated,
+            ElementType elementType,
+            Integer dims,
+            boolean indexed,
+            VectorSimilarity similarity,
+            DenseVectorIndexOptions indexOptions,
+            Map<String, String> meta,
+            boolean isSyntheticSource
+        ) {
+            this(
+                name,
+                indexVersionCreated,
+                elementType,
+                dims,
+                indexed,
+                similarity,
+                indexOptions,
+                meta,
+                isSyntheticSource,
+                PostFilterKnnQuery.DEFAULT_POST_FILTERING_THRESHOLD
+            );
+        }
+
+        public DenseVectorFieldType(
+            String name,
+            IndexVersion indexVersionCreated,
+            ElementType elementType,
+            Integer dims,
+            boolean indexed,
+            VectorSimilarity similarity,
+            DenseVectorIndexOptions indexOptions,
+            Map<String, String> meta,
+            boolean isSyntheticSource,
+            float postFilterSelectivityThreshold
+        ) {
+            super(name, indexed ? IndexType.vectors() : IndexType.docValuesOnly(), false, meta);
+            this.element = Element.getElement(elementType);
+            this.dims = dims;
+            this.indexed = indexed;
+            this.similarity = similarity;
+            this.indexVersionCreated = indexVersionCreated;
+            this.indexOptions = indexOptions;
+            this.isSyntheticSource = isSyntheticSource;
+            this.postFilterSelectivityThreshold = postFilterSelectivityThreshold;
+        }
+
+        public VectorSimilarity similarity() {
+            return similarity;
+        }
+
+        @Override
+        public String typeName() {
+            return CONTENT_TYPE;
+        }
+
+        @Override
+        public ValueFetcher valueFetcher(SearchExecutionContext context, String format) {
+            VectorFormat vectorFormat = format == null ? VectorFormat.ARRAY : parseFormat(format);
+            if (dims == null) {
+                // No values indexed
+                return ValueFetcher.EMPTY;
+            }
+
+            // Always read from _source, even when it does not hold the vector (synthetic source, or
+            // index.mapping.exclude_source_vectors). Doc values cannot serve fields under a nested object, since
+            // NestedValueFetcher delegates with the root doc id rather than the nested document holding the vector. They would
+            // save nothing either: ShardGetService#maybeExcludeVectorFields keeps a vector requested through the fields API in
+            // the loaded _source, so it is patched back in regardless and doc values would only be read a second time.
+            return new DenseVectorSourceValueFetcher(name(), context, element.elementType(), dims, vectorFormat);
+        }
+
+        @Override
+        public DocValueFormat docValueFormat(String format, ZoneId timeZone) {
+            if (format == null) {
+                return DocValueFormat.DENSE_VECTOR;
+            }
+            return switch (parseFormat(format)) {
+                case ARRAY -> DocValueFormat.DENSE_VECTOR;
+                case BINARY -> DocValueFormat.BINARY;
+            };
+        }
+
+        private VectorFormat parseFormat(String format) {
+            return VectorFormat.fromString(format)
+                .orElseThrow(
+                    () -> new IllegalArgumentException(
+                        "Field ["
+                            + name()
+                            + "] of type ["
+                            + typeName()
+                            + "] doesn't support format ["
+                            + format
+                            + "]. Supported formats are "
+                            + Arrays.toString(VectorFormat.values())
+                            + "."
+                    )
+                );
+        }
+
+        @Override
+        public boolean isSearchable() {
+            return indexed;
+        }
+
+        @Override
+        public boolean isAggregatable() {
+            return false;
+        }
+
+        @Override
+        public boolean isVectorEmbedding() {
+            return true;
+        }
+
+        @Override
+        public FieldAndFormat embeddingsFieldAndFormat(@Nullable VectorType vectorType) {
+            if (vectorType != null && vectorType != VectorType.DENSE_VECTOR) {
+                throw unsupportedEmbeddings(vectorType);
+            }
+            return new FieldAndFormat(name(), null);
+        }
+
+        @Override
+        public IndexFieldData.Builder fielddataBuilder(FieldDataContext fieldDataContext) {
+            return element.fielddataBuilder(this, fieldDataContext);
+        }
+
+        @Override
+        public Query existsQuery(SearchExecutionContext context) {
+            return new FieldExistsQuery(name());
+        }
+
+        @Override
+        public Query termQuery(Object value, SearchExecutionContext context) {
+            throw new IllegalArgumentException("Field [" + name() + "] of type [" + typeName() + "] doesn't support term queries");
+        }
+
+        public VectorData resolveQueryVector(VectorData queryVector) {
+            if (queryVector == null || queryVector.isStringVector() == false) {
+                return queryVector;
+            }
+            return VectorData.decodeQueryVector(queryVector.stringVector(), element.elementType(), dims);
+        }
+
+        /**
+         * Builds an exact (brute-force) kNN query, that requires an index to exist. Whether it scores against the
+         * quantized or the full-precision vectors follows whether rescoring is needed: rescoring means the approximate
+         * path produces full-precision scores, so this query uses full-precision vectors too; otherwise both stay
+         * quantized. That keeps callers such as {@code inner_hits} in the same score domain as the query phase.
+         *
+         * @param oversample the query-time {@code rescore_vector.oversample} override, or {@code null} to use whatever
+         *                   the field's index options specify
+         */
+        public Query createIndexedExactKnnQuery(VectorData queryVector, Float vectorSimilarity, @Nullable Float oversample) {
+            if (indexed == false) {
+                throw new IllegalArgumentException(
+                    "to perform knn search on field [" + name() + "], its mapping must have [index] set to [true]"
+                );
+            }
+            return createExactKnnQuery(queryVector, vectorSimilarity, null, needsRescore(effectiveOversample(oversample)) == false);
+        }
+
+        /**
+         * Resolves the oversample the approximate path would apply: the query-time override when given, otherwise the
+         * value configured on the field's index options. Mirrors the resolution in {@link #createKnnFloatQuery}.
+         */
+        private Float effectiveOversample(@Nullable Float queryOversample) {
+            if (queryOversample != null) {
+                return queryOversample;
+            }
+            return indexOptions instanceof QuantizedIndexOptions quantizedIndexOptions && quantizedIndexOptions.rescoreVector != null
+                ? quantizedIndexOptions.rescoreVector.oversample
+                : null;
+        }
+
+        /**
+         * Builds an exact (brute-force) kNN query, supporting non-indexed (index:false) fields.
+         *
+         * @param queryVector the query vector
+         * @param vectorSimilarityThreshold optional minimum similarity threshold; results scoring below this
+         *                                  in the user-domain are filtered out
+         * @param similarityOverride optional override of the scoring metric; if {@code null}, the field's
+         *                           configured similarity is used
+         * @param useQuantized indicates if quantized vectors should be used for scoring. Cannot be true when {@code similarityOverride} is
+         *                     provided
+         */
+        public Query createExactKnnQuery(
+            VectorData queryVector,
+            Float vectorSimilarityThreshold,
+            VectorSimilarity similarityOverride,
+            boolean useQuantized
+        ) {
+            if (dims == null) {
+                return new MatchNoDocsQuery("No data has been indexed for field [" + name() + "]");
+            }
+            boolean isSimilarityOverridden = similarityOverride != null;
+            if (isSimilarityOverridden && element.elementType() == ElementType.BIT && similarityOverride != VectorSimilarity.L2_NORM) {
+                throw new IllegalArgumentException("[" + VectorSimilarity.L2_NORM + "] is the only supported similarity for bit vectors");
+            }
+            if (useQuantized && isSimilarityOverridden) {
+                throw new IllegalArgumentException("[similarity_function] cannot be used when [quantized] is true");
+            }
+            VectorSimilarity effectiveSimilarity = effectiveSimilarity(similarityOverride);
+            VectorData resolvedQueryVector = resolveQueryVector(queryVector);
+            Query knnQuery = indexed == false
+                ? element.createDocValuesExactKnnQuery(resolvedQueryVector, dims, effectiveSimilarity, name(), indexVersionCreated)
+                : createIndexedExactKnnQuery(resolvedQueryVector, effectiveSimilarity, isSimilarityOverridden, useQuantized);
+            if (vectorSimilarityThreshold != null) {
+                knnQuery = new VectorSimilarityQuery(
+                    knnQuery,
+                    vectorSimilarityThreshold,
+                    effectiveSimilarity.score(vectorSimilarityThreshold, element.elementType(), dims)
+                );
+            }
+            return knnQuery;
+        }
+
+        private VectorSimilarity effectiveSimilarity(@Nullable VectorSimilarity similarityOverride) {
+            if (similarityOverride != null) return similarityOverride;
+            if (similarity != null) return similarity;
+            return element.elementType().defaultSimilarity();
+        }
+
+        private Query createIndexedExactKnnQuery(
+            VectorData resolvedQueryVector,
+            VectorSimilarity effectiveSimilarity,
+            boolean isSimilarityOverridden,
+            boolean useQuantized
+        ) {
+            assert !(useQuantized && isSimilarityOverridden) : "Use quantized cannot be combined with overridden similarity function";
+            // if useQuantized is true, function parameter is ignored.
+            final VectorSimilarityFunction function = isSimilarityOverridden
+                ? effectiveSimilarity.defaultVectorSimilarityFunction()
+                : effectiveSimilarity.vectorSimilarityFunction(indexVersionCreated, element.elementType());
+            return element.resolveAndValidate(resolvedQueryVector, dims, effectiveSimilarity, isSimilarityOverridden, isNormalized())
+                .createExactKnnQuery(name(), function, useQuantized);
+        }
+
+        public boolean isNormalized() {
+            return indexVersionCreated.onOrAfter(NORMALIZE_COSINE) && VectorSimilarity.COSINE.equals(similarity);
+        }
+
+        private static float[] normalizeQueryVector(float[] queryVector, float squaredMagnitude) {
+            float length = (float) Math.sqrt(squaredMagnitude);
+            float[] normalized = Arrays.copyOf(queryVector, queryVector.length);
+            for (int i = 0; i < normalized.length; i++) {
+                normalized[i] /= length;
+            }
+            return normalized;
+        }
+
+        public Query createKnnQuery(
+            VectorData queryVector,
+            int k,
+            int numCands,
+            Float visitPercentage,
+            Float oversample,
+            Query filter,
+            Float similarityThreshold,
+            BitSetProducer parentFilter,
+            FilterHeuristic heuristic,
+            boolean hnswEarlyTermination
+        ) {
+            return createKnnQuery(
+                queryVector,
+                k,
+                numCands,
+                visitPercentage,
+                oversample,
+                filter,
+                similarityThreshold,
+                parentFilter,
+                heuristic,
+                hnswEarlyTermination,
+                null
+            );
+        }
+
+        /**
+         * Creates the approximate nearest neighbour query for this field. On a slice-enabled index the query only visits the
+         * slices the request reads: through the vector format when it partitions the vectors by slice, through {@code filter}
+         * otherwise. It fails when the request selects no slice.
+         *
+         * @param context the search execution context of the request, or {@code null} when the query is built outside a request
+         */
+        public Query createKnnQuery(
+            VectorData queryVector,
+            int k,
+            int numCands,
+            Float visitPercentage,
+            Float oversample,
+            Query filter,
+            Float similarityThreshold,
+            BitSetProducer parentFilter,
+            FilterHeuristic heuristic,
+            boolean hnswEarlyTermination,
+            @Nullable SearchExecutionContext context
+        ) {
+            if (indexType.hasVectors() == false) {
+                throw new IllegalArgumentException(
+                    "to perform knn search on field [" + name() + "], its mapping must have [index] set to [true]"
+                );
+            }
+            if (dims == null) {
+                return new MatchNoDocsQuery("No data has been indexed for field [" + name() + "]");
+            }
+            VectorData resolvedQueryVector = resolveQueryVector(queryVector);
+            KnnSearchStrategy knnSearchStrategy = heuristic.getKnnSearchStrategy();
+            hnswEarlyTermination &= canApplyPatienceQuery();
+            // No similarity_function override exists on this path, so isOverridden is always false — matching
+            // today's unconditional "normalize when isNormalized() && !isUnitVector" behavior below.
+            ResolvedVector resolved = element.resolveAndValidate(resolvedQueryVector, dims, similarity, false, isNormalized());
+            BytesRef[] sliceIds = null;
+            if (context != null && context.getIndexSettings().isSliceEnabled()) {
+                final SliceSelection slices = context.sliceSelection();
+                if (slices.isSpecified() == false) {
+                    throw new IllegalArgumentException(
+                        "to perform knn search on field [" + name() + "], the slices to search must be selected: its index is slice-enabled"
+                    );
+                }
+                if (indexOptions instanceof BBQIVFIndexOptions && resolved instanceof ResolvedVector.Bits == false) {
+                    sliceIds = toSliceIds(slices);
+                } else {
+                    filter = filterBySlice(filter, context.sliceFilter());
+                }
+            }
+            return switch (resolved) {
+                case ResolvedVector.Floats(float[] vector, boolean denormalize) -> createKnnFloatQuery(
+                    vector,
+                    k,
+                    numCands,
+                    visitPercentage,
+                    oversample,
+                    filter,
+                    similarityThreshold,
+                    parentFilter,
+                    knnSearchStrategy,
+                    hnswEarlyTermination,
+                    sliceIds
+                );
+                case ResolvedVector.Bits(byte[] vector) -> createKnnBitQuery(
+                    vector,
+                    k,
+                    numCands,
+                    filter,
+                    similarityThreshold,
+                    parentFilter,
+                    knnSearchStrategy,
+                    hnswEarlyTermination
+                );
+                case ResolvedVector.Bytes(byte[] vector) -> createKnnByteQuery(
+                    vector,
+                    k,
+                    numCands,
+                    visitPercentage,
+                    oversample,
+                    filter,
+                    similarityThreshold,
+                    parentFilter,
+                    knnSearchStrategy,
+                    hnswEarlyTermination,
+                    sliceIds
+                );
+            };
+        }
+
+        private boolean canPostFilter(Query filter) {
+            return filter != null && postFilterSelectivityThreshold < 1.0f;
+        }
+
+        private boolean needsRescore(Float rescoreOversample) {
+            return rescoreOversample != null && rescoreOversample > 0 && isQuantized();
+        }
+
+        private boolean isQuantized() {
+            return indexOptions != null && indexOptions.type != null && indexOptions.type.isQuantized();
+        }
+
+        private boolean canApplyPatienceQuery() {
+            return indexOptions instanceof HnswIndexOptions
+                || indexOptions instanceof Int8HnswIndexOptions
+                || indexOptions instanceof Int4HnswIndexOptions
+                || indexOptions instanceof BBQHnswIndexOptions;
+        }
+
+        private Query createKnnBitQuery(
+            byte[] queryVector,
+            int k,
+            int numCands,
+            Query filter,
+            Float similarityThreshold,
+            BitSetProducer parentFilter,
+            KnnSearchStrategy searchStrategy,
+            boolean hnswEarlyTermination
+        ) {
+            Query cachedFilter = filter == null ? null : new CachingEnableFilterQuery(filter);
+            Query knnQuery;
+            if (indexOptions != null && indexOptions.isFlat()) {
+                // Bit vectors have no VectorSimilarityFunction; the codec scorer always computes Hamming distance.
+                Query exactKnnQuery = DenseVectorQuery.Bytes.codecScored(queryVector, name()).filteredBy(filter);
+                knnQuery = parentFilter != null ? new DiversifyingParentBlockQuery(parentFilter, exactKnnQuery) : exactKnnQuery;
+            } else {
+                knnQuery = parentFilter != null
+                    ? new ESDiversifyingChildrenByteKnnVectorQuery(
+                        name(),
+                        queryVector,
+                        cachedFilter,
+                        k,
+                        numCands,
+                        parentFilter,
+                        searchStrategy,
+                        hnswEarlyTermination
+                    )
+                    : new ESKnnByteVectorQuery(name(), queryVector, k, numCands, cachedFilter, searchStrategy, hnswEarlyTermination);
+            }
+            if (canPostFilter(filter) && knnQuery instanceof PostFilterableKnnQuery pfknnQuery) {
+                knnQuery = new PostFilterKnnQuery(pfknnQuery, filter, k, name(), parentFilter, postFilterSelectivityThreshold);
+            }
+            if (similarityThreshold != null) {
+                knnQuery = new VectorSimilarityQuery(
+                    knnQuery,
+                    similarityThreshold,
+                    similarity.score(similarityThreshold, element.elementType(), dims)
+                );
+            }
+            return knnQuery;
+        }
+
+        private Query createKnnByteQuery(
+            byte[] queryVector,
+            int k,
+            int numCands,
+            Float visitPercentage,
+            Float queryOversample,
+            Query filter,
+            Float similarityThreshold,
+            BitSetProducer parentFilter,
+            KnnSearchStrategy searchStrategy,
+            boolean hnswEarlyTermination,
+            @Nullable BytesRef[] sliceIds
+        ) {
+            int adjustedKForRescoring = k;
+            int adjustedNumCandsForRescoring = numCands;
+            // By default utilize the quantized oversample if configured
+            // allow the user provided at query time overwrite
+            Float oversample = effectiveOversample(queryOversample);
+            boolean rescore = needsRescore(oversample);
+            if (rescore) {
+                adjustedKForRescoring = Math.min((int) Math.ceil(k * oversample), OVERSAMPLE_LIMIT);
+                adjustedNumCandsForRescoring = Math.max(adjustedKForRescoring, numCands);
+            }
+            // Pre-filter consumers eagerly materialize the filter into a bitset, so we
+            // force the cache wrapper. PostFilterKnnQuery gets the raw filter because it evaluates the
+            // filter against a small candidate set per query and would otherwise pay an unnecessary cache build.
+            Query cachedFilter = filter == null ? null : new CachingEnableFilterQuery(filter);
+            Query knnQuery;
+            if (indexOptions != null && indexOptions.isFlat()) {
+                Query exactKnnQuery = DenseVectorQuery.Bytes.codecScored(queryVector, name()).filteredBy(filter);
+                knnQuery = parentFilter != null ? new DiversifyingParentBlockQuery(parentFilter, exactKnnQuery) : exactKnnQuery;
+            } else if (indexOptions instanceof BBQIVFIndexOptions bbqIndexOptions) {
+                float defaultVisitRatio = (float) (bbqIndexOptions.defaultVisitPercentage / 100d);
+                float visitRatio = visitPercentage == null ? defaultVisitRatio : (float) (visitPercentage / 100d);
+                if (bbqIndexOptions.autoCalibrate()) {
+                    // Rescoring happens inside the IVF query itself (AbstractIVFKnnVectorQuery#rewrite ->
+                    // #getAutoRescoreQuery), or, when post-filtering, after the filter via #finalizeTopK.
+                    rescore = false;
+                }
+                float mappingOversample = bbqIndexOptions.rescoreVector != null
+                    ? bbqIndexOptions.rescoreVector.oversample
+                    : DEFAULT_OVERSAMPLE;
+                var ivfQueryConfigResolver = IvfQueryConfigResolver.from(
+                    bbqIndexOptions.autoCalibrate(),
+                    bbqIndexOptions.doPrecondition,
+                    bbqIndexOptions.bits,
+                    mappingOversample,
+                    queryOversample
+                );
+                if (sliceIds != null) {
+                    knnQuery = parentFilter != null
+                        ? new DiversifyingChildrenIVFKnnByteSlicedVectorQuery(
+                            name(),
+                            queryVector,
+                            k,
+                            numCands,
+                            cachedFilter,
+                            parentFilter,
+                            visitRatio,
+                            ivfQueryConfigResolver,
+                            SliceIndexing.SLICE_KEY_FIELD_NAME,
+                            sliceIds
+                        )
+                        : new IVFKnnByteSlicedVectorQuery(
+                            name(),
+                            queryVector,
+                            k,
+                            numCands,
+                            cachedFilter,
+                            visitRatio,
+                            ivfQueryConfigResolver,
+                            SliceIndexing.SLICE_KEY_FIELD_NAME,
+                            sliceIds
+                        );
+                } else {
+                    knnQuery = parentFilter != null
+                        ? new DiversifyingChildrenIVFKnnByteVectorQuery(
+                            name(),
+                            queryVector,
+                            k,
+                            numCands,
+                            cachedFilter,
+                            parentFilter,
+                            visitRatio,
+                            ivfQueryConfigResolver
+                        )
+                        : new IVFKnnByteVectorQuery(name(), queryVector, k, numCands, cachedFilter, visitRatio, ivfQueryConfigResolver);
+                }
+            } else {
+                knnQuery = parentFilter != null
+                    ? new ESDiversifyingChildrenByteKnnVectorQuery(
+                        name(),
+                        queryVector,
+                        cachedFilter,
+                        adjustedKForRescoring,
+                        adjustedNumCandsForRescoring,
+                        parentFilter,
+                        searchStrategy,
+                        hnswEarlyTermination
+                    )
+                    : new ESKnnByteVectorQuery(
+                        name(),
+                        queryVector,
+                        adjustedKForRescoring,
+                        adjustedNumCandsForRescoring,
+                        cachedFilter,
+                        searchStrategy,
+                        hnswEarlyTermination
+                    );
+            }
+            if (canPostFilter(filter) && knnQuery instanceof PostFilterableKnnQuery pfknnQuery) {
+                knnQuery = new PostFilterKnnQuery(pfknnQuery, filter, k, name(), parentFilter, postFilterSelectivityThreshold);
+            }
+            if (rescore) {
+                knnQuery = RescoreKnnVectorQuery.fromInnerQuery(name(), queryVector, k, adjustedKForRescoring, knnQuery);
+            }
+            if (similarityThreshold != null) {
+                knnQuery = new VectorSimilarityQuery(
+                    knnQuery,
+                    similarityThreshold,
+                    similarity.score(similarityThreshold, element.elementType(), dims)
+                );
+            }
+            return knnQuery;
+        }
+
+        private Query createKnnFloatQuery(
+            float[] queryVector,
+            int k,
+            int numCands,
+            Float visitPercentage,
+            Float queryOversample,
+            Query filter,
+            Float similarityThreshold,
+            BitSetProducer parentFilter,
+            KnnSearchStrategy knnSearchStrategy,
+            boolean hnswEarlyTermination,
+            @Nullable BytesRef[] sliceIds
+        ) {
+            int adjustedKForRescoring = k;
+            int adjustedNumCandsForRescoring = numCands;
+            // By default utilize the quantized oversample is configured
+            // allow the user provided at query time overwrite
+            Float oversample = effectiveOversample(queryOversample);
+            boolean rescore = needsRescore(oversample);
+            if (rescore) {
+                // Will get k * oversample for rescoring, and get the top k
+                adjustedKForRescoring = Math.min((int) Math.ceil(k * oversample), OVERSAMPLE_LIMIT);
+                adjustedNumCandsForRescoring = Math.max(adjustedKForRescoring, numCands);
+            }
+            Query cachedFilter = filter == null ? null : new CachingEnableFilterQuery(filter);
+            Query knnQuery;
+            if (indexOptions != null && indexOptions.isFlat()) {
+                Query exactKnnQuery = DenseVectorQuery.Floats.codecScored(queryVector, name()).filteredBy(filter);
+                knnQuery = parentFilter != null ? new DiversifyingParentBlockQuery(parentFilter, exactKnnQuery) : exactKnnQuery;
+            } else if (indexOptions instanceof BBQIVFIndexOptions bbqIndexOptions) {
+                float defaultVisitRatio = (float) (bbqIndexOptions.defaultVisitPercentage / 100d);
+                float visitRatio = visitPercentage == null ? defaultVisitRatio : (float) (visitPercentage / 100d);
+                if (bbqIndexOptions.autoCalibrate()) {
+                    // Rescoring happens inside the IVF query itself (AbstractIVFKnnVectorQuery#rewrite ->
+                    // #getAutoRescoreQuery), or, when post-filtering, after the filter via #finalizeTopK.
+                    rescore = false;
+                }
+                float mappingOversample = bbqIndexOptions.rescoreVector != null
+                    ? bbqIndexOptions.rescoreVector.oversample
+                    : DEFAULT_OVERSAMPLE;
+                var ivfQueryConfigResolver = IvfQueryConfigResolver.from(
+                    bbqIndexOptions.autoCalibrate(),
+                    bbqIndexOptions.doPrecondition,
+                    bbqIndexOptions.bits,
+                    mappingOversample,
+                    queryOversample
+                );
+                if (sliceIds != null) {
+                    knnQuery = parentFilter != null
+                        ? new DiversifyingChildrenIVFKnnFloatSlicedVectorQuery(
+                            name(),
+                            queryVector,
+                            k,
+                            numCands,
+                            cachedFilter,
+                            parentFilter,
+                            visitRatio,
+                            ivfQueryConfigResolver,
+                            SliceIndexing.SLICE_KEY_FIELD_NAME,
+                            sliceIds
+                        )
+                        : new IVFKnnFloatSlicedVectorQuery(
+                            name(),
+                            queryVector,
+                            k,
+                            numCands,
+                            cachedFilter,
+                            visitRatio,
+                            ivfQueryConfigResolver,
+                            SliceIndexing.SLICE_KEY_FIELD_NAME,
+                            sliceIds
+                        );
+                } else {
+                    knnQuery = parentFilter != null
+                        ? new DiversifyingChildrenIVFKnnFloatVectorQuery(
+                            name(),
+                            queryVector,
+                            k,
+                            numCands,
+                            cachedFilter,
+                            parentFilter,
+                            visitRatio,
+                            ivfQueryConfigResolver
+                        )
+                        : new IVFKnnFloatVectorQuery(name(), queryVector, k, numCands, cachedFilter, visitRatio, ivfQueryConfigResolver);
+                }
+            } else {
+                knnQuery = parentFilter != null
+                    ? new ESDiversifyingChildrenFloatKnnVectorQuery(
+                        name(),
+                        queryVector,
+                        cachedFilter,
+                        adjustedKForRescoring,
+                        adjustedNumCandsForRescoring,
+                        parentFilter,
+                        knnSearchStrategy,
+                        hnswEarlyTermination
+                    )
+                    : new ESKnnFloatVectorQuery(
+                        name(),
+                        queryVector,
+                        adjustedKForRescoring,
+                        adjustedNumCandsForRescoring,
+                        cachedFilter,
+                        knnSearchStrategy,
+                        hnswEarlyTermination
+                    );
+            }
+            if (canPostFilter(filter) && knnQuery instanceof PostFilterableKnnQuery pfknnQuery) {
+                knnQuery = new PostFilterKnnQuery(pfknnQuery, filter, k, name(), parentFilter, postFilterSelectivityThreshold);
+            }
+            if (rescore) {
+                knnQuery = RescoreKnnVectorQuery.fromInnerQuery(name(), queryVector, k, adjustedKForRescoring, knnQuery);
+            }
+            if (similarityThreshold != null) {
+                knnQuery = new VectorSimilarityQuery(
+                    knnQuery,
+                    similarityThreshold,
+                    similarity.score(similarityThreshold, element.elementType(), dims)
+                );
+            }
+            return knnQuery;
+        }
+
+        /**
+         * The slices a slice-partitioned vector format searches. An empty array searches every slice.
+         */
+        private static BytesRef[] toSliceIds(SliceSelection slices) {
+            return slices.names().stream().map(BytesRef::new).toArray(BytesRef[]::new);
+        }
+
+        /**
+         * Adds the slice filter to the filter of a query whose vector format does not partition the vectors by slice.
+         * Either may be {@code null}: without a slice filter every slice is searched, without a filter only the slices restrict
+         * the search.
+         */
+        private static Query filterBySlice(@Nullable Query filter, @Nullable Query sliceFilter) {
+            if (sliceFilter == null) {
+                return filter;
+            }
+            if (filter == null) {
+                return sliceFilter;
+            }
+            return new BooleanQuery.Builder().add(filter, BooleanClause.Occur.FILTER).add(sliceFilter, BooleanClause.Occur.FILTER).build();
+        }
+
+        public VectorSimilarity getSimilarity() {
+            return similarity;
+        }
+
+        public int getVectorDimensions() {
+            return dims;
+        }
+
+        public ElementType getElementType() {
+            return element.elementType();
+        }
+
+        public DenseVectorIndexOptions getIndexOptions() {
+            return indexOptions;
+        }
+
+        @Override
+        public BlockLoader blockLoader(MappedFieldType.BlockLoaderContext blContext) {
+            if (dims == null) {
+                // No data has been indexed yet
+                return ConstantNull.INSTANCE;
+            }
+
+            BlockLoaderFunctionConfig cfg = blContext.blockLoaderFunctionConfig();
+            if (indexed) {
+                if (cfg == null) {
+                    return new DenseVectorBlockLoader<>(
+                        name(),
+                        dims,
+                        this,
+                        new DenseVectorBlockLoaderProcessor.DenseVectorLoaderProcessor()
+                    );
+                }
+                return switch (cfg.function()) {
+                    case V_COSINE, V_DOT_PRODUCT, V_HAMMING, V_L1NORM, V_L2NORM -> {
+                        VectorSimilarityFunctionConfig similarityConfig = (VectorSimilarityFunctionConfig) cfg;
+                        yield new DenseVectorBlockLoader<>(
+                            name(),
+                            dims,
+                            this,
+                            new DenseVectorBlockLoaderProcessor.DenseVectorSimilarityProcessor(similarityConfig)
+                        );
+                    }
+                    default -> throw new UnsupportedOperationException("Unknown block loader function config: " + cfg.function());
+                };
+            }
+
+            if (cfg != null) {
+                throw new IllegalArgumentException(
+                    "Field ["
+                        + name()
+                        + "] of type ["
+                        + typeName()
+                        + "] doesn't support block loader functions when [index] is set to [false]"
+                );
+            }
+
+            if (hasDocValues() && (blContext.fieldExtractPreference() != FieldExtractPreference.STORED || isSyntheticSource)) {
+                return new DenseVectorFromBinaryBlockLoader(name(), dims, indexVersionCreated, element.elementType());
+            }
+            return new BlockSourceReader.DenseVectorBlockLoader(
+                new DenseVectorSourceValueFetcher(
+                    name(),
+                    blContext.sourcePaths(name()),
+                    blContext.indexSettings().getIgnoredSourceFormat(),
+                    element.elementType(),
+                    dims,
+                    VectorFormat.ARRAY
+                ),
+                BlockSourceReader.lookupMatchingAll(),
+                element.elementType().vectorLength(dims)
+            );
+        }
+
+        @Override
+        public boolean supportsBlockLoaderConfig(BlockLoaderFunctionConfig config, FieldExtractPreference preference) {
+            if (dims == null) {
+                // No data has been indexed yet
+                return true;
+            }
+
+            if (indexed) {
+                return switch (config.function()) {
+                    case V_COSINE, V_DOT_PRODUCT, V_HAMMING, V_L1NORM, V_L2NORM -> true;
+                    default -> false;
+                };
+            }
+            return false;
+        }
+
+    }
+
+    private final DenseVectorIndexOptions indexOptions;
+    private final IndexVersion indexCreatedVersion;
+    private final IndexMode indexMode;
+    private final boolean excludeSourceVectorsSetting;
+    private final boolean excludeSourceVectors;
+    private final boolean experimentalFeaturesEnabled;
+    private final List<VectorsFormatProvider> extraVectorsFormatProviders;
+    private final boolean indexDisabledByDefault;
+
+    private DenseVectorFieldMapper(
+        String simpleName,
+        MappedFieldType mappedFieldType,
+        BuilderParams params,
+        DenseVectorIndexOptions indexOptions,
+        IndexVersion indexCreatedVersion,
+        IndexMode indexMode,
+        boolean excludeSourceVectorsSetting,
+        boolean excludeSourceVectors,
+        boolean experimentalFeaturesEnabled,
+        List<VectorsFormatProvider> vectorsFormatProviders,
+        boolean indexDisabledByDefault
+    ) {
+        super(simpleName, mappedFieldType, params);
+        this.indexOptions = indexOptions;
+        this.indexCreatedVersion = indexCreatedVersion;
+        this.indexMode = indexMode;
+        this.excludeSourceVectorsSetting = excludeSourceVectorsSetting;
+        this.excludeSourceVectors = excludeSourceVectors;
+        this.experimentalFeaturesEnabled = experimentalFeaturesEnabled;
+        this.extraVectorsFormatProviders = vectorsFormatProviders;
+        this.indexDisabledByDefault = indexDisabledByDefault;
+    }
+
+    @Override
+    public DenseVectorFieldType fieldType() {
+        return (DenseVectorFieldType) super.fieldType();
+    }
+
+    @Override
+    public boolean parsesArrayValue() {
+        return true;
+    }
+
+    @Override
+    public ParseResult parse(DocumentParserContext context) throws IOException {
+        if (context.doc().getByKey(fieldType().name()) != null) {
+            throw new IllegalArgumentException(
+                "Field ["
+                    + fullPath()
+                    + "] of type ["
+                    + typeName()
+                    + "] doesn't support indexing multiple values for the same field in the same document"
+            );
+        }
+        if (Token.VALUE_NULL == context.parser().currentToken()) {
+            return ParseResult.INDEXED;
+        }
+        if (fieldType().dims == null) {
+            int dims = fieldType().element.parseDimensionCount(context);
+            DenseVectorFieldMapper.Builder builder = (Builder) getMergeBuilder();
+            builder.dimensions(dims);
+            context.addDynamicMapper(builder, fullPath());
+            return ParseResult.INDEXED;
+        }
+        if (fieldType().indexed) {
+            parseKnnVectorAndIndex(context);
+        } else {
+            parseBinaryDocValuesVectorAndIndex(context);
+        }
+        return ParseResult.INDEXED;
+    }
+
+    private void parseKnnVectorAndIndex(DocumentParserContext context) throws IOException {
+        fieldType().element.parseKnnVectorAndIndex(context, this);
+    }
+
+    private void parseBinaryDocValuesVectorAndIndex(DocumentParserContext context) throws IOException {
+        // encode array of floats as array of integers and store into buf
+        // this code is here and not in the VectorEncoderDecoder so not to create extra arrays
+        int dims = fieldType().dims;
+        Element element = fieldType().element;
+        int numBytes = indexCreatedVersion.onOrAfter(MAGNITUDE_STORED_INDEX_VERSION)
+            ? element.getNumBytes(dims) + MAGNITUDE_BYTES
+            : element.getNumBytes(dims);
+
+        ByteBuffer byteBuffer = element.createByteBuffer(indexCreatedVersion, numBytes);
+        VectorData vectorData = element.parseKnnVector(context, dims, (i, b) -> {
+            if (b) {
+                checkDimensionMatches(i, context);
+            } else {
+                checkDimensionExceeded(i, context);
+            }
+        }, fieldType().similarity);
+        vectorData.addToBuffer(element, byteBuffer);
+        if (indexCreatedVersion.onOrAfter(MAGNITUDE_STORED_INDEX_VERSION)) {
+            // encode vector magnitude at the end
+            double dotProduct = element.computeSquaredMagnitude(vectorData);
+            float vectorMagnitude = (float) Math.sqrt(dotProduct);
+            byteBuffer.putFloat(vectorMagnitude);
+        }
+        Field field = new BinaryDocValuesField(fieldType().name(), new BytesRef(byteBuffer.array()));
+        context.doc().addWithKey(fieldType().name(), field);
+    }
+
+    private void checkDimensionExceeded(int index, DocumentParserContext context) {
+        if (index >= fieldType().dims) {
+            throw new IllegalArgumentException(
+                "The ["
+                    + typeName()
+                    + "] field ["
+                    + fullPath()
+                    + "] in doc ["
+                    + context.documentDescription()
+                    + "] has more dimensions "
+                    + "than defined in the mapping ["
+                    + fieldType().dims
+                    + "]"
+            );
+        }
+    }
+
+    private void checkDimensionMatches(int index, DocumentParserContext context) {
+        if (index != fieldType().dims) {
+            throw new IllegalArgumentException(
+                "The ["
+                    + typeName()
+                    + "] field ["
+                    + fullPath()
+                    + "] in doc ["
+                    + context.documentDescription()
+                    + "] has a different number of dimensions "
+                    + "["
+                    + index
+                    + "] than defined in the mapping ["
+                    + fieldType().dims
+                    + "]"
+            );
+        }
+    }
+
+    @Override
+    protected void parseCreateField(DocumentParserContext context) {
+        throw new AssertionError("parse is implemented directly");
+    }
+
+    @Override
+    protected String contentType() {
+        return CONTENT_TYPE;
+    }
+
+    @Override
+    public FieldMapper.Builder getMergeBuilder() {
+        return new Builder(
+            leafName(),
+            indexCreatedVersion,
+            indexMode,
+            excludeSourceVectorsSetting,
+            experimentalFeaturesEnabled,
+            extraVectorsFormatProviders,
+            indexDisabledByDefault,
+            fieldType().postFilterSelectivityThreshold
+        ).init(this);
+    }
+
+    private static DenseVectorIndexOptions parseIndexOptions(
+        String fieldName,
+        Object propNode,
+        MappingParserContext context,
+        boolean experimentalFeaturesEnabled
+    ) {
+        @SuppressWarnings("unchecked")
+        Map<String, ?> indexOptionsMap = (Map<String, ?>) propNode;
+        Object typeNode = indexOptionsMap.remove("type");
+        if (typeNode == null) {
+            throw new MapperParsingException("[index_options] requires field [type] to be configured");
+        }
+        String type = XContentMapValues.nodeStringValue(typeNode);
+        Optional<VectorIndexType> vectorIndexType = VectorIndexType.fromString(type);
+        if (vectorIndexType.isEmpty()) {
+            throw new MapperParsingException("Unknown vector index options type [" + type + "] for field [" + fieldName + "]");
+        }
+        VectorIndexType parsedType = vectorIndexType.get();
+        return parsedType.parseIndexOptions(fieldName, indexOptionsMap, context, experimentalFeaturesEnabled);
+    }
+
+    private static boolean parseOnDiskMerge(Map<String, ?> indexOptionsMap) {
+        return XContentMapValues.nodeBooleanValue(indexOptionsMap.remove("on_disk_merge"), false);
+    }
+
+    private static Float parseConfidenceInterval(String fieldName, Map<String, ?> indexOptionsMap, IndexVersion indexVersion) {
+        Object confidenceIntervalNode = indexOptionsMap.remove("confidence_interval");
+        if (confidenceIntervalNode == null) {
+            return null;
+        }
+        float confidenceInterval = (float) XContentMapValues.nodeDoubleValue(confidenceIntervalNode);
+        boolean shouldWarn = indexVersion.onOrAfter(IndexVersions.UPGRADE_TO_LUCENE_10_4_0);
+        if (shouldWarn) {
+            deprecationLogger.warn(
+                DeprecationCategory.MAPPINGS,
+                "dense_vector_confidence_interval_deprecated",
+                CONFIDENCE_INTERVAL_DEPRECATION_MESSAGE,
+                fieldName
+            );
+        }
+        return confidenceInterval;
+    }
+
+    /**
+     * @return the custom kNN vectors format that is configured for this field or
+     * {@code null} if the default format should be used.
+     * @param defaultFormat      the default kNN vectors format to use if no custom format is configured
+     * @param indexSettings      the index settings
+     * @param threadPool         the thread pool to use for merging, or {@code null} if not available
+     */
+    public KnnVectorsFormat getKnnVectorsFormatForField(
+        KnnVectorsFormat defaultFormat,
+        IndexSettings indexSettings,
+        @Nullable ThreadPool threadPool
+    ) {
+        ExecutorService mergingExecutorService = null;
+        int maxMergingWorkers = 1;
+        if (indexSettings.isIntraMergeParallelismEnabled() && threadPool != null) {
+            maxMergingWorkers = threadPool.info(ThreadPool.Names.MERGE).getMax();
+            if (maxMergingWorkers > 1) {
+                mergingExecutorService = threadPool.executor(ThreadPool.Names.MERGE);
+            }
+        }
+        ExecutorService quantizerExecutorService = null;
+        if (threadPool != null) {
+            // use the MERGE pool as a CPU-bound writing-time threadpool
+            // that scales with the number of cores
+            // FLUSH only has 5 threads, and is targetted at IO operations
+            quantizerExecutorService = threadPool.executor(ThreadPool.Names.MERGE);
+        }
+
+        final KnnVectorsFormat format;
+        ElementType elementType = fieldType().element.elementType();
+        final String sliceField = SliceIndexing.SLICE_FEATURE_FLAG.isEnabled() && indexSettings.isSliceEnabled()
+            ? SliceIndexing.SLICE_KEY_FIELD_NAME
+            : null;
+        if (indexOptions == null) {
+            format = switch (elementType) {
+                case BYTE, FLOAT -> defaultFormat;
+                case BIT, BFLOAT16 -> new ES93HnswVectorsFormat(
+                    DEFAULT_MAX_CONN,
+                    DEFAULT_MAX_CONN,
+                    elementType,
+                    maxMergingWorkers,
+                    mergingExecutorService,
+                    -1,
+                    false
+                );
+            };
+        } else {
+            // if plugins provided alternative KnnVectorsFormat for this indexOptions, use it instead of standard
+            KnnVectorsFormat extraKnnFormat = null;
+            for (VectorsFormatProvider vectorsFormatProvider : extraVectorsFormatProviders) {
+                extraKnnFormat = vectorsFormatProvider.getKnnVectorsFormat(
+                    indexSettings,
+                    indexOptions,
+                    fieldType().similarity(),
+                    elementType,
+                    mergingExecutorService,
+                    maxMergingWorkers,
+                    quantizerExecutorService
+                );
+                if (extraKnnFormat != null) {
+                    break;
+                }
+            }
+            format = extraKnnFormat != null
+                ? extraKnnFormat
+                : indexOptions.getVectorsFormat(
+                    elementType,
+                    mergingExecutorService,
+                    maxMergingWorkers,
+                    quantizerExecutorService,
+                    sliceField
+                );
+        }
+        // It's legal to reuse the same format name as this is the same on-disk format.
+        return new KnnVectorsFormat(format.getName()) {
+            @Override
+            public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
+                return format.fieldsWriter(state);
+            }
+
+            @Override
+            public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
+                return format.fieldsReader(state);
+            }
+
+            @Override
+            public int getMaxDimensions(String fieldName) {
+                return MAX_DIMS_COUNT;
+            }
+
+            @Override
+            public String toString() {
+                return format.toString();
+            }
+        };
+    }
+
+    @Override
+    public SourceLoader.SyntheticVectorsLoader syntheticVectorsLoader() {
+        if (excludeSourceVectors == false) {
+            return null;
+        }
+        // Recreate the loader for each leaf so that different segments can be searched concurrently. It has to match where
+        // the vector lives: the vector index when the field is indexed, binary doc values otherwise.
+        if (fieldType().indexed) {
+            return new SyntheticVectorsPatchFieldLoader<>(
+                () -> new IndexedSyntheticFieldLoader(indexCreatedVersion, fieldType().similarity),
+                IndexedSyntheticFieldLoader::copyVectorAsList
+            );
+        }
+        return new SyntheticVectorsPatchFieldLoader<>(
+            () -> new DocValuesSyntheticFieldLoader(indexCreatedVersion),
+            DocValuesSyntheticFieldLoader::copyVectorAsList
+        );
+    }
+
+    @Override
+    protected SyntheticSourceSupport syntheticSourceSupport() {
+        return new SyntheticSourceSupport.Native(
+            () -> fieldType().indexed
+                ? new IndexedSyntheticFieldLoader(indexCreatedVersion, fieldType().similarity)
+                : new DocValuesSyntheticFieldLoader(indexCreatedVersion)
+        );
+    }
+
+    private class IndexedSyntheticFieldLoader extends SourceLoader.DocValuesBasedSyntheticFieldLoader {
+        private FloatVectorValues floatValues;
+        private ByteVectorValues byteValues;
+        private NumericDocValues magnitudeReader;
+
+        private boolean hasValue;
+        private boolean hasMagnitude;
+        private int ord;
+
+        private final IndexVersion indexCreatedVersion;
+        private final VectorSimilarity vectorSimilarity;
+        private final Thread creationThread;
+
+        private IndexedSyntheticFieldLoader(IndexVersion indexCreatedVersion, VectorSimilarity vectorSimilarity) {
+            this.indexCreatedVersion = indexCreatedVersion;
+            this.vectorSimilarity = vectorSimilarity;
+            this.creationThread = Thread.currentThread();
+        }
+
+        @Override
+        public DocValuesLoader docValuesLoader(LeafReader reader, int[] docIdsInLeaf) throws IOException {
+            floatValues = reader.getFloatVectorValues(fullPath());
+            if (floatValues != null) {
+                if (shouldNormalize()) {
+                    magnitudeReader = reader.getNumericDocValues(fullPath() + COSINE_MAGNITUDE_FIELD_SUFFIX);
+                }
+                return createLoader(floatValues.iterator(), true);
+            }
+
+            byteValues = reader.getByteVectorValues(fullPath());
+            if (byteValues != null) {
+                return createLoader(byteValues.iterator(), false);
+            }
+
+            return null;
+        }
+
+        private boolean shouldNormalize() {
+            return indexCreatedVersion.onOrAfter(NORMALIZE_COSINE) && VectorSimilarity.COSINE.equals(vectorSimilarity);
+        }
+
+        private DocValuesLoader createLoader(KnnVectorValues.DocIndexIterator iterator, boolean checkMagnitude) {
+            return docId -> {
+                assert creationThread == Thread.currentThread()
+                    : "Thread mismatch: created by [" + creationThread + "], but accessed by [" + Thread.currentThread() + "]";
+                if (iterator.docID() > docId) {
+                    return hasValue = false;
+                }
+                if (iterator.docID() == docId || iterator.advance(docId) == docId) {
+                    ord = iterator.index();
+                    hasValue = true;
+                    hasMagnitude = checkMagnitude && magnitudeReader != null && magnitudeReader.advanceExact(docId);
+                } else {
+                    hasValue = false;
+                }
+                return hasValue;
+            };
+        }
+
+        @Override
+        public boolean hasValue() {
+            return hasValue;
+        }
+
+        @Override
+        public void write(XContentBuilder b) throws IOException {
+            if (false == hasValue) {
+                return;
+            }
+            float magnitude = hasMagnitude ? Float.intBitsToFloat((int) magnitudeReader.longValue()) : Float.NaN;
+            b.startArray(leafName());
+            if (floatValues != null) {
+                for (float v : floatValues.vectorValue(ord)) {
+                    b.value(hasMagnitude ? v * magnitude : v);
+                }
+            } else if (byteValues != null) {
+                for (byte v : byteValues.vectorValue(ord)) {
+                    b.value(v);
+                }
+            }
+            b.endArray();
+        }
+
+        /**
+         * Returns a deep-copied vector for the current document, either as a list of floats
+         * (with optional cosine normalization) or a list of bytes.
+         *
+         * @throws IOException if reading fails
+         */
+        private List<?> copyVectorAsList() throws IOException {
+            assert hasValue : "vector is null for ord=" + ord;
+            if (floatValues != null) {
+                float[] raw = floatValues.vectorValue(ord);
+                List<Float> copyList = new ArrayList<>(raw.length);
+
+                if (hasMagnitude) {
+                    float mag = Float.intBitsToFloat((int) magnitudeReader.longValue());
+                    for (int i = 0; i < raw.length; i++) {
+                        copyList.add(raw[i] * mag);
+                    }
+                } else {
+                    for (int i = 0; i < raw.length; i++) {
+                        copyList.add(raw[i]);
+                    }
+                }
+                return copyList;
+            } else if (byteValues != null) {
+                byte[] raw = byteValues.vectorValue(ord);
+                List<Byte> copyList = new ArrayList<>(raw.length);
+                for (int i = 0; i < raw.length; i++) {
+                    copyList.add(raw[i]);
+                }
+                return copyList;
+            }
+
+            throw new IllegalStateException("No vector values available to copy.");
+        }
+
+        @Override
+        public String fieldName() {
+            return fullPath();
+        }
+    }
+
+    private class DocValuesSyntheticFieldLoader extends SourceLoader.DocValuesBasedSyntheticFieldLoader {
+        private BinaryDocValues values;
+        private boolean hasValue;
+        private final IndexVersion indexCreatedVersion;
+
+        private DocValuesSyntheticFieldLoader(IndexVersion indexCreatedVersion) {
+            this.indexCreatedVersion = indexCreatedVersion;
+        }
+
+        @Override
+        public DocValuesLoader docValuesLoader(LeafReader leafReader, int[] docIdsInLeaf) throws IOException {
+            values = leafReader.getBinaryDocValues(fullPath());
+            if (values == null) {
+                return null;
+            }
+            return docId -> {
+                if (values.docID() > docId) {
+                    return hasValue = false;
+                }
+                if (values.docID() == docId) {
+                    return hasValue = true;
+                }
+                hasValue = docId == values.advance(docId);
+                return hasValue;
+            };
+        }
+
+        @Override
+        public boolean hasValue() {
+            return hasValue;
+        }
+
+        @Override
+        public void write(XContentBuilder b) throws IOException {
+            if (false == hasValue) {
+                return;
+            }
+            b.startArray(leafName());
+            ByteBuffer byteBuffer = byteBuffer();
+            int vectorLength = fieldType().element.elementType().vectorLength(fieldType().dims);
+            for (int i = 0; i < vectorLength; i++) {
+                fieldType().element.readAndWriteValue(byteBuffer, b);
+            }
+            b.endArray();
+        }
+
+        private ByteBuffer byteBuffer() throws IOException {
+            BytesRef ref = values.binaryValue();
+            ByteBuffer byteBuffer = ByteBuffer.wrap(ref.bytes, ref.offset, ref.length);
+            if (indexCreatedVersion.onOrAfter(LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION)) {
+                byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
+            }
+            return byteBuffer;
+        }
+
+        /**
+         * Rebuilds the vector from its binary doc value as a list, mirroring {@link #write}.
+         */
+        private List<?> copyVectorAsList() throws IOException {
+            assert hasValue : "vector is null";
+            ByteBuffer byteBuffer = byteBuffer();
+            int vectorLength = fieldType().element.elementType().vectorLength(fieldType().dims);
+            List<Number> copyList = new ArrayList<>(vectorLength);
+            for (int i = 0; i < vectorLength; i++) {
+                copyList.add(fieldType().element.readValue(byteBuffer));
+            }
+            return copyList;
+        }
+
+        @Override
+        public String fieldName() {
+            return fullPath();
+        }
+    }
+
+    /**
+     * Interface for a function that takes a int and boolean
+     */
+    @FunctionalInterface
+    public interface IntBooleanConsumer {
+        void accept(int value, boolean isComplete);
+    }
+
+    public interface SimilarityFunction {
+        float calculateSimilarity(float[] leftVector, float[] rightVector);
+
+        float calculateSimilarity(byte[] leftVector, byte[] rightVector);
+
+        BlockLoaderFunctionConfig.Function function();
+    }
+
+    /**
+     * Configuration for a {@link BlockLoaderFunctionConfig} that calculates vector similarity.
+     * Functions that use this config should use SIMILARITY_FUNCTION_NAME as their name.
+     */
+    public static class VectorSimilarityFunctionConfig implements BlockLoaderFunctionConfig {
+
+        private final SimilarityFunction similarityFunction;
+        private final float[] vector;
+        private final byte[] vectorAsBytes;
+
+        public VectorSimilarityFunctionConfig(SimilarityFunction similarityFunction, float[] vector) {
+            Objects.requireNonNull(vector);
+            assert vector.length > 0 : "vector length must be > 0";
+            this.similarityFunction = similarityFunction;
+            this.vector = vector;
+            this.vectorAsBytes = null;
+        }
+
+        public VectorSimilarityFunctionConfig(SimilarityFunction similarityFunction, byte[] vectorAsBytes) {
+            this.similarityFunction = similarityFunction;
+            this.vector = null;
+            this.vectorAsBytes = vectorAsBytes;
+        }
+
+        @Override
+        public Function function() {
+            return similarityFunction.function();
+        }
+
+        public byte[] vectorAsBytes() {
+            assert vectorAsBytes != null : "vectorAsBytes is null, maybe incorrect element type during construction?";
+            return vectorAsBytes;
+        }
+
+        public float[] vector() {
+            assert vector != null : "vector is null, maybe incorrect element type during construction?";
+            return vector;
+        }
+
+        public SimilarityFunction similarityFunction() {
+            return similarityFunction;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o == null || getClass() != o.getClass()) return false;
+            VectorSimilarityFunctionConfig that = (VectorSimilarityFunctionConfig) o;
+            return Objects.equals(similarityFunction, that.similarityFunction)
+                && Objects.deepEquals(vector, that.vector)
+                && Objects.deepEquals(vectorAsBytes, that.vectorAsBytes);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(similarityFunction, Arrays.hashCode(vector), Arrays.hashCode(vectorAsBytes));
+        }
+    }
+}
