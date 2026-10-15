@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 471745,
+  "bundle_sha256": "67cf87634ecff553e1b1993db815d176b5cfad143dd94826292aeff797d71867",
+  "extracted_tree": {
+    "bytes": 2929599,
+    "files": 73,
+    "sha256": "769ff19e96cc8c0c0db74b36a5cfaf2565db69a69a8e45c3601fe7834226985e"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 471745,
+      "name": "rules.bundle.zip.part-0001",
+      "sha256": "67cf87634ecff553e1b1993db815d176b5cfad143dd94826292aeff797d71867"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "rules",
+  "source_bytes": 2929599,
+  "source_commit": "0ab9be6adef922c573cecdf0878ab05bd40431f6",
+  "source_files": 73,
+  "source_ref": "master",
+  "source_repo": "jruizgit/rules",
+  "source_tree": {
+    "bytes": 2929599,
+    "files": 73,
+    "sha256": "769ff19e96cc8c0c0db74b36a5cfaf2565db69a69a8e45c3601fe7834226985e"
+  }
+}
