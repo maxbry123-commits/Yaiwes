@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 5352848,
+  "bundle_sha256": "8fef0768d477d2b12de0e158ef455805f40f9ba5b00dc4c854bacdb81c4446de",
+  "extracted_tree": {
+    "bytes": 7702015,
+    "files": 360,
+    "sha256": "f3b8b9009d42fba8a4b096725681048665aabf9daa7a1064c0cf2c147cc999b6"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 5352848,
+      "name": "differential-dataflow.bundle.zip.part-0001",
+      "sha256": "8fef0768d477d2b12de0e158ef455805f40f9ba5b00dc4c854bacdb81c4446de"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "differential-dataflow",
+  "source_bytes": 7702015,
+  "source_commit": "aa8745f93ea8abe131104fc7885ba4fd47e63902",
+  "source_files": 360,
+  "source_ref": "master",
+  "source_repo": "TimelyDataflow/differential-dataflow",
+  "source_tree": {
+    "bytes": 7702015,
+    "files": 360,
+    "sha256": "f3b8b9009d42fba8a4b096725681048665aabf9daa7a1064c0cf2c147cc999b6"
+  }
+}
