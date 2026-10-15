@@ -1,0 +1,61 @@
+# TestLatest: skip
+# in.cue below is deliberately written for an older language version: it uses
+# the prefix alias syntax, which a file at v0.18.0 no longer parses, and it
+# relies on an embedding not closing its siblings. Upgrading the module is
+# what this script tests.
+
+exec cue export .
+cp stdout export.before
+
+exec cue mod upgrade v0.18.0
+
+cmp in.cue expect/out
+cmp cue.mod/module.cue expect/outmod
+
+# The upgraded module exports the same data and is valid at its new version.
+exec cue export .
+cmp stdout export.before
+exec cue vet .
+
+-- cue.mod/module.cue --
+module: "mod.test"
+
+language: version: "v0.14.0"
+
+-- in.cue --
+package foo
+
+#A: a: int
+#B: b: int
+
+#X: {
+	#A // foo
+
+	// bar
+	#B
+	c: string
+}
+
+Y: [Name=string]: n?: Name
+
+out: #X & {a: 1, b: 2, c: "c"}
+-- expect/outmod --
+module: "mod.test"
+language: version: "v0.18.0"
+-- expect/out --
+package foo
+
+#A: a: int
+#B: b: int
+
+#X: {
+	#A... // foo
+
+	// bar
+	#B...
+	c: string
+}
+
+Y: [string]~(Name,_): n?: Name
+
+out: #X & {a: 1, b: 2, c: "c"}

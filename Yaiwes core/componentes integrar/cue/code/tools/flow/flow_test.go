@@ -1,0 +1,532 @@
+// Copyright 2020 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package flow_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"testing/fstest"
+	"testing/synctest"
+	"time"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+	"cuelang.org/go/cue/errors"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/cue/load"
+	"cuelang.org/go/cue/stats"
+	"cuelang.org/go/internal/cuetdtest"
+	"cuelang.org/go/internal/cuetxtar"
+	"cuelang.org/go/tools/flow"
+)
+
+// TestTasks tests the logic that determines which nodes are tasks and what are
+// their dependencies.
+func TestFlow(t *testing.T) {
+	test := cuetxtar.TxTarTest{
+		Root:   "./testdata",
+		Name:   "run",
+		Matrix: cuetdtest.SmallMatrix,
+	}
+
+	test.Run(t, func(t *cuetxtar.Test) {
+		v := t.CueContext().BuildInstance(t.Instance())
+		if err := v.Err(); err != nil {
+			t.Fatal(errors.Details(err, nil))
+		}
+
+		setSeqNum(0)
+
+		updateFunc := func(c *flow.Controller, task *flow.Task) error {
+			str := flow.MermaidGraph(c)
+			step := fmt.Sprintf("t%d", seqNum)
+			fmt.Fprintln(t.Writer(step), str)
+
+			if task != nil {
+				n := task.Value().Syntax(cue.Final())
+				b, err := format.Node(n)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fmt.Fprintln(t.Writer(path.Join(step, "value")), string(b))
+
+				if t.M.IsDefault() {
+					stats := task.Stats()
+					fmt.Fprintln(t.Writer(path.Join(step, "stats")), &stats)
+				}
+			}
+
+			incSeqNum()
+
+			return nil
+		}
+
+		cfg := &flow.Config{
+			Root:            cue.ParsePath("root"),
+			InferTasks:      t.Bool("InferTasks"),
+			IgnoreConcrete:  t.Bool("IgnoreConcrete"),
+			FindHiddenTasks: t.Bool("FindHiddenTasks"),
+			UpdateFunc:      updateFunc,
+		}
+
+		c := flow.New(cfg, v, taskFunc)
+
+		w := t.Writer("errors")
+		if err := c.Run(context.Background()); err != nil {
+			cwd, _ := os.Getwd()
+			fmt.Fprint(w, "error: ")
+			errors.Print(w, err, &errors.Config{
+				Cwd:     cwd,
+				ToSlash: true,
+			})
+		}
+
+		if !t.M.IsDefault() {
+			return
+		}
+
+		// Sum the stats of all tasks, including those which never completed,
+		// such as tasks terminated by an aborted dependency.
+		var tasksTotal stats.Counts
+		for _, task := range c.Tasks() {
+			tasksTotal.Add(task.Stats())
+		}
+		totals := c.Stats()
+		if tasksTotal != zeroStats && totals != tasksTotal {
+			t.Errorf(diffMsg, tasksTotal, totals, tasksTotal.Since(totals))
+		}
+		fmt.Fprintln(t.Writer("stats/totals"), totals)
+	})
+}
+
+var zeroStats stats.Counts
+
+const diffMsg = `
+stats: task totals different from controller:
+task totals:
+%v
+
+controller totals:
+%v
+
+task totals - controller totals:
+%v`
+
+// TestFlowConcurrentContextUse tests that a task runner can use the shared
+// cue.Context while the controller concurrently recomputes the configuration.
+// Compiling a value under the import path used by the configuration used to
+// re-register that path and race with the controller resolving the import;
+// run with -race to exercise this. Issue: https://cuelang.org/issue/2184
+func TestFlowConcurrentContextUse(t *testing.T) {
+	fsys := fstest.MapFS{
+		"cue.mod/module.cue": &fstest.MapFile{Data: []byte(`
+module: "example.com/tasks"
+language: version: "v0.9.0"
+`)},
+		"demo.cue": &fstest.MapFile{Data: []byte(`
+package demo
+
+import "example.com/tasks:task"
+
+a: task.#task & {
+	task: "one"
+}
+b: task.#task & {
+	task: "two"
+}
+`)},
+		"task.cue": &fstest.MapFile{Data: []byte(`
+package task
+
+#task: task: string
+`)},
+	}
+	insts := load.Instances([]string{".:demo"}, &load.Config{FS: fsys})
+	if err := insts[0].Err; err != nil {
+		t.Fatal(err)
+	}
+	// The iteration counts are arbitrary: enough runs of the flow, each with
+	// enough compiles overlapping the controller's recomputation, for the
+	// race detector to fire reliably on the unfixed code.
+	for range 20 {
+		ctx := cuecontext.New()
+		v := ctx.BuildInstance(insts[0])
+		if err := v.Err(); err != nil {
+			t.Fatal(err)
+		}
+		top := ctx.CompileString("_")
+		c := flow.New(nil, v, func(v cue.Value) (flow.Runner, error) {
+			taskName, err := v.LookupPath(cue.MakePath(cue.Str("task"))).String()
+			if err != nil {
+				return nil, nil
+			}
+			return flow.RunnerFunc(func(t *flow.Task) error {
+				if taskName == "two" {
+					for range 100 {
+						ctx.CompileString(`{foo: 1}`, cue.ImportPath("example.com/tasks:task"))
+					}
+				}
+				return t.Fill(top)
+			}), nil
+		})
+		if err := c.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestFlowNonRootValue tests that when the value passed to New is not at the
+// root of its instance, a task at the top of that value is run with the
+// correct value and its results are filled in at the right place.
+// Issue: https://cuelang.org/issue/2185
+func TestFlowNonRootValue(t *testing.T) {
+	ctx := cuecontext.New()
+	inst := ctx.CompileString(`
+#task: {
+	task: true
+}
+`)
+	root := inst.LookupPath(cue.MakePath(cue.Def("#task")))
+	if err := root.Err(); err != nil {
+		t.Fatal(err)
+	}
+	isTask := func(v cue.Value) bool {
+		return v.LookupPath(cue.MakePath(cue.Str("task"))).Exists()
+	}
+	var runs int
+	c := flow.New(nil, root, func(v cue.Value) (flow.Runner, error) {
+		if !isTask(v) {
+			return nil, nil
+		}
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			runs++
+			if v := t.Value(); !isTask(v) {
+				return fmt.Errorf("runner called with wrong value:\n%v", v)
+			}
+			return t.Fill(map[string]bool{"done": true})
+		}), nil
+	})
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatal(errors.Details(err, nil))
+	}
+	if runs != 1 {
+		t.Errorf("runner ran %d times, want 1", runs)
+	}
+	if done, err := c.Value().LookupPath(cue.MakePath(cue.Str("done"))).Bool(); err != nil || !done {
+		t.Errorf("done: got (%v, %v), want (true, nil)", done, err)
+	}
+}
+
+// TestFlowCallerAppendsToSlices tests whether appending to the slices
+// returned by [flow.Controller.Tasks] and [flow.Task.Dependencies]
+// writes into storage shared with other results.
+func TestFlowCallerAppendsToSlices(t *testing.T) {
+	v := cuecontext.New().CompileString(`
+a1: {$id: "a", out: string}
+a2: {$id: "a", out: string}
+a3: {$id: "a", out: string}
+b: {$id: "b", in: a1.out + a2.out + a3.out}
+c: {$id: "c"}
+`)
+	ctrl := flow.New(nil, v, taskFunc)
+	paths := func(ts []*flow.Task) (s []string) {
+		for _, t := range ts {
+			s = append(s, t.Path().String())
+		}
+		return s
+	}
+	check := func(what string, ts []*flow.Task, want ...string) {
+		if got := paths(ts); !slices.Equal(got, want) {
+			t.Errorf("%s: got %v, want %v", what, got, want)
+		}
+	}
+	tasks := ctrl.Tasks()
+	check("Tasks", tasks, "a1", "a2", "a3", "b", "c")
+	b, c := tasks[3], tasks[4]
+
+	// Appending to one result leaves the other results unchanged.
+	tasksB := append(ctrl.Tasks(), b)
+	_ = append(ctrl.Tasks(), c)
+	check("Tasks appended", tasksB, "a1", "a2", "a3", "b", "c", "b")
+
+	depsB := append(b.Dependencies(), b)
+	_ = append(b.Dependencies(), c)
+	check("Dependencies appended", depsB, "a1", "a2", "a3", "b")
+}
+
+// TestFlowRunStopsEarly tests that when Run stops early, it returns without
+// waiting for the tasks which are still running, even if they ignore the
+// cancellation, and that their goroutines exit once those tasks finish.
+// Issue: https://cuelang.org/issue/2663
+func TestFlowRunStopsEarly(t *testing.T) {
+	// How the "stop" task stops the run.
+	for _, stop := range []string{"fail", "update", "cancel"} {
+		t.Run(stop, func(t *testing.T) {
+			// synctest panics when goroutines in the bubble remain
+			// blocked after the test function returns.
+			synctest.Test(t, func(t *testing.T) {
+				testFlowRunStopsEarly(t, stop)
+			})
+		})
+	}
+}
+
+func testFlowRunStopsEarly(t *testing.T, stop string) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	v := cuecontext.New().CompileString(`
+slow: $id: "slow"
+stop: $id: "stop"
+`)
+	slowStarted := make(chan struct{})
+	release := make(chan struct{})
+	cfg := &flow.Config{
+		UpdateFunc: func(c *flow.Controller, t *flow.Task) error {
+			if stop == "update" && t != nil && t.Path().String() == "stop" {
+				return fmt.Errorf("update failed")
+			}
+			return nil
+		},
+	}
+	c := flow.New(cfg, v, func(v cue.Value) (flow.Runner, error) {
+		id, err := v.LookupPath(cue.MakePath(cue.Str("$id"))).String()
+		if err != nil {
+			return nil, nil
+		}
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			if id == "slow" {
+				// Ignore cancellation, like a task blocked reading stdin.
+				close(slowStarted)
+				<-release
+				return nil
+			}
+			<-slowStarted
+			switch stop {
+			case "fail":
+				return fmt.Errorf("stop failed")
+			case "cancel":
+				cancel()
+			}
+			return nil
+		}), nil
+	})
+	err := c.Run(ctx)
+	close(release)
+	if gotErr, wantErr := err != nil, stop != "cancel"; gotErr != wantErr {
+		t.Errorf("Run error: got %v, want error: %v", err, wantErr)
+	}
+}
+
+func TestFlowValuePanic(t *testing.T) {
+	f := `
+    root: {
+        a: {
+            $id: "slow"
+            out: string
+        }
+        b: {
+            $id:    "slow"
+            $after: a
+            out:    string
+        }
+    }
+    `
+	ctx := cuecontext.New()
+	v := ctx.CompileString(f)
+
+	ch := make(chan bool, 1)
+
+	cfg := &flow.Config{
+		Root: cue.ParsePath("root"),
+		UpdateFunc: func(c *flow.Controller, t *flow.Task) error {
+			ch <- true
+			return nil
+		},
+	}
+
+	c := flow.New(cfg, v, taskFunc)
+
+	defer func() { recover() }()
+
+	go c.Run(context.TODO())
+
+	// Call Value amidst two task runs. This should trigger a panic as the flow
+	// is not terminated.
+	<-ch
+	c.Value()
+	<-ch
+
+	t.Errorf("Value() did not panic")
+}
+
+func taskFunc(v cue.Value) (flow.Runner, error) {
+	idPath := cue.MakePath(cue.Str("$id"))
+	valPath := cue.MakePath(cue.Str("val"))
+
+	switch name, err := v.LookupPath(idPath).String(); name {
+	default:
+		if err == nil {
+			return flow.RunnerFunc(func(t *flow.Task) error {
+				t.Fill(map[string]string{"stdout": "foo"})
+				return nil
+			}), nil
+		} else if v.LookupPath(idPath).Exists() {
+			return nil, err
+		}
+
+	case "valToOut":
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			if str, err := t.Value().LookupPath(valPath).String(); err == nil {
+				t.Fill(map[string]string{"out": str})
+			}
+			return nil
+		}), nil
+
+	case "failure":
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			return errors.New("failure")
+		}), nil
+
+	case "abort":
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			t.Fill(map[string]string{"out": "aborted"})
+			return flow.ErrAbort
+		}), nil
+
+	case "list":
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			t.Fill(map[string][]int{"out": {1, 2}})
+			return nil
+		}), nil
+
+	case "slow":
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			time.Sleep(10 * time.Millisecond)
+			t.Fill(map[string]string{"out": "finished"})
+			return nil
+		}), nil
+
+	case "sequenced":
+		// This task is used to serialize different runners in case
+		// non-deterministic scheduling is possible.
+		return flow.RunnerFunc(func(t *flow.Task) error {
+			seq, err := t.Value().LookupPath(cue.MakePath(cue.Str("seq"))).Int64()
+			if err != nil {
+				return err
+			}
+
+			if err := waitSeqNum(t.Context(), seq); err != nil {
+				return err
+			}
+
+			if str, err := t.Value().LookupPath(valPath).String(); err == nil {
+				t.Fill(map[string]string{"out": str})
+			}
+
+			return nil
+		}), nil
+	}
+	return nil, nil
+}
+
+// These vars are used to serialize tasks that are run in parallel. This allows
+// for testing running tasks in parallel, while obtaining deterministic output.
+var (
+	seqLock    sync.Mutex
+	seqNum     int64
+	seqChanged = make(chan struct{}) // closed and replaced when seqNum changes
+)
+
+func setSeqNum(n int64) {
+	seqLock.Lock()
+	defer seqLock.Unlock()
+	seqNum = n
+	close(seqChanged)
+	seqChanged = make(chan struct{})
+}
+
+func incSeqNum() {
+	seqLock.Lock()
+	defer seqLock.Unlock()
+	seqNum++
+	close(seqChanged)
+	seqChanged = make(chan struct{})
+}
+
+func loadSeqNum() (int64, <-chan struct{}) {
+	seqLock.Lock()
+	defer seqLock.Unlock()
+	return seqNum, seqChanged
+}
+
+// waitSeqNum waits until seqNum reaches seq, or until ctx is canceled.
+// A flow which stops early leaves its running tasks behind,
+// and they must not act on the seqNum of a later test.
+func waitSeqNum(ctx context.Context, seq int64) error {
+	for {
+		n, changed := loadSeqNum()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if n == seq {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// DO NOT REMOVE: for testing purposes.
+func TestX(t *testing.T) {
+	in := `
+	`
+
+	if strings.TrimSpace(in) == "" {
+		t.Skip()
+	}
+
+	rt := cuecontext.New()
+	v := rt.CompileString(in)
+	if err := v.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := flow.New(&flow.Config{
+		Root: cue.ParsePath("root"),
+		UpdateFunc: func(c *flow.Controller, ft *flow.Task) error {
+			if ft != nil {
+				t.Errorf("\nTASK:\n%s", ft.Stats())
+			}
+			return nil
+		},
+	}, v, taskFunc)
+
+	t.Error(flow.MermaidGraph(c))
+
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatal(errors.Details(err, nil))
+	}
+
+	t.Errorf("\nCONTROLLER:\n%s", c.Stats())
+}

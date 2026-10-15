@@ -1,0 +1,143 @@
+# Tests that closedness is correctly tracked when combining schemas through
+# inheritance and embedding using the & operator. The issue caused CUE to reject
+# fields that should be permitted under the merged schema definitions.
+# https://cuelang.org/issue/599
+-- in.cue --
+package deps
+
+a: {
+	#A: {
+		n:          string
+		depends_on: [...#AnyA]
+	}
+
+	#AnyA: {
+		n:          string
+		depends_on: [...#AnyA]
+		...
+	}
+
+	#A1: {
+		#A... // spread, as x and y are not fields of #A
+		x: int
+		y: z: string // Comment to avoid error
+	}
+
+	#A2: {
+		#A... // spread, as i is not a field of #A
+		i: string
+	}
+
+	s: [string]~(Name,_): #AnyA & {n: Name}
+
+	s: foo: #A1 & {
+		x: 10
+		y: z: "z" // Comment to avoid error
+	}
+
+	s: bar: #A2 & {
+		i:          "hello bar"
+		depends_on: [s.foo]
+	}
+}
+
+b: {
+	#A: {
+		f: {...}
+	}
+
+	#A1: {
+		#A
+		// f: {...} // Uncomment to fix
+	}
+
+	#C: {
+		d: {...}
+	}
+
+	s: [string]: #A1
+
+	s: foo: {
+		f: #C & {
+			d: foo: "bar"
+		}
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    #A: {
+      n: string
+      depends_on: [
+        ...〈2;#AnyA〉,
+      ]
+    }
+    #AnyA: {
+      n: string
+      depends_on: [
+        ...〈2;#AnyA〉,
+      ]
+      ...
+    }
+    #A1: {
+      〈1;#A〉...
+      x: int
+      y: {
+        z: string
+      }
+    }
+    #A2: {
+      〈1;#A〉...
+      i: string
+    }
+    s: {
+      [string]: (〈1;#AnyA〉 & {
+        n: 〈1;-〉
+      })
+    }
+    s: {
+      foo: (〈1;#A1〉 & {
+        x: 10
+        y: {
+          z: "z"
+        }
+      })
+    }
+    s: {
+      bar: (〈1;#A2〉 & {
+        i: "hello bar"
+        depends_on: [
+          〈3;s〉.foo,
+        ]
+      })
+    }
+  }
+  b: {
+    #A: {
+      f: {
+        ...
+      }
+    }
+    #A1: {
+      〈1;#A〉
+    }
+    #C: {
+      d: {
+        ...
+      }
+    }
+    s: {
+      [string]: 〈1;#A1〉
+    }
+    s: {
+      foo: {
+        f: (〈2;#C〉 & {
+          d: {
+            foo: "bar"
+          }
+        })
+      }
+    }
+  }
+}

@@ -1,0 +1,312 @@
+# Tests that builtins satisfy function types: unifying a builtin with a
+# compatible function type succeeds and yields the builtin, with the type's
+# parameter and result constraints additionally enforced on every ordinary
+# full call. The legacy validator-constructor form remains a separate path.
+# A builtin binds its raw arguments by position. Positional type parameters
+# align with those raw slots by ordinal; a plain name supplies a contract label
+# only when the slot does not already have a different one. A required or
+# optional parameter of a type is the builtin parameter with its label, as
+# named by the builtin's signatures; an optional one that matches nothing
+# contributes no slot or label. Defaults declared by the signatures fill
+# omitted arguments and must agree with the builtin's own defaults.
+# Statically checked at unification time are parameter matching, arity, and
+# kind-level compatibility where the constraint is literally a basic type;
+# all other constraints surface when the tightened builtin is called.
+-- in.cue --
+@experiment(functions)
+
+import (
+	"list"
+	"path"
+	"strings"
+)
+
+tighten: {
+	T:  func(string, ...) -> string
+	up: T & strings.ToUpper
+	x:  up("hi") @test(eq, "HI")
+
+	// Order of unification does not matter.
+	upRev: strings.ToUpper & T
+	xRev:  upRev("hi") @test(eq, "HI")
+
+	// An open type with no parameters is satisfied by any builtin.
+	O:  func(...) -> string
+	o:  O & strings.ToUpper
+	ox: o("hi") @test(eq, "HI")
+
+	// The generated signature names this raw positional slot s; the same
+	// contract label may be repeated by a compatible type.
+	named: (func(s: string) -> string) & strings.ToUpper
+	nx:    named("hi") @test(eq, "HI")
+	nxLabel: named(s: "bye") @test(eq, "BYE")
+}
+
+static: {
+	// Arity is checked statically in both directions: the type must not
+	// declare more positional parameters than the builtin accepts, and a
+	// closed type must cover every defaultless parameter of the builtin.
+	tooMany: (func(string, string, ...) -> string) & strings.ToUpper @test(err, code=eval, contains="function type has more positional parameters than builtin strings.ToUpper")
+	tooFew:  (func() -> string) & strings.ToUpper @test(err, code=eval, contains="builtin strings.ToUpper has more parameters than closed function type")
+
+	// Kind-level conflicts that are decidable from the compiled signature
+	// (the constraint is literally a basic type) are rejected statically.
+	badParam:  (func(int, ...) -> string) & strings.ToUpper @test(err, code=eval, contains="parameter 1 of function type has kind int, conflicting with kind string of builtin strings.ToUpper")
+	badResult: (func(string, ...) -> int) & strings.ToUpper @test(err, code=eval, contains="result of function type has kind int, conflicting with result kind string of builtin strings.ToUpper")
+
+	// A builtin never unifies with a proper function value.
+	f:        func(a: string) -> string: a
+	conflict: f & strings.ToUpper @test(err, code=eval, contains="conflicting values")
+}
+
+// Constraints that are not decidable from the signatures alone are enforced
+// dynamically, on every ordinary full call through the tightened builtin.
+dynamic: {
+	// The type narrows the parameter to a bound.
+	P:  func(<="m", ...) -> string
+	up: P & strings.ToUpper
+
+	ok:  up("hi") @test(eq, "HI")
+	oob: up("zz") @test(err, code=eval, contains="out of bound")
+
+	// The type narrows the result.
+	R:   func(string, ...) -> "HI"
+	up2: R & strings.ToUpper
+
+	good: up2("hi") @test(eq, "HI")
+	bad:  up2("no") @test(err, code=eval, contains="conflicting values")
+
+	// Narrowing stacks across a chain of tightenings.
+	A:   func(string, ...) -> string
+	B:   func(<="m", ...) -> _
+	up3: A & B & strings.ToUpper
+
+	mid: up3("hi") @test(eq, "HI")
+	hi:  up3("zz") @test(err, code=eval, contains="out of bound")
+}
+
+// An extra parameter is admitted against a closed signature iff it is
+// optional. An unmatched optional name-only parameter contributes no slot or
+// label, but no call needs it either. A builtin parameter that a closed type
+// does not cover is admitted only if the builtin has a default for it.
+optionalExtra: {
+	O:  func(string, sep?: string) -> string
+	up: O & strings.ToUpper
+	x:  up("hi") @test(eq, "HI")
+
+	// An unmatched optional name-only constraint contributes no raw slot.
+	OnlyExtra: func(extra?: int, ...) -> string
+	upExtra:   OnlyExtra & strings.ToUpper
+	y:         upExtra("hi") @test(eq, "HI")
+
+	// A required parameter must name a parameter of the builtin.
+	bad: (func(string, sep!: string) -> string) & strings.ToUpper @test(err, code=eval, contains="parameter sep of function type not allowed by builtin strings.ToUpper")
+}
+
+// A required or optional parameter of a type and the builtin parameter with
+// the same label are the same parameter, so the type covers it.
+labelMatch: {
+	opt:     strings.Repeat & (func(string, count?: <3) -> string)
+	optOK:   opt("x", 2) @test(eq, "xx")
+	optBad:  opt("x", 5) @test(err, code=eval, contains="out of bound")
+	req:     strings.Repeat & (func(string, count!: int) -> string)
+	reqOK:   req("x", count: 2) @test(eq, "xx")
+	// A label that names no builtin parameter is rejected.
+	unknown: strings.Repeat & (func(string, times!: int) -> string) @test(err, code=eval, contains="parameter times of function type not allowed by builtin strings.Repeat")
+
+	// The builtin's labels are known however its uses are unified, also
+	// when a type labeling another parameter is unified first.
+	split: strings.Repeat
+	split: func(s: string, count!: int) -> string
+	splitOK: split("a", count: 3) @test(eq, "aaa")
+}
+
+// Tightened builtins are equal when derived from the same builtin with the
+// same type constraints: disjunction deduplication collapses them to a
+// single callable value.
+disjunction: {
+	T:    func(string, ...) -> string
+	t1:   T & strings.ToUpper
+	t2:   T & strings.ToUpper
+	pick: t1 | t2
+	x:    pick("hi") @test(eq, "HI")
+}
+
+// Partial application of builtins is not supported: a call with a trailing
+// "..." reports a clear error instead of silently dropping the "..." (len)
+// or morphing into a validator (strings.Contains).
+partial: {
+	contains: strings.Contains("abcd", ...) @test(err, code=eval, contains="partial application of builtin")
+	length:   len([1, 2], ...) @test(err, code=eval, contains="partial application of builtin")
+}
+
+// len is polymorphic over strings, bytes, lists, and structs; its kind-level
+// signature is compatible with a type over any of these.
+polymorphic: {
+	L: func(_, ...) -> int
+	l: L & len
+
+	str:  l("foo") @test(eq, 3)
+	list: l([1, 2]) @test(eq, 2)
+
+	// The type may narrow the accepted arguments to a subset of the kinds
+	// the builtin accepts; the narrowing applies per call.
+	S:    func(string, ...) -> int
+	ls:   S & len
+	sOk:  ls("foo") @test(eq, 3)
+	sBad: ls([1, 2]) @test(err, code=eval, contains="conflicting values")
+
+	// A statically incompatible result kind is rejected.
+	bad: (func(_, ...) -> string) & len @test(err, code=eval, contains="result of function type has kind string, conflicting with result kind int of builtin len")
+}
+
+// A labeled argument binds through the contract labels of the builtin's
+// declared signature; the call proceeds with the arguments in positional
+// order. Generated, signature-bearing standard-library functions ordinarily
+// carry attached labels which are callable.
+labeled: {
+	import1: {
+		named:   list.Drop(x: [1, 2, 3], n: 1) @test(eq, [2, 3])
+		swapped: list.Drop(n: 1, x: [1, 2, 3]) @test(eq, [2, 3])
+		mixed:   strings.Repeat("ab", count: 2) @test(eq, "abab")
+	}
+
+	errors: {
+		// A label no attached signature declares does not bind.
+		unknown: list.Drop(lst: [1], n: 0) @test(err, code=eval, contains="unknown argument lst in call to list.Drop")
+
+		// A parameter cannot be given both positionally and by label.
+		dup: strings.Repeat("ab", s: "x") @test(err, code=eval, contains="argument s provided by position and label in call to strings.Repeat")
+
+		// Labels cannot leave a hole before a bound position.
+		hole: list.Slice([1, 2, 3], j: 2) @test(err, code=eval, contains="missing argument 2 in call to list.Slice")
+	}
+
+	// An anonymous user type remains compatible with the builtin's named
+	// declaration. The declaration's contract label stays callable.
+	user: {
+		T: func(s: string, sep: string) -> [...string]
+		f: T & strings.SplitN @test(err, code=eval, contains="builtin strings.SplitN has more parameters than closed function type")
+
+		U:  func(string, ...) -> string
+		up: U & strings.ToUpper
+		x:  up(s: "hi") @test(eq, "HI")
+
+		// A second contract name for the already named slot conflicts.
+		badName: (func(text: string, ...) -> string) & strings.ToUpper @test(err, code=eval, contains="conflicting parameter labels")
+	}
+}
+// Defaults are part of CUE signatures, for builtins as for function
+// literals: a default declared by a function type unified with a builtin
+// fills an omitted argument, and it must agree with the builtin's own
+// default.
+typeDefaults: {
+	Rep:     func(s: string, count: int = 2) -> string
+	rep:     Rep & strings.Repeat
+	repX:    rep("ab", 3) @test(eq, "ababab")
+	repOmit: rep("ab") @test(eq, "abab")
+
+	// Two types attached to the builtin must still agree on their defaults,
+	// as they would without it: ignoring a default when completing the
+	// builtin's arguments does not make conflicting declarations compatible.
+	Rep3:       func(s: string, count: int = 3) -> string
+	repTypes:   Rep & Rep3 @test(err, code=eval, contains="conflicting defaults for parameter count")
+	repBoth:    strings.Repeat & Rep & Rep3 @test(err, code=eval, contains="conflicting defaults for parameter count")
+	repBothRev: Rep3 & strings.Repeat & Rep @test(err, code=eval, contains="conflicting defaults for parameter count")
+	repSame:    (Rep & strings.Repeat & Rep)("ab", 3) @test(eq, "ababab")
+
+	// A declared default must agree with the builtin's own default.
+	Join:   func(elem: [...string], os: string = "windows") -> string
+	join:   Join & path.Join @test(err, code=eval, contains="conflicting defaults for parameter os")
+
+	// A default declared on a type fills an omitted argument of a builtin
+	// as it would for a function value.
+	_rep: strings.Repeat
+	_rep: func(s: string, count: int = 3) -> string
+	split: _rep("a") @test(eq, "aaa")
+	Unix:   func(elem: [...string], os: string = "unix") -> string
+	unix:   Unix & path.Join
+	unixX:  unix(["a", "b"]) @test(eq, "a/b")
+	unixOS: unix(["a", "b"], "windows") @test(eq, "a\\b")
+}
+-- out/errors.txt --
+[eval] static.tooMany: function type has more positional parameters than builtin strings.ToUpper:
+    ./in.cue:34:51
+    ./in.cue:34:12
+[eval] static.tooFew: builtin strings.ToUpper has more parameters than closed function type:
+    ./in.cue:35:32
+    ./in.cue:35:12
+[eval] static.badParam: parameter 1 of function type has kind int, conflicting with kind string of builtin strings.ToUpper:
+    ./in.cue:39:42
+    ./in.cue:39:14
+[eval] static.badResult: result of function type has kind int, conflicting with result kind string of builtin strings.ToUpper:
+    ./in.cue:40:42
+    ./in.cue:40:14
+[eval] static.conflict: conflicting values func(a: string) -> string: ... and strings.ToUpper:
+    ./in.cue:43:12
+    ./in.cue:44:12
+    ./in.cue:44:16
+[eval] invalid value "zz" (out of bound <="m"):
+    ./in.cue:51:11
+    ./in.cue:55:10
+[eval] conflicting values "HI" and "NO":
+    ./in.cue:58:28
+    ./in.cue:62:8
+[eval] invalid value "zz" (out of bound <="m"):
+    ./in.cue:66:12
+    ./in.cue:70:11
+[eval] optionalExtra.bad: parameter sep of function type not allowed by builtin strings.ToUpper: no parameter of the builtin has this label:
+    ./in.cue:88:48
+    ./in.cue:88:8
+[eval] invalid value 5 (out of bound <3):
+    ./in.cue:94:50
+    ./in.cue:96:20
+[eval] labelMatch.unknown: parameter times of function type not allowed by builtin strings.Repeat: no parameter of the builtin has this label:
+    ./in.cue:100:29
+[eval] partial.contains: partial application of builtin strings.Contains is not supported:
+    ./in.cue:124:12
+[eval] partial.length: partial application of builtin len is not supported:
+    ./in.cue:125:12
+[eval] conflicting values string and [1,2] (mismatched types string and list):
+    ./in.cue:139:13
+    ./in.cue:142:11
+[eval] polymorphic.bad: result of function type has kind string, conflicting with result kind int of builtin len:
+    ./in.cue:145:8
+[eval] labeled.errors.unknown: unknown argument lst in call to list.Drop:
+    ./in.cue:161:12
+[eval] labeled.errors.dup: argument s provided by position and label in call to strings.Repeat:
+    ./in.cue:164:8
+[eval] labeled.errors.hole: missing argument 2 in call to list.Slice:
+    ./in.cue:167:9
+[eval] labeled.user.f: builtin strings.SplitN has more parameters than closed function type:
+    ./in.cue:173:6
+[eval] labeled.user.badName: conflicting parameter labels text and s for positional parameter 1 in function type and function type:
+    ./in.cue:181:50
+    ./in.cue:181:13
+[eval] conflicting defaults for parameter count: conflicting values 2 and 3:
+    ./in.cue:197:43
+    ./in.cue:189:40
+    ./in.cue:198:20
+[eval] conflicting defaults for parameter count: conflicting values 2 and 3:
+    ./in.cue:197:43
+    ./in.cue:189:40
+    ./in.cue:199:37
+[eval] conflicting defaults for parameter count: conflicting values 3 and 2:
+    ./in.cue:189:40
+    ./in.cue:197:43
+    ./in.cue:200:38
+[eval] conflicting defaults for parameter os: conflicting values "unix" and "windows":
+    ./in.cue:204:47
+    ./in.cue:205:10
+-- out/eval/stats --
+Leaks:  3
+Freed:  167
+Reused: 144
+Allocs: 26
+Retain: 0
+
+Unifications: 122
+Conjuncts:    288
+Disjuncts:    38
+
+NumCloseIDs: 56

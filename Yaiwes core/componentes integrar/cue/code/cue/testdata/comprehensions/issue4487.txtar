@@ -1,0 +1,207 @@
+# Each comprehension in a struct pushes down a pending arc, which stays pending
+# when the comprehension yields nothing. A list comprehension reading the
+# struct, and a guard reading that list in turn, must both see the settled
+# field set.
+#
+# A guard reading a struct with a comprehension nested in another's body must
+# likewise see the field the inner comprehension declares.
+# https://cuelang.org/issue/4487
+-- in.cue --
+empty: {
+	q: {
+		a: 0
+		if false {b: 1}
+		if false {c: 2}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) == 0 {
+		out: "empty"
+	}
+	@test(eq, {q: {a: 0}, n: [], out: "empty"})
+}
+
+populated: {
+	q: {
+		a: 0
+		b: 1
+		if false {c: 2}
+		if false {d: 3}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) != 0 {
+		out: n
+	}
+	@test(eq, {
+		q: {a: 0, b: 1}
+		n: [{a: 0, b: 1}]
+		out: [{a: 0, b: 1}]
+	})
+}
+
+threeArcs: {
+	q: {
+		a: 0
+		if false {b: 1}
+		if false {c: 2}
+		if false {d: 3}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) == 0 {
+		out: "empty"
+	}
+	@test(eq, {q: {a: 0}, n: [], out: "empty"})
+}
+
+forLoops: {
+	q: {
+		a: 0
+		for x in [] {b: x}
+		for x in [] {c: x}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) == 0 {
+		out: "empty"
+	}
+	@test(eq, {q: {a: 0}, n: [], out: "empty"})
+}
+
+guardFirst: {
+	spec: {
+		if len(n) != 0 {
+			out: n
+		}
+	}
+	q: {
+		a: 0
+		if false {b: 1}
+		if false {c: 2}
+	}
+	n: [if len(q) > 1 {q}]
+	@test(eq, {spec: {}, q: {a: 0}, n: []})
+}
+
+subField: {
+	q: {
+		a: 0
+		if true {b: c: 1}
+		if false {d: 3}
+		if false {e: 4}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) != 0 {
+		out: n
+	}
+	@test(eq, {
+		q: {a: 0, b: c: 1}
+		n: [{a: 0, b: c: 1}]
+		out: [{a: 0, b: c: 1}]
+	})
+}
+
+nestedPending: {
+	q: {
+		a: 0
+		if false {b: x: 1}
+		if false {b: y: 2}
+		if false {c: 2}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) == 0 {
+		out: "empty"
+	}
+	@test(eq, {q: {a: 0}, n: [], out: "empty"})
+}
+
+inDisjunction: {
+	d: {
+		kind: "a"
+		if false {b: 1}
+		if false {c: 2}
+	} | {kind: "b", x: 1, y: 2}
+	d: kind: "a"
+	n: [if len(d) > 1 {d}]
+	if len(n) == 0 {
+		out: "empty"
+	}
+	@test(eq, {d: {kind: "a"}, n: [], out: "empty"})
+}
+
+nested: {
+	q: {
+		a: 0
+		for x in [1] {
+			if x == 1 {c: 2}
+		}
+		if false {d: 3}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) != 0 {
+		out: n
+	}
+	@test(eq, {
+		q: {a: 0, c: 2}
+		n: [{a: 0, c: 2}]
+		out: [{a: 0, c: 2}]
+	})
+}
+
+nestedGuard: {
+	q: {
+		a: 0
+		for x in [1] {
+			if true {c: 2}
+		}
+	}
+	if len(q) > 1 {
+		out: q
+	}
+	@test(eq, {q: {a: 0, c: 2}, out: {a: 0, c: 2}})
+}
+
+deepNested: {
+	q: {
+		a: 0
+		for x in [1] {
+			for y in [1] {
+				if x == y {c: 2}
+			}
+		}
+		if false {d: 3}
+	}
+	n: [if len(q) > 1 {q}]
+	if len(n) != 0 {
+		out: n
+	}
+	@test(eq, {
+		q: {a: 0, c: 2}
+		n: [{a: 0, c: 2}]
+		out: [{a: 0, c: 2}]
+	})
+}
+
+deepNestedGuard: {
+	q: {
+		a: 0
+		if true {
+			if true {
+				if true {c: 2}
+			}
+		}
+	}
+	if len(q) > 1 {
+		out: q
+	}
+	@test(eq, {q: {a: 0, c: 2}, out: {a: 0, c: 2}})
+}
+-- out/eval/stats --
+Leaks:  39
+Freed:  60
+Reused: 45
+Allocs: 54
+Retain: 0
+
+Unifications: 95
+Conjuncts:    78
+Disjuncts:    2
+
+NumCloseIDs: 2

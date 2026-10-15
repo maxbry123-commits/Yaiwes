@@ -1,0 +1,5504 @@
+// Copyright 2026 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pretty
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/errors"
+	"cuelang.org/go/cue/literal"
+	"cuelang.org/go/cue/token"
+	"cuelang.org/go/internal"
+)
+
+// File overview
+//
+// Here we translate CUE AST nodes into the [doc] algebra defined in
+// doc.go. The translation entry point is [converter.node]; we recurse
+// through the AST and produce a [doc] that render.go renders to bytes.
+//
+// # Two layout strategies
+//
+// CUE ASTs may or may not carry layout hints. The parser sets
+// [token.Pos] RelPos values (NoSpace / Blank / Newline / NewSection /
+// Elided) to encode the user's authored layout. Programmatic ASTs
+// (built by code, or parser output with RelPos stripped) may have no
+// RelPos values. We pick between two modes per-subtree:
+//
+//   - authored-mode: we respect the authored layout. We wrap the
+//     converted [doc] in a [docInfiniteWidth] scope (see "finite vs
+//     infinite width" in the package doc), so width-driven [docGroup]
+//     breaks are suppressed and only hard line breaks produce
+//     newlines.
+//
+//   - programmatic-mode: width-driven Wadler-Lindig. We wrap the
+//     converted [doc] in a [docFiniteWidth] subtree so that, when the
+//     subtree is itself nested inside a [docInfiniteWidth] scope, its
+//     inner [docGroup]s still pick flat-vs-broken against the real
+//     width budget rather than inheriting the outer unlimited budget.
+//
+// The mode only changes at "wrap-site" AST nodes: node types where we
+// call [converter.maybeGroup]. See [wrapEligibility] for the list.
+// [converter.analyse] sets the [isAuthored] flag on the smallest
+// wrap-site AST node that covers each RelPos cluster, so a RelPos hint
+// in an otherwise-programmatic AST does *not* tip the whole file into
+// authored-mode. A programmatic pocket nested inside a
+// [docInfiniteWidth] scope (a wrap-eligible subtree with no RelPos
+// descendants) gets width-driven layout via the [docFiniteWidth]
+// boundary.
+//
+// These modes are orthogonal to flat-mode vs broken-mode.
+//
+// # Tables
+//
+// We use [docTable] (defined in doc.go) for column-aligned layouts:
+// struct fields aligned by ":", chain arms aligned by trailing
+// comments, list elements by their value column, and so on. See the
+// package doc for [docTable] semantics and render.go for the
+// segmentation algorithm.
+//
+// # Terminology
+//
+// See the package doc (doc.go) for algebra-level terms (flat-mode /
+// broken-mode, hard / soft line breaks, finite / infinite width).
+// AST-specific terms used here:
+//
+//   - RelPos: a token.Pos's relative-position hint. Drives
+//     authored-mode layout decisions.
+//   - authored-mode / programmatic-mode: see above. "Programmatic"
+//     covers both code-built ASTs and parser output with RelPos
+//     stripped.
+//   - wrap-site: an AST node type where we call [converter.maybeGroup].
+//     Each wrap-site is a candidate for the [docInfiniteWidth] wrap;
+//     isAuthored selects which actually fire.
+//   - chain: a brace-less sequence of Fields where each value is a
+//     single-element StructLit (e.g. a: b: c: 1); or a sequence of
+//     BinaryExprs with the same operator (e.g. a | b | c). A chain
+//     "arm" is an operand within the chain.
+//   - simple field / complex field: an [ast.Field] is "simple" if
+//     [converter.simpleFieldChain] returns a non-nil chain for it -
+//     it's then eligible for table alignment as `key: value`. If not,
+//     it's "complex": multi-line values, doc comments on the value,
+//     values on their own lines, or a non-collapsible chain.
+//
+// # Limits of Scope
+//
+// In scope: rendering ASTs that the CUE parser can produce. We hold
+// the invariant "if t is an AST and b = format(t), then b ==
+// format(parse(b))". Programmatic ASTs that match this shape (no
+// RelPos hints, but otherwise parser-shaped) are also fully
+// supported.
+//
+// Out of scope: rendering AST shapes the parser cannot produce.
+// Consider an [ast.Field] with a Position=1 comment (between label and
+// colon): it has no source layout, since `//` runs to end of line and
+// the parser doesn't allow a newline between label and colon, so this
+// construction can only be built programmatically. We render such ASTs
+// with a best-effort placement that may not round-trip; preserving
+// such positional intent is not a goal.
+
+// nodeFlag bits record precomputed properties of AST nodes used by
+// the layout decision points (see [converter.analyse]).
+type nodeFlag uint8
+
+const (
+	// relPosInChildren marks a node which has at least one strict
+	// descendant (i.e. excluding the node itself) that carries any
+	// RelPos at all (NoSpace, Blank, Newline, NewSection, Elided).
+	relPosInChildren nodeFlag = 1 << iota
+	// newlineInChildren refines relPosInChildren: it is used to mark a
+	// node which has at least one strict descendant (i.e. excluding
+	// the node itself) that carries a Newline or NewSection RelPos.
+	newlineInChildren
+	// isAuthored marks a node which is itself eligible for wrapping,
+	// and carries any RelPos, or has a descendent that carries any
+	// RelPos. Further, there is no such node on the path between this
+	// node and the RelPos node that is eligible for wrapping. I.e. we
+	// set isAuthored on the eligible node nearest a RelPos-containing
+	// subtree, and not any higher - in contrast to relPosInChildren,
+	// which propagates up the tree to the very root once set.
+	isAuthored
+	// endsWithOwnLineComment marks a node whose rendered output ends
+	// with a `//` comment on its own line (Slash RelPos != Blank and
+	// cg.Line == false). We set it when the node has such a trailing
+	// comment attached directly, and propagate it up only through the
+	// rightmost-rendered child of non-bracketed nodes (Field,
+	// BinaryExpr, UnaryExpr, SelectorExpr, LetClause, EmbedDecl,
+	// PostfixExpr). Bracketed nodes (StructLit, ListLit, CallExpr,
+	// IndexExpr, SliceExpr, ParenExpr, ImportDecl) end with their
+	// closing bracket, so descendants don't propagate through them.
+	endsWithOwnLineComment
+	// endsWithLineComment marks a node whose rendered output ends with a
+	// `//` comment, whether or not that comment sits on the node's own
+	// line (cg.Line). CUE has only `//` line comments, which run to
+	// end-of-line, so such a tail swallows any same-line token emitted
+	// after the node. This is broader than endsWithOwnLineComment (which
+	// we restrict to own-line comments for the declaration-separator
+	// promotion in declSep); we use it to force a break before a
+	// comprehension body whose preceding clause ends with a trailing
+	// comment. Propagated up only through the rightmost-rendered child
+	// of non-bracketed nodes, mirroring endsWithOwnLineComment.
+	endsWithLineComment
+	// interiorPrefix marks the body of a comprehension, on which the
+	// parser attaches a same-line comment following the opening brace
+	// at PosPrefix. Unlike in other contexts (see
+	// [trailingPrefixComments]), such a comment is interior.
+	interiorPrefix
+	// afterCommentsLifted marks a node whose comments rendered after it
+	// were moved after a following operator by
+	// [converter.liftTailComments], so that
+	// [converter.withCommentsSlots] leaves them out.
+	afterCommentsLifted
+)
+
+// converter translates a CUE AST into the Doc algebra.
+type converter struct {
+	nodeFlags map[ast.Node]nodeFlag
+
+	// errs accumulates formatting errors encountered while converting
+	// the AST (e.g. an invalid identifier in expression position).
+	// [Config.Node] returns them to the caller. It is nil when no error
+	// occurred.
+	errs errors.Error
+
+	// subscript is the syntactic nesting depth inside index/slice
+	// subscripts. [converter.binaryExpr] reads it to compact operator
+	// spacing: a binary expression at the top of a value renders with
+	// normal spacing (`1 + 2`), but the same expression inside `[...]`
+	// renders compact (`1+2`). We bump it in indexExpr/sliceExpr around
+	// their contents and reset it to 0 at a struct/list (block)
+	// boundary, whose fields/elements start fresh at the top level. This
+	// is a layout property independent of RelPos, so it lives here
+	// rather than in the style pre-pass.
+	subscript int
+}
+
+// errf records a formatting error at pos.
+func (c *converter) errf(pos token.Pos, format string, args ...any) {
+	c.errs = errors.Append(c.errs, errors.Newf(pos, format, args...))
+}
+
+// node converts an AST node to a Doc.
+func (c *converter) node(n ast.Node) doc {
+	c.analyse(n)
+	switch n := n.(type) {
+	case *ast.File:
+		return cat(c.maybeGroup(n, c.file(n)), lineBreakHard)
+	case ast.Expr:
+		return c.expr(n)
+	case ast.Decl:
+		return c.decl(n)
+	default:
+		return nil
+	}
+}
+
+// analyse walks root to populate c.nodeFlags. We OR the
+// strict-descendants flags (newlineInChildren, relPosInChildren) onto
+// every ancestor up the current stack, short-circuiting at the first
+// ancestor that already carries every bit we're propagating, so total
+// work stays amortised O(N).
+//
+// We set isAuthored on the smallest wrap-eligible covering subtree for
+// each connected RelPos cluster: a wrap-eligible node that sees any
+// uncovered RelPos sets isAuthored on itself and suppresses
+// propagation to its parent.
+//
+// A wrap-eligible node only "covers" RelPos hints when its own
+// structural tokens are authored ([wrapEligibility] reports authored
+// == true). A wrap-eligible node whose structure was synthesised
+// programmatically (e.g. a StructLit with Lbrace.IsValid() == false,
+// or a File whose decls all lack RelPos hints) acts as a pass-through:
+// RelPos hints in its subtree bubble past it to the nearest
+// wrap-eligible ancestor with authored structure, and the synthesised
+// wrap stays under [finiteWidth].
+func (c *converter) analyse(root ast.Node) {
+	if root == nil {
+		return
+	}
+	nodeFlags := c.nodeFlags
+	if nodeFlags == nil {
+		nodeFlags = make(map[ast.Node]nodeFlag)
+		c.nodeFlags = nodeFlags
+	} else {
+		clear(nodeFlags)
+	}
+
+	type frame struct {
+		flags                        nodeFlag
+		hasRelPos                    bool
+		lastChildTrailingCommentLine bool
+		lastChildEndsLineComment     bool
+	}
+	var stack stack[frame]
+
+	ast.Walk(root,
+		func(n ast.Node) bool {
+			relPos := n.Pos().RelPos()
+			hasRelPos := relPos != 0
+
+			if hasRelPos {
+				ancestorsFlags := relPosInChildren
+				if relPos >= token.Newline {
+					ancestorsFlags |= newlineInChildren
+				}
+
+				for i := len(stack) - 1; i >= 0; i-- {
+					// Propagate the flags up the stack.
+					f := &stack[i]
+					if missing := ancestorsFlags &^ f.flags; missing == 0 {
+						// Once a frame already has the flags we want, we
+						// know all its ancestors do too, so there is
+						// nothing further to do.
+						break
+					}
+					f.flags |= ancestorsFlags
+				}
+			}
+
+			if x, ok := n.(*ast.Comprehension); ok && x.Value != nil {
+				nodeFlags[x.Value] |= interiorPrefix
+			}
+
+			stack.push(frame{hasRelPos: hasRelPos})
+			return true
+		},
+		func(n ast.Node) {
+			f := stack.pop()
+			var parent *frame
+			if len(stack) > 0 {
+				parent = &stack[len(stack)-1]
+			}
+
+			flags := f.flags
+			if f.hasRelPos {
+				if eligible, authored := wrapEligibility(n); eligible && authored {
+					flags |= isAuthored
+				} else if parent != nil {
+					parent.hasRelPos = true
+				}
+			}
+
+			slots := classifyComments(n)
+			trailingCommentLine := (f.lastChildTrailingCommentLine && !isBracketed(n)) || hasTrailingCommentLine(slots)
+			if trailingCommentLine {
+				flags |= endsWithOwnLineComment
+			}
+			if parent != nil {
+				parent.lastChildTrailingCommentLine = trailingCommentLine
+			}
+
+			endsLineComment := (f.lastChildEndsLineComment && !isBracketed(n)) ||
+				nodeEndsWithLineComment(n, slots) || liftsChildComment(n, nodeFlags)
+			if endsLineComment {
+				flags |= endsWithLineComment
+			}
+			if parent != nil {
+				parent.lastChildEndsLineComment = endsLineComment
+			}
+
+			if flags != 0 {
+				// only write if flags differs from the zero-value
+				nodeFlags[n] |= flags
+			}
+		})
+}
+
+// file renders a [ast.File].
+func (c *converter) file(f *ast.File) doc {
+	// We partition f.Decls into a header (longest prefix of Package /
+	// ImportDecl / CommentGroup decls) and a body (everything after).
+	// The CUE parser guarantees Package occupies decl 0 (if present)
+	// and every ImportDecl precedes every non-import non-comment decl.
+	// Header decls are not field-value pairs and never align in a
+	// table, so isolating them keeps declSlice's invariant simple: it
+	// only ever sees the body's mix of fields and field-adjacent decls.
+
+	preamble := f.Preamble()
+	header := c.fileHeader(preamble)
+	body := c.declSlice(f.Decls[len(preamble):])
+
+	var leading, trailing []*ast.CommentGroup
+	for _, cg := range ast.Comments(f) {
+		if cg.Position == PosDoc {
+			leading = append(leading, cg)
+		} else {
+			trailing = append(trailing, cg)
+		}
+	}
+
+	var firstDeclSep doc
+	if len(f.Decls) > 0 {
+		// Separator between the last leading comment and the body. We
+		// use LeadingRelPos so a NewSection on the first decl's own doc
+		// comment (the first visible token after the file-level leading
+		// comments) is honoured - otherwise a blank line between a
+		// file-level comment and the next decl's doc comment is
+		// silently dropped.
+		firstDeclSep = relBreakOr(LeadingRelPos(f.Decls[0]), lineBreakHard)
+	}
+
+	parts := make([]doc, 0, len(leading)*2+3+len(trailing)*2)
+	lastIdx := len(leading) - 1
+	for i, cg := range leading {
+		parts = append(parts, c.commentGroup(cg))
+		if i == lastIdx {
+			parts = append(parts, firstDeclSep)
+		} else {
+			parts = append(parts, relBreakOr(leading[i+1].Pos().RelPos(), lineBreakHard))
+		}
+	}
+	if header != nil {
+		parts = append(parts, header)
+		if body != nil {
+			// Separator between the header and the body. declSep keys
+			// off the first body decl's leading RelPos, so a blank line
+			// in the source stays a BlankLine, a Newline stays a
+			// HardLine, and programmatic source (NoSpace) gets a
+			// lineBreakComma.
+			parts = append(parts, c.declSep(f.Decls[len(preamble)], f.Decls[len(preamble)-1]))
+		}
+	}
+	if body != nil {
+		parts = append(parts, body)
+	}
+	for _, cg := range trailing {
+		parts = append(parts, c.commentSep(cg, c.commentGroup(cg)), switchMode(nil, lineBreakHard))
+	}
+	return cats(parts...)
+}
+
+// fileHeader renders the file's header decls (Package, ImportDecl,
+// CommentGroup, Attribute). We emit each decl as a standalone Doc with
+// relpos-driven separators between them; alignment never applies here
+// because header decls are not field-value pairs. Returns nil for
+// empty input.
+func (c *converter) fileHeader(decls []ast.Decl) doc {
+	if len(decls) == 0 {
+		return nil
+	}
+	docs := make([]doc, 0, 2*len(decls))
+	var prev ast.Decl
+	for _, decl := range decls {
+		var sep doc
+		if prev != nil {
+			sep = c.declSep(decl, prev)
+		}
+		doc := c.decl(decl)
+		if _, ok := decl.(*ast.CommentGroup); !ok {
+			doc = c.withComments(decl, doc)
+		}
+		docs = append(docs, sep, doc)
+		prev = decl
+	}
+	return cats(docs...)
+}
+
+// declSlice joins a slice of Decls with RelPos-driven separators.
+func (c *converter) declSlice(decls []ast.Decl) doc {
+	if len(decls) == 0 {
+		return nil
+	}
+
+	docs := make([]doc, 0, len(decls))
+	tableRows := make([]row, 0, len(decls))
+	hasAligned := false // true if tableRows contains at least one aligned row
+	curChainLen := 0    // chain length of the most recent aligned row (0 if none)
+
+	// Mixed-layout uniformity: if any inter-decl separator is a hard
+	// break (Newline / NewSection RelPos), we lay every decl out on its
+	// own line. We promote comma-separated runs to HardLine so the
+	// struct doesn't render with some fields on their own line and
+	// others packed onto a shared line - that mix produces awkward
+	// table alignment (column-padded keys followed by `, key:` on the
+	// same row).
+	multiLine := multilineDecls(decls)
+
+	flushTable := func() {
+		if len(tableRows) == 0 {
+			return
+		}
+
+		if hasAligned {
+			docs = append(docs, tableRows[0].sep, table(tableRows))
+		} else {
+			// No aligned rows - just emit raw rows directly.
+			for _, row := range tableRows {
+				docs = append(docs, row.sep, row.raw)
+			}
+		}
+		tableRows = tableRows[len(tableRows):]
+		hasAligned = false
+		curChainLen = 0
+	}
+
+	var prev ast.Decl
+	for _, decl := range decls {
+		var sep doc
+		if prev != nil {
+			sep = c.declSep(decl, prev)
+			if multiLine && sep == lineBreakOrComma {
+				sep = lineBreakHard
+			}
+		}
+		prev = decl
+
+		if _, ok := decl.(*ast.CommentGroup); ok {
+			flushTable()
+			docs = append(docs, sep, c.decl(decl))
+			continue
+		}
+
+		// A blank line separator breaks the table - we don't align
+		// across visual section boundaries.
+		if sep == blankLine {
+			flushTable()
+		}
+
+		f, isField := decl.(*ast.Field)
+		var chain []*ast.Field
+		if isField {
+			chain = c.simpleFieldChain(f)
+		}
+		if chain != nil {
+			chainLen := len(chain)
+			rows, postComments := c.fieldRow(chain)
+			row0 := &rows[0]
+			row0.sep = sep
+			// A doc comment visually separates fields, so we flush the
+			// table to prevent alignment across the comment.
+			if row0.docComment != nil && len(tableRows) > 0 {
+				flushTable()
+			}
+			// A change in the composite-key chain length (e.g. from
+			// `a: b: 1` to `c: d: e: 2`) gives the first column a
+			// different shape, so values would no longer line up
+			// meaningfully. We flush the table to start a fresh
+			// alignment group.
+			if curChainLen != 0 && curChainLen != chainLen {
+				flushTable()
+			}
+			tableRows = append(tableRows, rows...)
+			hasAligned = true
+			curChainLen = chainLen
+			// Post-field block comments were attached to the field by
+			// the parser but are visually separate from its row. We emit
+			// them as sibling blocks after flushing the table so they
+			// keep their original position instead of being folded into
+			// the row's value cell.
+			if len(postComments) > 0 {
+				flushTable()
+				for _, cg := range postComments {
+					docs = append(docs,
+						relBreakOr(cg.Pos().RelPos(), lineBreakHard),
+						c.commentGroup(cg))
+				}
+			}
+			continue
+		}
+
+		// Anything that isn't a simple field-value row breaks
+		// alignment: complex fields (multi-line value, doc comment on
+		// value, value on its own line, non-collapsible chain) and
+		// every non-field, non-CommentGroup decl (LetClause, EmbedDecl,
+		// Comprehension, Alias, Attribute, Ellipsis, BadDecl). We flush
+		// the table and emit the decl standalone. Centralising this rule
+		// here keeps table-flush concerns in one place rather than split
+		// between construction-time decisions and render-time
+		// segmentation.
+		//
+		// Package and ImportDecl never reach this loop: file()
+		// partitions them off into the header before declSlice runs,
+		// and a struct literal cannot contain either of them
+		// syntactically.
+		flushTable()
+		doc := c.decl(decl)
+		// field() (via decl()) handles all of the field's comments
+		// internally, so we don't double-wrap with withComments.
+		if !isField {
+			doc = c.withComments(decl, doc)
+		}
+		docs = append(docs, sep, doc)
+	}
+	flushTable()
+
+	return cats(docs...)
+}
+
+// simpleFieldChain returns the field chain (x: y: z: val -> [x,y,z])
+// when f is eligible for table alignment, or nil otherwise. A chain
+// is eligible when it is a braceless single-element StructLit chain
+// whose leaf value:
+//
+//   - exists and has no doc comment,
+//   - has no Newline/NewSection RelPos, and
+//   - has no Position=2 comment.
+//
+// A StructLit or ListLit value still qualifies: whether it renders
+// without newlines is decided at render time by the table's row
+// partitioning.
+func (c *converter) simpleFieldChain(f *ast.Field) []*ast.Field {
+	// A non-collapsible chain renders its collapsible prefix as keys,
+	// and the rest as the braced value of the prefix's last field. So
+	// for alignment purposes it is that prefix, whose leaf value is
+	// that struct; a single-line struct value still aligns in the
+	// table, and a multi-line one breaks the segment via the leaf
+	// checks / table machinery below.
+	chain := unchainField(f)
+	leaf := chain[len(chain)-1]
+	if leaf.Value == nil ||
+		leaf.Value.Pos().IsNewline() ||
+		HasDocComment(leaf.Value) ||
+		hasCommentAt(leaf, PosSuffix) {
+		return nil
+	}
+	return chain
+}
+
+// unchainField walks a braceless field chain (x: y: z: val is a
+// chain of three Fields) and returns the longest prefix of Fields,
+// from the head, which can be safely rendered as a single composite
+// key. The rest of the chain is the value of the prefix's last Field.
+// The whole chain qualifies, up to its leaf, only when:
+//   - every intermediate StructLit and every Field after the head is
+//     comment-free, and
+//   - no Field after the head carries Newline/NewSection RelPos, and
+//   - the head has no Position=1/2 comments, and
+//   - no non-leaf Field carries attributes.
+func unchainField(f *ast.Field) []*ast.Field {
+	chain := []*ast.Field{f}
+	cur := f
+	for {
+		sl, ok := cur.Value.(*ast.StructLit)
+		if !ok || braced(sl) || len(sl.Elts) != 1 || len(ast.Comments(sl)) > 0 {
+			break
+		}
+		inner, ok := sl.Elts[0].(*ast.Field)
+		if !ok {
+			break
+		}
+		chain = append(chain, inner)
+		cur = inner
+	}
+	if hasCommentAt(f, PosPrefix) || hasCommentAt(f, PosSuffix) {
+		return chain[:1]
+	}
+	lastIdx := len(chain) - 1
+	for i, cf := range chain {
+		if i > 0 && (len(fieldComments(cf)) > 0 || cf.Pos().IsNewline()) {
+			return chain[:i]
+		}
+		if i < lastIdx && len(cf.Attrs) > 0 {
+			return chain[:i+1]
+		}
+	}
+	return chain
+}
+
+// declSep computes the separator before a declaration based on its
+// leading RelPos. Newline produces a HardLine, NewSection a
+// BlankLine; lower RelPos values fall back to [lineBreakOrComma] since
+// declarations need at least a comma or newline between them.
+//
+// Two upgrades fire on top of the authored RelPos.
+//
+// First, if prev's rendered output ends with an own-line `//` comment,
+// we promote the separator to NewSection when prev is a Definition
+// (#Foo) or any non-field, non-comment decl. Inside an [infiniteWidth]
+// wrap a lineBreakComma would otherwise be rewritten to stringLit(", ")
+// and the `//` would absorb the next decl. Promoting also keeps the
+// parse/format cycle idempotent when the comment migrates from prev's
+// trailing slot into the next decl's doc on reparse.
+//
+// Second, if prev's rendered output ends with any `//` comment - own
+// line or same line - we force the separator to at least Newline,
+// since a CUE line comment runs to end-of-line and would otherwise
+// swallow an inline (`, `) separator and the following decl.
+func (c *converter) declSep(d ast.Decl, prev ast.Decl) doc {
+	rel := LeadingRelPos(d)
+
+	if prev == nil {
+		return relBreakOr(rel, lineBreakOrComma)
+	}
+
+	const ownLineMask = relPosInChildren | endsWithOwnLineComment
+	prevOwnLineComment := c.nodeFlags[prev]&ownLineMask == ownLineMask
+
+	if rel < token.NewSection && prevOwnLineComment {
+		switch prev := prev.(type) {
+		case *ast.Field:
+			if internal.IsDefinition(prev.Label) {
+				rel = token.NewSection
+			}
+		case *ast.CommentGroup: // noop
+		default:
+			rel = token.NewSection
+		}
+	}
+
+	if rel < token.Newline && c.nodeFlags[prev]&endsWithLineComment != 0 {
+		rel = token.Newline
+	}
+
+	return relBreakOr(rel, lineBreakOrComma)
+}
+
+// authored reports whether n's subtree carries any RelPos - that is,
+// whether the subtree came from the parser (or had RelPos info added
+// programmatically) rather than being built RelPos-free. The
+// [infiniteWidth] wrap is driven by the [isAuthored] flag, not this
+// function - see [converter.maybeGroup].
+func (c *converter) authored(n ast.Node) bool {
+	return c.nodeFlags[n]&relPosInChildren != 0
+}
+
+// shouldHug reports whether a bracketed construct with a single
+// child should wrap its open/close tokens directly around the
+// child's Doc, bypassing the usual [docGroup]+[docNest] layout. The hug
+// defeats the cascade that would otherwise double-indent a child
+// that is already rendering with forced breaks: produces
+// "{a: {...}}" rather than "{\n    a: {...}\n}". It applies when:
+//   - the child has no explicit Newline on its own Pos;
+//   - some Newline/NewSection RelPos exists in the child's subtree,
+//     so the child will render with forced breaks anyway;
+//   - the child has no comments attached to itself: a doc comment
+//     would land right after the parent's opener (no space), and a
+//     trailing line comment would swallow the parent's closer.
+//     Comments deep in descendants are safe as long as they live
+//     inside their own brackets, never reaching the outer parent's
+//     boundary, which [endsWithLineComment] tells.
+func (c *converter) shouldHug(child ast.Node) bool {
+	return child != nil &&
+		!child.Pos().IsNewline() &&
+		len(ast.Comments(child)) == 0 &&
+		c.nodeFlags[child]&endsWithLineComment == 0 &&
+		c.hasNewlineInSubtree(child)
+}
+
+// hasNewlineInSubtree reports whether any node in the subtree rooted
+// at n carries a Newline or NewSection RelPos. Returns false for nil n.
+func (c *converter) hasNewlineInSubtree(n ast.Node) bool {
+	if n == nil {
+		return false
+	}
+	// NB: because this is the only use of newlineInChildren, it's
+	// tempting to change [converter.analyse] so that it sets this flag
+	// on the current node rather than just ancestors (we could then drop
+	// the || here). But that costs us: it grows the nodeFlags map and
+	// forces a map lookup every time. Testing n.Pos().IsNewline() here
+	// is measurably faster.
+	return n.Pos().IsNewline() || c.nodeFlags[n]&newlineInChildren != 0
+}
+
+// renderCommentChain renders cgs joined by per-rel breaks: HardLine
+// by default, upgraded to BlankLine when the next group's RelPos is
+// NewSection, so we preserve blank lines the user wrote between comment
+// groups. We append no trailing separator. Returns nil for an empty
+// input.
+func (c *converter) renderCommentChain(cgs []*ast.CommentGroup) doc {
+	if len(cgs) == 0 {
+		return nil
+	}
+	parts := make([]doc, 0, 2*len(cgs)-1)
+	for i, cg := range cgs {
+		if i > 0 {
+			parts = append(parts, relBreakOr(cg.Pos().RelPos(), lineBreakHard))
+		}
+		parts = append(parts, c.commentGroup(cg))
+	}
+	return cats(parts...)
+}
+
+// docCommentBlock renders a sequence of Position=0 comment groups
+// followed by a trailing separator chosen from trailingRel: HardLine
+// by default; BlankLine when trailingRel is NewSection. The host
+// node's RelPos drives trailingRel so a Position=0 leading comment
+// separated from its host by a blank line keeps that blank line on the
+// right side.
+//
+// A true doc comment ([ast.CommentGroup.Doc] is true on the last group
+// in cgs) is tight to its host, so we clamp trailingRel at Newline: a
+// NewSection there would wrongly insert a blank line between the doc
+// comment and the host it documents.
+//
+// Returns nil for an empty input.
+func (c *converter) docCommentBlock(cgs []*ast.CommentGroup, trailingRel token.RelPos) doc {
+	chain := c.renderCommentChain(cgs)
+	if chain == nil {
+		return nil
+	}
+	if len(cgs) > 0 && cgs[len(cgs)-1].Doc && trailingRel > token.Newline {
+		trailingRel = token.Newline
+	}
+	return cat(chain, relBreakOr(trailingRel, lineBreakHard))
+}
+
+// The CUE parser numbers comment positions by token index. For a
+// bracketed node `<0> open <1> body <2> close <3>`:
+//   - Position 0   -> doc (before the node)
+//   - Position 1   -> prefix (inside, just after the opener)
+//   - Position 2   -> suffix (inside, just before the closer)
+//   - Position >=3 -> trailing (after the node)
+//
+// CommentGroup.Line distinguishes layout flavour, not syntax: it is
+// true when the comment ends the line that the previous token starts
+// on (e.g. `{ // c` followed by a newline) and false when the comment
+// stands on its own line. Line does NOT change which slot the comment
+// belongs in: a `// c` written immediately after `{` is still at
+// Position 1 and is interior to the braces.
+//
+// The constants (and the comment helpers [FirstCommentAt],
+// [HasDocComment], and [LeadingRelPos]) are exported for packages
+// whose AST rewrites or construction must classify comments and
+// leading positions exactly as this converter does.
+const (
+	PosDoc         int8 = 0 // before the node's first token
+	PosPrefix      int8 = 1 // inside, just after the opener
+	PosSuffix      int8 = 2 // inside, just before the closer
+	PosTrailingMin int8 = 3 // first position counted as trailing
+
+	// posImportBeforeRparen is where the parser files a comment group
+	// sitting between an import declaration's last spec and its
+	// closing parenthesis; the slot index does not scale with the
+	// number of specs.
+	posImportBeforeRparen int8 = 3
+
+	// PosImportAfterRparen is where the parser files a comment group
+	// that trails a parenthesised import declaration's closing
+	// parenthesis. Constructed ASTs use the same slot: at or above
+	// [PosTrailingMin], and distinct from [posImportBeforeRparen],
+	// whose non-Line groups render inside the parentheses.
+	PosImportAfterRparen int8 = 5
+
+	// posIndexAfterLbrack and posIndexBeforeRbrack are where the parser
+	// files a comment group inside an index expression's brackets: after
+	// the opening one, and before the closing one, respectively.
+	// [converter.indexExpr] renders both in place.
+	posIndexAfterLbrack  int8 = 2
+	posIndexBeforeRbrack int8 = 4
+)
+
+type commentSlots struct {
+	doc      []*ast.CommentGroup // Position==PosDoc
+	prefix   []*ast.CommentGroup // Position==PosPrefix
+	suffix   []*ast.CommentGroup // Position==PosSuffix
+	trailing []*ast.CommentGroup // Position>=PosTrailingMin
+}
+
+// any reports whether s has at least one comment in any slot.
+func (s commentSlots) any() bool {
+	return len(s.doc)+len(s.prefix)+len(s.suffix)+len(s.trailing) > 0
+}
+
+// hasInterior reports whether s carries any prefix (Position=1) or
+// suffix (Position=2) comments - those that live inside a bracketed
+// node's `{...}` / `[...]` / `(...)` area.
+func (s commentSlots) hasInterior() bool {
+	return len(s.prefix)+len(s.suffix) > 0
+}
+
+// all returns the comments from every slot in slot order (doc,
+// prefix, suffix, trailing).
+func (s commentSlots) all() []*ast.CommentGroup {
+	out := make([]*ast.CommentGroup, 0, len(s.doc)+len(s.prefix)+len(s.suffix)+len(s.trailing))
+	out = append(out, s.doc...)
+	out = append(out, s.prefix...)
+	out = append(out, s.suffix...)
+	out = append(out, s.trailing...)
+	return out
+}
+
+// nonDoc returns the prefix, suffix, and trailing comments in that order:
+// every comment but the doc comments.
+func (s commentSlots) nonDoc() []*ast.CommentGroup {
+	out := make([]*ast.CommentGroup, 0, len(s.prefix)+len(s.suffix)+len(s.trailing))
+	out = append(out, s.prefix...)
+	out = append(out, s.suffix...)
+	out = append(out, s.trailing...)
+	return out
+}
+
+// wrapInteriorComments places prefix comments before inner, and
+// suffix comments after inner, each on its own line. We separate
+// consecutive comments within a block by HardLine (upgraded to
+// BlankLine when the next group's RelPos is NewSection, preserving
+// authored blank lines), and bridge between the comment block(s) and
+// the inner body with a HardLine. When inner is nil we emit only the
+// comments, joined by a HardLine between the prefix and suffix blocks
+// if both are present.
+func (c *converter) wrapInteriorComments(inner doc, prefix, suffix []*ast.CommentGroup) doc {
+	if len(prefix) == 0 && len(suffix) == 0 {
+		return inner
+	}
+	parts := make([]doc, 0, 5)
+	if len(prefix) > 0 {
+		parts = append(parts, c.renderCommentChain(prefix))
+	}
+	switch {
+	case inner != nil:
+		if len(prefix) > 0 {
+			parts = append(parts, lineBreakHard)
+		}
+		parts = append(parts, inner)
+		if len(suffix) > 0 {
+			parts = append(parts, lineBreakHard)
+		}
+	case len(prefix) > 0 && len(suffix) > 0:
+		// inner is nil but both blocks exist - join them.
+		parts = append(parts, lineBreakHard)
+	}
+	if len(suffix) > 0 {
+		parts = append(parts, c.renderCommentChain(suffix))
+	}
+	return cats(parts...)
+}
+
+// withComments wraps a Doc with its node's attached comments. The
+// separator between the last doc comment and the body honours the
+// node's RelPos (NewSection -> blank line).
+func (c *converter) withComments(n ast.Node, body doc) doc {
+	return c.withCommentsSlots(n, body, classifyComments(n))
+}
+
+// withCommentsSlots is like [converter.withComments] but lets the
+// caller supply pre-computed (and possibly filtered) slots.
+func (c *converter) withCommentsSlots(n ast.Node, body doc, slots commentSlots) doc {
+	if x, ok := n.(*ast.ImportDecl); ok {
+		// [converter.importDecl] renders the paren-interior slots;
+		// doc and trailing are left for the generic rendering here.
+		p := partitionImportComments(x)
+		slots = commentSlots{doc: p.doc, trailing: p.trailing}
+	}
+	if !slots.any() {
+		return body
+	}
+	// Non-bracketed nodes don't have a natural "inside the brackets"
+	// area, so prefix/suffix slots are treated as trailing content.
+	// Ordering: prefix first (nearest the opening), then suffix
+	// (nearest the closing), then trailing (after the whole node).
+	//
+	// Bracketed nodes (StructLit/ListLit) - those whose exprCore
+	// already places interior comments inside the body - skip the
+	// prefix/suffix slots here so the same comments aren't rendered
+	// both inside and outside the brackets.
+	var trailing []*ast.CommentGroup
+	if flags := c.nodeFlags[n]; flags&afterCommentsLifted == 0 {
+		skipInterior := nodeManagesInteriorComments(n)
+		trailing = make([]*ast.CommentGroup, 0,
+			len(slots.prefix)+len(slots.suffix)+len(slots.trailing))
+		if !skipInterior {
+			trailing = append(trailing, slots.prefix...)
+			trailing = append(trailing, slots.suffix...)
+		} else {
+			// Interior-managing nodes render prefix/suffix comments inside the
+			// node, except a prefix comment that is really trailing; emit that
+			// one here with the trailing comments. See [trailingPrefixComments].
+			if flags&interiorPrefix == 0 {
+				trailing = append(trailing, trailingPrefixComments(n)...)
+			}
+		}
+		trailing = append(trailing, slots.trailing...)
+	}
+
+	var after []doc
+	if len(trailing) > 0 {
+		after = make([]doc, 0, len(trailing)+1)
+		// Trailing // comment: place it, then force the enclosing group
+		// to break so the comment doesn't swallow closing
+		// brackets/braces in flat-mode.
+		for _, cg := range trailing {
+			cgDoc := c.commentGroup(cg)
+			sep := c.commentSep(cg, cgDoc)
+			after = append(after, sep)
+		}
+		// switchMode(nil, lineBreakHard) is invisible in broken-mode and
+		// prevents flat rendering.
+		after = append(after, switchMode(nil, lineBreakHard))
+	}
+
+	parts := make([]doc, 0, 2+len(after))
+	if doc := c.docCommentBlock(slots.doc, n.Pos().RelPos()); doc != nil {
+		parts = append(parts, doc)
+	}
+	parts = append(parts, body)
+	parts = append(parts, after...)
+	return cats(parts...)
+}
+
+// commentGroup converts a CommentGroup to a Doc.
+func (c *converter) commentGroup(cg *ast.CommentGroup) doc {
+	if len(cg.List) == 0 {
+		return nil
+	}
+	docs := make([]doc, 0, len(cg.List)*2-1)
+	for i, comment := range cg.List {
+		if i > 0 {
+			docs = append(docs, lineBreakHard)
+		}
+		docs = append(docs, stringLit(comment.Text))
+	}
+	return cats(docs...)
+}
+
+// commentSep returns a Doc that wraps comment cd with the appropriate
+// separation based on its leading RelPos.
+//
+// cg.Line=true means the comment sits on the same line as the
+// preceding token; the Slash RelPos there is only meaningful as
+// intra-line spacing. The Line=true case is normalised to Blank so
+// these comments flow through the same "same-line trailing" path
+// uniformly.
+//
+// Mapping (for cg.Line=false):
+//   - rel == Blank: same-line trailing - emit " // ...".
+//   - rel == Newline: own line, single break.
+//   - rel == NewSection: own line, blank line before.
+//   - any other rel (NoRelPos, NoSpace, Elided): fall back to a blank
+//     line. The comment must not be inlined - CUE's `//` runs to
+//     end-of-line, so squashing onto a shared line would absorb
+//     subsequent tokens.
+func (c *converter) commentSep(cg *ast.CommentGroup, cd doc) doc {
+	rel := cg.Pos().RelPos()
+	if cg.Line {
+		rel = token.Blank
+	}
+	var sep doc
+	switch rel {
+	case token.Blank:
+		sep = spaceLit
+	case token.Newline:
+		sep = lineBreakHard
+	default:
+		// NoRelPos, NoSpace, Elided, NewSection: blank line.
+		sep = blankLine
+	}
+	return cat(sep, cd)
+}
+
+// maybeGroup wraps body in the layout primitive selected for n's
+// subtree: [infiniteWidth] when [isAuthored] is set on n (so only hard
+// line breaks survive and width-driven newlines are suppressed),
+// otherwise [finiteWidth] for width-driven Wadler-Lindig layout. See
+// those functions for the underlying mechanisms.
+//
+// Panics if n is not one of the wrap-eligible types reported by
+// [wrapEligibility].
+func (c *converter) maybeGroup(n ast.Node, body doc) doc {
+	// Integrity check: every maybeGroup call site must operate on a
+	// type listed in wrapEligibility. The isAuthored analyse pass
+	// only flags eligible types, so a call on a non-eligible type
+	// would silently never enter the infiniteWidth branch even when
+	// the subtree carries RelPos. Panic loudly so the drift is caught
+	// immediately.
+	if eligible, _ := wrapEligibility(n); !eligible {
+		panic(fmt.Sprintf("pretty: maybeGroup called on non-wrap-eligible type %T", n))
+	}
+	if c.nodeFlags[n]&isAuthored != 0 {
+		return infiniteWidth(body)
+	}
+	return finiteWidth(body)
+}
+
+// expr converts an expression node to a Doc, including any comments.
+func (c *converter) expr(x ast.Expr) doc {
+	if x == nil {
+		return nil
+	}
+	return c.withComments(x, c.exprCore(x))
+}
+
+// exprCore converts an expression without handling comments on it.
+func (c *converter) exprCore(x ast.Expr) doc {
+	if x == nil {
+		return nil
+	}
+	switch x := x.(type) {
+	case *ast.Ident:
+		// An identifier in expression position must be a valid
+		// identifier; unlike a label (see [converter.label]) it cannot
+		// be quoted into a string. Record an error and emit the name as
+		// a best-effort rendering.
+		if !ast.IsValidIdent(x.Name) {
+			c.errf(x.Pos(), "invalid identifier %q", x.Name)
+		}
+		return stringLit(x.Name)
+
+	case *ast.BasicLit:
+		return c.basicLit(x)
+
+	case *ast.BottomLit:
+		return bottomLit
+
+	case *ast.BadExpr:
+		// A bad node has no valid syntax; render it as bottom (`_|_`),
+		// which is valid CUE.
+		return bottomLit
+
+	case *ast.StructLit:
+		return c.structLit(x)
+
+	case *ast.ListLit:
+		return c.listLit(x)
+
+	case *ast.Ellipsis:
+		return c.ellipsis(x)
+
+	case *ast.Comprehension:
+		return c.comprehension(x)
+
+	case *ast.UnaryExpr:
+		return c.unaryExpr(x)
+
+	case *ast.BinaryExpr:
+		return c.binaryExpr(x)
+
+	case *ast.PostfixExpr:
+		return c.postfixExpr(x)
+
+	case *ast.SelectorExpr:
+		return c.selectorExpr(x)
+
+	case *ast.IndexExpr:
+		return c.indexExpr(x)
+
+	case *ast.SliceExpr:
+		return c.sliceExpr(x)
+
+	case *ast.CallExpr:
+		return c.callExpr(x)
+
+	case *ast.ParenExpr:
+		return c.parenExpr(x)
+
+	case *ast.Interpolation:
+		return c.interpolation(x)
+
+	case *ast.Func:
+		return c.funcExpr(x)
+
+	case *ast.Alias:
+		// In expression position (including inside pattern labels
+		// like [x=string]) aliases use tight "=" without surrounding
+		// spaces. Decl-position aliases are rendered by decl() with
+		// " = " instead.
+		return c.aliasExpr(x.Ident.Name, x.Expr)
+
+	default:
+		return stringLit("/* unknown expr */")
+	}
+}
+
+// label converts a Label node to a Doc.
+func (c *converter) label(l ast.Label) doc {
+	switch x := l.(type) {
+	case *ast.Ident:
+		// Escape an identifier label with invalid characters (e.g. an
+		// empty name) as a quoted string label. This only arises in
+		// programmatic ASTs; the parser never produces an invalid ident
+		// label.
+		if !ast.IsValidIdent(x.Name) {
+			return stringLit(literal.Label.Quote(x.Name))
+		}
+		return stringLit(x.Name)
+	case *ast.BasicLit:
+		// A label rendered as a multi-line `"""..."""` or raw `#"..."#`
+		// string is collapsed to its single-line escaped form. A label
+		// must fit on one line (it has to share a line with at least
+		// the colon, and chain labels share with one another), so the
+		// multi-line representation is unusable here. Other BasicLit
+		// labels - kept-single-line strings, numbers, etc. - go through
+		// basicLit unchanged.
+		if x.Kind == token.STRING && (strings.HasPrefix(x.Value, `"""`) || strings.HasPrefix(x.Value, "#")) {
+			if u, err := literal.Unquote(x.Value); err == nil {
+				return stringLit(literal.Label.Quote(u))
+			}
+		}
+		return c.basicLit(x)
+	case *ast.Interpolation:
+		return c.interpolation(x)
+	case *ast.ListLit:
+		if len(x.Elts) == 1 {
+			elt := x.Elts[0]
+			// A `//` comment ending the element would swallow the `]`.
+			closer := rBracketLit
+			if c.nodeFlags[elt]&endsWithLineComment != 0 {
+				closer = cat(lineBreakHard, rBracketLit)
+			}
+			return cats(listOpener(x), c.exprAfter(nil, nil, elt), closer)
+		}
+		return c.listLit(x)
+	case *ast.ParenExpr:
+		return c.parenExpr(x)
+	case *ast.Alias:
+		return c.aliasExpr(x.Ident.Name, x.Expr)
+	default:
+		return c.expr(l.(ast.Expr))
+	}
+}
+
+// aliasExpr renders an expression-position alias as used in pattern
+// labels (`[x=string]`) and value-position aliases. The `=` hugs both
+// sides with no surrounding spaces, except where omitting the space
+// would merge it with expr's leading token into a longer
+// operator. Decl-position aliases are rendered by decl() with ` = `
+// instead.
+func (c *converter) aliasExpr(ident string, expr ast.Expr) doc {
+	bind := equalsLit
+	if aliasEqualsMergesWithExpr(expr) {
+		bind = cat(equalsLit, spaceLit)
+	}
+	return cats(stringLit(ident), bind, c.expr(expr))
+}
+
+// basicLit converts a BasicLit to a Doc.
+func (c *converter) basicLit(x *ast.BasicLit) doc {
+	value := normaliseNumericLit(x.Kind, x.Value)
+
+	// A multi-line string/bytes literal carries its body indentation
+	// in the literal text itself (the whitespace before the closing
+	// quote, repeated on each body line). That embedded indent
+	// reflects whatever the source or producer happened to use -
+	// parsed source preserves the author's columns, while a producer
+	// such as the YAML decoder or [internal/core/export] embeds a
+	// fixed guess from its own nesting that need not match the
+	// literal's eventual render position. Rather than trust it, we
+	// always re-indent the body to the actual render depth. This is
+	// idempotent for correctly-indented source: re-indenting to the
+	// level it already sits at is a no-op.
+	if x.Kind == token.STRING && strings.IndexByte(value, '\n') >= 0 {
+		if d := reindentMultilineString(value); d != nil {
+			return d
+		}
+	}
+
+	lines := strings.Split(value, "\n")
+	parts := make([]doc, 0, len(lines)*2-1)
+	// We have to intersperse lineBreakBare directly here. Using
+	// sep(lineBreakBare, parts) wouldn't work because some parts could
+	// be nil (stringLit("") gives nil) and sep skips over nil parts.
+	for i, line := range lines {
+		if i > 0 {
+			parts = append(parts, lineBreakBare)
+		}
+		parts = append(parts, stringLit(line))
+	}
+	return cats(parts...)
+}
+
+// normaliseNumericLit rewrites Go-style numeric literals that the
+// CUE parser would reject (e.g. `0755` for octal, a trailing dot like
+// `5.`, or uppercase `E` for the exponent that may collide with
+// future use of `E` as a SI exa multiplier) into valid CUE.
+func normaliseNumericLit(kind token.Token, data string) string {
+	switch kind {
+	case token.INT:
+		if len(data) > 1 && data[0] == '0' && data[1] >= '0' && data[1] <= '9' {
+			data = "0o" + data[1:]
+			break
+		}
+		fallthrough
+	case token.FLOAT:
+		switch p := strings.IndexByte(data, '.'); {
+		case p < 0:
+		case p == 0:
+			data = "0" + data
+		case p == len(data)-1:
+			data += "0"
+		case data[p+1] < '0' || data[p+1] > '9':
+			// `.` immediately followed by a non-digit, i.e. an exponent
+			// (3.e100): insert a `0` so the fractional part is explicit
+			// (3.0e100).
+			data = data[:p+1] + "0" + data[p+1:]
+		}
+	}
+	// Lowercase a decimal exponent `E` to `e` for both INT and FLOAT
+	// literals: CUE reserves uppercase `E` as a potential Exa SI
+	// multiplier, so the formatter always writes the exponent
+	// lowercase. Guarded on a non-trailing `E` so a hex literal whose
+	// last digit is `E` (`0x1E`) is left alone.
+	if kind == token.INT || kind == token.FLOAT {
+		if p := strings.IndexByte(data, 'E'); p != -1 && p < len(data)-1 {
+			data = strings.ToLower(data)
+		}
+	}
+	return data
+}
+
+// bracketedLayout describes the shared decoration of struct / list /
+// call literal bodies - the `<openPrefix><open><inner><close>` shape
+// with hug, shareIndent, openBreak, closeBreak, and maybeGroup
+// rules. [converter.computeBracketedPolicy] derives a
+// [bracketedPolicy] from it and [converter.applyBracketed] assembles
+// the final Doc.
+type bracketedLayout struct {
+	node       ast.Node     // for maybeGroup + relPosInChildren lookup
+	openPrefix doc          // emitted before open (e.g. CallExpr's fun); nil otherwise
+	open       doc          // bracket open token (lBrace / lBracket / lParen)
+	close      doc          // bracket close token
+	openerRel  token.RelPos // RelPos of the opening token (used for openBreak when body is empty)
+	closerRel  token.RelPos // RelPos of the closing token
+
+	firstElem ast.Node // first element (nil if body is empty); EmbedDecl-unwrapped at the call site if needed
+	lastElem  ast.Node // last element (nil if body is empty)
+	numElems  int
+
+	hasInterior   bool // PosPrefix/PosSuffix interior comments on the bracket
+	anyDoc        bool // any element has a Position-0 doc comment (anyHasDocComment)
+	anyPost       bool // any element has a post-element comment (anyHasPostComment)
+	sameLineOpen  bool // hasSameLineOpener over the elements
+	noElemNewline bool // noElemHasNewline over the elements
+	lineHeader    bool // user wrote `{ // c\n...`
+
+	// forceOpenBreak opens the body broken whatever the first element's
+	// RelPos says: the first row starts with a comment the element does
+	// not own, as a parameter's doc comment hoisted from its constraint
+	// or default does (see [funcParamComments]), or the closer of a
+	// synthesized struct must break after a comment (see
+	// [converter.structLit]).
+	forceOpenBreak bool
+
+	// allowsTrailingComma reports whether the last element may carry
+	// a trailing comma before the closing bracket: true for calls,
+	// parameter lists, and lists other than comma-free ones; false
+	// for structs. Whether it does is decided by
+	// computeBracketedPolicy as policy.wantTrailingComma rather than
+	// at each callsite.
+	allowsTrailingComma bool
+
+	inner doc // body content; interior comments already prepended/appended for struct/list
+
+	// rows holds the rows of inner when it is a single table of
+	// elements, as for lists and calls, so that a shared indent can
+	// end partway through them; see [sharedIndentBody].
+	rows []row
+}
+
+// bracketedPolicy holds the layout decisions derived from a
+// bracketedLayout: whether the bracket pair hugs first/last, whether
+// it shares indent with an inner opener, the resolved open and close
+// breaks, and whether the last element should carry a trailing comma.
+type bracketedPolicy struct {
+	hugFirst          bool
+	hugLast           bool
+	shareIndent       bool
+	wantTrailingComma bool
+	openBreak         doc
+	closeBreak        doc
+
+	// useBodyShape selects the [docBodyShape]-driven layout: the body
+	// gets wrapped in [docBodyShape] which independently picks one of
+	// three shapes at render time. See [docBodyShape] for the
+	// examples. When set, the inner content produced by
+	// [applyBracketed] takes the docBodyShape branch and the policy's
+	// openBreak/closeBreak/hugFirst/hugLast fields are unused.
+	useBodyShape bool
+}
+
+// structLit converts a StructLit. Interior comments attached directly
+// to the StructLit (Position > 0, not a trailing // line) are rendered
+// inside the braces; doc and trailing comments on the StructLit itself
+// are wrapped around the result.
+func (c *converter) structLit(x *ast.StructLit) doc {
+	// A struct body is a block boundary: its fields start fresh at the
+	// top level, so the subscript depth resets (only relevant when
+	// this struct appears inside an index/slice subscript).
+	if c.subscript != 0 {
+		saved := c.subscript
+		c.subscript = 0
+		defer func() { c.subscript = saved }()
+	}
+	var firstElem, lastElem ast.Node
+	if len(x.Elts) > 0 {
+		firstElem = x.Elts[0]
+		lastElem = x.Elts[len(x.Elts)-1]
+	}
+	elems := x.Elts
+
+	// A no-Lbrace StructLit always renders with synthesised braces at
+	// this point: the chain form (`a: b: c: 1` written as a nested
+	// braceless StructLit chain) is handled one level out by
+	// [converter.fieldValDoc] and [converter.declSlice]'s
+	// [converter.simpleFieldChain] - never by structLit itself.
+	// Falling through to the braced rendering path is the only safe
+	// choice in any other context, since a braceless multi-element
+	// or non-Field body at expression position (CallExpr argument,
+	// BinaryExpr operand, ListLit element, ...) is not valid CUE.
+	// The braced path picks up NoRelPos from the invalid
+	// Lbrace/Rbrace via openerRel/closerRel, which translates to a
+	// soft break - exactly the behaviour we want for synthesised
+	// braces. [analyse] has already arranged for x's isAuthored flag
+	// to stay clear (see [wrapEligibility]), so [maybeGroup]
+	// will pick [finiteWidth] and the soft breaks emitted inside the
+	// body stay soft.
+
+	slots := classifyComments(x)
+	// Keep only genuinely interior prefix comments; a trailing one is
+	// rendered by the container, not inside the braces.
+	if len(slots.prefix) > 0 && c.nodeFlags[x]&interiorPrefix == 0 {
+		slots.prefix = nonTrailingPrefix(x, slots.prefix)
+	}
+	hasInterior := slots.hasInterior()
+
+	switch {
+	case len(elems) == 0 && !hasInterior:
+		return cats(structOpener(x), rBraceLit)
+	case len(elems) == 1 && !hasInterior && !nodeType[*ast.Field](elems[0]) && c.shouldHug(elems[0]):
+		// A struct hugs only when its single element renders the value
+		// directly after the brace - an embed (`{ {...} }`). A *Field*
+		// (`field: {...}`) would wedge the label between the braces
+		// (`{field: {`), so it falls through to the broken layout
+		// below.
+		return cats(structOpener(x), c.decl(elems[0]), rBraceLit)
+	}
+
+	inner := c.wrapInteriorComments(c.declSlice(elems), slots.prefix, slots.suffix)
+
+	// A comment ending the last element would swallow the closer. In a
+	// parsed struct the closer follows it on a new line, but not in a
+	// synthesized one, nor when the comment moved from inside the
+	// element. A closer without a position of its own also opens the
+	// body broken, as a synthesized struct has no layout to keep.
+	closerRel := x.Rbrace.RelPos()
+	forceOpenBreak := false
+	if lastElem != nil && closerRel < token.Newline && c.nodeFlags[lastElem]&endsWithLineComment != 0 {
+		forceOpenBreak = closerRel == token.NoRelPos
+		closerRel = token.Newline
+	}
+
+	layout := bracketedLayout{
+		node:           x,
+		open:           structOpener(x),
+		close:          rBraceLit,
+		openerRel:      x.Lbrace.RelPos(),
+		closerRel:      closerRel,
+		firstElem:      firstElem,
+		lastElem:       lastElem,
+		numElems:       len(elems),
+		hasInterior:    hasInterior,
+		anyDoc:         anyHasDocComment(elems),
+		anyPost:        anyHasPostComment(elems),
+		sameLineOpen:   hasSameLineOpener(c, elems, elems),
+		noElemNewline:  noElemHasNewline(elems),
+		lineHeader:     hasLineLeadingComment(slots, firstElem),
+		forceOpenBreak: forceOpenBreak,
+		inner:          inner,
+	}
+	return c.applyBracketed(layout, c.computeBracketedPolicy(layout))
+}
+
+// listLit converts a ListLit. As with structLit, interior comments
+// attached directly to the ListLit are rendered inside the brackets.
+func (c *converter) listLit(x *ast.ListLit) doc {
+	// A list body is a block boundary: its elements start fresh at the
+	// top level, so the subscript depth resets (only relevant when
+	// this list appears inside an index/slice subscript).
+	if c.subscript != 0 {
+		saved := c.subscript
+		c.subscript = 0
+		defer func() { c.subscript = saved }()
+	}
+	var firstElem, lastElem ast.Node
+	if len(x.Elts) > 0 {
+		firstElem = x.Elts[0]
+		lastElem = x.Elts[len(x.Elts)-1]
+	}
+	elems := x.Elts
+
+	// A ListLit without Lbrack only arises in programmatic ASTs: the
+	// parser always populates Lbrack for parsed list literals. Unlike
+	// braceless structs (which have a chain form), there is no
+	// bracketless list shape in CUE syntax, so the only safe choice
+	// is to synthesise brackets. We fall through to the bracketed
+	// path; openerRel/closerRel pick up NoRelPos from the invalid
+	// positions, which translates to a soft break - what we want for
+	// synthesised brackets. [analyse] keeps x's isAuthored flag clear
+	// in this case (see [wrapEligibility]), so [maybeGroup] uses
+	// [finiteWidth] and the soft breaks inside the body stay soft.
+
+	slots := classifyComments(x)
+	// Keep only genuinely interior prefix comments; a trailing one is
+	// rendered by the container, not inside the brackets.
+	slots.prefix = nonTrailingPrefix(x, slots.prefix)
+	hasInterior := slots.hasInterior()
+
+	switch {
+	case len(elems) == 0 && !hasInterior:
+		return cats(listOpener(x), rBracketLit)
+	case len(elems) == 1 && !hasInterior && c.shouldHug(elems[0]):
+		return cats(listOpener(x), c.expr(elems[0]), rBracketLit)
+	}
+
+	// Preserve the source's comma style. In the comma-free style no
+	// trailing comma is emitted and inter-element commas appear only
+	// between same-line elements.
+	omitCommas := listOmitsCommas(elems, x.Lbrack, x.Rbrack)
+
+	// A comment ending the last row would swallow the closer.
+	closerRel := x.Rbrack.RelPos()
+	if lastElem != nil && closerRel < token.Newline && c.rowEndsWithComment(lastElem) {
+		closerRel = token.Newline
+	}
+
+	// Compute policy first so we can thread WantTrailingComma into
+	// listElemRow before building inner.
+	layout := bracketedLayout{
+		node:                x,
+		open:                listOpener(x),
+		close:               rBracketLit,
+		openerRel:           x.Lbrack.RelPos(),
+		closerRel:           closerRel,
+		firstElem:           firstElem,
+		lastElem:            lastElem,
+		numElems:            len(elems),
+		hasInterior:         hasInterior,
+		anyDoc:              anyHasDocComment(elems),
+		anyPost:             anyHasPostComment(elems),
+		sameLineOpen:        hasSameLineOpener(c, elems, elems),
+		noElemNewline:       noElemHasNewline(elems),
+		lineHeader:          hasLineLeadingComment(slots, firstElem),
+		allowsTrailingComma: !omitCommas,
+	}
+	policy := c.computeBracketedPolicy(layout)
+	useBodyShape := !hasInterior && !layout.anyDoc && !layout.anyPost && allBracketsLackRelPos(elems)
+	if useBodyShape {
+		// docBodyShape's hug shape renders the body in modeBreak so a
+		// per-row commaWhenBroken would emit a stray `,` against the
+		// closing bracket (`}]` vs `},]`). Suppress the per-row
+		// trailing comma entirely when we're on the docBodyShape path;
+		// the indented shape gets its trailing comma instead from
+		// docBodyShape directly (see [bodyShape]'s trailingComma
+		// argument), and the flat shape doesn't need one.
+		policy.wantTrailingComma = false
+	}
+	policy.useBodyShape = useBodyShape
+
+	var inner doc
+	if rows := c.elementRows(elems, policy.wantTrailingComma, useBodyShape, omitCommas); rows != nil {
+		inner = table(rows)
+		layout.rows = rows
+	}
+	layout.inner = c.wrapInteriorComments(inner, slots.prefix, slots.suffix)
+
+	return c.applyBracketed(layout, policy)
+}
+
+// computeBracketedPolicy derives the [bracketedPolicy] from b.
+func (c *converter) computeBracketedPolicy(b bracketedLayout) bracketedPolicy {
+	// hug strips the closer's line break entirely (`{a:1}]` style), so
+	// a post-element comment on any element would land on the closer's
+	// line and `//` would swallow the bracket - anyPost disqualifies
+	// it.
+	//
+	// hugFirst and hugLast fire together only for the single-element
+	// `[{...}]` / `({...})` shape, where dropping both edges leaves
+	// the inner opener's body at one indent level instead of two. The
+	// multi-element bracketed-at-both-ends shape (`[{...}, {...}]`)
+	// is handled by the [docBodyShape] / [docNextGroupNoop] machinery
+	// at render time (see [bracketedPolicy.useBodyShape]), so the
+	// policy here keeps the conservative single-elt-only gate.
+	hugPermitted := !b.hasInterior && !b.anyDoc && !b.anyPost
+	soleElem := hugPermitted && b.numElems == 1
+	hugFirst, hugLast := false, false
+	if soleElem && b.firstElem != nil && nodeIsContiguousOpener(b.firstElem) {
+		hugFirst = !b.firstElem.Pos().IsNewline()
+		hugLast = b.closerRel < token.Newline
+	}
+	// forceOpen breaks the opener for a single-field struct whose
+	// field value breaks across lines, instead of hugging it as
+	// `{field: {` (the label would sit between the braces). A Field
+	// first element only occurs in structs, so list/call/embed hugs
+	// are untouched. When it fires the body must keep the parent
+	// [docNest], so shareIndent is suppressed too. forceOpenBreak
+	// forces the same break.
+	forceOpen := b.forceOpenBreak ||
+		(nodeType[*ast.Field](b.firstElem) && c.hasNewlineInSubtree(b.firstElem))
+	// infiniteWidth reports whether this bracket renders under
+	// infiniteWidth - i.e. it has authored structure (a real Lbrace /
+	// Lbrack), the same signal maybeGroup keys off. It gates
+	// shareIndent below.
+	infiniteWidth := c.nodeFlags[b.node]&isAuthored != 0
+	// shareIndent only drops the parent's [docNest] - closeBreak still
+	// fires, so `]` / `}` / `)` keeps its own line and a post-element
+	// comment can render as a separate Raw row above the closer
+	// without risk. Disabling shareIndent on anyPost would just shift
+	// the surviving elements' bodies by one indent level, which is
+	// surprising: commenting out a sibling shouldn't move what's left.
+	shareIndentPermitted := !b.hasInterior && !b.anyDoc
+	// Share indent in two flavours:
+	//   - sameLineOpen: an inner contiguous opener (e.g. `[{...},
+	//     ...]`) provides the indent for breaks; the parent drops its
+	//     [docNest] so the two layers don't compound.
+	//   - noElemNewline: every element shares a line with its
+	//     predecessor, so under asInfiniteWidth the parent's openBreak
+	//     and the separators between elements emit no newlines. The
+	//     parent's [docNest] is then unused for its own structure, and
+	//     stacking it on top of an inner break (e.g. an inner list whose
+	//     body is multi-line in `{a: 1, b: [\n c\n]}`) would push that
+	//     break one indent level too deep. Drop the [docNest] in this
+	//     case too.
+	//
+	// Rows which still start a new line, such as post-element comments
+	// or later elements, keep the [docNest]; see [sharedIndentBody].
+	// Both flavours assume the inner opener hugs the parent bracket so
+	// its own [docNest] supplies the indent. That only holds under
+	// infiniteWidth: a synthesised bracket renders under finiteWidth,
+	// where the soft openBreak breaks to a newline and the inner
+	// opener lands on its own line, so dropping the [docNest] would
+	// under-indent the body - hence the infiniteWidth gate.
+	shareIndent := infiniteWidth && shareIndentPermitted && !hugFirst && !forceOpen && (b.sameLineOpen || b.noElemNewline)
+	// A bracketed body that opens broken must also close broken: when
+	// the first element starts on its own line (or
+	// interior/line-header comments force the open break), the closing
+	// bracket lands on its own line too, never hugging the last
+	// element. Without this an AST whose first element carries a
+	// Newline RelPos but whose closing brace is Blank (as some
+	// decoders emit for inline maps) renders half-broken - `{` breaks
+	// but `}` hugs the last field. The converse shape - the opener
+	// hugging an inner contiguous opener (`[{`-style) while the closer
+	// breaks - is a legitimate shared-indent layout, so the open break
+	// is left to its own RelPos and is not forced here. leadRel is the
+	// first element's leading RelPos, or the opener's own when the
+	// body is empty.
+	leadRel := b.openerRel
+	if b.firstElem != nil {
+		leadRel = LeadingRelPos(b.firstElem)
+	}
+	openBreaks := b.lineHeader || b.hasInterior || leadRel >= token.Newline || forceOpen
+	forceClose := openBreaks || b.closerRel >= token.Newline
+	// The last element carries a trailing comma when the closer lands
+	// on its own line, unless the closer hugs it (`{a:1}]`). Without
+	// RelPos in the subtree, the runtime [docSwitchMode] inside
+	// commaWhenBroken drops the comma when the bracket fits flat.
+	// Otherwise the decision is static: under [infiniteWidth] the
+	// enclosing group renders broken whenever any hard break exists in
+	// the subtree, even where the closer shares a line with the last
+	// element (`[a,\n b]`), so the comma follows forceClose instead.
+	wantTrailingComma := b.allowsTrailingComma && !hugLast &&
+		(forceClose || !c.authored(b.node))
+	return bracketedPolicy{
+		hugFirst:          hugFirst,
+		hugLast:           hugLast,
+		shareIndent:       shareIndent,
+		wantTrailingComma: wantTrailingComma,
+		openBreak:         openBreakDoc(b.lineHeader, b.hasInterior, forceOpen, leadRel),
+		closeBreak:        closeBreakDoc(b.closerRel, forceClose),
+	}
+}
+
+// sharedIndentBody returns the table of rows for a bracket which shares
+// its indent with a same-line opener (see [bracketedPolicy.shareIndent]).
+// The shared indent holds only up to the first row which starts on a
+// new line without an opener of its own: as nothing else would indent
+// that row and those after it, they nest as usual. Under
+// [infiniteWidth], which shareIndent requires, only a hard separator
+// starts a new line.
+func sharedIndentBody(rows []row) doc {
+	for i := 1; i < len(rows); i++ {
+		if r := rows[i]; !r.opener && (r.sep == lineBreakHard || r.sep == blankLine) {
+			return cat(table(rows[:i]), nest(cat(r.sep, table(rows[i:]))))
+		}
+	}
+	return table(rows)
+}
+
+// applyBracketed assembles the final Doc using a precomputed policy.
+// Drops the parent's [docNest] under hugFirst/shareIndent (the inner
+// element's [docNest] provides the indent; see [sharedIndentBody] for
+// the rows that keep it); drops closeBreak under
+// hugLast so `}]` / `)]` / `}}` stay adjacent. When p.useBodyShape
+// is set, the inner content is wrapped in [docBodyShape] which
+// picks one of the three shapes (flat, indented, hug; see
+// [docBodyShape]) at render time - openBreak, closeBreak, hugFirst,
+// hugLast, and shareIndent are ignored in that branch.
+func (c *converter) applyBracketed(b bracketedLayout, p bracketedPolicy) doc {
+	if p.useBodyShape {
+		// Pass commaLit as the trailing comma so [docBodyShape]
+		// emits it in the indented shape. Both ListLit and CallExpr
+		// accept a trailing comma before their closer in CUE;
+		// emitting it keeps the indented shape idempotent under the
+		// standard re-render path. allowsTrailingComma is true for
+		// the brackets that reach this branch (lists and calls), so
+		// we can pass commaLit unconditionally.
+		var trailingComma doc
+		if b.allowsTrailingComma {
+			trailingComma = commaLit
+		}
+		return c.maybeGroup(b.node,
+			cats(b.openPrefix, b.open, bodyShape(b.inner, trailingComma), b.close))
+	}
+	var inner doc
+	switch {
+	case p.hugFirst:
+		// Drop openBreak and the parent's [docNest] entirely - the inner
+		// element's own [docNest] provides the one indent level needed.
+		inner = b.inner
+	case p.shareIndent:
+		// Keep openBreak so leading non-opener elements render
+		// normally, but skip the parent's [docNest] so the same-line
+		// opener's content shares indent, up to the first row which
+		// needs it again.
+		body := b.inner
+		if b.rows != nil {
+			body = sharedIndentBody(b.rows)
+		}
+		inner = cat(p.openBreak, body)
+	default:
+		inner = nest(cat(p.openBreak, b.inner))
+	}
+	closeBreak := p.closeBreak
+	if p.hugLast {
+		closeBreak = nil
+	}
+	return c.maybeGroup(b.node,
+		cats(b.openPrefix, b.open, inner, closeBreak, b.close))
+}
+
+// elementRows builds the per-element Rows for a list literal or
+// call expression. Each element produces one element row (via
+// listElemRow) plus zero or more Raw rows for any post-element
+// comments. Inter-element rows carry an [elemBreak]-derived Sep so a
+// Newline / NewSection RelPos on the element gets honoured.
+// trailingComma is the parent's trailing-comma decision. Returns nil
+// for empty input.
+//
+// Adjacent bracketed-without-RelPos pairs get a literal-space Sep
+// instead of [elemBreak]'s soft break: when both elements are
+// bracketed and both ends of each one carry no RelPos (see
+// [bracketsLackRelPos]), the pair reads horizontally as
+// `}, {` even when each cell's body breaks internally. Cells that
+// carry RelPos hints on their brackets fall through to [elemBreak] so
+// the authored per-line layout is preserved.
+//
+// wrapLinked wraps each element's value cell in [docNextGroupNoop],
+// which forwards a [docBodyShape] modeBreak decision into each cell by
+// neutralising the cell's own outer [docGroup], so when the hug shape
+// fires every cell stays broken alongside its siblings.
+func (c *converter) elementRows(elems []ast.Expr, trailingComma, wrapLinked, omitCommas bool) []row {
+	if len(elems) == 0 {
+		return nil
+	}
+	rows := make([]row, 0, len(elems))
+	lastIdx := len(elems) - 1
+	prevLackRelPos := false
+	prevHasComment := false
+	for i, e := range elems {
+		row, postCgs := c.listElemRow(nil, e, i == lastIdx, trailingComma, omitCommas)
+		row.opener = isContiguousOpener(e)
+		if wrapLinked && len(row.cells) > 0 {
+			row.cells[0] = nextGroupNoop(row.cells[0])
+		}
+		curLackRelPos := bracketsLackRelPos(e)
+		if i > 0 {
+			// In the comma-free style the separator carries the
+			// inter-element comma (the cell does not - see
+			// [converter.listElemRow]), so a comma appears exactly when
+			// the elements share a line and never otherwise. This holds
+			// even under [infiniteWidth], where [asInfiniteWidth]
+			// collapses the soft break and the comma it carries
+			// together: a stray comma between two elements the renderer
+			// puts on the same line is impossible by construction.
+			switch {
+			case prevLackRelPos && curLackRelPos && !prevHasComment && row.docComment == nil:
+				// Two adjacent bracketed elements with no RelPos render
+				// horizontally (`}, {`). That is only safe when the
+				// previous element does not end with a `//` comment
+				// (which would swallow the following `{`) and the current
+				// element has no doc comment (which needs its own line);
+				// otherwise fall back to a normal element break.
+				if omitCommas {
+					row.sep = commaSpaceLit
+				} else {
+					row.sep = spaceLit
+				}
+			case prevHasComment:
+				// The previous row ends in a comment, which may have
+				// moved there from inside the element, so e's own RelPos
+				// does not tell whether a line break follows it.
+				row.sep = relBreakOr(LeadingRelPos(e), lineBreakHard)
+			case omitCommas:
+				// lineBreakOrComma is ", " when flat (same line) and a
+				// newline (no comma) when broken.
+				row.sep = relBreakOr(LeadingRelPos(e), lineBreakOrComma)
+			default:
+				row.sep = elemBreak(e)
+			}
+		}
+		prevLackRelPos = curLackRelPos
+		prevHasComment = row.hasComment || len(postCgs) > 0 || c.rowEndsWithComment(e)
+		rows = append(rows, row)
+		rows = append(rows, c.postCommentRows(postCgs)...)
+	}
+	return rows
+}
+
+// listElemRow builds a Row for a list element (or call argument).
+// The Row has cells [value+comma, trailing-comment] so trailing
+// comments align in a column across rows when the list is rendered
+// broken. Doc comments become Row.DocComment and render above the
+// value without contributing to column widths.
+//
+// For the last element, the separator depends on trailing: when
+// trailing is true it is a TrailingComma emitted only in broken-mode,
+// so an inline list does not acquire a spurious comma; when trailing
+// is false no comma is emitted at all.
+//
+// Comments attached to e at Position 1/2 with Line=false are
+// "post-element" comments: own-line comments after the element that
+// cannot be folded into the element's cell (the trailing comma would
+// land after the `//` and be absorbed). They are returned in the
+// second result to be emitted as separate Raw rows after the
+// element's row.
+//
+// label is a named call argument's label, or nil. A named argument
+// starts at its label, which carries the argument's leading RelPos and
+// any comment before it; a comment after the label's colon trails the
+// row, as one after a parameter's colon does (see [funcParamComments]).
+func (c *converter) listElemRow(label ast.Label, e ast.Expr, last, trailing, omitCommas bool) (row, []*ast.CommentGroup) {
+	var comma doc
+	switch {
+	case !last && omitCommas:
+		// Comma-free style: a comma is emitted only when this element
+		// shares a line with the next, in which case the row separator
+		// carries it (see [converter.elementRows]). We deliberately
+		// leave the cell comma empty so the comma and the inter-element
+		// line break are one decision and cannot disagree - a
+		// switchMode here would follow the enclosing group's mode,
+		// which under [infiniteWidth] goes broken whenever any element
+		// is multi-line, suppressing the comma even though same-line
+		// siblings still need it.
+	case !last:
+		comma = commaLit
+	case trailing:
+		comma = commaWhenBroken
+	}
+
+	// For StructLit/ListLit/BinaryExpr, exprCore already placed
+	// prefix/suffix (interior) comments inside the brackets so those
+	// slots are skipped here. The doc slot becomes the row's
+	// DocComment; the trailing slot is split by Line into trailing-
+	// comment cell content (Line=true) vs post-element rows
+	// (Line=false), the latter returned to the caller for emission as
+	// Raw rows after this row's own Sep+comma so the trailing comma
+	// stays glued to the value rather than being swallowed by a `//`
+	// comment.
+	slots := classifyComments(e)
+	var core doc
+	// The parser attaches a trailing comment on `...T` to T (the
+	// rightmost token), not to the Ellipsis. exprCore would then
+	// render the comment inline after T, so the comma appended below
+	// would land inside the `//` comment and be lost. Render T's core
+	// instead and fold T's comments into this row's slots so the
+	// trailing comment is routed to the trailing cell, after the
+	// comma.
+	if ell, ok := e.(*ast.Ellipsis); ok && ell.Type != nil {
+		if ts := classifyComments(ell.Type); len(ts.doc)+len(ts.prefix)+len(ts.suffix)+len(ts.trailing) > 0 {
+			core = cat(ellipsisLit, c.exprCore(ell.Type))
+			slots.doc = append(slots.doc, ts.doc...)
+			slots.prefix = append(slots.prefix, ts.prefix...)
+			slots.suffix = append(slots.suffix, ts.suffix...)
+			slots.trailing = append(slots.trailing, ts.trailing...)
+		}
+	}
+	if core == nil {
+		core = c.exprCore(e)
+	}
+	skipInterior := nodeManagesInteriorComments(e)
+	var trailingComment doc
+	var postComments []*ast.CommentGroup
+	hasComment := false
+	routeNonDoc := func(cg *ast.CommentGroup) {
+		hasComment = true
+		// A same-line trailing comment belongs in the element's trailing
+		// cell. The parser marks these with Blank RelPos, but a
+		// programmatically built AST (e.g. the textproto decoder) may set
+		// only cg.Line - the authoritative "same line as the element"
+		// flag - and leave the RelPos unset. Honour either.
+		if cg.Line || cg.Pos().RelPos() == token.Blank {
+			trailingComment = joinLines(trailingComment, c.commentGroup(cg))
+		} else {
+			postComments = append(postComments, cg)
+		}
+	}
+	docRel := e.Pos().RelPos()
+	if label != nil {
+		core = cats(c.label(label), colonLit, spaceLit, core)
+		ls := classifyComments(label)
+		// The label follows its own doc comments, or else the value's,
+		// which are moved before the label.
+		docRel = token.Newline
+		if len(ls.doc) > 0 {
+			docRel = label.Pos().RelPos()
+		}
+		slots.doc = append(ls.doc, slots.doc...)
+		for _, cg := range ls.nonDoc() {
+			routeNonDoc(cg)
+		}
+	}
+	if !skipInterior {
+		for _, cg := range slots.prefix {
+			routeNonDoc(cg)
+		}
+		for _, cg := range slots.suffix {
+			routeNonDoc(cg)
+		}
+	}
+	for _, cg := range slots.trailing {
+		routeNonDoc(cg)
+	}
+	// Lift a PosPrefix comment the element's own renderer treats as
+	// interior into this row's trailing cell, so it column-aligns with
+	// sibling elements' trailing comments. See [trailingPrefixComments].
+	for _, cg := range trailingPrefixComments(e) {
+		routeNonDoc(cg)
+	}
+
+	cells := []doc{cat(core, comma)}
+	if trailingComment != nil {
+		cells = append(cells, trailingComment)
+	}
+
+	return row{
+		docComment: c.docCommentBlock(slots.doc, docRel),
+		cells:      cells,
+		hasComment: hasComment,
+	}, postComments
+}
+
+// postCommentRows turns a list of post-element comments into Raw
+// rows. Each row's Sep honours the comment's own RelPos (NewSection
+// -> BlankLine, Newline/anything else -> HardLine) so blank lines the
+// user wrote between the element and the comment, or between
+// consecutive comments, survive into the output.
+func (c *converter) postCommentRows(cgs []*ast.CommentGroup) []row {
+	if len(cgs) == 0 {
+		return nil
+	}
+	rows := make([]row, len(cgs))
+	for i, cg := range cgs {
+		sep := relBreakOr(cg.Pos().RelPos(), lineBreakHard)
+		rows[i] = row{sep: sep, raw: c.commentGroup(cg)}
+	}
+	return rows
+}
+
+// ellipsis converts an Ellipsis node.
+func (c *converter) ellipsis(x *ast.Ellipsis) doc {
+	if x.Type != nil {
+		return cat(ellipsisLit, c.expr(x.Type))
+	}
+	return ellipsisLit
+}
+
+// unaryExpr converts a UnaryExpr. The operand is obtained via
+// exprCore so that its trailing comments are placed after the
+// operator+operand unit, not between them. Comments which sit between
+// the operator and the operand in the source, and the operand's doc
+// comments, stay between them, with the operand on the next line. The
+// operand passes through [wrapForPrecedence] with [token.UnaryPrec] so
+// a lower-precedence binary operand is parenthesised, preserving its
+// grouping (`!a & b` must not re-parse as `(!a) & b`).
+func (c *converter) unaryExpr(x *ast.UnaryExpr) doc {
+	op := x.Op.String()
+	xDoc := wrapForPrecedence(c.exprCore(x.X), x.X, token.UnaryPrec)
+	xSlots := classifyComments(x.X)
+
+	if inner := slices.Concat(unaryInteriorComments(x), xSlots.doc); len(inner) > 0 {
+		xSlots.doc = nil
+		parts := make([]doc, 0, 2*len(inner)+2)
+		for i, cg := range inner {
+			sep := doc(lineBreakHard)
+			if i == 0 && isLineComment(cg) {
+				sep = spaceLit
+			}
+			parts = append(parts, sep, c.commentGroup(cg))
+		}
+		parts = append(parts, lineBreakHard, xDoc)
+		return c.withCommentsSlots(x.X, cat(stringLit(op), nest(cats(parts...))), xSlots)
+	}
+
+	// A unary operator hugs its operand (`-10`, `!a`, `>=3`). CUE has
+	// no meaningful space there, so we neither emit nor preserve one,
+	// regardless of the operand's RelPos - except where omitting it
+	// would merge the operator with the operand's leading token into a
+	// different operator (see [unaryOpMergesWithOperand]). Keying off
+	// tokenisation rather than RelPos means the required space is
+	// emitted by construction, even for programmatic ASTs that carry
+	// no RelPos - without it `!(=~"x")` would render `!=~"x"` and fail
+	// to re-parse.
+	body := cat(stringLit(op), xDoc)
+	if unaryOpMergesWithOperand(x.Op, x.X) {
+		body = cats(stringLit(op), spaceLit, xDoc)
+	}
+
+	return c.withCommentsSlots(x.X, body, xSlots)
+}
+
+// unaryInteriorComments returns the comments attached to x which sit
+// between its operator and its operand, as in `- // c` followed by the
+// operand on the next line. The parser attaches these at [PosPrefix],
+// as it does with the trailing comment of a call argument, so only
+// their absolute positions tell them apart. [classifyComments] leaves
+// them out, as [converter.unaryExpr] renders them.
+func unaryInteriorComments(x *ast.UnaryExpr) []*ast.CommentGroup {
+	var out []*ast.CommentGroup
+	for _, cg := range ast.Comments(x) {
+		pos, xPos := cg.Pos(), x.X.Pos()
+		if cg.Position == PosPrefix && pos.HasAbsPos() && xPos.HasAbsPos() && pos.Compare(xPos) < 0 {
+			out = append(out, cg)
+		}
+	}
+	return out
+}
+
+// postfixExpr converts a PostfixExpr. The operand is obtained via
+// exprCore so that the suffix operator is placed before any trailing
+// comments on the operand. The operand passes through
+// [wrapForPrecedence] with [token.HighestPrec] so a lower-precedence
+// binary operand is parenthesised, preserving its grouping (`a & b ...`
+// must not re-parse as `a & (b ...)`).
+func (c *converter) postfixExpr(x *ast.PostfixExpr) doc {
+	xDoc := wrapForPrecedence(c.exprCore(x.X), x.X, token.HighestPrec)
+	body := cat(xDoc, stringLit(x.Op.String()))
+
+	return c.withComments(x.X, body)
+}
+
+// binaryExpr converts a BinaryExpr, dispatching by shape:
+//
+//   - any same-operator chain carrying a trailing // comment goes to
+//     [converter.binaryChainTable] so the comments column-align;
+//   - a | or & chain whose post-first arms are all bracketed
+//     (struct/list/paren/call/index) goes to [converter.binaryExprPrec],
+//     keeping the operator inline as `} | {`;
+//   - any other | / & chain goes to [converter.chainGroupArms], which
+//     renders the arms inline when they fit and one-per-line when they
+//     don't;
+//   - any other BinaryExpr (precedence-sensitive +, -, *, ==, ...) goes
+//     to [converter.binaryExprPrec].
+func (c *converter) binaryExpr(x *ast.BinaryExpr) doc {
+	// The starting depth reflects how deeply the expression is nested
+	// inside index/slice subscripts: at the top of a value it is 1
+	// (normal spacing), inside `[...]` it is 2+ (compact spacing). The
+	// binary tree threads further +1 per operand level from here.
+	depth := 1 + c.subscript
+	arms, hasTrailing := c.binaryChainArms(x)
+	if hasTrailing && c.chainAligns(x, arms) {
+		return c.binaryChainTable(x, arms, nil)
+	}
+	if x.Op == token.OR || x.Op == token.AND {
+		if len(arms) > 1 && allBracketArms(arms[1:]) {
+			return c.binaryExprPrec(x, binaryCutoff(x, depth), depth)
+		}
+		return c.chainGroupArms(x, arms)
+	}
+	return c.binaryExprPrec(x, binaryCutoff(x, depth), depth)
+}
+
+// chainAligns reports whether a comment-bearing chain x should render as
+// a column-aligned [docTable] rather than via [converter.binaryExprPrec].
+// A | or & chain always does. For a precedence-sensitive operator we
+// require a top-level position (subscripts and interpolations stay
+// compact and inline) and that every arm's trailing comment is same-line
+// (Line): an own-line comment between operator and operand is not a
+// trailing comment of the arm and is left to binaryExprPrec, which gives
+// it its own line.
+func (c *converter) chainAligns(x *ast.BinaryExpr, arms []chainArm) bool {
+	if x.Op == token.OR || x.Op == token.AND {
+		return true
+	}
+	if c.subscript != 0 {
+		return false
+	}
+	for _, arm := range arms {
+		for _, cg := range arm.trailing {
+			if !cg.Line {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// binaryChainTable lays out a comment-bearing chain as a [docTable]
+// with the trailing comments column-aligned.
+func (c *converter) binaryChainTable(x *ast.BinaryExpr, arms []chainArm, fieldTrailing doc) doc {
+	// Lift the comments ending every arm but the last, which
+	// [converter.binaryChainArms] moved to the arm's trailing comments.
+	for _, arm := range arms[:len(arms)-1] {
+		c.liftTailComments(arm.expr)
+	}
+	if x.Op == token.OR || x.Op == token.AND {
+		return c.chainTableExpr(x, arms, fieldTrailing)
+	}
+	return c.arithChainTableExpr(x, arms, fieldTrailing)
+}
+
+// chainArm holds one operand of a flattened | or & chain together
+// with any comments attached to the BinaryExpr whose operator follows
+// this arm (i.e. the "| // trailing" belonging to this row's op).
+type chainArm struct {
+	expr     ast.Expr
+	trailing []*ast.CommentGroup // Position>=2, Line=true: goes in this row's comment column
+	interior []*ast.CommentGroup // Position==1: interior of next arm (inject if possible)
+}
+
+// binaryChainArms is [flattenBinaryChain], except that the `//`
+// comments ending an arm other than the last, which would swallow the
+// operator after it, move to the start of the arm's trailing comments,
+// after the operator. [converter.binaryChainTable] lifts them out of
+// the arm when it renders the chain.
+func (c *converter) binaryChainArms(x *ast.BinaryExpr) (arms []chainArm, hasTrailing bool) {
+	arms, hasTrailing = flattenBinaryChain(x)
+	for i := range len(arms) - 1 {
+		arm := &arms[i]
+		if tail := c.tailComments(arm.expr); len(tail) > 0 {
+			arm.trailing = append(tail, arm.trailing...)
+			hasTrailing = true
+		}
+	}
+	return arms, hasTrailing
+}
+
+// tailComments returns the comments rendered at the end of n's output,
+// each of which runs to the end of its line; see [endsWithLineComment].
+// It descends only into the operands which their parent renders via
+// [converter.withCommentsSlots], and skips comments which are lifted
+// already.
+func (c *converter) tailComments(n ast.Node) []*ast.CommentGroup {
+	return c.tails(n, false)
+}
+
+// liftTailComments returns the [converter.tailComments] of operand e,
+// which would swallow an operator following e on the same line, and
+// lifts them out of e's rendering; the caller renders them after the
+// operator.
+func (c *converter) liftTailComments(e ast.Expr) []*ast.CommentGroup {
+	return c.tails(e, true)
+}
+
+// tails implements [converter.tailComments], marking the nodes whose
+// comments it returns with [afterCommentsLifted] if lift is set.
+func (c *converter) tails(n ast.Node, lift bool) []*ast.CommentGroup {
+	flags := c.nodeFlags[n]
+	if flags&endsWithLineComment == 0 {
+		return nil
+	}
+	var out []*ast.CommentGroup
+	switch n := n.(type) {
+	case *ast.BinaryExpr:
+		out = c.tails(n.Y, lift)
+	case *ast.UnaryExpr:
+		out = c.tails(n.X, lift)
+	case *ast.PostfixExpr:
+		out = c.tails(n.X, lift)
+	}
+	if flags&afterCommentsLifted != 0 {
+		return out // they render elsewhere
+	}
+	own := len(out)
+	slots := classifyComments(n)
+	if nodeManagesInteriorComments(n) {
+		if flags&interiorPrefix == 0 {
+			out = append(out, trailingPrefixComments(n)...)
+		}
+	} else {
+		out = append(out, slots.prefix...)
+		out = append(out, slots.suffix...)
+	}
+	out = append(out, slots.trailing...)
+	if lift && len(out) > own {
+		// n has an entry already, so this does not grow the map.
+		c.nodeFlags[n] |= afterCommentsLifted
+	}
+	return out
+}
+
+// chainGroupArms formats a same-operator | or & chain as a [docGroup]
+// whose arms are joined by soft separators. In flat-mode the arms
+// render on one line as `a | b | c`. When the chain doesn't fit, the
+// [docGroup] breaks and the soft separator becomes a hard newline,
+// yielding
+//
+//	a |
+//		b |
+//		c
+//
+// Continuation arms are indented one level deeper than the first
+// arm. Newline / NewSection RelPos on an arm is honoured: it forces
+// the corresponding separator to a HardLine / BlankLine, so a
+// hand-broken chain in the source preserves its layout under
+// [infiniteWidth].
+func (c *converter) chainGroupArms(x *ast.BinaryExpr, arms []chainArm) doc {
+	outerPrec := x.Op.Precedence()
+	if len(arms) == 1 {
+		return c.armDoc(arms[0], outerPrec)
+	}
+	opDoc := stringLit(" " + x.Op.String())
+
+	first := c.armDoc(arms[0], outerPrec)
+	first = cat(first, opDoc)
+
+	arms = arms[1:]
+
+	rest := make([]doc, 0, 2*len(arms)-1)
+	lastIdx := len(arms) - 1
+	for i, arm := range arms {
+		elem := c.armDoc(arm, outerPrec+1)
+		if i < lastIdx {
+			elem = cat(elem, opDoc)
+		}
+		rest = append(rest, elemBreak(arm.expr), elem)
+	}
+
+	// The [docNest] indents continuation arms when the chain breaks across
+	// lines (`a |\n\tb |\n\tc`). It must apply exactly when the arm
+	// separators emit newlines: applying it to a chain whose arms all
+	// stay on one line pushes any inner HardLine (e.g. a bracketed arm
+	// whose own body breaks) one indent level too deep - `a & b &
+	// {\n\t\tc: _\n\t}` instead of the wanted `a & b & {\n\tc: _\n}`.
+	//
+	// In an authored chain with no Newline/NewSection RelPos on any
+	// arm (chainBreaks below), the separators are soft and
+	// [asInfiniteWidth] bakes them to their flat text - they can never
+	// break. But the enclosing [docGroup] can still render broken: an
+	// arm containing a hard break (a bracketed arm whose body breaks)
+	// fails the flat-fit test. A [docSwitchMode] would then pick its
+	// broken branch and force the [docNest] onto a visually flat chain. So
+	// this case must skip the [docNest] statically.
+	//
+	// In every other case the separators track the group's mode, so
+	// [docSwitchMode] applies the [docNest] exactly when they break: an
+	// authored chain with hard separators forces the group broken
+	// ([docNest] applies), and a programmatic chain's soft separators break
+	// iff the group breaks on width.
+	chainBreaks := false
+	for _, arm := range arms {
+		if LeadingRelPos(arm.expr) >= token.Newline {
+			chainBreaks = true
+			break
+		}
+	}
+	body := cats(rest...)
+	var wrapped doc
+	if c.authored(x) && !chainBreaks {
+		wrapped = body
+	} else {
+		wrapped = switchMode(nest(body), body)
+	}
+
+	return c.maybeGroup(x, cat(first, wrapped))
+}
+
+// flattenBinaryChain walks a left-associative (or mixed) chain of
+// BinaryExprs with operator x.Op and returns one chainArm per leaf
+// operand. Comments on each intermediate BinaryExpr are attached to
+// the arm whose operator they follow: trailing //-comments go on the
+// left arm's row; interior (Position==1) comments belong to the
+// following arm and are later injected into its body if it is a
+// braced StructLit.
+//
+// A right operand with operator x.Op, which the parser only produces
+// from parenthesized source, is flattened only where dropping its
+// parentheses keeps the meaning; see [flattensRight]. Otherwise it
+// stays a single arm, which the renderers parenthesize.
+//
+// On the outermost BinaryExpr (x), Position=PosDoc and
+// Position>=PosTrailingMin comments are the chain's outer doc/trailing
+// comments handled by the surrounding withComments wrap, so they are
+// skipped here to avoid double-rendering; Position=PosPrefix and
+// Position=PosSuffix comments are "inside the chain" with no other
+// home and are collected onto arm interior/trailing.
+//
+// hasTrailing reports whether any intermediate node carries a trailing
+// comment of any kind (anything at Position >= PosSuffix, inline or
+// own-line).
+func flattenBinaryChain(x *ast.BinaryExpr) (arms []chainArm, hasTrailing bool) {
+	// Comments lifted to the chain's trailing column (only ever on the
+	// outermost node); skipped below. See [trailingPrefixComments].
+	lifted := trailingPrefixComments(x)
+
+	var pending []*ast.CommentGroup // interior comments pending for next arm
+	var walk func(e ast.Expr, outermost, right bool)
+	walk = func(e ast.Expr, outermost, right bool) {
+		bin, ok := e.(*ast.BinaryExpr)
+		if !ok || bin.Op != x.Op || (right && !flattensRight(bin)) {
+			arms = append(arms, chainArm{expr: e, interior: pending})
+			pending = nil
+			return
+		}
+
+		walk(bin.X, false, false)
+		// Split this BinaryExpr's comments. Position=PosPrefix
+		// always means interior-of-next-arm (regardless of
+		// layout), matching the classification in binaryExprPrec;
+		// PosSuffix is "between op and right" and also belongs
+		// to the chain. Position >= PosTrailingMin is post-
+		// chain trailing - on intermediate BinaryExprs it
+		// belongs to the preceding arm, but on the outermost it
+		// is the chain's own outer trailing and is handled by
+		// the surrounding withComments wrap. Position==PosDoc on
+		// the outermost is also handled by withComments and must
+		// be skipped here too - a programmatic BinaryExpr can
+		// carry a Position=0 doc comment, and including it as a
+		// preceding-arm trailing would duplicate the comment.
+		var trailing, interior []*ast.CommentGroup
+		for _, cg := range ast.Comments(bin) {
+			switch {
+			case outermost && slices.Contains(lifted, cg):
+				// Lifted to the trailing column; not rendered as an
+				// interior comment before the last arm.
+			case cg.Position == PosPrefix:
+				interior = append(interior, cg)
+			case outermost && (cg.Position == PosDoc || cg.Position >= PosTrailingMin):
+				// Skip - withComments handles this.
+			default:
+				trailing = append(trailing, cg)
+			}
+		}
+		hasTrailing = hasTrailing || len(trailing) > 0
+		prevArm := &arms[len(arms)-1]
+		prevArm.trailing = append(prevArm.trailing, trailing...)
+		pending = append(pending, interior...)
+		walk(bin.Y, false, true)
+	}
+	walk(x, true, false)
+	return arms, hasTrailing
+}
+
+// flattensRight reports whether y, the right operand of a BinaryExpr
+// with the same operator, can render without parentheses. That is the
+// case for &, which is associative, and for a | whose own arms carry
+// no default marker: `*1 | (*2 | 3)` has the single default 1, while
+// `*1 | *2 | 3` has two. The compiler flattens such an operand either
+// way, but the printed source is reparsed with the parentheses as
+// written.
+func flattensRight(y *ast.BinaryExpr) bool {
+	switch y.Op {
+	case token.AND:
+		return true
+	case token.OR:
+		return !hasMarkedDisjunct(y)
+	}
+	return false
+}
+
+// hasMarkedDisjunct reports whether e is a default-marked disjunct, or a
+// | chain with one among the arms reached without parentheses.
+func hasMarkedDisjunct(e ast.Expr) bool {
+	switch e := e.(type) {
+	case *ast.UnaryExpr:
+		return e.Op == token.MUL
+	case *ast.BinaryExpr:
+		return e.Op == token.OR && (hasMarkedDisjunct(e.X) || hasMarkedDisjunct(e.Y))
+	}
+	return false
+}
+
+// chainTableRow is one rendered row of a chain table: its cell content
+// (without the trailing connector) and the `//` comments on its line.
+type chainTableRow struct {
+	cell     doc
+	trailing []*ast.CommentGroup
+}
+
+// chainTable lays out chain rows (| / & arms or selector segments) as a
+// [docTable] whose trailing comments column-align. connector is appended
+// to every cell but the last - the operator or period that glues to the
+// preceding line. fieldTrailing, when non-nil, folds onto the last row's
+// comment so it aligns with the rest. The head row renders Raw: its
+// connector stays glued and its comment, if any, is appended inline,
+// since there is no column to align to yet. The result is nest(table);
+// the caller applies the mode wrap.
+func (c *converter) chainTable(rows []chainTableRow, connector, fieldTrailing doc) doc {
+	out := make([]row, len(rows))
+	last := len(rows) - 1
+	for i, r := range rows {
+		var commentDoc doc
+		for _, cg := range r.trailing {
+			commentDoc = joinLines(commentDoc, c.commentGroup(cg))
+		}
+		cell0 := r.cell
+		if i < last {
+			cell0 = cat(cell0, connector)
+		} else if fieldTrailing != nil {
+			commentDoc = joinLines(commentDoc, fieldTrailing)
+		}
+		hasComment := commentDoc != nil
+
+		if i == 0 {
+			raw := cell0
+			if hasComment {
+				raw = cats(raw, spaceLit, commentDoc)
+			}
+			out[i] = row{raw: raw, hasComment: hasComment}
+			continue
+		}
+
+		cells := []doc{cell0}
+		if hasComment {
+			cells = append(cells, commentDoc)
+		}
+		out[i] = row{
+			sep:        lineBreakHard,
+			cells:      cells,
+			hasComment: hasComment,
+		}
+	}
+	return nest(table(out))
+}
+
+// chainTableExpr renders a chain of same-operator BinaryExprs (| or &)
+// via [converter.chainTable], rendering each arm and joining with the
+// operator. fieldTrailing, when non-nil, is an enclosing field's
+// same-line trailing comment that aligns in the chain's comment column.
+func (c *converter) chainTableExpr(x *ast.BinaryExpr, arms []chainArm, fieldTrailing doc) doc {
+	outerPrec := x.Op.Precedence()
+	rows := make([]chainTableRow, len(arms))
+	for i, arm := range arms {
+		prec := outerPrec
+		if i > 0 {
+			prec++ // a right operand at the chain's own precedence needs parens
+		}
+		rows[i] = chainTableRow{cell: c.armDoc(arm, prec), trailing: arm.trailing}
+	}
+	return c.maybeGroup(x, c.chainTable(rows, stringLit(" "+x.Op.String()), fieldTrailing))
+}
+
+// arithChainTableExpr renders a precedence-sensitive chain (+, -, *,
+// ==, ...) via [converter.chainTable] so the trailing comments
+// column-align.  Each arm is rendered through
+// [converter.binaryOperand] with the chain's precedence and depth,
+// matching [converter.binaryExprPrec]. This preserves spacing layout
+// that signals precedence.
+func (c *converter) arithChainTableExpr(x *ast.BinaryExpr, arms []chainArm, fieldTrailing doc) doc {
+	depth := 1 + c.subscript
+	co := binaryCutoff(x, depth)
+	prec := x.Op.Precedence()
+
+	rows := make([]chainTableRow, len(arms))
+	for i, arm := range arms {
+		var cell doc
+		if i == 0 {
+			cell = c.binaryOperand(arm.expr, prec, depth+binaryDiffPrec(arm.expr, prec))
+		} else {
+			cell = c.binaryOperand(arm.expr, prec+1, depth+1)
+		}
+		// Interior (Position==1) comments have no bracket to inject into on
+		// an arithmetic arm, so render them on their own line before it,
+		// matching [converter.armDoc]'s non-bracketed fallback.
+		if len(arm.interior) > 0 {
+			parts := make([]doc, 0, 2*len(arm.interior)+1)
+			for _, cg := range arm.interior {
+				parts = append(parts, c.commentGroup(cg), lineBreakHard)
+			}
+			cell = cats(append(parts, cell)...)
+		}
+		rows[i] = chainTableRow{cell: cell, trailing: arm.trailing}
+	}
+
+	connector := doc(stringLit(x.Op.String()))
+	if prec < co {
+		connector = cat(spaceLit, connector)
+	}
+	return c.maybeGroup(x, c.chainTable(rows, connector, fieldTrailing))
+}
+
+// armDoc renders a single chainArm: its expression, with any interior
+// comments injected. outerPrec is the precedence of the chain's own
+// operator, plus one for every arm but the first; when the arm is
+// itself a [*ast.BinaryExpr] with a lower precedence, the arm is
+// wrapped in parens so the rendered output re-parses to the same tree.
+// The increment parenthesizes a right operand with the chain's own
+// operator, which [flattenBinaryChain] left unflattened.
+func (c *converter) armDoc(a chainArm, outerPrec int) doc {
+	body := c.armExpr(a.expr, outerPrec)
+	if len(a.interior) == 0 {
+		return body
+	}
+	if isBracketedInjectionTarget(a.expr) {
+		// Bracketed targets aren't BinaryExprs, so the parens-or-not
+		// decision in armExpr collapsed to a plain c.expr call. The
+		// interior comments belong inside the brackets, not before
+		// them, so route through injectInteriorComments.
+		return c.injectInteriorComments(a.expr, a.interior)
+	}
+	prefix := make([]doc, 0, 2*len(a.interior)+1)
+	for _, cg := range a.interior {
+		prefix = append(prefix, c.commentGroup(cg), lineBreakHard)
+	}
+	prefix = append(prefix, body)
+	return cats(prefix...)
+}
+
+// armExpr renders e as a chain arm under a chain whose operator has
+// precedence outerPrec. A nested BinaryExpr at lower precedence, or a
+// function literal whose result or body would absorb the following
+// operator, is wrapped in parens so the chain shape `a OP_outer arm`
+// re-parses to the same tree on round-trip; see [wrapForPrecedence]
+// and [converter.armDoc].
+func (c *converter) armExpr(e ast.Expr, outerPrec int) doc {
+	return wrapForPrecedence(c.expr(e), e, outerPrec)
+}
+
+// injectInteriorComments renders a braced StructLit or bracketed
+// ListLit with extra comments prepended to its body, so comments that
+// belong inside the brackets parse back to the same attachment. Panics
+// if x is neither a StructLit nor a ListLit.
+//
+// When the first injected comment is Line=true (e.g. `{// c` or
+// `[// c`), it is kept on the opener's line with a single space,
+// matching how structLit / listLit handle their own Position=1 prefix
+// comments.
+func (c *converter) injectInteriorComments(x ast.Expr, extra []*ast.CommentGroup) doc {
+	var open, body, close doc
+	var closerRel token.RelPos
+	switch n := x.(type) {
+	case *ast.StructLit:
+		open, close = structOpener(n), rBraceLit
+		body = c.declSlice(n.Elts)
+		closerRel = n.Rbrace.RelPos()
+	case *ast.ListLit:
+		open, close = listOpener(n), rBracketLit
+		omitCommas := listOmitsCommas(n.Elts, n.Lbrack, n.Rbrack)
+		if rows := c.elementRows(n.Elts, false, false, omitCommas); rows != nil {
+			body = table(rows)
+		}
+		closerRel = n.Rbrack.RelPos()
+	default:
+		panic(fmt.Sprintf("pretty: injectInteriorComments: unexpected %T", x))
+	}
+	inner := c.wrapInteriorComments(body, extra, nil)
+	openBreak := doc(lineBreakHard)
+	closeBreak := relBreak(closerRel)
+	if len(extra) > 0 && (extra[0].Line || extra[0].Pos().RelPos() == token.Blank) {
+		openBreak = spaceLit
+		if closerRel < token.Newline {
+			// A `//` header runs to end-of-line, so the closer must
+			// start a fresh line even when the source didn't request
+			// one.
+			closeBreak = lineBreakHard
+		}
+	}
+	return c.maybeGroup(x, cats(
+		open,
+		nest(cat(openBreak, inner)),
+		closeBreak,
+		close,
+	))
+}
+
+// binaryExprPrec formats a binary expression with precedence-aware
+// spacing. Spaces are added around operators at precedences below the
+// cutoff. Newline RelPos on Y is always honoured. Blank/NoSpace
+// RelPos is ignored (the spacing is determined by precedence).
+//
+// (Algorithm suggestion by Russ Cox.)
+//
+//	7             *  /  % quo rem div mod
+//	6             +  -
+//	5             ==  !=  <  <=  >  >=
+//	4             &&
+//	3             ||
+//	2             &
+//	1             |
+//
+// Spaces are always used at precedence 5 and below. At levels 6-7,
+// spaces are used when there's a mix of precedences (to distinguish
+// them visually).
+func (c *converter) binaryExprPrec(x *ast.BinaryExpr, co, depth int) doc {
+	prec := x.Op.Precedence()
+
+	// Comments ending the left operand go after the operator, which
+	// they would otherwise swallow.
+	lifted := c.liftTailComments(x.X)
+	left := c.binaryOperand(x.X, prec, depth+binaryDiffPrec(x.X, prec))
+	right := c.binaryOperand(x.Y, prec+1, depth+1)
+
+	op := x.Op.String()
+
+	var maybeSpace doc
+	if prec < co || operatorsWouldMerge(x.Op, x.Y) {
+		// prec < co: precedence-driven spacing. operatorsWouldMerge:
+		// even in compact mode, force a blank when the operator and the
+		// RHS's leading sign would lex as a different token (`+ +b` ->
+		// `++`).
+		maybeSpace = spaceLit
+	}
+
+	// Position semantics on a BinaryExpr (only the internal slots
+	// are processed here; PosDoc and trailing slots are externalised
+	// to expr() -> withComments / listElemRow / fieldRow, so binary
+	// handlers don't double-render them):
+	//   PosPrefix : interior of the RHS - typically a comment written
+	//               inside an empty `{ ... }` on the right that the
+	//               parser hung off the BinaryExpr because there was
+	//               no field to attach it to.
+	//   PosSuffix, Line=true  : same-line `//` trailing the operator.
+	//   PosSuffix, Line=false : own-line `//` comment between op and
+	//                           right (forces a break before RHS).
+	//
+	// CUE "//" line comments extend to end-of-line, so any non-doc
+	// comment forces the RHS onto the next line. Operator must stay
+	// on the left's line (leading operator on a new line is not valid
+	// CUE because of auto-semicolon insertion).
+	slots := classifyComments(x)
+	// Exclude a prefix comment that is really trailing; the container
+	// lifts it, so it must not render between op and RHS. See
+	// [nonTrailingPrefix].
+	interior := nonTrailingPrefix(x, slots.prefix)
+	var opInline []doc               // PosSuffix on the op's line (cg.Line or Blank)
+	var midBlock []*ast.CommentGroup // PosSuffix on its own line
+	for _, cg := range slices.Concat(lifted, slots.suffix) {
+		if cg.Line || cg.Pos().RelPos() == token.Blank {
+			opInline = append(opInline, spaceLit, c.commentGroup(cg))
+		} else {
+			midBlock = append(midBlock, cg)
+		}
+	}
+
+	// Interior (Position==1) comments must be rendered inside the RHS.
+	// When the RHS is a braced StructLit or bracketed ListLit we can
+	// inject them into the bracket body so the output parses back to
+	// the same attachment. Without a host bracket we fall back to
+	// placing them between op and right - which is not ideal but
+	// better than dropping them.
+	// brokenRHS builds `left op<opInline>\n<midBlock comments>\nbody`,
+	// indenting body and any midBlock comments by one nest level.
+	// Used in two places: the interior-comment-into-empty-bracket
+	// case when there are *also* other constraints forcing a break,
+	// and the general "RHS goes on its own line" path below.
+	brokenRHS := func(body doc) doc {
+		inner := make([]doc, 0, 2*len(midBlock)+2)
+		inner = append(inner, lineBreakHard)
+		for _, cg := range midBlock {
+			inner = append(inner, c.commentGroup(cg), lineBreakHard)
+		}
+		inner = append(inner, body)
+		return cats(left, maybeSpace, stringLit(op), cats(opInline...), nest(cats(inner...)))
+	}
+
+	if len(interior) > 0 {
+		if isBracketedInjectionTarget(x.Y) {
+			injected := c.injectInteriorComments(x.Y, interior)
+			if len(opInline) > 0 || len(midBlock) > 0 || LeadingRelPos(x.Y) >= token.Newline {
+				// Still break before Y because of other constraints.
+				return brokenRHS(injected)
+			}
+			return cats(left, maybeSpace, stringLit(op), maybeSpace, injected)
+		}
+		// No host bracket on the RHS: fall through with interior
+		// comments merged into midBlock (they'll land between op and
+		// right, forcing a break).
+		midBlock = append(midBlock, interior...)
+	}
+
+	if LeadingRelPos(x.Y) >= token.Newline || len(opInline) > 0 || len(midBlock) > 0 {
+		return brokenRHS(right)
+	}
+	return cats(left, maybeSpace, stringLit(op), maybeSpace, right)
+}
+
+// binaryOperand formats one operand of a binary expression, recursing
+// into nested binary expressions at the same or higher precedence. A
+// nested binary at *lower* precedence is wrapped in parentheses by
+// [wrapForPrecedence] so the rendered output re-parses to the same
+// tree shape.
+func (c *converter) binaryOperand(e ast.Expr, prec, depth int) doc {
+	if bin, ok := e.(*ast.BinaryExpr); ok && bin.Op.Precedence() >= prec {
+		return c.binaryExprPrec(bin, binaryCutoff(bin, depth), depth)
+	}
+	return wrapForPrecedence(c.expr(e), e, prec)
+}
+
+// selArm is one segment of a flattened selector chain (a.b.c).
+type selArm struct {
+	doc      doc                 // the rendered segment
+	rel      token.RelPos        // leading RelPos of the segment (NoRelPos for the head)
+	trailing []*ast.CommentGroup // `//` comments sharing this segment's line
+}
+
+// selectorExpr renders a selector chain (a.b.c). With a trailing
+// comment on any segment it builds a column-aligned [docTable];
+// otherwise it preserves authored line breaks and is otherwise flat.
+func (c *converter) selectorExpr(x *ast.SelectorExpr) doc {
+	arms, hasTrailing := c.flattenSelectorChain(x)
+	if hasTrailing {
+		return c.selectorTableExpr(arms, nil)
+	}
+	return c.selectorGroupArms(arms)
+}
+
+// flattenSelectorChain returns one selArm per segment of a selector
+// chain, head first. A period glues to the segment before it; a
+// SelectorExpr's PosSuffix comment trails (after the period,
+// e.g. `a. // c`). Comments belonging to the chain as a whole -
+// PosDoc and trailing (Position >= PosTrailingMin) on the outermost
+// node - are excluded. hasTrailing reports whether any returned
+// segment carries a trailing comment.
+func (c *converter) flattenSelectorChain(x *ast.SelectorExpr) (arms []selArm, hasTrailing bool) {
+	var walk func(e ast.Expr, outermost bool)
+	walk = func(e ast.Expr, outermost bool) {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok {
+			// The head receiver is a primary expression: `.sel` binds
+			// tighter than any binary operator, so a binary head needs
+			// parens to keep its grouping (`(a & b).c`, not `a & b.c`).
+			arms = append(arms, selArm{doc: wrapForPrecedence(c.expr(e), e, token.HighestPrec)})
+			return
+		}
+		walk(sel.X, false)
+		var trailing []*ast.CommentGroup
+		for _, cg := range ast.Comments(sel) {
+			if outermost && (cg.Position == PosDoc || cg.Position >= PosTrailingMin) {
+				continue // chain-level, not a per-segment comment
+			}
+			trailing = append(trailing, cg)
+		}
+		hasTrailing = hasTrailing || len(trailing) > 0
+		prev := &arms[len(arms)-1]
+		prev.trailing = append(prev.trailing, trailing...)
+		arm := selArm{doc: c.label(sel.Sel), rel: sel.Sel.Pos().RelPos()}
+		// A doc comment before the selected label starts its segment, on
+		// a line of its own.
+		if docs := classifyComments(sel.Sel).doc; len(docs) > 0 {
+			arm.doc = cat(c.docCommentBlock(docs, token.Newline), arm.doc)
+			arm.rel = max(arm.rel, token.Newline)
+		}
+		arms = append(arms, arm)
+	}
+	walk(x, true)
+	return arms, hasTrailing
+}
+
+// selectorGroupArms renders a comment-free selector chain. A segment
+// whose leading RelPos is Newline / NewSection breaks onto its own
+// indented line after the preceding period; otherwise it stays glued
+// (a.b.c). The chain never breaks on width: each separator is a hard
+// break or nothing, with no soft alternative.
+func (c *converter) selectorGroupArms(arms []selArm) doc {
+	first := cat(arms[0].doc, periodLit)
+	rest := arms[1:]
+	parts := make([]doc, 0, 2*len(rest))
+	lastIdx := len(rest) - 1
+	for i, arm := range rest {
+		parts = append(parts, relBreakOr(arm.rel, nil))
+		elem := arm.doc
+		if i < lastIdx {
+			elem = cat(elem, periodLit)
+		}
+		parts = append(parts, elem)
+	}
+	return cat(first, nest(cats(parts...)))
+}
+
+// selectorTableExpr renders a selector chain via [converter.chainTable],
+// one row per segment joined with the period. fieldTrailing, if non-nil,
+// folds onto the last row's comment so it aligns with the rest.
+func (c *converter) selectorTableExpr(arms []selArm, fieldTrailing doc) doc {
+	rows := make([]chainTableRow, len(arms))
+	for i, arm := range arms {
+		rows[i] = chainTableRow{cell: arm.doc, trailing: arm.trailing}
+	}
+	return group(c.chainTable(rows, periodLit, fieldTrailing))
+}
+
+// callExpr converts a CallExpr. Arguments are handled like list
+// elements: RelPos is honoured, commas come before trailing comments,
+// and a trailing comma before ')' is emitted on the same terms as
+// lists.
+func (c *converter) callExpr(x *ast.CallExpr) doc {
+	// The callee is a primary expression: `(...)` binds tighter than
+	// any binary operator, so a binary callee needs parens (`(a &
+	// b)(x)`).
+	fun := wrapForPrecedence(c.expr(x.Fun), x.Fun, token.HighestPrec)
+
+	if len(x.Args) == 0 {
+		if x.Ellipsis != token.NoPos {
+			return cats(fun, stringLit("(...)"))
+		}
+		return cats(fun, stringLit("()"))
+	}
+	// A named argument hugs only if its label could too.
+	if arg, l := x.Args[0], callArgLabel(x, 0); len(x.Args) == 1 && c.shouldHug(arg) && x.Ellipsis == token.NoPos &&
+		(l == nil || (!l.Pos().IsNewline() && len(ast.Comments(l)) == 0)) {
+		return cats(fun, lParenLit, c.callArg(x, 0), rParenLit)
+	}
+	anyDoc := anyHasDocComment(x.Args)
+	anyPost := anyHasPostComment(x.Args)
+	closerRel := x.Rparen.RelPos()
+	var sameLineOpen, noElemNewline bool
+	// A comment ending the last argument's row would swallow the closer.
+	lastEndsWithComment := c.rowEndsWithComment(x.Args[len(x.Args)-1])
+	if len(x.ArgLabels) == 0 {
+		sameLineOpen = hasSameLineOpener(c, x.Args, x.Args)
+		noElemNewline = noElemHasNewline(x.Args)
+	} else {
+		// A comment after a label's colon moves to the end of the
+		// argument's row, so whatever follows starts on a new line.
+		leads := make([]ast.Node, len(x.Args))
+		movesComment, lastMovesComment := false, false
+		for i := range x.Args {
+			leads[i] = callArgLead(x, i)
+			l := callArgLabel(x, i)
+			lastMovesComment = l != nil && nodeEndsWithLineComment(l, classifyComments(l))
+			movesComment = movesComment || lastMovesComment
+		}
+		anyDoc = anyDoc || anyHasDocComment(leads)
+		anyPost = anyPost || anyHasPostComment(leads)
+		sameLineOpen = hasSameLineOpener(c, leads, x.Args)
+		noElemNewline = !movesComment && noElemHasNewline(leads)
+		lastEndsWithComment = lastEndsWithComment || lastMovesComment
+	}
+	if lastEndsWithComment && x.Ellipsis == token.NoPos && closerRel < token.Newline {
+		closerRel = token.Newline
+	}
+	first := callArgLead(x, 0)
+
+	layout := bracketedLayout{
+		node:          x,
+		openPrefix:    fun,
+		open:          lParenLit,
+		close:         rParenLit,
+		openerRel:     x.Lparen.RelPos(),
+		closerRel:     closerRel,
+		firstElem:     first,
+		lastElem:      callArgLead(x, len(x.Args)-1),
+		numElems:      len(x.Args),
+		hasInterior:   false, // calls don't carry PosPrefix/PosSuffix interior comments
+		anyDoc:        anyDoc,
+		anyPost:       anyPost,
+		sameLineOpen:  sameLineOpen,
+		noElemNewline: noElemNewline,
+		// CallExpr carries no interior comments of its own - the
+		// parser hangs Position 1/2 comments on the args themselves,
+		// not on the call. Pass an empty commentSlots so only the
+		// first arg's leading doc-comment is inspected.
+		lineHeader:          hasLineLeadingComment(commentSlots{}, first),
+		allowsTrailingComma: true,
+	}
+	policy := c.computeBracketedPolicy(layout)
+	useBodyShape := !layout.anyDoc && !layout.anyPost && allBracketsLackRelPos(x.Args)
+	if useBodyShape {
+		policy.wantTrailingComma = false
+	}
+	policy.useBodyShape = useBodyShape
+	// Call arguments are always comma-separated; comma-free style is a
+	// list-literal feature only.
+	layout.rows = c.callArgRows(x, policy.wantTrailingComma, useBodyShape)
+	layout.inner = table(layout.rows)
+	return c.applyBracketed(layout, policy)
+}
+
+func (c *converter) callArg(x *ast.CallExpr, i int) doc {
+	arg := c.expr(x.Args[i])
+	if l := callArgLabel(x, i); l != nil {
+		return cats(c.label(l), colonLit, spaceLit, arg)
+	}
+	return arg
+}
+
+// callArgLabel returns the label of the i'th argument of x, or nil if
+// the argument is positional.
+func callArgLabel(x *ast.CallExpr, i int) ast.Label {
+	if i < len(x.ArgLabels) {
+		return x.ArgLabels[i]
+	}
+	return nil
+}
+
+// callArgLead returns the node that starts the i'th argument of x. A
+// named argument starts at its label, which carries the argument's
+// leading RelPos and the comments before it, unless only its value has
+// a doc comment: [converter.listElemRow] moves that comment before the
+// label, so the argument starts there. The label still leads when its
+// RelPos is the stronger one, so that a blank line before it is kept.
+func callArgLead(x *ast.CallExpr, i int) ast.Node {
+	l := callArgLabel(x, i)
+	if l == nil {
+		return x.Args[i]
+	}
+	if !HasDocComment(l) {
+		if cg := FirstCommentAt(x.Args[i], PosDoc); cg != nil && cg.Pos().RelPos() >= l.Pos().RelPos() {
+			return cg
+		}
+	}
+	return l
+}
+
+func (c *converter) callArgRows(x *ast.CallExpr, trailingComma, wrapLinked bool) []row {
+	open := x.Ellipsis != token.NoPos
+	if len(x.Args) == 0 {
+		if open {
+			return []row{{cells: []doc{ellipsisLit}}}
+		}
+		return nil
+	}
+	rows := make([]row, 0, len(x.Args)+1)
+	lastIdx := len(x.Args) - 1
+	if open {
+		// The trailing "..." is the last element, so every real argument
+		// gets a comma.
+		lastIdx = len(x.Args)
+	}
+	prevLackRelPos := false
+	prevHasComment := false
+	// A row ending in a comment must be followed by a line break, as the
+	// comment would otherwise swallow what follows. The comment may have
+	// moved there from after a label's colon, so the next argument's own
+	// RelPos does not tell.
+	soft := lineBreakOrSpace
+	for i, e := range x.Args {
+		label := callArgLabel(x, i)
+		row, postCgs := c.listElemRow(label, e, i == lastIdx, trailingComma, false)
+		row.opener = label == nil && isContiguousOpener(e)
+		if wrapLinked && len(row.cells) > 0 {
+			row.cells[0] = nextGroupNoop(row.cells[0])
+		}
+		curLackRelPos := bracketsLackRelPos(e)
+		if i > 0 {
+			switch {
+			case prevLackRelPos && curLackRelPos && !prevHasComment && row.docComment == nil:
+				row.sep = spaceLit
+			default:
+				row.sep = relBreakOr(LeadingRelPos(callArgLead(x, i)), soft)
+			}
+		}
+		prevLackRelPos = curLackRelPos
+		prevHasComment = row.hasComment || len(postCgs) > 0 || c.rowEndsWithComment(e)
+		soft = lineBreakOrSpace
+		if prevHasComment {
+			soft = lineBreakHard
+		}
+		rows = append(rows, row)
+		rows = append(rows, c.postCommentRows(postCgs)...)
+	}
+	if open {
+		r := row{cells: []doc{ellipsisLit}}
+		if len(rows) > 0 {
+			r.sep = relBreakOr(x.Ellipsis.RelPos(), soft)
+		}
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+// indexExpr converts an IndexExpr. Honours RelPos on the index
+// expression. A newline before ']' is not valid CUE (auto-comma
+// insertion triggers), so the index and closing bracket stay on the
+// same line.
+//
+// Comments inside the brackets stay there, so that they cannot swallow
+// a postfix operator following the closing bracket. One before the
+// closing bracket is followed by a line break; the parser accepts it as
+// the auto-inserted comma after the index.
+func (c *converter) indexExpr(x *ast.IndexExpr) doc {
+	openBreak := relBreak(x.Index.Pos().RelPos())
+	var closeBreak doc
+	var afterOpen, beforeClose []doc
+	for _, cg := range ast.Comments(x) {
+		switch cg.Position {
+		case posIndexAfterLbrack:
+			// The parser attaches an own-line comment after the opening
+			// bracket to the index instead.
+			afterOpen = append(afterOpen, spaceLit, c.commentGroup(cg))
+			openBreak = lineBreakHard
+		case posIndexBeforeRbrack:
+			var sep doc = spaceLit
+			if !isLineComment(cg) {
+				sep = relBreakOr(cg.Pos().RelPos(), lineBreakHard)
+			}
+			beforeClose = append(beforeClose, sep, c.commentGroup(cg))
+			closeBreak = lineBreakHard
+		}
+	}
+	// The receiver is a primary expression: `[i]` binds tighter than
+	// any binary operator, so a binary receiver needs parens (`(a &
+	// b)[i]`). It renders at the current depth; the subscript contents
+	// render one level deeper, compacting binary operators (`s[1+2]`).
+	recv := wrapForPrecedence(c.expr(x.X), x.X, token.HighestPrec)
+	c.subscript++
+	index := c.expr(x.Index)
+	c.subscript--
+	return c.maybeGroup(x, cats(
+		recv,
+		lBracketLit,
+		nest(cats(cats(afterOpen...), openBreak, index, cats(beforeClose...))),
+		closeBreak,
+		rBracketLit,
+	))
+}
+
+// sliceExpr converts a SliceExpr.
+func (c *converter) sliceExpr(x *ast.SliceExpr) doc {
+	// Blanks around ':' when this slice is at the top level (not
+	// nested in a subscript), both bounds are present, and either
+	// bound is a binary expression (e.g. `s[1+2 : 2+4]`).
+	colon := colonLit
+	if c.subscript == 0 && x.Low != nil && x.High != nil &&
+		(nodeType[*ast.BinaryExpr](x.Low) || nodeType[*ast.BinaryExpr](x.High)) {
+		colon = cats(spaceLit, colonLit, spaceLit)
+	}
+	// The receiver is a primary expression: the slice `[lo:hi]` binds
+	// tighter than any binary operator, so a binary receiver needs
+	// parens. The bounds render one level deeper (compact operators).
+	recv := wrapForPrecedence(c.expr(x.X), x.X, token.HighestPrec)
+	c.subscript++
+	low := c.exprAfter(nil, nil, x.Low)
+	high := c.exprAfter(nil, nil, x.High)
+	c.subscript--
+	return cats(recv, lBracketLit, low, colon, high, rBracketLit)
+}
+
+// operatorsWouldMerge reports whether printing binary operator op
+// immediately before the rendering of rhs (with no surrounding space)
+// would lex as a different token sequence: `+` before a unary `+`
+// (`++`), `-` before `-` (`--`), or `/` before `*` (`/*`). It
+// descends to rhs's leftmost leading token, since only a unary sign
+// there can merge with the preceding operator.
+func operatorsWouldMerge(op token.Token, rhs ast.Expr) bool {
+	var lead token.Token
+	for {
+		switch x := rhs.(type) {
+		case *ast.BinaryExpr:
+			rhs = x.X
+			continue
+		case *ast.UnaryExpr:
+			lead = x.Op
+		}
+		break
+	}
+	switch op {
+	case token.ADD:
+		return lead == token.ADD // ++
+	case token.SUB:
+		return lead == token.SUB // --
+	case token.QUO:
+		return lead == token.MUL // /*
+	}
+	return false
+}
+
+// parenExpr converts a ParenExpr. '(' hugs the inner expression
+// unless the inner expression's RelPos explicitly requests a newline;
+// otherwise breaks in the inner expression (e.g. a multi-line struct
+// or a broken chain) should not force a break after '('. A newline
+// before ')' is not valid CUE (auto-comma insertion triggers), so the
+// expression and closing paren stay on the same line.
+func (c *converter) parenExpr(x *ast.ParenExpr) doc {
+	// Omit redundant parentheses around an already-parenthesized
+	// expression: `((x))` renders as `(x)`. The outer paren's own
+	// comments are handled by the enclosing [converter.expr]. The inner
+	// paren's comments have nowhere else to go, so we keep both then.
+	if x, ok := x.X.(*ast.ParenExpr); ok && len(ast.Comments(x)) == 0 {
+		return c.parenExpr(x)
+	}
+	if LeadingRelPos(x.X) >= token.Newline {
+		return cats(
+			lParenLit,
+			nest(cat(lineBreakHard, c.expr(x.X))),
+			rParenLit,
+		)
+	}
+	return cats(lParenLit, c.exprAfter(nil, nil, x.X), rParenLit)
+}
+
+// interpolation converts an Interpolation node. Its elements alternate
+// between string fragments (BasicLit, which already include the \( and
+// ) delimiters and are emitted verbatim) and interpolated expressions.
+//
+// Multi-line strings get special treatment: the body's strip prefix
+// (the leading whitespace before the closing `"""`) is parsed and
+// lifted into the renderer's nest level via [docAtIndent], so any
+// [docNest] inside an interpolated expression lands one level deeper
+// than the line that contained `\(` rather than at the field's level.
+func (c *converter) interpolation(x *ast.Interpolation) doc {
+	multiLine := false
+	for _, e := range x.Elts {
+		if lit, ok := e.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			if strings.Contains(lit.Value, "\n") {
+				multiLine = true
+				break
+			}
+		}
+	}
+
+	// A comment beside a `\(` or `)` delimiter, or before an
+	// interpolated expression, forces line breaks within the string,
+	// which the multi-line path knows how to place.
+	hasComments := slices.ContainsFunc(x.Elts, func(e ast.Expr) bool {
+		return len(ast.Comments(e)) > 0
+	})
+	if !multiLine && !hasComments {
+		parts := make([]doc, len(x.Elts))
+		for i, e := range x.Elts {
+			if lit, ok := e.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				parts[i] = stringLit(lit.Value)
+			} else {
+				// An interpolation `\(...)` is a subscript-like context:
+				// its expression renders one level deeper, compacting
+				// binary operators (`"\(1+2)"`).
+				c.subscript++
+				parts[i] = c.expr(e)
+				c.subscript--
+			}
+		}
+		return cats(parts...)
+	}
+
+	return c.multiLineInterpolation(x, multiLine)
+}
+
+// multiLineInterpolation handles the multi-line case of
+// [converter.interpolation]. It produces an opener (everything up to
+// the first newline, rendered at the caller's indent) plus a body
+// wrapped in a [docNest] so it lands one level deeper than the opening
+// line. The embedded strip prefix is removed from each body line and
+// the renderer re-supplies the indentation at the actual render depth
+// via [docLineBreakHard].
+//
+// When an interpolated expression breaks onto its own line right after
+// `\(`, its content is wrapped in a [docNest] so it indents one level
+// deeper than the line holding `\(`, mirroring a struct/list/call body.
+//
+// An Elt whose leading RelPos is a Newline / NewSection breaks onto its
+// own body line, so a `\(...)` written across lines stays that way. The
+// `\(` and `)` delimiters end and start the surrounding string Elts, so a
+// comment beside one is a PosSuffix (after `\(`) or PosPrefix (before
+// `)`) comment on that Elt, rendered here in place.
+//
+// A single-line string whose Elts carry comments also comes here, with
+// multiLine false. Its lines after the first are not nested, as no
+// string fragment spans them: only the interpolated expressions indent.
+func (c *converter) multiLineInterpolation(x *ast.Interpolation, multiLine bool) doc {
+	stripPrefix := stripPrefixFromInterp(x)
+
+	var opener, body, interp []doc
+	inBody := false
+	// inInterp is true while we are between a `\(` and its matching
+	// `)`. interpLeadingBreak records whether the first thing emitted
+	// into interp was a line break - i.e. the expression starts on its
+	// own line below `\(` rather than hugging it.
+	inInterp := false
+	interpLeadingBreak := false
+	emit := func(d doc) {
+		switch {
+		case !inBody:
+			opener = append(opener, d)
+		case inInterp:
+			interp = append(interp, d)
+		default:
+			body = append(body, d)
+		}
+	}
+	emitBreak := func(br doc) {
+		inBody = true
+		if inInterp {
+			if len(interp) == 0 {
+				interpLeadingBreak = true
+			}
+			interp = append(interp, br)
+		} else {
+			body = append(body, br)
+		}
+	}
+	closeInterp := func() {
+		if !inInterp {
+			return
+		}
+		d := cats(interp...)
+		if interpLeadingBreak {
+			d = nest(d)
+		}
+		body = append(body, d)
+		interp = nil
+		inInterp = false
+		interpLeadingBreak = false
+	}
+
+	forceBreak := false // a `//` comment ended the previous Elt's line
+	for idx, e := range x.Elts {
+		lit, isStr := e.(*ast.BasicLit)
+		isStr = isStr && lit.Kind == token.STRING
+
+		// A string Elt's comments sit beside a delimiter: those at or before
+		// PosPrefix lead the `)` (trailing the previous line), the rest
+		// trail the `\(`. Expression Elts carry their own comments.
+		var before, after []*ast.CommentGroup
+		if isStr {
+			for _, cg := range ast.Comments(lit) {
+				if cg.Position <= PosPrefix {
+					before = append(before, cg)
+				} else {
+					after = append(after, cg)
+				}
+			}
+		}
+		// before comments lead the closing `)`, so they trail the
+		// interpolated expression's line and stay inside the open
+		// interpolation's nest.
+		for _, cg := range before {
+			emit(cat(spaceLit, c.commentGroup(cg)))
+		}
+
+		// A string Elt other than the first starts with the `)` that
+		// closes the open interpolation: fold its content into the nest
+		// before emitting the `)` line at the outer indent.
+		if isStr {
+			closeInterp()
+		}
+
+		// Break before this Elt's content: an authored Newline / NewSection
+		// RelPos, or a forced break when a `//` comment - the previous Elt's
+		// trailing one or this Elt's leading one - would otherwise swallow
+		// the content. An expression's doc comment needs a line of its own.
+		if idx > 0 {
+			br := relBreakOr(e.Pos().RelPos(), nil)
+			if br == nil && (forceBreak || len(before) > 0 || (!isStr && HasDocComment(e))) {
+				br = lineBreakHard
+			}
+			if br != nil {
+				emitBreak(br)
+			}
+		}
+
+		if isStr {
+			for i, line := range strings.Split(lit.Value, "\n") {
+				if i > 0 {
+					// Line-break before this line. A line that starts with
+					// the strip prefix uses [docLineBreakHard], which the
+					// surrounding [docNest] re-indents to the render depth; we
+					// strip the prefix from `line` so we don't double
+					// up. A line without the prefix (a bare empty line, or
+					// whitespace shorter than the prefix) uses
+					// [docLineBreakBare], a bare `\n` that adds no
+					// indentation, so it is rendered verbatim.
+					if rest, ok := strings.CutPrefix(line, stripPrefix); ok && stripPrefix != "" {
+						emitBreak(lineBreakHard)
+						line = rest
+					} else {
+						emitBreak(lineBreakBare)
+					}
+				}
+				if line == "" {
+					continue
+				}
+				emit(stringLit(line))
+			}
+		} else {
+			// Interpolation expressions render one level deeper (compact
+			// operators), as in the single-line case above.
+			c.subscript++
+			emit(c.expr(e))
+			c.subscript--
+		}
+
+		for _, cg := range after {
+			emit(cat(spaceLit, c.commentGroup(cg)))
+		}
+		forceBreak = len(after) > 0
+
+		// A string Elt other than the last ends with the `\(` that opens
+		// the next interpolation: route the following content (the
+		// expression and any comment leading its `)`) into the nest.
+		if isStr && idx < len(x.Elts)-1 {
+			inInterp = true
+		}
+	}
+
+	if !inBody {
+		// Nothing broke the line, which can only happen when multiLine is
+		// false.
+		return cats(opener...)
+	}
+
+	// A still-open interpolation would mean a malformed AST (no closing
+	// `)`); fold it defensively rather than drop its content.
+	closeInterp()
+
+	if !multiLine {
+		return cats(cats(opener...), cats(body...))
+	}
+	return cats(cats(opener...), nest(cats(body...)))
+}
+
+// funcExpr converts a Func node.
+func (c *converter) funcExpr(x *ast.Func) doc {
+	open := x.Ellipsis != token.NoPos
+	// Parameters synthesizes positional parameters from the legacy Args
+	// field; those carry no label, attributes, or comments, so they
+	// render as their bare values below.
+	params := x.Parameters()
+	if len(params) == 0 && !open {
+		return c.funcResult(cats(stringLit("func"), lParenLit, rParenLit), x)
+	}
+	// A parameter list with a comment or a line break renders as a table,
+	// one row per parameter, laid out like call arguments: a parameter
+	// written on its own line stays there, a // comment sits after the
+	// row's comma and can swallow neither the next parameter nor the
+	// closing parenthesis, and a comment on its own line keeps that line.
+	// Comments on a parameter's constraint or default count as the
+	// parameter's own; see [funcParamComments]. params may contain nil
+	// entries when the AST is constructed programmatically; skip them, as
+	// funcParamRows does.
+	var anyComment, anyNewline, anyDoc, anyPost, firstHoistedDoc bool
+	first := true
+	for _, p := range params {
+		if p == nil {
+			continue
+		}
+		slots := funcParamComments(p)
+		if slots.any() {
+			anyComment = true
+		}
+		if funcParamLeadingRelPos(p, slots) >= token.Newline {
+			anyNewline = true
+		}
+		if len(slots.doc) > 0 {
+			anyDoc = true
+			if first && !HasDocComment(p) {
+				firstHoistedDoc = true
+			}
+		}
+		first = false
+		for _, cg := range slots.nonDoc() {
+			if !isLineComment(cg) {
+				anyPost = true
+			}
+		}
+	}
+	closerRel := x.Rparen.RelPos()
+	if !anyComment && !anyNewline && x.Ellipsis.RelPos() < token.Newline && closerRel < token.Newline {
+		args := make([]doc, 0, len(params)+1)
+		for _, p := range params {
+			if p == nil {
+				continue
+			}
+			args = append(args, c.funcParamCore(p))
+		}
+		if open {
+			args = append(args, ellipsisLit)
+		}
+		argDoc := sep(commaSpaceLit, args...)
+		return c.funcResult(cats(stringLit("func"), lParenLit, argDoc, rParenLit), x)
+	}
+	if anyComment && closerRel < token.Newline {
+		// A parameter list with a comment closes on its own line: a //
+		// comment on the last row would swallow a closing parenthesis on
+		// the same line, and the comment may have moved to the row's end
+		// from after ":" or "=", so the authored position of ")" does not
+		// tell.
+		closerRel = token.Newline
+	}
+	// As named call arguments, parameters may share their indent with
+	// an opener which ends one of them on the line of "(".
+	leads := make([]*ast.FuncParam, 0, len(params))
+	ends := make([]ast.Node, 0, len(params))
+	for _, p := range params {
+		if p != nil {
+			leads = append(leads, p)
+			ends = append(ends, funcParamEnd(p))
+		}
+	}
+	firstParam := firstFuncParam(params)
+	layout := bracketedLayout{
+		node:                x,
+		openPrefix:          stringLit("func"),
+		open:                lParenLit,
+		close:               rParenLit,
+		openerRel:           x.Lparen.RelPos(),
+		closerRel:           closerRel,
+		firstElem:           firstParam,
+		lastElem:            lastFuncParam(params),
+		numElems:            len(params),
+		anyDoc:              anyDoc,
+		anyPost:             anyPost,
+		sameLineOpen:        hasSameLineOpener(c, leads, ends),
+		noElemNewline:       !anyNewline,
+		lineHeader:          hasLineLeadingComment(commentSlots{}, firstParam),
+		forceOpenBreak:      firstHoistedDoc,
+		allowsTrailingComma: true,
+	}
+	policy := c.computeBracketedPolicy(layout)
+	layout.rows = c.funcParamRows(params, x.Ellipsis, policy.wantTrailingComma)
+	layout.inner = table(layout.rows)
+	return c.funcResult(c.applyBracketed(layout, policy), x)
+}
+
+// funcParamEnd returns the node which ends a parameter's rendering: its
+// constraint, its default if it has one, or the parameter itself when
+// attributes follow.
+func funcParamEnd(p *ast.FuncParam) ast.Node {
+	switch {
+	case len(p.Attrs) > 0:
+		return p
+	case p.Default != nil:
+		return p.Default
+	}
+	return p.Value
+}
+
+func (c *converter) funcResult(d doc, x *ast.Func) doc {
+	if x.Ret != nil {
+		d = cats(d, stringLit(" -> "), c.expr(x.Ret))
+	}
+	if x.Body != nil {
+		d = cats(d, colonLit, spaceLit, c.expr(x.Body))
+	}
+	return d
+}
+
+// funcParamCore renders a parameter without any comment: the caller
+// places the parameter's comments, including those of its constraint and
+// default (see [funcParamComments]), around the row it occupies.
+func (c *converter) funcParamCore(p *ast.FuncParam) doc {
+	if p == nil {
+		return nil
+	}
+	d := c.exprCore(p.Value)
+	if p.Default != nil {
+		// A parameter default follows the constraint as " = expr" and
+		// precedes the attributes.
+		d = cats(d, spaceLit, stringLit("="), spaceLit, c.exprCore(p.Default))
+	}
+	d = appendAttrs(d, p.Attrs)
+	if p.Label == nil {
+		return d
+	}
+	label := c.label(p.Label)
+	if p.Alias != nil {
+		label = cats(label, c.postfixAlias(p.Alias))
+	}
+	if p.Constraint != token.ILLEGAL {
+		label = cats(label, stringLit(p.Constraint.String()))
+	}
+	return cats(label, colonLit, spaceLit, d)
+}
+
+func (c *converter) funcParamRows(params []*ast.FuncParam, ellipsis token.Pos, trailingComma bool) []row {
+	open := ellipsis != token.NoPos
+	rows := make([]row, 0, len(params)+1)
+	lastIdx := len(params) - 1
+	if open {
+		lastIdx = len(params) // the "..." row is last
+	}
+	// A row that ends in a // comment, or is followed by a comment on its
+	// own line, must be followed by a line break: the comment would
+	// otherwise swallow the next row. The comment may have moved there
+	// from after ":" or "=", so the next row's own RelPos does not tell.
+	soft := lineBreakOrSpace
+	for i, p := range params {
+		if p == nil {
+			continue
+		}
+		var comma doc
+		switch {
+		case i < lastIdx:
+			comma = commaLit
+		case trailingComma:
+			comma = commaWhenBroken
+		}
+
+		// As for a list element (see [converter.listElemRow]): the doc
+		// slot becomes the row's doc comment, a same-line comment goes in
+		// the trailing cell after the comma, and any other comment
+		// follows the row on a line of its own.
+		slots := funcParamComments(p)
+		var trailing doc
+		var post []*ast.CommentGroup
+		for _, cg := range slots.nonDoc() {
+			if isLineComment(cg) {
+				trailing = joinLines(trailing, c.commentGroup(cg))
+			} else {
+				post = append(post, cg)
+			}
+		}
+		cells := []doc{cat(c.funcParamCore(p), comma)}
+		if trailing != nil {
+			cells = append(cells, trailing)
+		}
+		r := row{
+			docComment: c.docCommentBlock(slots.doc, p.Pos().RelPos()),
+			cells:      cells,
+			hasComment: slots.any(),
+			opener:     p.Label == nil && nodeIsContiguousOpener(funcParamEnd(p)),
+		}
+		if len(rows) > 0 {
+			r.sep = relBreakOr(funcParamLeadingRelPos(p, slots), soft)
+		}
+		rows = append(rows, r)
+		rows = append(rows, c.postCommentRows(post)...)
+		soft = lineBreakOrSpace
+		if trailing != nil || len(post) > 0 {
+			soft = lineBreakHard
+		}
+	}
+	if open {
+		r := row{cells: []doc{ellipsisLit}}
+		if len(rows) > 0 {
+			r.sep = relBreakOr(ellipsis.RelPos(), soft)
+		}
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+// funcParamLeadingRelPos is [LeadingRelPos] for a parameter whose doc
+// comments, slots.doc, include those hoisted from its constraint and
+// default: the first of them leads the row, wherever it is attached.
+func funcParamLeadingRelPos(p *ast.FuncParam, slots commentSlots) token.RelPos {
+	if len(slots.doc) > 0 {
+		return slots.doc[0].Pos().RelPos()
+	}
+	return p.Pos().RelPos()
+}
+
+// funcParamComments returns the comments of a parameter together with
+// those of its constraint and default expressions. The parser attaches a
+// comment on its own line before either expression to that expression,
+// but a parameter renders as a single table cell, so such a comment is
+// treated as the parameter's: a doc comment precedes the row and any
+// other comment follows it. The interior comments of a bracketed
+// expression stay inside it (see [nodeManagesInteriorComments]).
+func funcParamComments(p *ast.FuncParam) commentSlots {
+	slots := classifyComments(p)
+	for _, e := range []ast.Expr{p.Value, p.Default} {
+		if e == nil {
+			continue
+		}
+		es := classifyComments(e)
+		slots.doc = append(slots.doc, es.doc...)
+		if !nodeManagesInteriorComments(e) {
+			slots.prefix = append(slots.prefix, es.prefix...)
+			slots.suffix = append(slots.suffix, es.suffix...)
+		}
+		slots.trailing = append(slots.trailing, es.trailing...)
+	}
+	return slots
+}
+
+// isLineComment reports whether cg sits on the same line as the token it
+// follows. The parser marks these with a Blank RelPos; a programmatically
+// built AST may set only cg.Line.
+func isLineComment(cg *ast.CommentGroup) bool {
+	return cg.Line || cg.Pos().RelPos() == token.Blank
+}
+
+func firstFuncParam(params []*ast.FuncParam) ast.Node {
+	for _, p := range params {
+		if p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+func lastFuncParam(params []*ast.FuncParam) ast.Node {
+	for i := len(params) - 1; i >= 0; i-- {
+		if params[i] != nil {
+			return params[i]
+		}
+	}
+	return nil
+}
+
+// comprehension converts a Comprehension.
+func (c *converter) comprehension(x *ast.Comprehension) doc {
+	parts := make([]doc, 0, len(x.Clauses)+3)
+
+	// prevEndsLineComment tracks whether the part emitted just before
+	// the current separator ends with a `//` comment. CUE line comments
+	// run to end-of-line, so the following part (the next clause, the
+	// body, or the fallback keyword) must start on a fresh line or the
+	// comment swallows it - e.g. the body's opening brace lands inside
+	// the comment and the result no longer parses.
+	prevEndsLineComment := false
+
+	// sep chooses the separator before the next part. A break is forced
+	// either by the caller (forced, e.g. an authored Newline RelPos) or
+	// because the preceding part ends with a `//` comment; otherwise the
+	// inline separator is used.
+	sep := func(forced bool, inline doc) doc {
+		if forced || prevEndsLineComment {
+			return lineBreakHard
+		}
+		return inline
+	}
+
+	after := comprehensionClauseComments(x)
+	for i, clause := range x.Clauses {
+		var extra []*ast.CommentGroup
+		if after != nil {
+			extra = after[i]
+		}
+		clauseDoc := c.withComments(clause, c.clause(clause))
+		// A comment between clauses either shares the clause's line or
+		// sits on its own line, whatever its RelPos.
+		for _, cg := range extra {
+			var cgSep doc = lineBreakHard
+			if isLineComment(cg) {
+				cgSep = spaceLit
+			}
+			clauseDoc = cats(clauseDoc, cgSep, c.commentGroup(cg))
+		}
+		if i > 0 {
+			// LeadingRelPos gives the RelPos of the first visible token
+			// (the doc comment if any, otherwise the clause itself), so
+			// a doc-commented clause that begins on its own line keeps
+			// its break. A clause that carries a doc comment must also
+			// start on its own line regardless of RelPos, or the `//`
+			// would absorb the inline separator and merge with whatever
+			// follows. A NewSection RelPos keeps its blank line.
+			clauseSep := relBreakOr(LeadingRelPos(clause), sep(HasDocComment(clause), spaceLit))
+			clauseDoc = cat(clauseSep, clauseDoc)
+		}
+		parts = append(parts, clauseDoc)
+		prevEndsLineComment = c.nodeFlags[clause]&endsWithLineComment != 0 || len(extra) > 0
+	}
+
+	if x.Value != nil {
+		forced := LeadingRelPos(x.Value) >= token.Newline
+		parts = append(parts, sep(forced, spaceLit), c.expr(x.Value))
+		prevEndsLineComment = c.nodeFlags[x.Value]&endsWithLineComment != 0
+	}
+
+	if x.Fallback != nil {
+		parts = append(parts, c.fallbackClause(x, sep(false, spaceLit)))
+	}
+
+	return cats(parts...)
+}
+
+// clause converts a single clause.
+func (c *converter) clause(cl ast.Clause) doc {
+	switch x := cl.(type) {
+	case *ast.ForClause:
+		return c.forClause(x)
+	case *ast.IfClause:
+		return cats(stringLit("if "), c.expr(x.Condition))
+	case *ast.LetClause:
+		return c.letClause(x)
+	case *ast.TryClause:
+		return c.tryClause(x)
+	default:
+		return nil
+	}
+}
+
+// letClause converts a LetClause.
+func (c *converter) letClause(x *ast.LetClause) doc {
+	return cats(stringLit("let "), stringLit(x.Ident.Name), c.exprAfter(spaceEqualsLit, equalsSpaceLit, x.Expr))
+}
+
+// forClause converts a ForClause. The comments trailing the key or the
+// value go after the source, as they would otherwise swallow the
+// tokens which follow; see [liftsChildComment].
+func (c *converter) forClause(x *ast.ForClause) doc {
+	var tail []*ast.CommentGroup
+	ident := func(tok, tokSep doc, id *ast.Ident) doc {
+		slots := classifyComments(id)
+		tail = append(tail, slots.nonDoc()...)
+		d := c.withCommentsSlots(id, stringLit(id.Name), commentSlots{doc: slots.doc})
+		return docAfter(tok, tokSep, id, d)
+	}
+	var key doc
+	tok, tokSep := forLit, forSpaceLit
+	if x.Key != nil {
+		// The value may follow the comma after a comment.
+		key = ident(tok, tokSep, x.Key)
+		tok, tokSep = commaLit, commaSpaceLit
+	}
+	d := cats(key, ident(tok, tokSep, x.Value), inSpaceLit, c.expr(x.Source))
+	return c.withCommentsSlots(x, d, commentSlots{trailing: tail})
+}
+
+// exprAfter renders x after the token tok, and tokSep is tok followed
+// by its usual separator, or both are nil. A doc comment on x replaces
+// the separator with a break onto an indented line, as it needs a line
+// of its own, and [converter.withComments] only breaks the line after
+// it. A doc comment on the line of the preceding token stays there.
+// Taking tokSep as a single doc saves allocating their concatenation in
+// the common case without a doc comment.
+func (c *converter) exprAfter(tok, tokSep doc, x ast.Expr) doc {
+	return docAfter(tok, tokSep, x, c.expr(x))
+}
+
+// docAfter is like [converter.exprAfter], with x already rendered as d.
+func docAfter(tok, tokSep doc, x ast.Node, d doc) doc {
+	cg := FirstCommentAt(x, PosDoc)
+	if cg == nil {
+		return cat(tokSep, d)
+	}
+	var br doc = lineBreakHard
+	if cg.Line {
+		br = spaceLit
+	}
+	return cat(tok, nest(cat(br, d)))
+}
+
+// tryClause converts a TryClause.
+func (c *converter) tryClause(x *ast.TryClause) doc {
+	if x.Ident != nil {
+		return cats(stringLit("try "), stringLit(x.Ident.Name), equalsSpaceLit, c.expr(x.Expr))
+	}
+	return stringLit("try")
+}
+
+// fallbackClause converts the FallbackClause of a Comprehension. The
+// keyword depends on the comprehension's clauses: "otherwise" after
+// for-clauses or multiple clauses, "else" after a single if/try
+// clause. lead is the separator placed before the keyword.
+func (c *converter) fallbackClause(comp *ast.Comprehension, lead doc) doc {
+	// The keyword choice mirrors cue/parser.parseFallbackClause: a
+	// single if/try clause uses "else"; everything else (a for clause,
+	// or multiple clauses) uses "otherwise".
+	kw := "otherwise"
+	if len(comp.Clauses) == 1 {
+		switch comp.Clauses[0].(type) {
+		case *ast.IfClause, *ast.TryClause:
+			kw = "else"
+		}
+	}
+	return cats(lead, stringLit(kw), spaceLit, c.expr(comp.Fallback.Body))
+}
+
+// decl converts a declaration node to a Doc, without handling comments
+// on it.
+func (c *converter) decl(d ast.Decl) doc {
+	switch x := d.(type) {
+	case *ast.Field:
+		return c.field(x)
+
+	case *ast.Alias:
+		return cats(stringLit(x.Ident.Name), equalsSpaceLit, c.expr(x.Expr))
+
+	case *ast.EmbedDecl:
+		return c.expr(x.Expr)
+
+	case *ast.LetClause:
+		return c.letClause(x)
+
+	case *ast.Ellipsis:
+		return c.ellipsis(x)
+
+	case *ast.Comprehension:
+		return c.comprehension(x)
+
+	case *ast.Package:
+		return cats(stringLit("package "), stringLit(x.Name.Name))
+
+	case *ast.ImportDecl:
+		return c.importDecl(x)
+
+	case *ast.Attribute:
+		return stringLit(x.Text)
+
+	case *ast.CommentGroup:
+		return c.commentGroup(x)
+
+	case *ast.BadDecl:
+		// Render a bad declaration as bottom (`_|_`), consistently with
+		// BadExpr: valid CUE (an embedded bottom).
+		return bottomLit
+
+	case ast.Expr:
+		// An [ast.Expr] in a Decl slot acts as an embed: the [ast.Expr]
+		// interface satisfies [ast.Decl], so programmatic AST builders
+		// (notably the evaluator's value-to-syntax conversion) can put a
+		// bare expression directly into [ast.StructLit.Elts] without
+		// wrapping it in an [*ast.EmbedDecl]. The caller handles its
+		// comments, like for any other declaration.
+		return c.exprCore(x)
+	}
+	return nil
+}
+
+// field converts a Field to a Doc (full field, not table row),
+// handling all comments on the field itself.
+func (c *converter) field(f *ast.Field) doc {
+	slots := classifyComments(f)
+	// Position 1 (slots.prefix, between label and colon) is not
+	// generated by the CUE parser: there is no source layout for
+	// `name <comment> :` - `//` runs to end-of-line, so the colon
+	// would have to start a fresh line, and the parser doesn't
+	// allow a newline between label and colon. Programmatic ASTs
+	// that set Position=1 on a Field are out of scope; we ignore
+	// slots.prefix here.
+	key := c.fieldKey(f)
+	// Apply Position=2 comments (between colon and value). Inline
+	// ones (rel == Blank, e.g. `: // c\n  v`) stay on the colon's
+	// line by appending to key; own-line ones go inside val's [docNest]
+	// at the value's indent so re-parse / re-format round-trips:
+	// the parser re-attaches such a comment as a doc of the value
+	// with Newline RelPos, which renders identically (also at val's
+	// indent).
+	//
+	// preVal holds the leading-break content prepended to val inside
+	// [docNest]. Seed it with lineBreakHard when val needs to start on its
+	// own line (doc comment, braceless chain, or any Position=2
+	// comment - even inline ones force val to a new line because
+	// the suffix `//` runs to end-of-line). Subsequent HardLines
+	// separate stacked own-line suffix comments, and the final
+	// HardLine bridges the last comment to val.
+	var preVal doc
+	if HasDocComment(f.Value) || valNeedsLeadingBreak(f.Value) || len(slots.suffix) > 0 {
+		preVal = lineBreakHard
+	}
+	for _, cg := range slots.suffix {
+		cd := c.commentGroup(cg)
+		if cg.Line || cg.Pos().RelPos() == token.Blank {
+			key = cat(key, c.commentSep(cg, cd))
+		} else {
+			preVal = cats(preVal, cd, lineBreakHard)
+		}
+	}
+	val := c.fieldValDoc(f, preVal)
+
+	var before, after []doc
+	for _, cg := range slots.doc {
+		before = append(before, c.commentGroup(cg), lineBreakHard)
+	}
+	for _, cg := range slots.trailing {
+		after = append(after, c.commentSep(cg, c.commentGroup(cg)), switchMode(nil, lineBreakHard))
+	}
+
+	var body doc
+	if preVal == nil {
+		body = cats(key, spaceLit, val)
+	} else {
+		// When val is preceded by a leading break (preVal != nil), skip
+		// the " " between key and val - val already starts with HardLine.
+		body = cat(key, val)
+	}
+
+	return cats(append(append(before, body), after...)...)
+}
+
+// fieldRow splits a Field into one or more table Rows for alignment.
+// The first row carries the field itself; any further rows are
+// continuation rows holding extra same-line trailing comments. The
+// caller appends every returned row to the current table so they
+// share its column layout.
+//
+// Comment routing:
+//
+//   - Doc comments (Position 0) are placed in [row.DocComment] on the
+//     first row, before the key, not affecting column widths.
+//   - Position 1 (prefix) comments are ignored - the parser does not
+//     generate them on Fields (see [converter.field]).
+//   - Position 2 (suffix, between colon and value) comments are
+//     deferred and prepended to the value Doc after it is computed.
+//   - Same-line trailing comments go into the trailing-cell column
+//     for cross-row alignment. When a field has more than one, each
+//     comment past the first becomes its own continuation row whose
+//     leading cells are nil, so all the comments column-align beneath
+//     the field's trailing comment.
+//   - Post-field block comments (own-line, with Newline/NewSection
+//     RelPos and no preceding trailing-cell comment) are returned in
+//     the second result so the caller can emit them as sibling
+//     comment blocks after the field, preserving their original
+//     vertical position.
+//
+// For braceless chains (x: y: z: val) the caller provides the chain;
+// the head field identifies the row and the leaf field carries the
+// value.
+func (c *converter) fieldRow(chain []*ast.Field) ([]row, []*ast.CommentGroup) {
+	head := chain[0]
+	leaf := chain[len(chain)-1]
+
+	slots := classifyComments(head)
+	// Position 1 (slots.prefix) is not generated by the parser on
+	// Fields - see [converter.field] for the rationale. Ignored here
+	// too.
+	//
+	// slots.trailing (Position >= PosTrailingMin) is classified into
+	// three buckets:
+	//
+	//   - trailingLineDocs: comments routed to the trailing-cell
+	//     column. Line=true (a same-line trailing `//`) always lands
+	//     here. A Line=false RelPos=Newline comment that immediately
+	//     follows a trailingLineDocs entry is treated as a
+	//     continuation of that trailing (the parser produces this
+	//     shape when re-parsing aligned multi-comment output, so the
+	//     rule keeps alignment idempotent). When trailingLineDocs ends
+	//     up with >=2 entries each becomes its own continuation row so
+	//     they all column-align in the trailing-cell column.
+	//   - trailingFallback: Line=false !IsNewline comments. With
+	//     RelPos info this is the "Blank" case; without it
+	//     (programmatic ASTs) any !IsNewline comment lands here.
+	//     Joined with HardLine inside one cell - re-using the pre-
+	//     existing "broken cell renders flush to row indent" path so
+	//     the original layout round-trips without RelPos info.
+	//   - trailingComments: cg.Pos().IsNewline() with no preceding
+	//     trailingLineDocs entry, or NewSection - rendered as Raw rows
+	//     below the field.
+	var trailingLineDocs []doc
+	var trailingFallback doc
+	var trailingComments []*ast.CommentGroup
+	hasComment := len(slots.suffix) > 0
+	// slots.suffix (Position 2): between colon and value. valDoc isn't
+	// computed yet (we need leaf.Value's type to know whether
+	// attrs/trailing align in a chain table), so defer until later.
+	for _, cg := range slots.trailing {
+		hasComment = true
+		cd := c.commentGroup(cg)
+		rel := cg.Pos().RelPos()
+		switch {
+		case cg.Line:
+			trailingLineDocs = append(trailingLineDocs, cd)
+		case rel == token.Newline && len(trailingLineDocs) > 0:
+			// Continuation of the preceding trailing-cell comment:
+			// re-parse of an aligned multi-comment field has this shape,
+			// so routing here keeps the alignment idempotent.
+			trailingLineDocs = append(trailingLineDocs, cd)
+		case cg.Pos().IsNewline():
+			trailingComments = append(trailingComments, cg)
+		default:
+			trailingFallback = joinLines(trailingFallback, cd)
+		}
+	}
+	// Lift same-line (Line=true) comments attached to a leaf-token
+	// value up to the field's trailing-cell column. The parser
+	// attaches source-level same-line trailing `//` to the field
+	// itself, but [internal/core/export] attaches error annotations to
+	// the value ([*ast.BottomLit]) with Position=2, Line=true. Both
+	// are visually field-trailing comments and should column-align
+	// across sibling rows; lifting normalises the two AST shapes here
+	// so the rendered val cell stays pure text and doesn't trip the
+	// table segmenter's break-capable boundary rule. Restricted to
+	// leaf-token expression types: composite expressions (BinaryExpr,
+	// UnaryExpr, CallExpr, ...) attach internal-layout comments at
+	// Position=2 with Line=true that belong inside the expression's
+	// rendering, not at the field's trailing cell.
+	var leafValueSlots commentSlots
+	leafValueSlotsFiltered := false
+	if isLeafLitValue(leaf.Value) {
+		leafValueSlots = classifyComments(leaf.Value)
+		lifted, kept := partitionLineComments(leafValueSlots)
+		if lifted.any() {
+			leafValueSlots = kept
+			leafValueSlotsFiltered = true
+			for _, cg := range lifted.all() {
+				hasComment = true
+				trailingLineDocs = append(trailingLineDocs, c.commentGroup(cg))
+			}
+		}
+	}
+	// Assemble trailing-cell docs. When >=2 Line=true comments are
+	// present, each becomes its own continuation row so they all align
+	// in the trailing-cell column; trailingFallback (if any) merges
+	// into the last entry. Otherwise everything collapses to one cell
+	// (potentially with internal HardLines from joinLines, which
+	// renders as a broken-segment row whose internal newlines land at
+	// the row's indent - matching the original layout for
+	// stripped-RelPos input).
+	var trailingCommentDocs []doc
+	switch {
+	case len(trailingLineDocs) >= 2:
+		trailingCommentDocs = append(trailingCommentDocs, trailingLineDocs...)
+		if trailingFallback != nil {
+			i := len(trailingCommentDocs) - 1
+			trailingCommentDocs[i] = joinLines(trailingCommentDocs[i], trailingFallback)
+		}
+	case len(trailingLineDocs) == 1 || trailingFallback != nil:
+		var combined doc
+		if len(trailingLineDocs) > 0 {
+			combined = trailingLineDocs[0]
+		}
+		if trailingFallback != nil {
+			combined = joinLines(combined, trailingFallback)
+		}
+		trailingCommentDocs = []doc{combined}
+	}
+	docComment := c.docCommentBlock(slots.doc, head.Pos().RelPos())
+
+	// If the value is a binary chain (any operator) or a selector chain
+	// (a.b.c) AND it carries any trailing comments, hand the field's own
+	// trailing comment to the chain table so it column-aligns with the
+	// chain's arm comments. Otherwise keep it as a separate cell in the
+	// field row (so it aligns with simple fields' trailing comments).
+	//
+	// Attributes: for the plain (non-chain) path, attrs get their own
+	// table cell (column 2) so they column-align across rows just like
+	// trailing comments do. For the chain path the valDoc cell is itself
+	// a multi-line table, so attrs are appended inline instead - there
+	// is no well-defined column position for them in that case.
+	var valDoc doc
+	var attrsDoc doc
+	bin, isBinChain := leaf.Value.(*ast.BinaryExpr)
+	isBinChain = isBinChain && len(trailingCommentDocs) > 0
+	var binArms []chainArm
+	binHasTrailing := false
+	if isBinChain {
+		binArms, binHasTrailing = c.binaryChainArms(bin)
+	}
+	sel, isSelChain := leaf.Value.(*ast.SelectorExpr)
+	isSelChain = isSelChain && len(trailingCommentDocs) > 0
+	var selArms []selArm
+	selHasTrailing := false
+	if isSelChain {
+		selArms, selHasTrailing = c.flattenSelectorChain(sel)
+	}
+	// joinTrailing collapses the field's trailing comments into one Doc
+	// for a chain table's last row and clears trailingCommentDocs (the
+	// chain table renders that column itself, so the field's own
+	// trailing-cell column goes unused).
+	joinTrailing := func() doc {
+		var combined doc
+		for _, d := range trailingCommentDocs {
+			combined = joinLines(combined, d)
+		}
+		trailingCommentDocs = nil
+		return combined
+	}
+	switch {
+	case isBinChain && binHasTrailing && c.chainAligns(bin, binArms):
+		valDoc = appendAttrs(c.binaryChainTable(bin, binArms, joinTrailing()), leaf.Attrs)
+	case isSelChain && selHasTrailing:
+		valDoc = appendAttrs(c.selectorTableExpr(selArms, joinTrailing()), leaf.Attrs)
+	case leafValueSlotsFiltered:
+		valDoc = c.withCommentsSlots(leaf.Value, c.exprCore(leaf.Value), leafValueSlots)
+		attrsDoc = attrsSpaced(leaf.Attrs)
+	default:
+		valDoc = c.expr(leaf.Value)
+		attrsDoc = attrsSpaced(leaf.Attrs)
+	}
+
+	// Now process Position=2 comments (between colon and value);
+	// prepend them to valDoc.
+	for _, cg := range slots.suffix {
+		valDoc = cats(c.commentSep(cg, c.commentGroup(cg)), valDoc)
+	}
+
+	// For chain rows (len(chain) > 1) whose leaf value is atomic,
+	// build a merged alternative for cell 0: a tree of nested Groups
+	// with valDoc inside the deepest [docNest], woven through every label
+	// of the chain. The renderer uses this when the segment as a
+	// whole can't fit flat, so each split point's flat-fit check
+	// includes the value and partial chain breaks land the value on
+	// the chain's actual deepest line. When valDoc is complex
+	// ([docGroup] / [docTable] / [docLineBreakBare] inside) we leave
+	// mergedFirstCell nil so its own break point handles overflow.
+	//
+	// The loop below weaves the same fk into both the chain key
+	// (without valDoc) and, when set, mergedFirstCell (with valDoc
+	// innermost).
+	var mergedFirstCell doc
+	if len(chain) > 1 && !valDoc.canBreak() {
+		mergedFirstCell = valDoc
+	}
+	var key doc
+	for i := len(chain) - 1; i >= 0; i-- {
+		fk := c.fieldKey(chain[i])
+		if key == nil {
+			key = fk
+		} else {
+			// Build the chain key as nested Groups (one per split point)
+			// without the leaf's value, so cell 0 has a clean chain that
+			// can align across sibling rows in a multi-row segment.
+			key = group(cat(fk, nest(cat(lineBreakOrSpace, key))))
+		}
+		if mergedFirstCell != nil {
+			mergedFirstCell = group(cat(fk, nest(cat(lineBreakOrSpace, mergedFirstCell))))
+		}
+	}
+
+	// Column layout:
+	//   [key, val]                     - neither attrs nor comment
+	//   [key, val, attrs]              - attrs only
+	//   [key, val, nil, trailing]      - comment only (reserves the
+	//                                    attrs column so comment lands
+	//                                    in the same column across
+	//                                    attr-bearing rows)
+	//   [key, val, attrs, trailing]    - both
+	var firstTrailing doc
+	if len(trailingCommentDocs) > 0 {
+		firstTrailing = trailingCommentDocs[0]
+	}
+	cells := []doc{key, valDoc}
+	if attrsDoc != nil || firstTrailing != nil {
+		cells = append(cells, attrsDoc)
+		if firstTrailing != nil {
+			cells = append(cells, firstTrailing)
+		}
+	}
+
+	rows := []row{{
+		docComment:      docComment,
+		cells:           cells,
+		hasComment:      hasComment,
+		allowRowBreak:   true,
+		mergedFirstCell: mergedFirstCell,
+	}}
+	// Any extra trailing comments become continuation rows sharing the
+	// segment's column layout: every cell up to the trailing column is
+	// nil, so the table renderer pads to those columns' widths and the
+	// comment lands at the same column as the main row's trailing
+	// comment. Sep is HardLine so each continuation row appears on its
+	// own line below the main row.
+	if firstTrailing != nil {
+		for _, d := range trailingCommentDocs[1:] {
+			cont := make([]doc, len(cells))
+			cont[len(cont)-1] = d
+			rows = append(rows, row{
+				sep:           lineBreakHard,
+				cells:         cont,
+				hasComment:    true,
+				allowRowBreak: true,
+			})
+		}
+	}
+	return rows, trailingComments
+}
+
+// fieldKey builds the key portion of a field: label + alias +
+// constraint + colon.
+func (c *converter) fieldKey(f *ast.Field) doc {
+	key := c.label(f.Label)
+	if f.Alias != nil {
+		key = cat(key, c.postfixAlias(f.Alias))
+	}
+	if f.Constraint == token.OPTION || f.Constraint == token.NOT {
+		key = cat(key, stringLit(f.Constraint.String()))
+	}
+	return cat(key, colonLit)
+}
+
+// fieldValDoc builds the value portion of a field: value + attributes.
+// When preVal is non-nil it is the leading-break content prepended to
+// val, so val is rendered on its own line. For non-chain values the
+// continuation lives inside a [docNest] so it indents relative to the
+// key; for a braceless chain value (`a: b: c`) the chain elements stay
+// at the outer indent and the [docNest] is omitted, since the chain is
+// continuation of the same field rather than a nested body. preVal ==
+// nil means no leading break: val is returned as-is and rendered on
+// the key's line.
+func (c *converter) fieldValDoc(f *ast.Field, preVal doc) doc {
+	// If f itself carries attributes, the chain-collapse in
+	// [converter.fieldValExpr] would move them past a closer that no
+	// longer exists - `entries: {[string]: string} @attr` collapsed to
+	// `entries: [string]: string @attr` re-binds @attr from entries
+	// to the leaf, changing semantics. Take the regular c.expr path
+	// instead, which goes through structLit and keeps the synthesised
+	// braces so the trailing attr attaches to f.
+	valExprFun := c.fieldValExpr
+	if len(f.Attrs) > 0 {
+		valExprFun = c.expr
+	}
+	val := appendAttrs(valExprFun(f.Value), f.Attrs)
+	if preVal != nil {
+		// A chain value continues the outer field, so its
+		// continuation only indents when the chain itself was
+		// authored multi-line (inner field carries Newline RelPos
+		// via [valNeedsLeadingBreak]) or carries a doc comment.
+		// An inline `//` comment after the colon forces preVal but
+		// doesn't imply an indent: the chain body stays at the outer
+		// indent. Other values (struct, list, expression) always get
+		// the indenting [docNest].
+		if bracelessChainCollapsible(f.Value) &&
+			!HasDocComment(f.Value) &&
+			!valNeedsLeadingBreak(f.Value) {
+			val = cat(preVal, val)
+		} else {
+			val = nest(cat(preVal, val))
+		}
+	}
+	return val
+}
+
+// fieldValExpr renders an expression that sits in the value slot of
+// a Field. It is the same as [converter.expr] except that a braceless
+// StructLit with a single Field child is rendered as that inner Field
+// directly (no synthesised braces), preserving the parsed chain shape
+// `a: b: c: 1`. The chain is only valid here, where the surrounding
+// Field's key provides the binding; at every other expression position
+// the StructLit emits its synthesised braces via [converter.expr].
+//
+// The collapse is refused when the inner Field carries side data that
+// has no natural home in chain form:
+//
+//   - inner.Attrs: the `@attr` syntactically attaches to the leaf, so
+//     collapsing would silently move it and may change semantics.
+//   - inner doc / leading comments: in chain form they would be
+//     squeezed between the outer and inner keys.
+//   - StructLit-attached comments: no chain-form equivalent.
+func (c *converter) fieldValExpr(v ast.Expr) doc {
+	if !bracelessChainCollapsible(v) {
+		return c.expr(v)
+	}
+	return c.declSlice(v.(*ast.StructLit).Elts)
+}
+
+// postfixAlias converts a PostfixAlias.
+func (c *converter) postfixAlias(a *ast.PostfixAlias) doc {
+	// The single-alias form is always parenthesised (`~(X)`, never
+	// `~X`), consistent with the parser which accepts both but
+	// normalises to the parens form.
+	if a.Label == nil {
+		return cats(stringLit("~("), stringLit(a.Field.Name), rParenLit)
+	}
+	return cats(stringLit("~("), stringLit(a.Label.Name), commaLit, stringLit(a.Field.Name), rParenLit)
+}
+
+// importDecl converts an ImportDecl. Comments on each ImportSpec are
+// preserved via [converter.importSpecRow]. All separators (opener
+// break, inter-spec, closer break) are RelPos-driven: a
+// parser-produced AST carries Newline hints that lay the specs out
+// one per line, while a programmatic AST with no RelPos hints renders
+// flat, the enclosing [docGroup] picking compact `import ("a", "b")`
+// when it fits and breaking across lines otherwise.
+//
+// The specs render as a [docTable] so that trailing comments on specs
+// in the same group column-align (cell 0 is the whole spec, cell 1
+// the comment). A blank line (NewSection) between two specs flushes
+// the table, matching how [converter.declSlice] segments struct
+// fields.
+func (c *converter) importDecl(x *ast.ImportDecl) doc {
+	if len(x.Specs) == 0 {
+		return nil
+	}
+	if !importDeclParenthesised(x) {
+		// Single import without parens. A doc comment on the spec
+		// forces the parenthesised form below: the no-parens form would
+		// hoist the comment before the `import` keyword (via
+		// withComments), detaching it from the spec it documents.
+		s := x.Specs[0]
+		body := cats(stringLit("import "), c.importSpec(s))
+		return c.withComments(s, body)
+	}
+
+	comments := partitionImportComments(x)
+
+	var bodyParts []doc
+	for _, cg := range comments.afterLparen {
+		bodyParts = append(bodyParts, c.commentSep(cg, c.commentGroup(cg)))
+	}
+	tableRows := make([]row, 0, len(x.Specs))
+	flushTable := func() {
+		if len(tableRows) == 0 {
+			return
+		}
+		bodyParts = append(bodyParts, tableRows[0].sep, table(tableRows))
+		tableRows = tableRows[len(tableRows):]
+	}
+	for i, s := range x.Specs {
+		flat := lineBreakOrComma
+		if i == 0 {
+			flat = lineBreakOrEmpty
+		}
+		r := c.importSpecRow(s)
+		r.sep = relBreakOr(LeadingRelPos(s), flat)
+		// A blank line (NewSection) or a doc comment visually separates
+		// specs, so it starts a fresh alignment group - as in declSlice.
+		if len(tableRows) > 0 && (r.sep == blankLine || r.docComment != nil) {
+			flushTable()
+		}
+		tableRows = append(tableRows, r)
+	}
+	flushTable()
+	for _, cg := range comments.beforeRparen {
+		bodyParts = append(bodyParts, c.commentSep(cg, c.commentGroup(cg)))
+	}
+
+	closeBreak := relBreakOr(x.Rparen.RelPos(), lineBreakOrEmpty)
+	open := stringLit("import (")
+	if comments.hasInterior() {
+		// Comments inside the parentheses make the flat one-line
+		// rendering impossible (a group trailing the opening
+		// parenthesis would swallow the rest of the line, and
+		// own-line groups need their lines), so force the group to
+		// break.
+		parts := []doc{open}
+		for _, cg := range comments.lparenLine {
+			parts = append(parts, spaceLit, c.commentGroup(cg))
+		}
+		parts = append(parts, switchMode(nil, lineBreakHard))
+		open = cats(parts...)
+	}
+	return group(cats(
+		open,
+		nest(cats(bodyParts...)),
+		closeBreak,
+		rParenLit,
+	))
+}
+
+// importSpecRow builds the table row for one ImportSpec. Cell 0 is the
+// spec text (`name "path"` or `"path"`); a same-line trailing comment
+// becomes cell 1, so trailing comments column-align across the group. A
+// doc comment renders on its own line above the spec via row.docComment.
+// Any other comment shape is unusual for an import spec, so we fall back
+// to the generic [converter.withComments] rendering as a non-aligned raw
+// row rather than risk dropping or misplacing it. The caller fills in
+// row.sep.
+func (c *converter) importSpecRow(s *ast.ImportSpec) row {
+	slots := classifyComments(s)
+	specDoc := c.importSpec(s)
+
+	// Trailing comments align in the comment column. The parser files a
+	// same-line comment at PosSuffix for an unnamed spec and at a
+	// trailing position for a named one, so we gather both. A comment
+	// counts as trailing when it sits on the spec's line (Line=true) or
+	// carries no own-line break (!IsNewline) - the latter covers a
+	// programmatic / RelPos-stripped AST, keeping trailing comments in
+	// the cell there too. A genuine own-line comment after the spec, or a
+	// prefix comment, is unusual; fall back below.
+	var trailing doc
+	unusual := len(slots.prefix) > 0
+	collect := func(cgs []*ast.CommentGroup) {
+		for _, cg := range cgs {
+			if cg.Line || !cg.Pos().IsNewline() {
+				trailing = joinLines(trailing, c.commentGroup(cg))
+			} else {
+				unusual = true
+			}
+		}
+	}
+	collect(slots.suffix)
+	collect(slots.trailing)
+	if unusual {
+		return row{raw: c.withComments(s, specDoc)}
+	}
+
+	cells := []doc{specDoc}
+	hasComment := false
+	if trailing != nil {
+		cells = append(cells, trailing)
+		hasComment = true
+	}
+	return row{
+		cells:      cells,
+		docComment: c.docCommentBlock(slots.doc, s.Pos().RelPos()),
+		hasComment: hasComment,
+	}
+}
+
+// importSpec converts an ImportSpec.
+func (c *converter) importSpec(s *ast.ImportSpec) doc {
+	if s.Name != nil {
+		return cats(stringLit(s.Name.Name), spaceLit, stringLit(s.Path.Value))
+	}
+	return stringLit(s.Path.Value)
+}
+
+var (
+	// lineBreakHard returns a hard line break that always emits a
+	// newline. Any [docGroup] containing a HardLine is forced to
+	// break.
+	lineBreakHard    = &docLineBreakHard{docBase: docBase{breaks: true}}
+	lineBreakBare    = &docLineBreakBare{docBase: docBase{breaks: true}}
+	lineBreakOrEmpty = lineBreakSoft("")
+	// lineBreakOrSpace is a Line that emits a space when flat.
+	lineBreakOrSpace = lineBreakSoft(" ")
+	// lineBreakOrComma is a Line that emits ", " when flat.
+	lineBreakOrComma = lineBreakSoft(", ")
+	// blankLine emits a bare newline followed by an indented newline,
+	// producing a truly blank line (no trailing whitespace) as a
+	// separator.
+	blankLine = cat(lineBreakBare, lineBreakHard)
+	// commaWhenBroken emits a comma only in broken-mode.
+	commaWhenBroken = switchMode(commaLit, nil)
+	lBracketLit     = stringLit("[")
+	hashLBracket    = stringLit("#[")
+	hashLBrace      = stringLit("#{")
+	rBracketLit     = stringLit("]")
+	lBraceLit       = stringLit("{")
+	rBraceLit       = stringLit("}")
+	lParenLit       = stringLit("(")
+	rParenLit       = stringLit(")")
+	spaceLit        = stringLit(" ")
+	commaLit        = stringLit(",")
+	commaSpaceLit   = stringLit(", ")
+	periodLit       = stringLit(".")
+	colonLit        = stringLit(":")
+	equalsLit       = stringLit("=")
+	equalsSpaceLit  = stringLit(" = ")
+	spaceEqualsLit  = stringLit(" =")
+	forLit          = stringLit("for")
+	forSpaceLit     = stringLit("for ")
+	inSpaceLit      = stringLit(" in ")
+	bottomLit       = stringLit("_|_")
+	ellipsisLit     = stringLit("...")
+)
+
+// wrapEligibility reports whether n is one of the AST node types at
+// which the converter calls [converter.maybeGroup] (eligible), and
+// whether such a node has authored structural tokens of its own
+// (authored). For non-eligible types, both results are false.
+//
+// The eligible node types are *ast.File, *ast.StructLit, *ast.ListLit,
+// *ast.Func, *ast.CallExpr, *ast.BinaryExpr, and *ast.IndexExpr; the
+// isAuthored algorithm only sets the flag on these types.
+//
+// authored == false for a wrap-eligible node means its brackets were
+// synthesised by the converter (e.g. a programmatic StructLit with
+// Lbrace.IsValid() == false), so the [analyse] pass treats n as a
+// pass-through for RelPos bubble-up and the synthesised wrap ends up
+// under [finiteWidth] rather than [infiniteWidth], keeping its soft
+// opener/closer breaks soft.
+//
+// Only StructLit and ListLit have a meaningful authored check; the
+// other wrap-eligible types always have authored structural tokens, so
+// authored is always true for them.
+func wrapEligibility(n ast.Node) (eligible, authored bool) {
+	switch x := n.(type) {
+	case *ast.StructLit:
+		return true, x.Lbrace.IsValid()
+	case *ast.ListLit:
+		return true, x.Lbrack.IsValid()
+	case *ast.File, *ast.Func, *ast.CallExpr, *ast.BinaryExpr, *ast.IndexExpr:
+		return true, true
+	}
+	return false, false
+}
+
+// hasTrailingCommentLine reports whether a node with the comment slots
+// s has a trailing-position comment that would render on its own line
+// (Slash RelPos >= Newline and !cg.Line). Same-line trailing comments
+// don't qualify: the line ends naturally after them, and the parser
+// keeps them attached to the node on reparse.
+func hasTrailingCommentLine(s commentSlots) bool {
+	for _, cg := range s.trailing {
+		if !cg.Line && cg.Pos().RelPos() >= token.Newline {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeEndsWithLineComment reports whether the comments that
+// [converter.withCommentsSlots] renders after n, whose comment slots
+// are s, leave a `//` comment at the tail of n's output. The slot
+// selection mirrors withCommentsSlots: trailing comments (Position >=
+// PosTrailingMin) always render after the body, and for nodes that
+// don't manage their own interior comments the prefix/suffix slots are
+// emitted as trailing content too. CUE has only `//` line comments, so
+// any such tail comment runs to end-of-line.
+func nodeEndsWithLineComment(n ast.Node, s commentSlots) bool {
+	if len(s.trailing) > 0 {
+		return true
+	}
+	if !nodeManagesInteriorComments(n) && (len(s.prefix) > 0 || len(s.suffix) > 0) {
+		return true
+	}
+	return false
+}
+
+// liftsChildComment reports whether n's renderer moves the comment
+// ending one of its children, which is not rendered last, to the end of
+// n's output, as it would otherwise swallow the tokens which follow.
+// flags holds the children's flags.
+func liftsChildComment(n ast.Node, flags map[ast.Node]nodeFlag) bool {
+	ends := func(x ast.Node) bool { return flags[x]&endsWithLineComment != 0 }
+	switch n := n.(type) {
+	case *ast.ForClause:
+		return (n.Key != nil && ends(n.Key)) || ends(n.Value)
+	}
+	return false
+}
+
+// rowEndsWithComment reports whether the row [converter.listElemRow]
+// builds for e ends in a `//` comment, including one which moves there
+// from inside e, such as from after a unary operator or an operand.
+func (c *converter) rowEndsWithComment(e ast.Node) bool {
+	return c.nodeFlags[e]&endsWithLineComment != 0 || len(trailingPrefixComments(e)) > 0
+}
+
+// isBracketed reports whether n's rendered output ends with a
+// closing bracket - so descendant trailing comments are inside the
+// brackets and don't reach n's rendered end. Only n's own attached
+// trailing comments (rendered after the closer) can carry the tail
+// flag for these nodes. StructLit and ImportDecl can appear without
+// their delimiters (a braceless struct, e.g. a file body; a parenless
+// single-spec import); in that case the rendered end is the last
+// child and descendants do propagate.
+func isBracketed(n ast.Node) bool {
+	switch x := n.(type) {
+	case *ast.StructLit:
+		return braced(x)
+	case *ast.ImportDecl:
+		return x.Lparen.IsValid()
+	case *ast.ListLit, *ast.CallExpr, *ast.IndexExpr, *ast.SliceExpr, *ast.ParenExpr:
+		return true
+	default:
+		return false
+	}
+}
+
+// multilineDecls reports whether any inter-decl separator is a hard
+// break (Newline / NewSection RelPos).
+func multilineDecls(decls []ast.Decl) bool {
+	for i, decl := range decls {
+		if i > 0 && LeadingRelPos(decl) >= token.Newline {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCommentAt reports whether n has any CommentGroup whose Position
+// equals pos. Returns false for nil n.
+func hasCommentAt(n ast.Node, pos int8) bool {
+	if n == nil {
+		return false
+	}
+	for _, cg := range ast.Comments(n) {
+		if cg.Position == pos {
+			return true
+		}
+	}
+	return false
+}
+
+// FirstCommentAt returns the first CommentGroup attached to n whose
+// Position equals pos, or nil if there is none. Returns nil for nil n.
+func FirstCommentAt(n ast.Node, pos int8) *ast.CommentGroup {
+	if n == nil {
+		return nil
+	}
+	for _, cg := range ast.Comments(n) {
+		if cg.Position == pos {
+			return cg
+		}
+	}
+	return nil
+}
+
+// HasDocComment reports whether a node has any doc comments.
+func HasDocComment(n ast.Node) bool {
+	return hasCommentAt(n, PosDoc)
+}
+
+// importDeclParenthesised reports whether x has at least one spec
+// and either a valid Lparen, more than one spec, or a doc comment on
+// its sole spec - the declarations that render in the parenthesised
+// `import (...)` form rather than as a compact `import "path"`.
+func importDeclParenthesised(x *ast.ImportDecl) bool {
+	return len(x.Specs) > 0 &&
+		(x.Lparen.IsValid() || len(x.Specs) > 1 || HasDocComment(x.Specs[0]))
+}
+
+// importCommentSlots holds the comment groups attached to an
+// [*ast.ImportDecl], as partitioned by [partitionImportComments]:
+// every group lands in exactly one slot. Each slot has a single
+// consumer: [converter.importDecl] renders the paren-interior slots
+// inside the parentheses, and [converter.withCommentsSlots] renders
+// doc before the declaration and trailing after it.
+type importCommentSlots struct {
+	// doc holds the groups before the `import` keyword (PosDoc).
+	doc []*ast.CommentGroup
+	// lparenLine holds the groups trailing the opening parenthesis
+	// on its line (`import ( // c`): PosSuffix with Line set.
+	lparenLine []*ast.CommentGroup
+	// afterLparen holds the detached groups between the opening
+	// parenthesis and the first spec: PosSuffix without Line.
+	afterLparen []*ast.CommentGroup
+	// beforeRparen holds the groups between the last spec and the
+	// closing parenthesis: [posImportBeforeRparen] without Line.
+	beforeRparen []*ast.CommentGroup
+	// trailing holds every other group: those following the whole
+	// declaration, plus shapes the parser never files on an import
+	// declaration (a group between `import` and the parenthesis, or
+	// one at [posImportBeforeRparen] with Line set).
+	trailing []*ast.CommentGroup
+}
+
+// hasInterior reports whether any of the paren-interior slots
+// (lparenLine, afterLparen, beforeRparen) holds a group.
+func (s importCommentSlots) hasInterior() bool {
+	return len(s.lparenLine)+len(s.afterLparen)+len(s.beforeRparen) > 0
+}
+
+// partitionImportComments partitions the comment groups attached to x
+// into [importCommentSlots]. When [importDeclParenthesised] is false
+// the declaration has no paren interior, so every group other than
+// the doc groups lands in trailing.
+func partitionImportComments(x *ast.ImportDecl) importCommentSlots {
+	var s importCommentSlots
+	parens := importDeclParenthesised(x)
+	for _, cg := range ast.Comments(x) {
+		switch {
+		case cg.Position == PosDoc:
+			s.doc = append(s.doc, cg)
+		case !parens:
+			s.trailing = append(s.trailing, cg)
+		case cg.Position == PosSuffix && cg.Line:
+			s.lparenLine = append(s.lparenLine, cg)
+		case cg.Position == PosSuffix:
+			s.afterLparen = append(s.afterLparen, cg)
+		case cg.Position == posImportBeforeRparen && !cg.Line:
+			s.beforeRparen = append(s.beforeRparen, cg)
+		default:
+			s.trailing = append(s.trailing, cg)
+		}
+	}
+	return s
+}
+
+// appendAttrs concatenates a field's attributes after val, separated
+// by spaces. Returns val unchanged when attrs is empty.
+func appendAttrs(val doc, attrs []*ast.Attribute) doc {
+	for _, attr := range attrs {
+		val = cats(val, spaceLit, stringLit(attr.Text))
+	}
+	return val
+}
+
+// attrsSpaced returns a Doc rendering attrs joined by spaces, or nil
+// when attrs is empty.
+func attrsSpaced(attrs []*ast.Attribute) doc {
+	if len(attrs) == 0 {
+		return nil
+	}
+	parts := make([]doc, 0, 2*len(attrs)-1)
+	for i, attr := range attrs {
+		if i > 0 {
+			parts = append(parts, spaceLit)
+		}
+		parts = append(parts, stringLit(attr.Text))
+	}
+	return cats(parts...)
+}
+
+// nodeManagesInteriorComments reports whether a node's conversion
+// bakes its interior (PosPrefix / PosSuffix) comments into the
+// returned Doc, leaving doc and trailing comments for the caller to
+// wrap. True for StructLit, ListLit, and BinaryExpr - each places its
+// interior comments inside its own rendering, so withComments must skip
+// the prefix and suffix slots for these nodes to avoid double-rendering.
+func nodeManagesInteriorComments(n ast.Node) bool {
+	switch n.(type) {
+	case *ast.StructLit, *ast.ListLit, *ast.BinaryExpr, *ast.SelectorExpr:
+		return true
+	}
+	return false
+}
+
+// joinLines appends cd below acc, separated by a HardLine. A nil acc
+// is replaced by cd directly.
+func joinLines(acc, cd doc) doc {
+	if acc == nil {
+		return cd
+	}
+	return cats(acc, lineBreakHard, cd)
+}
+
+// classifyComments partitions n's attached comments into slots. It
+// leaves out the comments which n's own renderer places, such as the
+// interior comments of an IndexExpr or a UnaryExpr, and includes the
+// label doc comments of a Field; see [fieldComments].
+// See commentSlots for the slot semantics.
+func classifyComments(n ast.Node) commentSlots {
+	var s commentSlots
+	cgs := ast.Comments(n)
+	var skip func(*ast.CommentGroup) bool
+	switch x := n.(type) {
+	case *ast.Comprehension:
+		// A comprehension renders the comments between its clauses
+		// itself; see [comprehensionClauseComments]. Its other
+		// comments are doc comments or trail the whole comprehension,
+		// whatever their Position. A same-line comment comes first, as
+		// it trails the last token.
+		var own []*ast.CommentGroup
+		for _, cg := range comprehensionComments(x) {
+			switch {
+			case cg.Position == PosDoc:
+				s.doc = append(s.doc, cg)
+			case cg.Line:
+				s.trailing = append(s.trailing, cg)
+			default:
+				own = append(own, cg)
+			}
+		}
+		s.trailing = append(s.trailing, own...)
+		return s
+	case *ast.Field:
+		cgs = fieldComments(x)
+	case *ast.IndexExpr:
+		skip = func(cg *ast.CommentGroup) bool { // rendered by [converter.indexExpr]
+			return cg.Position == posIndexAfterLbrack || cg.Position == posIndexBeforeRbrack
+		}
+	case *ast.UnaryExpr:
+		interior := unaryInteriorComments(x) // rendered by [converter.unaryExpr]
+		skip = func(cg *ast.CommentGroup) bool { return slices.Contains(interior, cg) }
+	}
+	for _, cg := range cgs {
+		if skip != nil && skip(cg) {
+			continue
+		}
+		switch cg.Position {
+		case PosDoc:
+			s.doc = append(s.doc, cg)
+		case PosPrefix:
+			s.prefix = append(s.prefix, cg)
+		case PosSuffix:
+			s.suffix = append(s.suffix, cg)
+		default:
+			s.trailing = append(s.trailing, cg)
+		}
+	}
+	return s
+}
+
+// comprehensionClauseComments returns, for each clause of x, the
+// comments attached to x which follow that clause and precede the next
+// clause or the body.
+//
+// The parser attaches these to the comprehension, numbering their
+// Position by counting the clauses and the body as one position each,
+// plus one for each comma consumed between them. A comment can only
+// follow a clause on a later line, so it always comes after the comma
+// which the line break implies. We count such a comma after the last
+// clause too: without one, the body takes that position instead, so
+// no comment can have it.
+func comprehensionClauseComments(x *ast.Comprehension) [][]*ast.CommentGroup {
+	cgs := ast.Comments(x)
+	if len(cgs) == 0 {
+		return nil
+	}
+	var after [][]*ast.CommentGroup
+	pos := 0
+	for i := range x.Clauses {
+		pos++ // the clause itself
+		if i+1 < len(x.Clauses) && LeadingRelPos(x.Clauses[i+1]) < token.Newline {
+			// The next clause follows on the same line.
+			continue
+		}
+		pos++ // the comma ending the clause's line
+		for _, cg := range cgs {
+			if int(cg.Position) == pos {
+				if after == nil {
+					after = make([][]*ast.CommentGroup, len(x.Clauses))
+				}
+				after[i] = append(after[i], cg)
+			}
+		}
+	}
+	return after
+}
+
+// comprehensionComments returns the comments attached to x, excluding
+// those which [comprehensionClauseComments] places between clauses.
+func comprehensionComments(x *ast.Comprehension) []*ast.CommentGroup {
+	cgs := ast.Comments(x)
+	after := slices.Concat(comprehensionClauseComments(x)...)
+	if len(after) == 0 {
+		return cgs
+	}
+	return slices.DeleteFunc(slices.Clone(cgs), func(cg *ast.CommentGroup) bool {
+		return slices.Contains(after, cg)
+	})
+}
+
+// partitionLineComments splits in into (line, other): CommentGroups
+// with Line=true land in the first return value, the rest in the
+// second.
+func partitionLineComments(in commentSlots) (line, other commentSlots) {
+	split := func(src []*ast.CommentGroup) (l, o []*ast.CommentGroup) {
+		for _, cg := range src {
+			if cg.Line {
+				l = append(l, cg)
+			} else {
+				o = append(o, cg)
+			}
+		}
+		return
+	}
+	line.doc, other.doc = split(in.doc)
+	line.prefix, other.prefix = split(in.prefix)
+	line.suffix, other.suffix = split(in.suffix)
+	line.trailing, other.trailing = split(in.trailing)
+	return line, other
+}
+
+// relBreakOr returns the line-break Doc corresponding to a RelPos
+// with a soft fallback for the non-newline cases. Newline always
+// produces HardLine and NewSection always produces BlankLine.
+func relBreakOr(rel token.RelPos, soft doc) doc {
+	switch rel {
+	case token.Newline:
+		return lineBreakHard
+	case token.NewSection:
+		return blankLine
+	}
+	return soft
+}
+
+// relBreak returns the line-break Doc corresponding to a RelPos:
+// BlankLine for NewSection, HardLine for Newline, and
+// [lineBreakOrEmpty] otherwise.
+func relBreak(rel token.RelPos) doc {
+	return relBreakOr(rel, lineBreakOrEmpty)
+}
+
+// LeadingRelPos returns the RelPos that drives the separator placed
+// before n's first visible token. If n has a Position=0 doc comment,
+// the first visible token is that comment, so its RelPos wins;
+// otherwise n's own RelPos applies.
+func LeadingRelPos(n ast.Node) token.RelPos {
+	if cg := FirstCommentAt(n, PosDoc); cg != nil {
+		return cg.Pos().RelPos()
+	}
+	return n.Pos().RelPos()
+}
+
+// reindentMultilineString re-indents a multi-line string or bytes
+// literal so its body and closing quote render one level deeper than
+// the opening line (the opener stays inline after the `key: `). value
+// is the full literal text, e.g. "\"\"\"\n\tbody\n\t\"\"\"".
+//
+// The strip prefix (the whitespace before the closing quote, returned
+// by [literal.QuoteInfo.Whitespace]) is removed from each body line
+// and the renderer re-emits the indentation at its actual nest level
+// via [docLineBreakHard] inside a [docNest], so the body lands at
+// field-indent + 1 regardless of what the producer embedded. Empty
+// body lines emit a bare newline so they carry no trailing whitespace.
+// Returns nil if the quotes can't be parsed or the literal isn't
+// genuinely multi-line.
+func reindentMultilineString(value string) doc {
+	qi, _, _, err := literal.ParseQuotes(value, value)
+	if err != nil || !qi.IsMulti() {
+		return nil
+	}
+	lines := strings.Split(value, "\n")
+	if len(lines) < 2 {
+		return nil
+	}
+	strip := qi.Whitespace()
+	body := make([]doc, 0, (len(lines)-1)*2)
+	for _, line := range lines[1:] {
+		if rest, ok := strings.CutPrefix(line, strip); ok && strip != "" {
+			body = append(body, lineBreakHard, stringLit(rest))
+		} else {
+			// An empty line, or a line whose whitespace is shorter than
+			// the strip prefix: emit it verbatim after a bare newline so
+			// no indentation is added.
+			body = append(body, lineBreakBare, stringLit(line))
+		}
+	}
+	return cat(stringLit(lines[0]), nest(cats(body...)))
+}
+
+// isContiguousOpener reports whether e's rendering wraps its broken
+// inner content in a [docNest] of its own. When that's true, an
+// enclosing construct (struct/list/call) can drop its own [docNest] at
+// the boundary where it meets e, so the two layers don't compound and
+// chains like `[{...}]` or `f(g(h([...])))` stay at one indent level
+// for their broken bodies.
+//
+// StructLit/ListLit/ParenExpr begin literally with `{`/`[`/`(`.
+// CallExpr (`fun(args)`) and IndexExpr (`x[i]`) begin with their
+// callee/receiver text but expose their opener on the same physical
+// line, with the same [docNest] effect on indent, so they qualify too -
+// "contiguous" refers to layout effect on indent, not literal bracket
+// adjacency. Synthesised brackets on a programmatic StructLit/ListLit
+// (Lbrace/Lbrack == NoPos) behave identically to authored ones and
+// qualify the same way.
+func isContiguousOpener(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.StructLit, *ast.ListLit, *ast.ParenExpr, *ast.CallExpr, *ast.IndexExpr:
+		return true
+	}
+	return false
+}
+
+// nodeIsContiguousOpener reports whether n's rendering begins with
+// an opening `{`, `[`, or `(`. For Exprs that's a StructLit, ListLit,
+// or ParenExpr; for Decls only an EmbedDecl wrapping such an Expr
+// qualifies (fields always begin with a label).
+func nodeIsContiguousOpener(n ast.Node) bool {
+	switch e := n.(type) {
+	case *ast.EmbedDecl:
+		return isContiguousOpener(e.Expr)
+	case ast.Expr:
+		return isContiguousOpener(e)
+	}
+	return false
+}
+
+// hasSameLineOpener reports whether any element ends in a contiguous
+// opener that the user wrote on the parent's opener line. It walks
+// elements left-to-right and stops at the first element with a
+// Newline-or-stronger leading RelPos (including a Newline carried by a
+// doc comment), since that element and all later ones are on new lines.
+// leads[i] is the node which starts the i'th element, and values[i] the
+// node which ends it, such as the value of a named call argument; both
+// are the element itself otherwise.
+//
+// The opener must also break across lines to qualify: an opener that
+// stays inline (e.g. a short embedded list `[1, 3]`) supplies no
+// indent, so the same-line-opener rule that drops the parent's
+// [docNest] must not fire for it.
+func hasSameLineOpener[L, V ast.Node](c *converter, leads []L, values []V) bool {
+	for i, e := range values {
+		if LeadingRelPos(leads[i]) >= token.Newline {
+			return false
+		}
+		if nodeIsContiguousOpener(e) && c.hasNewlineInSubtree(e) {
+			return true
+		}
+	}
+	return false
+}
+
+// noElemHasNewline reports whether every element shares a line with
+// its predecessor (no Newline / NewSection leading RelPos on any
+// element - a doc comment's Slash is taken into account via
+// [LeadingRelPos]).
+func noElemHasNewline[T ast.Node](elems []T) bool {
+	for _, e := range elems {
+		if LeadingRelPos(e) >= token.Newline {
+			return false
+		}
+	}
+	return true
+}
+
+// hasLineLeadingComment reports whether the parent's opener line ends
+// with a `//` comment that the formatter must keep there. It returns
+// true in two cases:
+//
+//   - slots.prefix's first comment is Line=true: a comment attached
+//     to the bracketed node itself, written as `{ // c` immediately
+//     after the opener.
+//   - the first element/decl carries a Line=true Position=0 doc
+//     comment: `{ // c\n field`, `[ // c\n elem`, or `( // c\n arg`,
+//     with the `// c` hung off the first child by the parser.
+//
+// Pass an empty [commentSlots] when the parent node carries no
+// interior comments of its own (e.g. CallExpr); only the first child's
+// doc comment is then inspected.
+func hasLineLeadingComment(slots commentSlots, first ast.Node) bool {
+	// A comment sits on the opener line when the parser gives it a Blank
+	// RelPos; a programmatically built AST may signal the same with only
+	// cg.Line.
+	if len(slots.prefix) > 0 {
+		if cg := slots.prefix[0]; cg.Line || cg.Pos().RelPos() == token.Blank {
+			return true
+		}
+	}
+	if cg := FirstCommentAt(first, PosDoc); cg != nil {
+		return cg.Line || cg.Pos().RelPos() == token.Blank
+	}
+	return false
+}
+
+// openBreakDoc returns the separator between the opening bracket and
+// the inner content. lineHeader keeps a `{ // c\n...` comment on the
+// opener line; hasInterior forces a HardLine so a `//` swallowing the
+// closer is impossible; forceOpen forces a break too but honours a
+// NewSection leadRel, so a blank line the author wrote after the
+// opener survives; otherwise leadRel (the first element's leading
+// RelPos, or the opener's own when the body is empty) drives - a soft
+// break for an inline body, a HardLine/BlankLine when the first
+// element starts on its own line.
+func openBreakDoc(lineHeader, hasInterior, forceOpen bool, leadRel token.RelPos) doc {
+	switch {
+	case lineHeader:
+		return spaceLit
+	case hasInterior:
+		return lineBreakHard
+	case forceOpen:
+		return relBreakOr(leadRel, lineBreakHard)
+	default:
+		return relBreak(leadRel)
+	}
+}
+
+// closeBreakDoc returns the separator between the inner content and
+// the closing bracket. When forceClose is set (see
+// [converter.computeBracketedPolicy]) the closer lands on its own
+// line, promoting a soft closerRel to at least a HardLine (a stronger
+// NewSection break is preserved); otherwise it follows closerRel,
+// flattening away for an inline body.
+func closeBreakDoc(closerRel token.RelPos, forceClose bool) doc {
+	if forceClose {
+		return relBreakOr(closerRel, lineBreakHard)
+	}
+	return relBreak(closerRel)
+}
+
+// anyHasDocComment reports whether any node in the slice carries a
+// Position=0 (doc) comment.
+func anyHasDocComment[T ast.Node](nodes []T) bool {
+	for _, n := range nodes {
+		if HasDocComment(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyHasPostComment reports whether any node in nodes carries a
+// post-element comment: a non-doc, non-Line=true comment that the
+// parser hung off the node (Position 1/2 with Line=false on
+// non-bracketed nodes, or Position >= PosTrailingMin with Line=false
+// on any node).
+func anyHasPostComment[T ast.Node](nodes []T) bool {
+	for _, n := range nodes {
+		if hasPostComment(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPostComment reports whether n carries a post-element comment.
+// (See anyHasPostComment for the classification.)
+func hasPostComment(n ast.Node) bool {
+	// Most comments are doc or same-line comments, which do not qualify
+	// below, so we skip classifying the comments when they all are.
+	if !slices.ContainsFunc(ast.Comments(n), func(cg *ast.CommentGroup) bool {
+		return cg.Position != PosDoc && !isLineComment(cg)
+	}) {
+		return false
+	}
+	nManagesInteriorComments := nodeManagesInteriorComments(n)
+	var lifted []*ast.CommentGroup
+	if nManagesInteriorComments {
+		lifted = trailingPrefixComments(n)
+	}
+	for _, cg := range classifyComments(n).nonDoc() {
+		// Same-line comments are not post-element comments.
+		if isLineComment(cg) {
+			continue
+		}
+		// Bracketed nodes (StructLit/ListLit/BinaryExpr) handle their
+		// own PosPrefix/PosSuffix interior comments - those don't
+		// count as "post-element" because they're inside the body -
+		// unless the comment trails the node; see
+		// [trailingPrefixComments].
+		if nManagesInteriorComments &&
+			(cg.Position == PosPrefix || cg.Position == PosSuffix) &&
+			!slices.Contains(lifted, cg) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// elemBreak returns the line-break portion of a list element or chain
+// arm separator, without any comma. Uses LeadingRelPos so a
+// NewSection on the expression's doc comment becomes a blank line
+// before this element - placed before the comment, not between the
+// comment and the body.
+func elemBreak(e ast.Expr) doc {
+	return relBreakOr(LeadingRelPos(e), lineBreakOrSpace)
+}
+
+// bracketsLackRelPos reports whether e is a bracketed expression whose
+// opening and closing brackets both carry no RelPos hint - the signal
+// that no authored layout intent attaches to e's edges, either because
+// the AST was built programmatically or because a parsed AST has had
+// its RelPos stripped. Non-bracketed expressions (idents, literals,
+// operators, ...) are reported as false.
+func bracketsLackRelPos(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.StructLit:
+		return x.Lbrace.RelPos() == token.NoRelPos &&
+			x.Rbrace.RelPos() == token.NoRelPos
+	case *ast.ListLit:
+		return x.Lbrack.RelPos() == token.NoRelPos &&
+			x.Rbrack.RelPos() == token.NoRelPos
+	case *ast.ParenExpr:
+		return x.Lparen.RelPos() == token.NoRelPos &&
+			x.Rparen.RelPos() == token.NoRelPos
+	case *ast.CallExpr:
+		return x.Lparen.RelPos() == token.NoRelPos &&
+			x.Rparen.RelPos() == token.NoRelPos
+	case *ast.IndexExpr:
+		return x.Lbrack.RelPos() == token.NoRelPos &&
+			x.Rbrack.RelPos() == token.NoRelPos
+	}
+	return false
+}
+
+// allBracketsLackRelPos reports whether every elem is bracketed
+// without any RelPos hint on its outer bracket pair (see
+// [bracketsLackRelPos]). Returns false for empty input.
+func allBracketsLackRelPos(elems []ast.Expr) bool {
+	for _, e := range elems {
+		if !bracketsLackRelPos(e) {
+			return false
+		}
+	}
+	return len(elems) > 0
+}
+
+// listOmitsCommas reports whether a list literal should render in the
+// comma-free style (commas omitted between elements on separate
+// lines), selecting the style from the source's existing comma usage
+// rather than imposing it. It returns true when an inter-element comma
+// is missing on an element that begins on its own line; for a
+// single-element list the trailing comma (before ']') is checked
+// instead.
+//
+// The Scanned bit on lbrack distinguishes scanner-produced lists from
+// programmatically constructed ASTs; the latter (Scanned false) always
+// keep commas, since they carry no meaningful comma hints.
+//
+// The comma-free list syntax is a v0.17.0+ feature in which the newline
+// between two elements *replaces* the comma; the parser rejects a
+// comma-less boundary that is not a newline. So a missing comma only
+// signals the comma-free style when the element genuinely carries a
+// Newline/NewSection leading RelPos. A comma-less element that is not on
+// its own line cannot have come from parsed source - it only arises in
+// programmatic ASTs (e.g. the jsonschema encoder copies Scanned
+// positions onto an ast.NewList while leaving the elements with neither
+// comma bits nor RelPos). Treating those as comma-free would strip the
+// commas they actually need, producing invalid output.
+func listOmitsCommas(elems []ast.Expr, lbrack, rbrack token.Pos) bool {
+	if len(elems) == 0 || !lbrack.Scanned() {
+		return false
+	}
+	// elems[i].Pos().HasComma() records an explicit comma preceding the
+	// element (i.e. after elems[i-1]).
+	for i := 1; i < len(elems); i++ {
+		if !elems[i].Pos().HasComma() && LeadingRelPos(elems[i]) >= token.Newline {
+			return true
+		}
+	}
+	if len(elems) == 1 {
+		return !rbrack.HasComma()
+	}
+	return false
+}
+
+// unaryOpMergesWithOperand reports whether rendering unary operator
+// op immediately before operand would let the two re-lex as a single,
+// longer operator, so a separating space must be inserted. Unary
+// operators otherwise hug their operand (`-10`, `>=3`, `!a`); this is
+// the only case where we force a space.
+//
+// The hazard arises only when the operand starts with an operator
+// character, which happens only when the operand is itself a
+// UnaryExpr. All other operand begins with a digit, letter, quote, or
+// bracket (a binary operand is parenthesised by [wrapForPrecedence],
+// so it begins with `(`) and can never merge.
+//
+//   - op `<`, operand first byte `-`: forms `<-` (ARROW), e.g. `<-5`.
+//   - op `<`, operand first byte `=`: forms `<=` (LEQ), e.g. `<=~"x"`.
+//   - op `>`, operand first byte `=`: forms `>=` (GEQ), e.g. `>=~"x"`.
+//   - op `!`, operand first byte `=`: forms `!=` (NEQ), e.g. `!=~"x"`.
+//
+// Keying off tokenisation rather than RelPos means the space is emitted
+// by construction, even for programmatic ASTs that carry no RelPos.
+func unaryOpMergesWithOperand(op token.Token, operand ast.Expr) bool {
+	inner, ok := operand.(*ast.UnaryExpr)
+	if !ok {
+		return false
+	}
+	lead := inner.Op.String()
+	if lead == "" {
+		return false
+	}
+	switch op {
+	case token.LSS:
+		return lead[0] == '-' || lead[0] == '='
+	case token.GTR, token.NOT:
+		return lead[0] == '='
+	}
+	return false
+}
+
+// aliasEqualsMergesWithExpr reports whether rendering an alias's `=`
+// immediately before expr would let the two re-lex as a single, longer
+// operator, so a separating space must be inserted. An alias's `=`
+// otherwise hugs its expression (`x=string`); this is the only case
+// where we force a space.
+//
+// The hazard arises only when expr starts with `=`, which happens only
+// when expr's leftmost leading token is a unary `==` or `=~`. All other
+// expressions begin with a digit, letter, quote, or bracket and can
+// never merge. We descend through BinaryExpr.X to reach that leftmost
+// token, since the head of a `|` / `&` chain (e.g. `=~"a" | =~"b"`)
+// supplies it; the descent mirrors [operatorsWouldMerge].
+//
+//   - op `=`, operand `==` (EQL): forms `==` (EQL), e.g. `===5`.
+//   - op `=`, operand `=~` (MAT): forms `==` (EQL), e.g. `==~"foo"`.
+//
+// Keying off tokenisation rather than RelPos means the space is emitted
+// by construction, even for programmatic ASTs that carry no RelPos.
+func aliasEqualsMergesWithExpr(expr ast.Expr) bool {
+	var lead token.Token
+	for {
+		switch x := expr.(type) {
+		case *ast.BinaryExpr:
+			expr = x.X
+			continue
+		case *ast.UnaryExpr:
+			lead = x.Op
+		}
+		break
+	}
+	return lead == token.EQL || lead == token.MAT
+}
+
+// allBracketArms reports whether every arm's expression is a
+// contiguous opener (struct/list/paren/call/index). Returns false for
+// empty input.
+func allBracketArms(arms []chainArm) bool {
+	if len(arms) == 0 {
+		return false
+	}
+	for _, a := range arms {
+		if !isContiguousOpener(a.expr) {
+			return false
+		}
+	}
+	return true
+}
+
+// isBracketedInjectionTarget reports whether e is a bracketed form
+// onto which [converter.injectInteriorComments] can prepend interior
+// comments. Only braced StructLit and bracketed ListLit qualify: the
+// CUE parser routes interior comments through the surrounding
+// BinaryExpr for these two shapes when the brackets are otherwise
+// empty, whereas other bracketed forms attach such comments directly
+// to themselves.
+func isBracketedInjectionTarget(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.StructLit:
+		return braced(x)
+	case *ast.ListLit:
+		return x.Lbrack.IsValid() || x.Hash.IsValid()
+	}
+	return false
+}
+
+// bracketClose returns the closing-bracket position of e, whether
+// that bracket is empty, and whether e is a bracketed injection
+// target at all.
+func bracketClose(e ast.Expr) (close token.Pos, empty, bracketed bool) {
+	switch x := e.(type) {
+	case *ast.StructLit:
+		if braced(x) {
+			return x.Rbrace, len(x.Elts) == 0, true
+		}
+	case *ast.ListLit:
+		if x.Lbrack.IsValid() || x.Hash.IsValid() {
+			return x.Rbrack, len(x.Elts) == 0, true
+		}
+	}
+	return token.NoPos, false, false
+}
+
+// commentTrailsBracket reports whether the PosPrefix comment cg
+// trails the brackets described by (close, empty, bracketed) rather
+// than sitting inside them.
+//
+//   - No bracket (bracketed == false, e.g. a bare `a + b` operand):
+//     the comment cannot be interior, so it trails.
+//   - Without usable source offsets (a programmatic AST) we cannot
+//     tell the two forms apart. We prefer the trailing form
+//     `a & {}, // c` for a same-line comment, and keep an own-line one
+//     inside the brackets, where decoders and other producers place an
+//     interior comment.
+//   - Non-empty bracket: a genuine interior header attaches to the
+//     first element, not the bracket, so a comment on the bracket
+//     node itself trails.
+//   - Empty bracket: the trailing and interior forms collapse to the
+//     same node and RelPos (the parser has no inner element to anchor
+//     an interior comment to), so we compare source offsets.
+func commentTrailsBracket(cg *ast.CommentGroup, close token.Pos, empty, bracketed bool) bool {
+	if !bracketed {
+		return true
+	}
+	// This is the only place where we must look at the AbsPos.
+	if len(cg.List) == 0 || !close.HasAbsPos() || !cg.List[0].Slash.HasAbsPos() {
+		return cg.Line
+	}
+	return !empty || cg.List[0].Slash.Offset() > close.Offset()
+}
+
+// trailingPrefixComments returns the `//` comments the parser hangs at
+// PosPrefix on a call argument's outermost node, on the same line or on
+// the following lines, which logically trail the whole argument rather
+// than sitting interior to it. In the call-argument context the parser
+// attaches an argument's trailing comment at PosPrefix on the argument
+// node, uniformly across node types (unlike the list-element context,
+// where it uses trailing positions that route correctly on their own).
+//
+// We lift such a comment to the argument's trailing-comment column;
+// the node's own renderer skips it so it is not also rendered inside
+// the node. This is needed only for the node kinds whose renderer
+// would otherwise treat a PosPrefix comment as interior content - the
+// [nodeManagesInteriorComments] set: a BinaryExpr (the candidate
+// bracket is its final operand) or a StructLit / ListLit (the bracket
+// is the argument itself).
+func trailingPrefixComments(n ast.Node) []*ast.CommentGroup {
+	var close token.Pos
+	var empty, bracketed bool
+	switch n := n.(type) {
+	case *ast.BinaryExpr:
+		close, empty, bracketed = bracketClose(n.Y)
+	// A struct or list renders its brackets even when they have no
+	// position, as in a decoded AST.
+	case *ast.StructLit:
+		close, empty, bracketed = n.Rbrace, len(n.Elts) == 0, true
+	case *ast.ListLit:
+		close, empty, bracketed = n.Rbrack, len(n.Elts) == 0, true
+	default:
+		return nil
+	}
+	var out []*ast.CommentGroup
+	for _, cg := range ast.Comments(n) {
+		if cg.Position == PosPrefix && commentTrailsBracket(cg, close, empty, bracketed) {
+			out = append(out, cg)
+		}
+	}
+	return out
+}
+
+// nonTrailingPrefix returns the PosPrefix comments on n that are
+// genuinely interior to it: prefix minus the comments
+// [trailingPrefixComments] lifts to the trailing column. A node's
+// renderer uses it so a lifted comment is not also rendered inside the
+// node. Returns prefix unchanged when nothing is lifted (the common
+// case), so it allocates only when a lift actually applies.
+func nonTrailingPrefix(n ast.Node, prefix []*ast.CommentGroup) []*ast.CommentGroup {
+	lifted := trailingPrefixComments(n)
+	if len(lifted) == 0 {
+		return prefix
+	}
+	out := make([]*ast.CommentGroup, 0, len(prefix))
+	for _, cg := range prefix {
+		if !slices.Contains(lifted, cg) {
+			out = append(out, cg)
+		}
+	}
+	return out
+}
+
+// isLeafLitValue reports whether v is a leaf-token expression: one
+// whose entire rendered form is a single token with no internal
+// structure that could anchor a comment. Composite expressions
+// (BinaryExpr, UnaryExpr, CallExpr, ...) are excluded because the
+// parser legitimately attaches internal-layout comments to them that
+// must stay inside the expression's rendering.
+func isLeafLitValue(v ast.Expr) bool {
+	switch v.(type) {
+	case *ast.Ident, *ast.BasicLit, *ast.BottomLit, *ast.BadExpr:
+		return true
+	}
+	return false
+}
+
+// wrapForPrecedence wraps doc in parens when e's outer operator binds
+// less tightly than the surrounding precedence prec. The AST encodes
+// grouping by tree shape, but programmatic builders don't insert
+// [*ast.ParenExpr] wrappers, so each rendering site whose context binds
+// tighter than some binary operator must materialise the parens itself
+// or the output would re-parse to a differently-grouped tree.
+//
+// Besides [*ast.BinaryExpr], an [*ast.Func] with a result constraint or
+// a body needs the wrap: both extend to the end of the expression and
+// would absorb a following operator or selector when parsed back (e.g.
+// func() -> int & T parses the conjunction as part of the result).
+// Every other expression type either is itself bracketed, produces a
+// single token, or binds at least as tightly as the postfix / unary
+// contexts.
+func wrapForPrecedence(doc doc, e ast.Expr, prec int) doc {
+	switch x := e.(type) {
+	case *ast.BinaryExpr:
+		if x.Op.Precedence() < prec {
+			return cats(lParenLit, doc, rParenLit)
+		}
+	case *ast.Func:
+		if x.Ret != nil || x.Body != nil {
+			return cats(lParenLit, doc, rParenLit)
+		}
+	}
+	return doc
+}
+
+// binaryCutoff determines the precedence cutoff for spacing
+// decisions. Only operators at precedences below the cutoff get
+// spaces.
+//
+// In normal mode (depth 1), spaces are always used unless there's a
+// mix of + and * (in which case only + gets spaces, making a*b + c*d
+// clear). In compact mode (depth > 1, inside a larger expression),
+// spaces are minimised.
+func binaryCutoff(e *ast.BinaryExpr, depth int) int {
+	has6, has7 := binaryWalk(e)
+	if has6 && has7 {
+		if depth == 1 {
+			return 7 // spaces around +/- but not */
+		}
+		return 6 // no spaces at all in compact mode
+	}
+	if depth == 1 {
+		return 8 // spaces around everything in normal mode
+	}
+	return 6 // no spaces in compact mode
+}
+
+// binaryWalk scans a binary expression tree to determine whether
+// precedence levels 6 (+, -) and 7 (*, /) are both present.
+func binaryWalk(e *ast.BinaryExpr) (has6, has7 bool) {
+	switch e.Op.Precedence() {
+	case 6:
+		has6 = true
+	case 7:
+		has7 = true
+	}
+
+	if l, ok := e.X.(*ast.BinaryExpr); ok && l.Op.Precedence() >= e.Op.Precedence() {
+		h6, h7 := binaryWalk(l)
+		has6 = has6 || h6
+		has7 = has7 || h7
+	}
+
+	if r, ok := e.Y.(*ast.BinaryExpr); ok && r.Op.Precedence() > e.Op.Precedence() {
+		h6, h7 := binaryWalk(r)
+		has6 = has6 || h6
+		has7 = has7 || h7
+	}
+
+	return
+}
+
+// binaryDiffPrec returns 0 if expr is a BinaryExpr at the same
+// precedence as prec (used to avoid increasing depth for
+// same-precedence chains), and 1 otherwise.
+func binaryDiffPrec(expr ast.Expr, prec int) int {
+	if x, ok := expr.(*ast.BinaryExpr); ok && x.Op.Precedence() == prec {
+		return 0
+	}
+	return 1
+}
+
+// stripPrefixFromInterp returns the body strip prefix of a multi-line
+// Interpolation: the whitespace before the closing `"""`. Returns ""
+// if x is empty or its quotes can't be parsed.
+func stripPrefixFromInterp(x *ast.Interpolation) string {
+	if len(x.Elts) == 0 {
+		return ""
+	}
+	first, last := x.Quotes()
+	qi, _, _, err := literal.ParseQuotes(first.Value, last.Value)
+	if err != nil {
+		return ""
+	}
+	return qi.Whitespace()
+}
+
+// bracelessChainCollapsible reports whether v is a braceless
+// StructLit that [converter.fieldValExpr] will render as a Field
+// chain (no synthesised braces): exactly one inner Field, no
+// attributes on the inner Field, and no comments on either the inner
+// Field or the StructLit - the shapes where chain form has a
+// syntactic home for everything attached.
+func bracelessChainCollapsible(v ast.Expr) bool {
+	sl, ok := v.(*ast.StructLit)
+	if !ok || braced(sl) || len(sl.Elts) != 1 {
+		return false
+	}
+	inner, ok := sl.Elts[0].(*ast.Field)
+	if !ok {
+		return false
+	}
+	return len(inner.Attrs) == 0 && len(fieldComments(inner)) == 0 && len(ast.Comments(sl)) == 0
+}
+
+// fieldComments returns the comments attached to f, plus the doc
+// comments attached to its label, which [converter.label] does not
+// render. The parser attaches a doc comment to the label for the inner
+// fields of a braceless chain, such as y in `x:\n\t// doc\n\ty: 1`, as
+// they have no comment scope of their own.
+func fieldComments(f *ast.Field) []*ast.CommentGroup {
+	cgs := ast.Comments(f)
+	if f.Label == nil {
+		return cgs
+	}
+	docs := classifyComments(f.Label).doc
+	if len(docs) == 0 {
+		return cgs
+	}
+	return slices.Concat(docs, cgs)
+}
+
+// valNeedsLeadingBreak reports whether a field's value must be
+// rendered on its own line, indented relative to the key, rather than
+// continued after "key: " on the same line. Two shapes qualify:
+//
+//   - the value is a braceless StructLit that [converter.fieldValExpr]
+//     will render as a chain and whose inner Field's label carries
+//     Newline/NewSection RelPos (e.g. x:\n y: 1);
+//   - the value itself carries Newline/NewSection RelPos (a non-struct
+//     value written on a new line, e.g. x:\n 1).
+//
+// For a braceless StructLit, [ast.StructLit.Pos] falls through to its
+// first element, so v.Pos().IsNewline() would conflate the StructLit's
+// own position with its first child's. The StructLit branch is
+// therefore handled separately and only fires for collapsible chains.
+func valNeedsLeadingBreak(v ast.Expr) bool {
+	if sl, ok := v.(*ast.StructLit); ok && !braced(sl) {
+		if !bracelessChainCollapsible(v) {
+			return false
+		}
+		return sl.Elts[0].Pos().IsNewline()
+	}
+	return v.Pos().IsNewline()
+}
+
+type stack[T any] []T
+
+func (s *stack[T]) push(items ...T) {
+	*s = append(*s, items...)
+}
+
+func (s *stack[T]) pop() T {
+	n := len(*s)
+	if n == 0 {
+		panic("pop on empty stack")
+	}
+	x := (*s)[n-1]
+	*s = (*s)[:n-1]
+	return x
+}
+
+func nodeType[T ast.Node](n ast.Node) bool {
+	_, ok := n.(T)
+	return ok
+}
+
+// listOpener returns the opening of a list literal, including the "#" of a
+// closed literal.
+func listOpener(x *ast.ListLit) doc {
+	if x.Hash.IsValid() {
+		return hashLBracket
+	}
+	return lBracketLit
+}
+
+// structOpener returns the opening of a struct literal, including the "#" of
+// a closed literal.
+func structOpener(x *ast.StructLit) doc {
+	if x.Hash.IsValid() {
+		return hashLBrace
+	}
+	return lBraceLit
+}
+
+// braced reports whether a struct literal is rendered with braces: it has
+// them in the source, or it is a closed literal, which always has them.
+func braced(x *ast.StructLit) bool {
+	return x.Lbrace.IsValid() || x.Hash.IsValid()
+}

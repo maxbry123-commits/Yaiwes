@@ -1,0 +1,563 @@
+// Copyright 2019 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package yaml_test
+
+import (
+	"io"
+	"strings"
+	"testing"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/encoding/yaml"
+)
+
+func TestYAML(t *testing.T) {
+	testCases := []struct {
+		name     string
+		yaml     string
+		yamlOut  string
+		want     string
+		isStream bool
+	}{{
+		name:    "empty",
+		yaml:    "",
+		yamlOut: "null",
+		want:    "*null | _",
+	}, {
+		name:     "empty stream",
+		want:     "*null | _",
+		isStream: true,
+	}, {
+		name: "string literal",
+		yaml: `foo`,
+		want: `"foo"`,
+	}, {
+		name: "struct",
+		yaml: `a: foo
+b: bar`,
+		want: `a: "foo"
+b: "bar"`,
+	}, {
+		name: "stream",
+		yaml: `a: foo
+---
+b: bar
+c: baz
+`,
+		want: `[
+	{a: "foo"},
+	{
+		b: "bar"
+		c: "baz"
+	}
+]`,
+		isStream: true,
+	}, {
+		name: "stream with null",
+		yaml: `
+---
+a: foo
+---
+---
+b: bar
+c: baz
+---
+`,
+		// Not sure if a leading document separator should be gobbled, but the
+		// YAML parser seems to think so. This could have something to do with
+		// the fact that the document separator is really an "end of directives"
+		// marker, while ... means "end of document". YAML is hard!
+		yamlOut: `a: foo
+---
+null
+---
+b: bar
+c: baz
+---
+null
+`,
+		// TODO(bug): seems like bug in yaml parser. Try moving to yaml.v3,
+		// or validate that this is indeed a correct interpretation.
+		want: `[
+	{a: "foo"},
+	null,
+	{
+		b: "bar"
+		c: "baz"
+	},
+	null
+]`,
+		isStream: true,
+	}}
+	ctx := cuecontext.New()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := yaml.Extract(tc.name, tc.yaml)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := format.Node(f)
+			if got := strings.TrimSpace(string(b)); got != tc.want {
+				t.Errorf("Extract:\ngot  %q\nwant %q", got, tc.want)
+			}
+
+			file, err := yaml.Extract(tc.name, tc.yaml)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ = format.Node(file)
+			if got := strings.TrimSpace(string(b)); got != tc.want {
+				t.Errorf("Decode:\ngot  %q\nwant %q", got, tc.want)
+			}
+
+			yamlOut := tc.yaml
+			if tc.yamlOut != "" {
+				yamlOut = tc.yamlOut
+			}
+
+			wantVal := ctx.CompileString(tc.want)
+			if !tc.isStream {
+				b, err = yaml.Encode(wantVal)
+				if err != nil {
+					t.Error(err)
+				}
+				if got := strings.TrimSpace(string(b)); got != yamlOut {
+					t.Errorf("Encode:\ngot  %q\nwant %q", got, yamlOut)
+				}
+			} else {
+				iter, _ := wantVal.List()
+				b, err := yaml.EncodeStream(iter)
+				if err != nil {
+					t.Error(err)
+				}
+				if got := string(b); got != yamlOut {
+					t.Errorf("EncodeStream:\ngot  %q\nwant %q", got, yamlOut)
+				}
+			}
+		})
+	}
+}
+
+func TestDecoder(t *testing.T) {
+	testCases := []struct {
+		name    string
+		yaml    string
+		want    []string
+		wantErr bool
+	}{{
+		name: "empty document",
+		yaml: ``,
+		want: []string{`*null | _`},
+	}, {
+		name: "single struct",
+		yaml: `a: foo
+b: bar`,
+		want: []string{`{
+	a: "foo"
+	b: "bar"
+}`},
+	}, {
+		name: "single struct - inline",
+		yaml: `a: foo`,
+		want: []string{`{a: "foo"}`},
+	}, {
+		name: "single list",
+		yaml: `[1, 2, 3]`,
+		want: []string{`[1, 2, 3]`},
+	}, {
+		name: "single object",
+		yaml: `{"key": "value"}`,
+		want: []string{`{key: "value"}`},
+	}, {
+		name: "single string",
+		yaml: `simple string`,
+		want: []string{`"simple string"`},
+	}, {
+		name: "single number",
+		yaml: `42`,
+		want: []string{`42`},
+	}, {
+		name: "single boolean",
+		yaml: `true`,
+		want: []string{`true`},
+	}, {
+		name: "single null",
+		yaml: `null`,
+		want: []string{`null`},
+	}, {
+		name: "multiple documents with separator",
+		yaml: `a: foo
+---
+b: bar
+c: baz`,
+		want: []string{
+			`{a: "foo"}`,
+			`{
+	b: "bar"
+	c: "baz"
+}`,
+		},
+	}, {
+		name: "three documents",
+		yaml: `name: first
+---
+name: second
+---
+name: third`,
+		want: []string{
+			`{name: "first"}`,
+			`{
+
+	name: "second"
+}`,
+			`{
+
+	name: "third"
+}`,
+		},
+	}, {
+		name: "documents with lists",
+		yaml: `- one
+- two
+---
+- three
+- four`,
+		want: []string{
+			`[
+	"one",
+	"two",
+]`,
+			`[
+	"three",
+	"four",
+]`,
+		},
+	}, {
+		name: "document with null",
+		yaml: `---
+null
+---
+a: value`,
+		want: []string{
+			`null`,
+			`{
+
+	a: "value"
+}`,
+		},
+	}, {
+		name: "mixed types",
+		yaml: `string: text
+number: 42
+bool: true
+---
+list:
+  - item1
+  - item2`,
+		want: []string{
+			`{
+	string: "text"
+	number: 42
+	bool:   true
+}`,
+			`{
+	list: [
+		"item1",
+		"item2",
+	]
+}`,
+		},
+	}, {
+		// TODO: the valid input below is rejected;
+		// see https://github.com/goccy/go-yaml/issues/950.
+		name:    "quoted explicit key with a block scalar value",
+		yaml:    "? \"k\"\n: |\n  v\n",
+		wantErr: true,
+	}, {
+		// TODO: the two valid inputs below are rejected;
+		// see https://github.com/goccy/go-yaml/issues/951.
+		name:    "multi-line plain scalar in a nested flow mapping",
+		yaml:    "k: [{a: x, b: y-\n    z}]\n",
+		wantErr: true,
+	}, {
+		name:    "multi-line plain scalar with a blank line in a nested flow mapping",
+		yaml:    "k: {a: x\n\n  y}\n",
+		wantErr: true,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := yaml.NewDecoder(tc.name, strings.NewReader(tc.yaml))
+
+			var results []string
+			for {
+				expr, err := d.Extract()
+				if err == io.EOF {
+					break
+				}
+				if tc.wantErr {
+					if err == nil {
+						t.Fatal("expected error but got none")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				b, err := format.Node(expr)
+				if err != nil {
+					t.Fatalf("format error: %v", err)
+				}
+				results = append(results, strings.TrimSpace(string(b)))
+			}
+
+			if len(results) != len(tc.want) {
+				t.Fatalf("got %d documents, want %d\nresults: %v\nwant: %v",
+					len(results), len(tc.want), results, tc.want)
+			}
+
+			for i, got := range results {
+				if got != tc.want[i] {
+					t.Errorf("document %d:\ngot  %q\nwant %q", i, got, tc.want[i])
+				}
+			}
+
+			// Verify that calling Extract again returns EOF
+			_, err := d.Extract()
+			if err != io.EOF {
+				t.Errorf("expected io.EOF on subsequent Extract, got %v", err)
+			}
+		})
+	}
+}
+
+func TestYAMLValues(t *testing.T) {
+	longKey := strings.Repeat("k", 1025)
+	testCases := []struct {
+		cue  string
+		yaml string
+	}{
+		// strings
+		{`"""
+	single
+	"""`, "single"}, // TODO: CUE simplifies this.
+
+		{`"""
+	aaaa
+	bbbb
+	"""`, `|-
+  aaaa
+  bbbb`},
+
+		// keep as is
+		{`"non"`, `non`},
+
+		// Non-strings in v1.2. These are single-quoted by the go-yaml.v3 package.
+		{`"#cloudmon"`, `'#cloudmon'`},
+
+		// Strings that mimic numeric values are double quoted by the go-yaml.v3
+		// package.
+		{`".inf"`, `".inf"`},
+		{`".Inf"`, `".Inf"`},
+		{`".INF"`, `".INF"`},
+		{`".NaN"`, `".NaN"`},
+		{`"+.Inf"`, `"+.Inf"`},
+		{`"-.Inf"`, `"-.Inf"`},
+		{`"2002"`, `"2002"`},
+		{`"685_230.15"`, `"685_230.15"`},
+		{`"1e2"`, `"1e2"`},
+		{`"18446744073709551616"`, `"18446744073709551616"`},
+		// A bad YAML 1.1 octal: some decoders such as yaml.v3 resolve it
+		// as a float, so it must stay quoted.
+		{`"0778"`, `"0778"`},
+		// Strings that YAML 1.1 decoders resolve as numbers or values:
+		// its integers and floats allow underscores, including in
+		// sexagesimal numbers, and "=" is the default value key.
+		{`"1_:0"`, `"1_:0"`},
+		{`"190_0:20"`, `"190_0:20"`},
+		{`"0x_"`, `"0x_"`},
+		{`"0b_"`, `"0b_"`},
+		{`"="`, `"="`},
+		// Strings that go-yaml decoders, such as yaml.v3 and the one in
+		// sigs.k8s.io/yaml, resolve as numbers, as their resolvers accept
+		// base prefixes in any case, underscores anywhere, and signs
+		// after a prefix.
+		{`"0X1F"`, `"0X1F"`},
+		{`"0O17"`, `"0O17"`},
+		{`"0B11"`, `"0B11"`},
+		{`"-0Xb"`, `"-0Xb"`},
+		{`"0_Xa"`, `"0_Xa"`},
+		{`"0o+1"`, `"0o+1"`},
+		{`{"0X1F": 1}`, `"0X1F": 1`},
+		// Strings that are valid CUE numbers but not YAML numbers, such as
+		// Kubernetes resource quantities, do not need quoting.
+		{`"1Gi"`, `1Gi`},
+		{`"1.5Gi"`, `1.5Gi`},
+		{`"100m"`, `100m`},
+		// Note that go-yaml doesn't quote strings which look like hexadecimal numbers,
+		// but we do in our fork. See: https://github.com/go-yaml/yaml/issues/847
+		{`"0x123456789012345678901234567890"`, `"0x123456789012345678901234567890"`},
+
+		// Strings whose lines end in a space do not survive a round-trip
+		// through a literal block, and characters such as tabs or carriage
+		// returns cannot stay in a plain scalar; all are double quoted.
+		{`"a \nb"`, `"a \nb"`},
+		{`"a\n \nb"`, `"a\n \nb"`},
+		{`"x\n "`, `"x\n "`},
+		{`"x\ty"`, `"x\ty"`},
+		{`"a\rb"`, `"a\rb"`},
+		// Characters which need escaping are double quoted, even when
+		// the string would otherwise be single quoted.
+		{`"? \u0080"`, `"? \u0080"`},
+		{`"? a\rb"`, `"? a\rb"`},
+		{`{"? \u0085x": 1}`, `"? \u0085x": 1`},
+		// Strings quoted for any other reason are single quoted as they
+		// are: a single quoted scalar cannot carry escapes.
+		{`"Price: 10\u00a0€"`, "'Price: 10\u00a0€'"},
+		{`"# 👨\u200d👩\u200d👧"`, "'# 👨\u200d👩\u200d👧'"},
+		{`{" lead\u200b": "key: \u00ad"}`, "' lead\u200b': 'key: \u00ad'"},
+		// Document markers at the start of a line end or start a
+		// document, so strings starting with them are quoted.
+		{`"..."`, `"..."`},
+		{`"... x"`, `"... x"`},
+		{`{"...x": 1, "--- x": 2}`, `"...x": 1` + "\n" + `"--- x": 2`},
+		// A key longer than 1024 characters must be explicit.
+		{`{` + longKey + `: 1, b: [{` + longKey + `: 2}]}`,
+			"? " + longKey + "\n: 1\nb:\n  - ? " + longKey + "\n    : 2"},
+		// goccy's decoder misreads a block literal after a quoted
+		// explicit key, so such a value is double quoted.
+		{`{"#` + longKey + `": "a\nb"}`, "? '#" + longKey + "'\n" + `: "a\nb"`},
+		// A key containing a newline is double quoted, even when it
+		// would otherwise be single quoted.
+		{`{"? x\ny": 1}`, `"? x\ny": 1`},
+		// C1 control characters and the byte order mark cannot appear
+		// unescaped in YAML; a leading byte order mark would be dropped
+		// as an encoding mark.
+		{`"x\u0080y"`, `"x\u0080y"`},
+		{`"\ufeffa"`, `"\ufeffa"`},
+		{`{"\ufeffk": "x\ufeffy"}`, `"\ufeffk": "x\ufeffy"`},
+
+		// A literal block cannot carry a string of only newlines, which
+		// the block's chomping would drop, nor an indented first line
+		// after leading newlines, as the indentation of the first
+		// non-empty line sets the block's indentation.
+		{`"\n"`, `"\n"`},
+		{`"\n\n"`, `"\n\n"`},
+		{`"\n  indented"`, `"\n  indented"`},
+		{`"\n  a\nb"`, `"\n  a\nb"`},
+		{`"\n\tx"`, `"\n\tx"`},
+		{`{a: "\n\n", b: 1}`, `a: "\n\n"` + "\nb: 1"},
+
+		// Blank lines within a literal block stay truly empty, with no
+		// trailing whitespace padding.
+		{`"""
+	a
+
+	b
+	"""`, `|-
+  a
+
+  b`},
+
+		// Legacy values.format.
+		{`"no"`, `"no"`},
+		{`"on"`, `"on"`},
+		{`".Nan"`, `".Nan"`},
+
+		// binary
+		{`'no'`, `!!binary bm8=`},
+
+		// floats
+		{`.2`, "0.2"},
+		{`2.`, "2.0"},
+		{`".inf"`, `".inf"`},
+		{`685_230.15`, `685230.15`},
+
+		// Date and time-like
+		{`"2001-12-15T02:59:43.1Z"`, `"2001-12-15T02:59:43.1Z"`},
+		{`"2001-12-14t21:59:43.10-05:00"`, `"2001-12-14t21:59:43.10-05:00"`},
+		{`"2001-12-14 21:59:43.10 -5"`, `"2001-12-14 21:59:43.10 -5"`},
+		{`"2001-12-15 2:59:43.10"`, `"2001-12-15 2:59:43.10"`},
+		{`"2002-12-14"`, `"2002-12-14"`},
+		{`"12-12-12"`, `"12-12-12"`},
+
+		// legacy base60 floats
+		{`"2222:22"`, `"2222:22"`},
+
+		// hostport
+		{`"hostname:22"`, `hostname:22`},
+
+		// maps
+		{
+			cue: `
+			true:   1
+			True:   2
+			".Nan": 3
+			".Inf": 4
+			y:      5
+			`,
+			yaml: `"true": 1
+"True": 2
+".Nan": 3
+".Inf": 4
+"y": 5`,
+		},
+
+		// A tag on a list element is a declaration attribute by an embedding.
+		{`["first", {"second", @yaml(,tag="!Env")}]`, "- first\n- !Env second"},
+
+		// Empty bytes are an empty quoted string with a binary tag.
+		{`a: ''`, `a: !!binary ""`},
+
+		// A tagged empty collection stays on the line of its tag.
+		{`{d: {} @yaml(,tag="!Empty"), l: [{[], @yaml(,tag="!L")}]}`, "d: !Empty {}\nl:\n  - !L []"},
+
+		// Errors and non-concrete values fail to encode.
+		{`a: string`, `error: a: incomplete value string`},
+		{`a: 1 & 2`, `error: a: conflicting values 2 and 1`},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.cue, func(t *testing.T) {
+			c := cuecontext.New()
+			v := c.CompileString(tc.cue)
+
+			b, err := yaml.Encode(v)
+			got := strings.TrimSpace(string(b))
+			if err != nil {
+				got = "error: " + err.Error()
+			}
+			if got != tc.yaml {
+				t.Errorf("Encode:\ngot  %q\nwant %q", got, tc.yaml)
+			}
+			if err != nil {
+				return
+			}
+			// The encoding decodes back to the same value.
+			f, err := yaml.Extract("x.yaml", b)
+			if err != nil && strings.Contains(tc.cue, "@yaml") {
+				return // decoding does not support custom tags on scalars
+			} else if err != nil {
+				t.Fatalf("Extract: %v", err)
+			}
+			dec := c.BuildFile(f)
+			if dec.Subsume(v, cue.Final()) != nil || v.Subsume(dec, cue.Final()) != nil {
+				t.Errorf("Extract:\ngot  %v\nwant %v", dec, v)
+			}
+		})
+	}
+}

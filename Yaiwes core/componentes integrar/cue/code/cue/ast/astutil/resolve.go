@@ -1,0 +1,699 @@
+// Copyright 2018 The CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// This file implements scopes and the objects they contain.
+
+package astutil
+
+import (
+	"fmt"
+	"strings"
+
+	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/token"
+)
+
+// An ErrFunc processes errors.
+type ErrFunc func(pos token.Pos, msg string, args ...interface{})
+
+// TODO: future development
+//
+// Resolution currently assigns values along the table below. This is based on
+// Go's resolver and is not quite convenient for CUE's purposes. For one, CUE
+// allows manually setting resolution and than call astutil.Sanitize to
+// normalize the ast.File. Manually assigning resolutions according to the
+// below table is rather tedious though.
+//
+// Instead of using the Scope and Node fields in identifiers, we suggest the
+// following assignments:
+//
+//    Reference Node // an Decl or Clause
+//    Ident *Ident   // The identifier in References (optional)
+//
+// References always refers to the direct element in the scope in which the
+// identifier occurs, not the final value, so: *Field, *LetClause, *ForClause,
+// etc. In case Ident is defined, it must be the same pointer as the
+// referencing identifier. In case it is not defined, the Name of the
+// referencing identifier can be used to locate the proper identifier in the
+// referenced node.
+//
+// The Scope field in the original design then loses its function.
+//
+// Type of reference      Scope          Node
+// Let Clause             File/Struct    LetClause
+// Alias declaration      File/Struct    Alias (deprecated)
+// Illegal Reference      File/Struct
+// Value
+//   X in a: X=y          Field          Alias
+// Fields
+//   y in X: y            File/Struct    Expr (y)
+//   X in X=x: y          File/Struct    Field
+//   X in X=(x): y        File/Struct    Field
+//   X in X="\(x)": y     File/Struct    Field
+//   X in [X=x]: y        Field          Expr (x)
+//   X in X=[x]: y        Field          Field
+//
+//   V in foo~(K,V): v    File/Struct    Field
+//   K in foo~(K,V): v    Field          Expr "foo"
+//   V in [x]~(K,V): y    Field          Field
+//   K in [x]~(K,V): y    Field          Expr (x)
+//   V in (x)~(K,V): y    File/Struct    Field
+//   K in (x)~(K,V): y    Field          Expr (x)
+//
+// for k, v in            ForClause      Ident
+// let x = y              LetClause      Ident
+//
+// Fields inside lambda
+//    Label               Field          Expr
+//    Value               Field          Field
+// Pkg                    nil            ImportSpec
+
+// TODO: allow passing all files in a package and mark nodes as predeclared
+// identifiers.
+
+// Resolve resolves all identifiers in a file, populating [ast.Ident.Node] fields.
+// Unresolved identifiers are recorded in [ast.File.Unresolved].
+// It will not overwrite already resolved identifiers.
+// Resolving a file again replaces the list of unresolved identifiers
+// rather than appending to it.
+func Resolve(f *ast.File, errFn ErrFunc) {
+	f.Unresolved = resolve(f, errFn)
+}
+
+// ResolveExpr resolves all identifiers in an expression.
+// It will not overwrite already resolved values.
+func ResolveExpr(e ast.Expr, errFn ErrFunc) {
+	resolve(e, errFn)
+}
+
+// resolve resolves all identifiers in n, returning those it could not resolve.
+func resolve(n ast.Node, errFn ErrFunc) (unresolved []*ast.Ident) {
+	stack := make([]*scope, 0, 8)
+	visitor := &scope{
+		index:      make(map[string]entry),
+		errFn:      errFn,
+		identFn:    resolveIdent,
+		unresolved: &unresolved,
+		scopeStack: &stack,
+	}
+	ast.Walk(n, visitor.Before, nil)
+	return unresolved
+}
+
+// A scope maintains the set of named language entities declared
+// in the scope and a link to the immediately surrounding (outer)
+// scope.
+type scope struct {
+	outer   *scope
+	node    ast.Node
+	index   map[string]entry
+	inField bool
+
+	identFn func(s *scope, n *ast.Ident) bool
+	nameFn  func(name string)
+	errFn   func(p token.Pos, msg string, args ...interface{})
+
+	// unresolved collects the identifiers which [resolveIdent] cannot
+	// resolve. The pointer is shared between the root scope and all its
+	// children.
+	unresolved *[]*ast.Ident
+
+	// scopeStack is used to reuse scope allocations.
+	// The pointer is shared between the root scope and all its children.
+	scopeStack *[]*scope
+}
+
+type entry struct {
+	node  ast.Node
+	link  ast.Node   // Alias, LetClause, or Field
+	field *ast.Field // Used for LabelAliases
+}
+
+func (s *scope) allocScope() *scope {
+	if n := len(*s.scopeStack); n > 0 {
+		scope := (*s.scopeStack)[n-1]
+		*s.scopeStack = (*s.scopeStack)[:n-1]
+		return scope
+	}
+	return &scope{
+		index:      make(map[string]entry, 4),
+		scopeStack: s.scopeStack,
+	}
+}
+
+func (s *scope) freeScope() {
+	// Ensure no pointers remain, which can hold onto memory.
+	// We only reuse the index map capacity, and keep the scopeStack pointer.
+	*s = scope{index: s.index, scopeStack: s.scopeStack}
+	clear(s.index)
+	*s.scopeStack = append(*s.scopeStack, s)
+}
+
+// freeScopesUntil frees all scopes from s up to (but not including) 'ancestor'.
+func (s *scope) freeScopesUntil(ancestor *scope) {
+	for s != ancestor {
+		if s == nil {
+			panic("ancestor scope not found")
+		}
+		next := s.outer
+		s.freeScope()
+		s = next
+	}
+}
+
+func newScope(outer *scope, node ast.Node, decls []ast.Decl) *scope {
+	s := outer.allocScope()
+	s.outer = outer
+	s.node = node
+	s.inField = false
+	s.identFn = outer.identFn
+	s.nameFn = outer.nameFn
+	s.errFn = outer.errFn
+	s.unresolved = outer.unresolved
+
+	for _, d := range decls {
+		switch x := d.(type) {
+		case *ast.Field:
+			label := x.Label
+
+			if a, ok := x.Label.(*ast.Alias); ok {
+				name := a.Ident.Name
+				if _, ok := a.Expr.(*ast.ListLit); !ok {
+					s.insert(name, x, a, nil)
+				}
+				if x.Alias != nil {
+					// Error: cannot have both old-style label alias and postfix
+					// alias
+					s.errFn(x.Pos(),
+						"field has both label alias and postfix alias")
+				}
+			}
+			if _, isPattern := label.(*ast.ListLit); !isPattern {
+				if a := x.Alias; a != nil {
+					insertPostfixAliases(s, x, a.Label)
+				}
+			}
+
+			// TODO(perf): replace labelName with quick tests: this generates an
+			// error in many cases.
+			name, isIdent, _ := ast.LabelName(label)
+			if isIdent {
+				v := x.Value
+				// Avoid interpreting value aliases at this point.
+				if a, ok := v.(*ast.Alias); ok {
+					v = a.Expr
+				}
+				s.insert(name, v, x, nil)
+			}
+		case *ast.LetClause:
+			name, isIdent, _ := ast.LabelName(x.Ident)
+			if isIdent {
+				s.insert(name, x, x, nil)
+			}
+		case *ast.Alias:
+			name, isIdent, _ := ast.LabelName(x.Ident)
+			if isIdent {
+				s.insert(name, x, x, nil)
+			}
+		case *ast.ImportDecl:
+			for _, spec := range x.Specs {
+				info, _ := ParseImportSpec(spec)
+				s.insert(info.Ident, spec, spec, nil)
+			}
+		}
+	}
+	return s
+}
+
+func newFuncScope(outer *scope, fn *ast.Func) *scope {
+	s := outer.allocScope()
+	s.outer = outer
+	s.node = fn
+	s.inField = false
+	s.identFn = outer.identFn
+	s.nameFn = outer.nameFn
+	s.errFn = outer.errFn
+	s.unresolved = outer.unresolved
+
+	insertParam := func(name string, p *ast.FuncParam) {
+		if name == "" || name == "_" {
+			return
+		}
+		if e := s.index[name]; e.node != nil {
+			s.errFn(p.Pos(), "parameter %q redeclared in same scope", name)
+			return
+		}
+		s.insert(name, p, p, nil)
+	}
+	for _, p := range fn.Params {
+		if p == nil {
+			continue
+		}
+		if a := p.Alias; a != nil && a.Field != nil && a.Field.Name != "_" {
+			insertParam(a.Field.Name, p)
+			continue
+		}
+		if p.Label != nil {
+			name, isIdent, _ := ast.LabelName(p.Label)
+			if isIdent {
+				insertParam(name, p)
+			}
+		}
+	}
+	return s
+}
+
+func (s *scope) isLet(n, link ast.Node) bool {
+	if _, ok := s.node.(*ast.Field); ok {
+		return true
+	}
+	if _, ok := link.(*ast.PostfixAlias); ok {
+		return true
+	}
+	switch n.(type) {
+	case *ast.LetClause, *ast.TryClause, *ast.Alias, *ast.Field:
+		return true
+	}
+	return false
+}
+
+func (s *scope) mustBeUnique(n, link ast.Node) bool {
+	if _, ok := s.node.(*ast.Field); ok {
+		return true
+	}
+	switch link.(type) {
+	case *ast.PostfixAlias, *ast.ForClause:
+		return true
+	}
+	switch n.(type) {
+	// TODO: add *ast.ImportSpec when some implementations are moved over to
+	// Sanitize.
+	case *ast.ImportSpec, *ast.LetClause, *ast.TryClause, *ast.Alias, *ast.Field:
+		return true
+	}
+	return false
+}
+
+func (s *scope) insert(name string, n, link ast.Node, f *ast.Field) {
+	if name == "" {
+		return
+	}
+	if s.nameFn != nil {
+		s.nameFn(name)
+	}
+	// TODO: record both positions.
+	if outer, _, existing := s.lookup(name); existing.node != nil {
+		if s.isLet(n, link) != outer.isLet(existing.node, existing.link) {
+			s.errFn(n.Pos(), "cannot have both alias and field with name %q in same scope", name)
+			return
+		} else if s.mustBeUnique(n, link) || outer.mustBeUnique(existing.node, existing.link) {
+			if outer == s {
+				if _, ok := existing.node.(*ast.ImportSpec); ok {
+					return
+					// TODO:
+					// s.errFn(n.Pos(), "conflicting declaration %s\n"+
+					// 	"\tprevious declaration at %s",
+					// 	name, existing.node.Pos())
+				} else {
+					s.errFn(n.Pos(), "alias %q redeclared in same scope", name)
+				}
+				return
+			}
+			// TODO: Should we disallow shadowing of aliases?
+			// This was the case, but it complicates the transition to
+			// square brackets. The spec says allow it.
+			// s.errFn(n.Pos(), "alias %q already declared in enclosing scope", name)
+		}
+	}
+	s.index[name] = entry{node: n, link: link, field: f}
+}
+
+func (s *scope) resolveScope(name string, node ast.Node) (scope ast.Node, e entry, ok bool) {
+	last := s
+	for s != nil {
+		if n, ok := s.index[name]; ok && node == n.node {
+			if last.node == n.node {
+				return nil, n, true
+			}
+			return s.node, n, true
+		}
+		s, last = s.outer, s
+	}
+	return nil, entry{}, false
+}
+
+func (s *scope) lookup(name string) (p *scope, obj ast.Node, node entry) {
+	if name == "_" {
+		return nil, nil, entry{}
+	}
+	for s != nil {
+		if n, ok := s.index[name]; ok {
+			if _, ok := n.node.(*ast.ImportSpec); ok {
+				return s, nil, n
+			}
+			obj := s.node
+			if n.field != nil {
+				// Label alias case.
+				obj = n.field
+			}
+			return s, obj, n
+		}
+		// s, last = s.outer, s
+		s = s.outer
+	}
+	return nil, nil, entry{}
+}
+
+func insertPostfixAliases(s *scope, x *ast.Field, expr ast.Node) {
+	a := x.Alias
+	if a == nil {
+		return
+	}
+	hasField := a.Field != nil && a.Field.Name != "_"
+
+	if a.Label == nil {
+		// Single form: ~X
+		if !hasField {
+			s.errFn(a.Pos(),
+				"single postfix alias %q field cannot be the blank identifier", a.Field.Name)
+		} else {
+			s.insert(a.Field.Name, x, a, nil)
+		}
+		return
+	}
+
+	// Double form: ~(X,Y)
+	hasLabel := a.Label != nil && a.Label.Name != "_"
+	if !hasField && !hasLabel {
+		s.errFn(a.Pos(),
+			"both label and field in postfix alias cannot be the blank identifier")
+		return
+	}
+	if hasLabel {
+		s.insert(a.Label.Name, expr, a, x)
+	}
+	if hasField {
+		s.insert(a.Field.Name, x, a, nil)
+	}
+}
+
+func (s *scope) Before(n ast.Node) bool {
+	switch x := n.(type) {
+	case *ast.File:
+		s = newScope(s, x, x.Decls)
+		defer s.freeScope()
+		// Support imports.
+		for _, d := range x.Decls {
+			ast.Walk(d, s.Before, nil)
+		}
+		return false
+
+	case *ast.StructLit:
+		s = newScope(s, x, x.Elts)
+		defer s.freeScope()
+		for _, elt := range x.Elts {
+			ast.Walk(elt, s.Before, nil)
+		}
+		return false
+
+	case *ast.Func:
+		// Parameter constraints, parameter defaults, and the return type
+		// resolve in the enclosing scope; only the body gets a
+		// function-parameter scope. A reference to another parameter is
+		// reserved for a possible future dependent-parameter feature and is
+		// reported as an error rather than silently binding to a like-named
+		// field of an enclosing scope.
+		if params := x.Parameters(); len(params) > 0 {
+			cs := newFuncScope(s, x)
+			cs.identFn = paramConstraintIdentFn(cs, cs.identFn)
+			for _, p := range params {
+				if p == nil {
+					continue
+				}
+				if p.Value != nil {
+					ast.Walk(p.Value, cs.Before, nil)
+				}
+				if p.Default != nil {
+					ast.Walk(p.Default, cs.Before, nil)
+				}
+			}
+			if x.Ret != nil {
+				ast.Walk(x.Ret, cs.Before, nil)
+			}
+			cs.freeScope()
+		} else if x.Ret != nil {
+			ast.Walk(x.Ret, s.Before, nil)
+		}
+		if x.Body != nil {
+			s = newFuncScope(s, x)
+			defer s.freeScope()
+			ast.Walk(x.Body, s.Before, nil)
+		}
+		return false
+
+	case *ast.Comprehension:
+		outer := s
+		s = scopeClauses(s, x.Clauses)
+		defer s.freeScopesUntil(outer)
+		ast.Walk(x.Value, s.Before, nil)
+		// Walk the fallback clause in the OUTER scope, since fallback should not
+		// have access to for/let variables from the comprehension clauses.
+		if x.Fallback != nil {
+			ast.Walk(x.Fallback.Body, outer.Before, nil)
+		}
+		return false
+
+	case *ast.Field:
+		var n ast.Node = x.Label
+		alias, ok := x.Label.(*ast.Alias)
+		if ok {
+			n = alias.Expr
+		}
+
+		switch label := n.(type) {
+		case *ast.ParenExpr:
+			ast.Walk(label, s.Before, nil)
+
+		case *ast.Interpolation:
+			ast.Walk(label, s.Before, nil)
+
+		case *ast.ListLit:
+			if len(label.Elts) != 1 {
+				break
+			}
+			s = newScope(s, x, nil)
+			defer s.freeScope()
+			if alias != nil {
+				if name, _, _ := ast.LabelName(alias.Ident); name != "" {
+					s.insert(name, x, alias, nil)
+				}
+			}
+
+			expr := label.Elts[0]
+
+			if a, ok := expr.(*ast.Alias); ok {
+				if x.Alias != nil {
+					// Error: cannot have both old-style pattern alias and
+					// postfix alias
+					s.errFn(x.Pos(),
+						"pattern constraint has both label alias and postfix alias")
+				}
+				expr = a.Expr
+
+				// Add to current scope, instead of the value's, and allow
+				// references to bind to these illegally.
+				// We need this kind of administration anyway to detect
+				// illegal name clashes, and it allows giving better error
+				// messages. This puts the burden on clients of this library
+				// to detect illegal usage, though.
+				s.insert(a.Ident.Name, a.Expr, a, x)
+			} else {
+				insertPostfixAliases(s, x, expr)
+			}
+
+			ast.Walk(expr, nil, func(n ast.Node) {
+				if x, ok := n.(*ast.Ident); ok {
+					for s := s; s != nil && !s.inField; s = s.outer {
+						if _, ok := s.index[x.Name]; ok {
+							s.errFn(n.Pos(),
+								"reference %q in label expression refers to field against which it would be matched", x.Name)
+						}
+					}
+				}
+			})
+			ast.Walk(expr, s.Before, nil)
+		}
+
+		if n := x.Value; n != nil {
+			// Handle value aliases.
+			if alias, ok := x.Value.(*ast.Alias); ok {
+				// TODO: this should move into Before once decl attributes
+				// have been fully deprecated and embed attributes are introduced.
+				s = newScope(s, x, nil)
+				defer s.freeScope()
+				s.insert(alias.Ident.Name, alias, x, nil)
+				n = alias.Expr
+			}
+			s.inField = true
+			ast.Walk(n, s.Before, nil)
+			s.inField = false
+		}
+
+		return false
+
+	case *ast.LetClause:
+		// Disallow referring to the current LHS name.
+		name := x.Ident.Name
+		saved := s.index[name]
+		delete(s.index, name) // The same name may still appear in another scope
+
+		// Set inField so that the label expression check in pattern constraints
+		// does not walk beyond the let clause's value. A let clause's value is
+		// a separate context, just like a field value.
+		s.inField = true
+		ast.Walk(x.Expr, s.Before, nil)
+		s.inField = false
+		s.index[name] = saved
+		return false
+
+	case *ast.Alias:
+		// Disallow referring to the current LHS name.
+		name := x.Ident.Name
+		saved := s.index[name]
+		delete(s.index, name) // The same name may still appear in another scope
+
+		ast.Walk(x.Expr, s.Before, nil)
+		s.index[name] = saved
+		return false
+
+	case *ast.ImportSpec:
+		return false
+
+	case *ast.Attribute:
+		// TODO: tokenize attributes, resolve identifiers and store the ones
+		// that resolve in a list.
+
+	case *ast.SelectorExpr:
+		ast.Walk(x.X, s.Before, nil)
+		return false
+
+	case *ast.Ident:
+		if s.identFn(s, x) {
+			return false
+		}
+	}
+	return true
+}
+
+// paramConstraintIdentFn returns an identFn for identifiers that appear in a
+// parameter constraint or in the return type of the function whose parameters
+// are declared in cs. These resolve in the scope enclosing the function, but a
+// reference that resolves to one of the function's own parameters is reserved
+// for a possible future dependent-parameter feature and is reported as an
+// error. A closer binding (for example a let clause inside the constraint, or
+// a parameter of a nested function literal) shadows the parameter as usual and
+// is resolved normally. All other identifiers are delegated to base, the
+// identFn inherited from the enclosing scope, so that the check composes with
+// custom identFn implementations such as those used by Sanitize, and so that
+// the rule applies one signature at a time when function literals nest.
+func paramConstraintIdentFn(cs *scope, base func(*scope, *ast.Ident) bool) func(*scope, *ast.Ident) bool {
+	return func(s *scope, x *ast.Ident) bool {
+		if name, ok, _ := ast.LabelName(x); ok {
+			if p, _, node := s.lookup(name); node.node != nil {
+				if _, isParam := node.node.(*ast.FuncParam); isParam && p == cs {
+					s.errFn(x.Pos(),
+						"cannot refer to parameter %q in a parameter constraint or return type", name)
+					return true
+				}
+			}
+		}
+		return base(s, x)
+	}
+}
+
+func resolveIdent(s *scope, x *ast.Ident) bool {
+	name, ok, _ := ast.LabelName(x)
+	if !ok {
+		// TODO: generate error
+		return false
+	}
+	if _, obj, node := s.lookup(name); node.node != nil {
+		switch x.Node {
+		case nil:
+			x.Node = node.node
+			x.Scope = obj
+
+		case node.node:
+			x.Scope = obj
+
+		default: // x.Node != node
+			scope, _, ok := s.resolveScope(name, x.Node)
+			if !ok {
+				*s.unresolved = append(*s.unresolved, x)
+			}
+			x.Scope = scope
+		}
+	} else {
+		*s.unresolved = append(*s.unresolved, x)
+	}
+	return true
+}
+
+func scopeClauses(s *scope, clauses []ast.Clause) *scope {
+	for _, c := range clauses {
+		switch x := c.(type) {
+		case *ast.ForClause:
+			ast.Walk(x.Source, s.Before, nil)
+			s = newScope(s, x, nil)
+			if x.Key != nil {
+				s.insert(x.Key.Name, x.Key, x, nil)
+			}
+			s.insert(x.Value.Name, x.Value, x, nil)
+
+		case *ast.LetClause:
+			ast.Walk(x.Expr, s.Before, nil)
+			s = newScope(s, x, nil)
+			s.insert(x.Ident.Name, x.Ident, x, nil)
+
+		case *ast.TryClause:
+			// For the assignment form (try x = expr), handle scope like LetClause.
+			if x.Ident != nil {
+				ast.Walk(x.Expr, s.Before, nil)
+				s = newScope(s, x, nil)
+				s.insert(x.Ident.Name, x.Ident, x, nil)
+			} else {
+				// For the struct form (try { ... }), just walk normally.
+				ast.Walk(c, s.Before, nil)
+			}
+
+		default:
+			ast.Walk(c, s.Before, nil)
+		}
+	}
+	return s
+}
+
+// Debugging support
+func (s *scope) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "scope %p {", s)
+	if s != nil && len(s.index) > 0 {
+		fmt.Fprintln(&b)
+		for name := range s.index {
+			fmt.Fprintf(&b, "\t%v\n", name)
+		}
+	}
+	fmt.Fprintf(&b, "}\n")
+	return b.String()
+}

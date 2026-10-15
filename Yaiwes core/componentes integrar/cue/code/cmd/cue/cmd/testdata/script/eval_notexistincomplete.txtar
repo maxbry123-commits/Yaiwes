@@ -1,0 +1,31 @@
+#Issue: 1509
+
+# export
+! exec cue export
+cmp stderr expect-stderr1
+
+# eval
+exec cue eval
+cmp stdout expect-stdout2
+
+-- x.cue --
+package x
+
+import "list"
+
+x: [1, 2, 3]
+sortedx: list.Sort(x, cmp)
+
+cmp: _
+
+-- expect-stderr1 --
+cmp: incomplete value _:
+    ./x.cue:8:6
+sortedx: error in call to list.Sort: non-concrete argument 1:
+    ./x.cue:6:10
+-- expect-stdout2 --
+import "list"
+
+x:       [1, 2, 3]
+sortedx: list.Sort(x, cmp)
+cmp:     _

@@ -1,0 +1,386 @@
+package workspace
+
+import (
+	"slices"
+	"testing"
+
+	"cuelang.org/go/internal/golangorgx/gopls/protocol"
+	I "cuelang.org/go/internal/golangorgx/gopls/test/integration"
+	"github.com/go-quicktest/qt"
+)
+
+func TestCodeActionConvertToStruct(t *testing.T) {
+	t.Parallel()
+	type testCase struct {
+		name     string
+		input    string
+		position protocol.Position
+		expected string
+	}
+	testCases := []testCase{
+		{
+			name:     "simple",
+			input:    `foo: bar: "baz"`,
+			position: protocol.Position{Line: 0, Character: 5}, // bar
+			expected: `
+foo: {
+	bar: "baz"
+}
+`[1:],
+		},
+
+		{
+			name: "multiline_field",
+			input: `
+before: _
+          foo: bar: {
+	"baz"
+}
+  after: _ // weird indent
+`[1:],
+			position: protocol.Position{Line: 1, Character: 15}, // bar
+			expected: `
+before: _
+          foo: {
+          	bar: {
+          		"baz"
+          	}
+          }
+  after: _ // weird indent
+`[1:],
+		},
+
+		{
+			name:     "nested_fields",
+			input:    `a: [{x: y: z: _, w: "foo"}.w]: {}`,
+			position: protocol.Position{Line: 0, Character: 8}, // y
+			expected: `
+a: [{x: {
+	y: z: _
+}
+w: "foo"}.w]: {}
+`[1:],
+		},
+
+		{
+			name:     "comma_separated",
+			input:    `  a: b: _, x: y: _`,
+			position: protocol.Position{Line: 0, Character: 5}, // b
+			// Note how the comma between _ and x: gets removed
+			expected: `
+  a: {
+  	b: _
+  }
+  x: y: _
+`[1:],
+		},
+
+		{
+			name: "multiline_labels",
+			input: `
+a:
+	b: _
+`[1:],
+			position: protocol.Position{Line: 1, Character: 1}, // b
+			expected: `
+a:
+	{
+		b: _
+	}
+`[1:],
+		},
+	}
+
+	for _, tc := range testCases {
+		fun := func(t *testing.T, env *I.Env) {
+			resolveSupport, err := env.Editor.EditResolveSupport()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			env.OpenFile("input.cue")
+			env.Await(env.DoneWithOpen())
+			rootURI := env.Sandbox.Workdir.RootURI()
+
+			cursor := protocol.Location{
+				URI: rootURI + "/input.cue",
+				Range: protocol.Range{
+					Start: tc.position,
+				},
+			}
+
+			actions, err := env.Editor.CodeAction(env.Ctx, cursor, nil)
+			if err != nil {
+				qt.Assert(t, qt.IsNil(err))
+			}
+
+			var action protocol.CodeAction
+			found := slices.ContainsFunc(actions, func(a protocol.CodeAction) bool {
+				if a.Title == "Add surrounding struct braces" {
+					action = a
+					return true
+				}
+				return false
+			})
+			if !found {
+				t.Fatal("Failed to find ConvertToStruct code action")
+			}
+			// If we advertised to the LSP that we support lazy
+			// resolution for codeactions, we should have been sent back
+			// a nil-Edit property.
+			qt.Assert(t, qt.Equals(action.Edit == nil, resolveSupport))
+			// Calling ApplyCodeAction will make the additional call to
+			// resolve the Edit property if necessary.
+			env.ApplyCodeAction(action)
+			after := env.BufferText("input.cue")
+			qt.Check(t, qt.Equals(after, tc.expected))
+		}
+
+		t.Run(tc.name+"/eager", func(t *testing.T) {
+			I.WithOptions(I.RootURIAsDefaultFolder()).Run(t, "-- input.cue --\n"+tc.input, fun)
+		})
+
+		t.Run(tc.name+"/lazy", func(t *testing.T) {
+			I.WithOptions(
+				I.RootURIAsDefaultFolder(),
+				I.CapabilitiesJSON([]byte(`{
+  "textDocument": {"codeAction": {
+    "dataSupport": true,
+    "resolveSupport": {"properties": ["edit"]}
+  }}
+}`)),
+			).Run(t, "-- input.cue --\n"+tc.input, fun)
+		})
+	}
+}
+
+func TestCodeActionConvertFromStruct(t *testing.T) {
+	t.Parallel()
+	type testCase struct {
+		name     string
+		input    string
+		position protocol.Position
+		expected string
+	}
+	testCases := []testCase{
+		{
+			name: "simple",
+			input: `
+foo: {
+	bar: "baz"
+}
+`[1:],
+			position: protocol.Position{Line: 1, Character: 1}, // bar
+			expected: `
+foo: bar: "baz"
+`[1:],
+		},
+
+		{
+			name: "multiline_field",
+			input: `
+before: _
+          foo: {
+          	bar: {
+          		"baz"
+          	}
+          }
+  after: _ // weird indent
+`[1:],
+			position: protocol.Position{Line: 2, Character: 11}, // bar
+			expected: `
+before: _
+          foo: bar: {
+          			"baz"
+          		}
+  after: _ // weird indent
+`[1:],
+		},
+
+		{
+			name: "nested_fields",
+			input: `
+a: [{x: {
+	y: z: _
+}
+w: "foo"}.w]: {}
+`[1:],
+			position: protocol.Position{Line: 1, Character: 1}, // y
+			expected: `
+a: [{x: y: z: _
+w: "foo"}.w]: {}
+`[1:],
+		},
+
+		{
+			name: "comma_separated",
+			input: `
+  a: {
+  	b: _
+  }, x: y: _
+`[1:],
+			position: protocol.Position{Line: 1, Character: 3}, // b
+			expected: `
+  a: b: _
+  x: y: _
+`[1:],
+		},
+
+		{
+			name: "multiline_labels",
+			input: `
+a:
+	{
+		b: _
+	}
+`[1:],
+			position: protocol.Position{Line: 2, Character: 2}, // b
+			expected: `
+a:
+	b: _
+`[1:],
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			I.WithOptions(I.RootURIAsDefaultFolder()).Run(t, "-- input.cue --\n"+tc.input, func(t *testing.T, env *I.Env) {
+				env.OpenFile("input.cue")
+				env.Await(env.DoneWithOpen())
+				rootURI := env.Sandbox.Workdir.RootURI()
+
+				cursor := protocol.Location{
+					URI: rootURI + "/input.cue",
+					Range: protocol.Range{
+						Start: tc.position,
+					},
+				}
+
+				actions, err := env.Editor.CodeAction(env.Ctx, cursor, nil)
+				if err != nil {
+					qt.Assert(t, qt.IsNil(err))
+				}
+
+				var action protocol.CodeAction
+				found := slices.ContainsFunc(actions, func(a protocol.CodeAction) bool {
+					if a.Title == "Remove surrounding struct braces" {
+						action = a
+						return true
+					}
+					return false
+				})
+				if !found {
+					t.Fatal("Failed to find ConvertFromStruct code action")
+				}
+
+				env.ApplyCodeAction(action)
+				after := env.BufferText("input.cue")
+				qt.Check(t, qt.Equals(after, tc.expected))
+			})
+		})
+	}
+}
+
+// TestCodeActionConvertFromClosedStruct checks that the braces of a closed
+// struct literal, which the openlists experiment enables, are not offered
+// for removal: removing them would drop the closedness.
+func TestCodeActionConvertFromClosedStruct(t *testing.T) {
+	t.Parallel()
+	const archive = `-- cue.mod/module.cue --
+module: "closed.test"
+language: version: "v0.18.0"
+-- input.cue --
+@experiment(openlists)
+
+foo: #{
+	bar: "baz"
+}
+`
+	I.WithOptions(I.RootURIAsDefaultFolder()).Run(t, archive, func(t *testing.T, env *I.Env) {
+		env.OpenFile("input.cue")
+		env.Await(env.DoneWithOpen())
+		cursor := protocol.Location{
+			URI:   env.Sandbox.Workdir.RootURI() + "/input.cue",
+			Range: protocol.Range{Start: protocol.Position{Line: 3, Character: 1}}, // bar
+		}
+		actions, err := env.Editor.CodeAction(env.Ctx, cursor, nil)
+		qt.Assert(t, qt.IsNil(err))
+		for _, a := range actions {
+			qt.Check(t, qt.Not(qt.Equals(a.Title, "Remove surrounding struct braces")))
+		}
+	})
+}
+
+func TestCodeActionToggleStructBraces(t *testing.T) {
+	t.Parallel()
+	type testCase struct {
+		name     string
+		input    string
+		position protocol.Position
+		expected string
+	}
+	testCases := []testCase{
+		{
+			// Inside removable braces, toggle removes.
+			name: "remove",
+			input: `
+foo: {
+	bar: "baz"
+}
+`[1:],
+			position: protocol.Position{Line: 1, Character: 1}, // bar
+			expected: `
+foo: bar: "baz"
+`[1:],
+		},
+		{
+			// No removable braces at the cursor: toggle adds.
+			name:     "add",
+			input:    `foo: bar: "baz"`,
+			position: protocol.Position{Line: 0, Character: 5}, // bar
+			expected: `
+foo: {
+	bar: "baz"
+}
+`[1:],
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			I.WithOptions(I.RootURIAsDefaultFolder()).Run(t, "-- input.cue --\n"+tc.input, func(t *testing.T, env *I.Env) {
+				env.OpenFile("input.cue")
+				env.Await(env.DoneWithOpen())
+				rootURI := env.Sandbox.Workdir.RootURI()
+
+				cursor := protocol.Location{
+					URI: rootURI + "/input.cue",
+					Range: protocol.Range{
+						Start: tc.position,
+					},
+				}
+
+				actions, err := env.Editor.CodeAction(env.Ctx, cursor, nil)
+				if err != nil {
+					qt.Assert(t, qt.IsNil(err))
+				}
+
+				var action protocol.CodeAction
+				found := slices.ContainsFunc(actions, func(a protocol.CodeAction) bool {
+					if a.Title == "Toggle surrounding struct braces" {
+						action = a
+						return true
+					}
+					return false
+				})
+				if !found {
+					t.Fatal("Failed to find ToggleStructBraces code action")
+				}
+
+				env.ApplyCodeAction(action)
+				after := env.BufferText("input.cue")
+				qt.Check(t, qt.Equals(after, tc.expected))
+			})
+		})
+	}
+}

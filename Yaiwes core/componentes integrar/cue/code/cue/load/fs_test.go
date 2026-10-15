@@ -1,0 +1,401 @@
+package load
+
+import (
+	"cmp"
+	"fmt"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"github.com/go-quicktest/qt"
+	"golang.org/x/tools/txtar"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+)
+
+func TestIOFS(t *testing.T) {
+	dir := t.TempDir()
+	onDiskFiles := []string{
+		"foo/bar/a",
+		"foo/bar/b",
+		"foo/baz",
+		"arble",
+	}
+	for _, f := range onDiskFiles {
+		writeFile(t, filepath.Join(dir, f), f)
+	}
+	overlayFiles := []string{
+		"foo/bar/a",
+		"foo/bar/c",
+		"other/x",
+	}
+	overlay := map[string]Source{}
+	for _, f := range overlayFiles {
+		overlay[filepath.Join(dir, f)] = FromString(f + " overlay")
+	}
+	cfg, err := (&Config{
+		Dir:     filepath.Join(dir, "foo"),
+		Overlay: overlay,
+	}).complete()
+	qt.Assert(t, qt.IsNil(err))
+
+	fsys, err := newOverlayFS(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	ffsys := fsys.ioFS(dir, "v0.12.0")
+	err = fstest.TestFS(ffsys, append(slices.Clip(onDiskFiles), overlayFiles...)...)
+	qt.Assert(t, qt.IsNil(err))
+	checked := make(map[string]bool)
+	for _, f := range overlayFiles {
+		data, err := fs.ReadFile(ffsys, f)
+		qt.Assert(t, qt.IsNil(err))
+		qt.Assert(t, qt.Equals(string(data), f+" overlay"))
+		checked[f] = true
+	}
+	for _, f := range onDiskFiles {
+		if checked[f] {
+			continue
+		}
+		data, err := fs.ReadFile(ffsys, f)
+		qt.Assert(t, qt.IsNil(err))
+		qt.Assert(t, qt.Equals(string(data), f))
+	}
+}
+
+func TestLoadFromFS(t *testing.T) {
+	mapFS := fstest.MapFS{
+		"cue.mod/module.cue": &fstest.MapFile{
+			Data: []byte(`module: "example.com/test@v0"
+language: version: "v0.12.0"
+`),
+		},
+		"x.cue": &fstest.MapFile{
+			Data: []byte(`package test
+
+a: 1
+`),
+		},
+	}
+	cfg := &Config{
+		FS: mapFS,
+	}
+	insts := Instances([]string{"."}, cfg)
+	qt.Assert(t, qt.HasLen(insts, 1))
+	qt.Assert(t, qt.IsNil(insts[0].Err))
+	qt.Assert(t, qt.Equals(insts[0].PkgName, "test"))
+}
+
+func TestLoadFromFSSubdir(t *testing.T) {
+	mapFS := fstest.MapFS{
+		"mymod/cue.mod/module.cue": &fstest.MapFile{
+			Data: []byte(`module: "example.com/test@v0"
+language: version: "v0.12.0"
+`),
+		},
+		"mymod/x.cue": &fstest.MapFile{
+			Data: []byte(`package test
+
+a: 1
+`),
+		},
+	}
+	cfg := &Config{
+		FS:  mapFS,
+		Dir: "/mymod",
+	}
+	insts := Instances([]string{"."}, cfg)
+	qt.Assert(t, qt.HasLen(insts, 1))
+	qt.Assert(t, qt.IsNil(insts[0].Err))
+	qt.Assert(t, qt.Equals(insts[0].PkgName, "test"))
+}
+
+func TestLoadFromFSAndOverlayMutualExclusion(t *testing.T) {
+	cfg := &Config{
+		FS:      fstest.MapFS{},
+		Overlay: map[string]Source{"/foo": FromString("bar")},
+	}
+	insts := Instances([]string{"."}, cfg)
+	qt.Assert(t, qt.HasLen(insts, 1))
+	qt.Assert(t, qt.ErrorMatches(insts[0].Err, `.*cannot set both Config.FS and Config.Overlay.*`))
+}
+
+func TestLoadFromFSFromFSPath(t *testing.T) {
+	mapFS := fstest.MapFS{
+		"cue.mod/module.cue": &fstest.MapFile{
+			Data: []byte(`module: "example.com/test@v0"
+language: version: "v0.12.0"
+`),
+		},
+		"x.cue": &fstest.MapFile{
+			Data: []byte(`package test
+
+a: 1
+`),
+		},
+	}
+	cfg := &Config{
+		FS: mapFS,
+		FromFSPath: func(p string) string {
+			return "/real/source" + p
+		},
+	}
+	insts := Instances([]string{"."}, cfg)
+	qt.Assert(t, qt.HasLen(insts, 1))
+	qt.Assert(t, qt.IsNil(insts[0].Err))
+	// Check that file positions use the mapped path.
+	qt.Assert(t, qt.HasLen(insts[0].BuildFiles, 1))
+	qt.Assert(t, qt.Equals(insts[0].BuildFiles[0].Filename, "/real/source/x.cue"))
+	// Check that Dir and Root use the mapped display paths.
+	qt.Assert(t, qt.Equals(insts[0].Dir, "/real/source/"))
+	qt.Assert(t, qt.Equals(insts[0].Root, "/real/source/"))
+}
+
+func TestFSLocPopulatedInOSCase(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "cue.mod", "module.cue"), `module: "example.com/test@v0"
+language: version: "v0.12.0"
+`)
+	writeFile(t, filepath.Join(dir, "x.cue"), `package test
+a: 1
+`)
+	cfg := &Config{
+		Dir: dir,
+	}
+	insts := Instances([]string{"."}, cfg)
+	qt.Assert(t, qt.HasLen(insts, 1))
+	qt.Assert(t, qt.IsNil(insts[0].Err))
+	// FSLoc fields should be populated even without Config.FS.
+	qt.Assert(t, qt.IsFalse(insts[0].DirLoc.IsZero()))
+	qt.Assert(t, qt.IsFalse(insts[0].RootLoc.IsZero()))
+	qt.Assert(t, qt.Equals(insts[0].DirLoc.String(), insts[0].Dir))
+	qt.Assert(t, qt.Equals(insts[0].RootLoc.String(), insts[0].Root))
+	qt.Assert(t, qt.IsNotNil(insts[0].DirLoc.FS))
+	// BuildFile FilenameLoc should also be populated.
+	qt.Assert(t, qt.HasLen(insts[0].BuildFiles, 1))
+	qt.Assert(t, qt.IsFalse(insts[0].BuildFiles[0].FilenameLoc.IsZero()))
+	qt.Assert(t, qt.Equals(insts[0].BuildFiles[0].FilenameLoc.String(), insts[0].BuildFiles[0].Filename))
+}
+
+func TestLoadFromFSWithDirectoryReplace(t *testing.T) {
+	// A directory replacement value may be relative (starting with "./" or
+	// "../") or absolute (starting with "/"). Relative paths are resolved
+	// against the module root; absolute paths are absolute within the
+	// [io/fs.FS] namespace, whose root is "/".
+	tests := []struct {
+		testName string
+		dir      string
+		files    string
+	}{{
+		// Relative replacement, module at the FS root.
+		testName: "RelativeAtRoot",
+		files: `
+-- cue.mod/module.cue --
+module: "example.com/main@v0"
+language: version: "v0.17.0"
+deps: "example.com/dep@v0": {
+	v: "v0.1.0"
+}
+-- cue.mod/local-module.cue --
+deps: "example.com/dep@v0": {
+	v: "v0.1.0"
+	replaceWith: "./local_dep"
+}
+-- main.cue --
+package main
+
+import "example.com/dep@v0:lib"
+
+output: lib.value
+-- local_dep/cue.mod/module.cue --
+module: "example.com/dep@v0"
+language: version: "v0.9.0"
+-- local_dep/lib.cue --
+package lib
+
+value: "from local directory"
+`,
+	}, {
+		// Absolute replacement (absolute within the FS namespace), module
+		// at the FS root.
+		testName: "AbsoluteAtRoot",
+		files: `
+-- cue.mod/module.cue --
+module: "example.com/main@v0"
+language: version: "v0.17.0"
+deps: "example.com/dep@v0": {
+	v: "v0.1.0"
+}
+-- cue.mod/local-module.cue --
+deps: "example.com/dep@v0": {
+	v: "v0.1.0"
+	replaceWith: "/local_dep"
+}
+-- main.cue --
+package main
+
+import "example.com/dep@v0:lib"
+
+output: lib.value
+-- local_dep/cue.mod/module.cue --
+module: "example.com/dep@v0"
+language: version: "v0.9.0"
+-- local_dep/lib.cue --
+package lib
+
+value: "from local directory"
+`,
+	}, {
+		// Module root is a subdirectory of the FS and the relative
+		// replacement points outside the module root ("../local_dep"),
+		// resolving to "/local_dep" within the FS namespace.
+		testName: "RelativeOutsideModuleRoot",
+		dir:      "/mymod",
+		files: `
+-- mymod/cue.mod/module.cue --
+module: "example.com/main@v0"
+language: version: "v0.17.0"
+deps: "example.com/dep@v0": {
+	v: "v0.1.0"
+}
+-- mymod/cue.mod/local-module.cue --
+deps: "example.com/dep@v0": {
+	v: "v0.1.0"
+	replaceWith: "../local_dep"
+}
+-- mymod/main.cue --
+package main
+
+import "example.com/dep@v0:lib"
+
+output: lib.value
+-- local_dep/cue.mod/module.cue --
+module: "example.com/dep@v0"
+language: version: "v0.9.0"
+-- local_dep/lib.cue --
+package lib
+
+value: "from local directory"
+`,
+	}}
+	for _, test := range tests {
+		t.Run(test.testName, func(t *testing.T) {
+			fsys, err := txtar.FS(txtar.Parse([]byte(test.files)))
+			qt.Assert(t, qt.IsNil(err))
+			cfg := &Config{
+				FS:  fsys,
+				Dir: test.dir,
+			}
+			insts := Instances([]string{"."}, cfg)
+			qt.Assert(t, qt.HasLen(insts, 1))
+			qt.Assert(t, qt.IsNil(insts[0].Err))
+			qt.Assert(t, qt.Equals(insts[0].PkgName, "main"))
+		})
+	}
+}
+
+func writeFile(t *testing.T, fpath string, content string) {
+	err := os.MkdirAll(filepath.Dir(fpath), 0o777)
+	qt.Assert(t, qt.IsNil(err))
+	err = os.WriteFile(fpath, []byte(content), 0o666)
+	qt.Assert(t, qt.IsNil(err))
+}
+
+func TestLoadFromFSWildcard(t *testing.T) {
+	// Issue https://cuelang.org/issue/4480: the "..." wildcard walks
+	// the [fs.FS] with fs.WalkDir, whose paths must be mapped back to
+	// the loader's absolute path scheme before matching.
+	// The files under cue.mod and the nested module must be skipped.
+	fsys, err := txtar.FS(txtar.Parse([]byte(`
+-- cue.mod/module.cue --
+module: "example.com/test@v0"
+language: version: "v0.12.0"
+-- x.cue --
+package test
+-- pkg/sub/x.cue --
+package sub
+-- cue.mod/pkg/other.org/y.cue --
+package y
+-- nested/cue.mod/module.cue --
+module: "example.com/nested@v0"
+language: version: "v0.12.0"
+-- nested/z.cue --
+package z
+`)))
+	qt.Assert(t, qt.IsNil(err))
+	for _, tc := range []struct {
+		dir  string
+		want []string
+	}{
+		{"", []string{"example.com/test@v0", "example.com/test/pkg/sub@v0"}},
+		{"/", []string{"example.com/test@v0", "example.com/test/pkg/sub@v0"}},
+		{"/pkg", []string{"example.com/test/pkg/sub@v0"}},
+	} {
+		t.Run(tc.dir, func(t *testing.T) {
+			insts := Instances([]string{"./..."}, &Config{FS: fsys, Dir: tc.dir})
+			var got []string
+			for _, inst := range insts {
+				qt.Assert(t, qt.IsNil(inst.Err))
+				got = append(got, inst.ImportPath)
+			}
+			qt.Assert(t, qt.DeepEquals(got, tc.want))
+		})
+	}
+}
+
+func TestLoadFromFSLocalPackages(t *testing.T) {
+	// Packages in the main module's cue.mod/{gen,usr,pkg} directories
+	// belong to the "local" pseudo-module, and their instance root is the
+	// main module root within the [io/fs.FS] namespace.
+	ar := txtar.Parse([]byte(`
+-- cue.mod/module.cue --
+module: "example.com/main@v0"
+language: version: "v0.14.0"
+-- main.cue --
+package main
+
+import (
+	"example.com/fromgen"
+	"example.com/frompkg"
+	"example.com/fromusr"
+)
+
+out: [fromgen.x, frompkg.x, fromusr.x]
+-- cue.mod/gen/example.com/fromgen/x.cue --
+package fromgen
+
+x: "gen"
+-- cue.mod/pkg/example.com/frompkg/x.cue --
+package frompkg
+
+x: "pkg"
+-- cue.mod/usr/example.com/fromusr/x.cue --
+package fromusr
+
+x: "usr"
+`))
+	for _, dir := range []string{"", "/mymod"} {
+		t.Run(dir, func(t *testing.T) {
+			files := slices.Clone(ar.Files)
+			for i := range files {
+				files[i].Name = path.Join(strings.TrimPrefix(dir, "/"), files[i].Name)
+			}
+			fsys, err := txtar.FS(&txtar.Archive{Files: files})
+			qt.Assert(t, qt.IsNil(err))
+			insts := Instances([]string{"."}, &Config{FS: fsys, Dir: dir})
+			qt.Assert(t, qt.HasLen(insts, 1))
+			qt.Assert(t, qt.IsNil(insts[0].Err))
+			qt.Assert(t, qt.HasLen(insts[0].Imports, 3))
+			for _, imp := range insts[0].Imports {
+				qt.Assert(t, qt.IsNil(imp.Err))
+				qt.Assert(t, qt.Equals(imp.Root, cmp.Or(dir, "/")))
+			}
+			v := cuecontext.New().BuildInstance(insts[0])
+			qt.Assert(t, qt.Equals(fmt.Sprint(v.LookupPath(cue.ParsePath("out"))), `["gen", "pkg", "usr"]`))
+		})
+	}
+}

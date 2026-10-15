@@ -1,0 +1,38 @@
+! exec cue vet -c
+cmp stderr expect-stderr
+-- expect-stderr --
+b.str: incomplete value string:
+    ./partial.cue:8:7
+dfl: incomplete value "b" | "a" | string:
+    ./partial.cue:19:6
+    ./partial.cue:20:6
+sum: incomplete value 1 | 2:
+    ./partial.cue:4:6
+two: incomplete value string:
+    ./partial.cue:21:6
+    ./partial.cue:22:6
+b.idx: invalid non-ground value string (must be concrete string):
+    ./partial.cue:8:7
+-- partial.cue --
+package partial
+
+def: *1 | int
+sum: 1 | 2
+
+b: {
+	idx: a[str] // should resolve to top-level `a`
+	str: string
+}
+b: a: b: 4
+a: {
+	b: 3
+	c: 4
+}
+c: b & {str: "b"}
+
+// Issue #2507: errors for non-concrete values should report the positions
+// of all contributing conjuncts, including for conflicting defaults.
+dfl: *"b" | string
+dfl: *"a" | string
+two: string
+two: string

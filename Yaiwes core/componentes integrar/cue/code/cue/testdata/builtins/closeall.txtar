@@ -1,0 +1,79 @@
+-- in.cue --
+// Basic usage of __closeAll - makes structs recursively closed
+a: __closeAll({
+	field1: 1
+	nested: {
+		field2: "hello"
+	}
+}) @test(eq, {field1: 1, nested: {field2: "hello"}})
+
+// Test that extra fields are not allowed (should error)
+b: {
+	err: a & {extra: "not allowed"}
+	@test(err, at=err.extra, code=eval, contains="field not allowed", pos=[1:12])
+}
+
+// Test that nested extra fields are not allowed (should error)
+c: {
+	err: a & {
+		field1: 1
+		nested: {
+			field2: "hello"
+			extra: "not allowed"
+		}
+	}
+	@test(err, at=err.nested.extra, code=eval, contains="field not allowed", pos=[5:4])
+}
+
+// Test with non-struct should error
+d: {
+	err: __closeAll("not a struct") @test(err, code=eval, contains="argument must be a struct or list literal", pos=[0:7])
+}
+
+// Test with empty struct
+e: __closeAll({}) @test(eq, {})
+f: {
+	err: e & {extra: "not allowed"}  // should error
+	@test(err, at=err.extra, code=eval, contains="field not allowed", pos=[1:12])
+}
+
+
+#A: a: int
+g: {
+	err: __closeAll(#A) @test(err, code=eval, contains="argument must be a struct or list literal", pos=[0:7])
+}
+
+// The closing applies to each disjunct of a struct which embeds a
+// disjunction.
+embeddedDisjunction: {
+	#A: {a: 1}
+	#B: {b: 1}
+	v: __closeAll({(#A | #B)..., c: 2})
+	t1: v & {a: 1} @test(eq, {a: 1, c: 2})
+	t2: v & {d: 3} @test(err, code=eval, contains="field not allowed", pos=[0:11])
+}
+-- out/errors.txt --
+[eval] b.err.extra: field not allowed:
+    ./in.cue:11:12
+[eval] c.err.nested.extra: field not allowed:
+    ./in.cue:21:4
+[eval] d.err: error in call to __closeAll: argument must be a struct or list literal:
+    ./in.cue:29:7
+[eval] f.err.extra: field not allowed:
+    ./in.cue:35:12
+[eval] g.err: error in call to __closeAll: argument must be a struct or list literal:
+    ./in.cue:42:7
+[eval] embeddedDisjunction.t2.d: field not allowed:
+    ./in.cue:52:11
+-- out/eval/stats --
+Leaks:  3
+Freed:  90
+Reused: 63
+Allocs: 30
+Retain: 0
+
+Unifications: 65
+Conjuncts:    120
+Disjuncts:    12
+
+NumCloseIDs: 34

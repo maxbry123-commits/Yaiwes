@@ -1,0 +1,19 @@
+-- in.cue --
+a: "\(4)"
+b: "one \(a) two \( a+c )"
+c: "one"
+d: "\(r)"
+u: "\(_)" // literal _ can never resolve.
+r: _
+e: "\([])"
+-- out/compile --
+--- in.cue
+{
+  a: "\(4)"
+  b: "one \(〈0;a〉) two \((〈0;a〉 + 〈0;c〉))"
+  c: "one"
+  d: "\(〈0;r〉)"
+  u: "\(_)"
+  r: _
+  e: "\([])"
+}

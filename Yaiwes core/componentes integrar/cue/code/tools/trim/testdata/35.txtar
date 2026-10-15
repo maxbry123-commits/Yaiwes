@@ -1,0 +1,89 @@
+issue 3140
+-- a.cue --
+#Foo: {
+	id: string
+	...
+}
+
+foo: [_]~(ID,_): #Foo & {
+	id: ID
+}
+
+foo: X1: {
+	id: "X1"
+	alist: []
+}
+-- out/trim-v3 --
+== a.cue
+#Foo: {
+	id: string
+	...
+}
+
+foo: [_]~(ID,_): #Foo & {
+	id: ID
+}
+
+foo: X1: {
+	alist: []
+}
+-- diff/-out/trim-v3<==>+out/trim --
+diff old new
+--- old
++++ new
+@@ -4,8 +4,10 @@
+ 	...
+ }
+ 
+-foo: [ID=_]: #Foo & {
++foo: [_]~(ID,_): #Foo & {
+ 	id: ID
+ }
+ 
+-foo: X1: {}
++foo: X1: {
++	alist: []
++}
+-- out/trim-v3-noshare --
+== a.cue
+#Foo: {
+	id: string
+	...
+}
+
+foo: [_]~(ID,_): #Foo & {
+	id: ID
+}
+
+foo: X1: {
+	alist: []
+}
+-- diff/-out/trim-v3-noshare<==>+out/trim --
+diff old new
+--- old
++++ new
+@@ -4,8 +4,10 @@
+ 	...
+ }
+ 
+-foo: [ID=_]: #Foo & {
++foo: [_]~(ID,_): #Foo & {
+ 	id: ID
+ }
+ 
+-foo: X1: {}
++foo: X1: {
++	alist: []
++}
+-- out/trim --
+== a.cue
+#Foo: {
+	id: string
+	...
+}
+
+foo: [ID=_]: #Foo & {
+	id: ID
+}
+
+foo: X1: {}

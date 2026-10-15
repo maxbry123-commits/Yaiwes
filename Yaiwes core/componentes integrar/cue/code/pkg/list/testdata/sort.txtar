@@ -1,0 +1,262 @@
+// Issue #616
+-- in.cue --
+import "list"
+
+t1: {
+	l: ["c", "b", "a"]
+	ls:  list.Sort(l, list.Ascending)
+	il:  list.IsSorted(l, list.Ascending)
+	ils: list.IsSorted(ls, list.Ascending)
+}
+
+t2: {
+	l: ["c", "b", "a"]
+	il: list.IsSorted(l, list.Ascending)
+
+	ls:  list.Sort(l, list.Ascending)
+	ils: list.IsSorted(ls, list.Ascending)
+}
+
+t3: {
+	L: ["c", "b", "a", "e", "d"]
+	l:  list.Take(L, 4)
+	il: list.IsSorted(l, list.Ascending)
+
+	ls:  list.Sort(l, list.Ascending)
+	ils: list.IsSorted(ls, list.Ascending)
+
+	l2: l
+	l3: ls
+}
+// An error in the comparator is an error in the result,
+// including a less field which is not a concrete bool.
+lessErr: {
+	s:  list.Sort([{a: 2}, {b: 1}], {x: _, y: _, less: x.a < y.a})
+	ss: list.SortStable([{a: 2}, {b: 1}], {x: _, y: _, less: x.a < y.a})
+	is: list.IsSorted([{a: 2}, {b: 1}], {x: _, y: _, less: x.a < y.a})
+}
+lessString: {
+	s:  list.Sort([2, 1], {x: _, y: _, less: "foo"})
+	ss: list.SortStable([2, 1], {x: _, y: _, less: "foo"})
+	is: list.IsSorted([2, 1], {x: _, y: _, less: "foo"})
+	v:  [2, 1] & list.IsSorted({x: _, y: _, less: "foo"})
+}
+lessNonConcrete: {
+	s:  list.Sort([2, 1], {x: _, y: _, less: bool})
+	is: list.IsSorted([2, 1], {x: _, y: _, less: bool})
+}
+lessMissing: {
+	s:  list.Sort([2, 1], {x: _, y: _})
+	is: list.IsSorted([2, 1], {x: _, y: _})
+}
+// A less field which is not yet concrete is an incomplete error,
+// so that the comparator may still be completed.
+lessRef: {
+	#S: {
+		cond: bool
+		s:    list.Sort([2, 1], {x: _, y: _, less: cond})
+	}
+	v: #S & {cond: true}
+}
+// The fields of a comparator may come from an embedding or a unification.
+cmpIndirect: {
+	embed: list.Sort(["b", "a"], {list.Ascending})
+	unify: list.Sort(["b", "a"], list.Ascending & {T: string})
+	is:    list.IsSorted(["b", "a"], {list.Descending})
+}
+
+// A comparator without the fields x and y is an error.
+cmpMissing: {
+	s:   list.Sort([2, 1, 3], {less: true})
+	ss:  list.SortStable([2, 1, 3], {less: true})
+	is:  list.IsSorted([2, 1], {less: true})
+	noX: list.Sort([2, 1], {y: _, less: true})
+	noY: list.Sort([2, 1], {x: _, less: true})
+}
+
+// A comparator field which is only a constraint is missing too.
+cmpConstraint: {
+	lessOpt: list.Sort([2, 1], {x: _, y: _, less?: true})
+	lessReq: list.IsSorted([2, 1], {x: _, y: _, less!: true})
+	xOpt:    list.Sort([2, 1], {x?: _, y: _, less: true})
+	yReq:    list.IsSorted([2, 1], {x: _, y!: _, less: true})
+}
+
+// A comparator may use x and y outside of less, such as in a comprehension,
+// which must see the inputs rather than any defaults.
+cmpCond: {
+	cmp: {x: *0 | int, y: *0 | int, less: x < y, if x < y {extra: true}}
+	s:   list.Sort([3, 1, 2], cmp)
+	ss:  list.SortStable([3, 1, 2], cmp)
+	is:  list.IsSorted([3, 1, 2], cmp)
+}
+-- out/list --
+Errors:
+lessString.s: error in call to list.Sort: cannot use "foo" (type string) as type bool:
+    ./in.cue:37:6
+    ./in.cue:37:43
+lessString.ss: error in call to list.SortStable: cannot use "foo" (type string) as type bool:
+    ./in.cue:38:6
+    ./in.cue:38:49
+lessString.is: error in call to list.IsSorted: cannot use "foo" (type string) as type bool:
+    ./in.cue:39:6
+    ./in.cue:39:47
+lessString.v: invalid value [2,1] (does not satisfy list.IsSorted({x:_,y:_,less:"foo"})): cannot use "foo" (type string) as type bool:
+    ./in.cue:40:15
+    ./in.cue:40:6
+    ./in.cue:40:48
+lessMissing.s: error in call to list.Sort: field not found: less:
+    ./in.cue:47:6
+lessMissing.is: error in call to list.IsSorted: field not found: less:
+    ./in.cue:48:6
+cmpMissing.s: error in call to list.Sort: field not found: x:
+    ./in.cue:68:7
+cmpMissing.ss: error in call to list.SortStable: field not found: x:
+    ./in.cue:69:7
+cmpMissing.is: error in call to list.IsSorted: field not found: x:
+    ./in.cue:70:7
+cmpMissing.noX: error in call to list.Sort: field not found: x:
+    ./in.cue:71:7
+cmpMissing.noY: error in call to list.Sort: field not found: y:
+    ./in.cue:72:7
+cmpConstraint.lessOpt: error in call to list.Sort: field not found: less:
+    ./in.cue:77:11
+cmpConstraint.lessReq: error in call to list.IsSorted: field not found: less:
+    ./in.cue:78:11
+cmpConstraint.xOpt: error in call to list.Sort: field not found: x:
+    ./in.cue:79:11
+cmpConstraint.yReq: error in call to list.IsSorted: field not found: y:
+    ./in.cue:80:11
+
+Result:
+import "list"
+
+t1: {
+	l:   ["c", "b", "a"]
+	ls:  ["a", "b", "c"]
+	il:  false
+	ils: true
+}
+t2: {
+	l:   ["c", "b", "a"]
+	il:  false
+	ls:  ["a", "b", "c"]
+	ils: true
+}
+t3: {
+	L:   ["c", "b", "a", "e", "d"]
+	l:   ["c", "b", "a", "e"]
+	il:  false
+	ls:  ["a", "b", "c", "e"]
+	ils: true
+	l2:  ["c", "b", "a", "e"]
+	l3:  ["a", "b", "c", "e"]
+}
+// An error in the comparator is an error in the result,
+// including a less field which is not a concrete bool.
+lessErr: {
+	s: list.Sort([
+		{a: 2}, {b: 1},
+	], {
+		x:    _
+		y:    _
+		less: x.a < y.a
+	})
+	ss: list.SortStable([
+		{a: 2}, {b: 1},
+	], {
+		x:    _
+		y:    _
+		less: x.a < y.a
+	})
+	is: list.IsSorted([
+		{a: 2}, {b: 1},
+	], {
+		x:    _
+		y:    _
+		less: x.a < y.a
+	})
+}
+lessString: {
+	s:  _|_ // lessString.s: error in call to list.Sort: cannot use "foo" (type string) as type bool
+	ss: _|_ // lessString.ss: error in call to list.SortStable: cannot use "foo" (type string) as type bool
+	is: _|_ // lessString.is: error in call to list.IsSorted: cannot use "foo" (type string) as type bool
+	v:  _|_ // lessString.v: invalid value [2,1] (does not satisfy list.IsSorted({x:_,y:_,less:"foo"})): cannot use "foo" (type string) as type bool
+}
+lessNonConcrete: {
+	s: list.Sort([
+		2,
+		1,
+	], {
+		x:    _
+		y:    _
+		less: bool
+	})
+	is: list.IsSorted([
+		2,
+		1,
+	], {
+		x:    _
+		y:    _
+		less: bool
+	})
+}
+lessMissing: {
+	s:  _|_ // lessMissing.s: error in call to list.Sort: field not found: less
+	is: _|_ // lessMissing.is: error in call to list.IsSorted: field not found: less
+}
+// A less field which is not yet concrete is an incomplete error,
+// so that the comparator may still be completed.
+lessRef: {
+	#S: {
+		cond: bool
+		s: list.Sort([
+			2,
+			1,
+		], {
+			x:    _
+			y:    _
+			less: cond
+		})
+	}
+	v: {
+		cond: true
+		s:    [1, 2]
+	}
+}
+// The fields of a comparator may come from an embedding or a unification.
+cmpIndirect: {
+	embed: ["a", "b"]
+	unify: ["a", "b"]
+	is:    true
+}
+
+// A comparator without the fields x and y is an error.
+cmpMissing: {
+	s:   _|_ // cmpMissing.s: error in call to list.Sort: field not found: x
+	ss:  _|_ // cmpMissing.ss: error in call to list.SortStable: field not found: x
+	is:  _|_ // cmpMissing.is: error in call to list.IsSorted: field not found: x
+	noX: _|_ // cmpMissing.noX: error in call to list.Sort: field not found: x
+	noY: _|_ // cmpMissing.noY: error in call to list.Sort: field not found: y
+}
+
+// A comparator field which is only a constraint is missing too.
+cmpConstraint: {
+	lessOpt: _|_ // cmpConstraint.lessOpt: error in call to list.Sort: field not found: less
+	lessReq: _|_ // cmpConstraint.lessReq: error in call to list.IsSorted: field not found: less
+	xOpt:    _|_ // cmpConstraint.xOpt: error in call to list.Sort: field not found: x
+	yReq:    _|_ // cmpConstraint.yReq: error in call to list.IsSorted: field not found: y
+}
+
+// A comparator may use x and y outside of less, such as in a comprehension,
+// which must see the inputs rather than any defaults.
+cmpCond: {
+	cmp: {
+		x:    *0 | int
+		y:    *0 | int
+		less: false
+	}
+	s:  [1, 2, 3]
+	ss: [1, 2, 3]
+	is: false
+}

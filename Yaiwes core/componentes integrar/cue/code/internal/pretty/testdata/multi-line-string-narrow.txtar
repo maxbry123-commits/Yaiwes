@@ -1,0 +1,27 @@
+#width: 10
+
+# Even at narrow width, multi-line string content is never reflowed.
+-- in --
+{
+        x: """
+                hello
+                world
+                """
+        y: 1
+}
+-- out/relpos --
+{
+	x: """
+		hello
+		world
+		"""
+	y: 1
+}
+-- out/norelpos --
+{
+	x: """
+		hello
+		world
+		"""
+	y: 1
+}

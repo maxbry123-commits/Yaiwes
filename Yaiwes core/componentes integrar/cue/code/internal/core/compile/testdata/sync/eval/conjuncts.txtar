@@ -1,0 +1,169 @@
+// These tests are related to issue 2351.
+// Tests conjunct unification with disjunctions and comprehensions, including
+// regression fixes for undefined field errors (issue 2351) and cycle errors
+// (issue 2355) in the v3 evaluator.
+-- in.cue --
+
+conjunct: t1: ({
+	#early: *"X" | string
+	#early
+} & {
+	#early: *"X" | string
+	string
+})
+
+conjunct: t2: {
+	#early: *"X" | string
+	#early
+}
+conjunct: t2: {
+	#early: *"X" | string
+	string
+}
+
+conjunct: t3: (conjunct.t1 & conjunct.t2)
+
+handleComprehensions: {
+	if false {
+		subs: #sub2 & 2
+	}
+	#sub2: 2
+}
+
+-- issue2351.cue --
+// Regression between v0.4.3 and v0.5.0: "undefined field" error when embedding
+// a for comprehension, caused by incorrect error reporting for let/hidden fields.
+// https://cuelang.org/issue/2351
+issue2351: let: {
+	let _param = "foo"
+	({
+		param: _param & [{}]
+		gen: [for p in param {p}]
+	}).gen
+}
+
+issue2351: hidden: {
+	_in1: ["foo"]
+	{
+		in2: _in1
+		out: [for x in in2 {x}]
+	}.out
+}
+
+-- issue2355.cue --
+// Regression v0.4.3→v0.5.0: cycle error when using let fields within nested
+// struct embeddings, breaking previously working code.
+// https://cuelang.org/issue/2355
+issue2355: {
+	#GetF1: {
+		in:  _
+		out: in.f1
+	}
+
+	#PutOut1: {
+		in: _
+		out: out1: "\(in)"
+	}
+
+	export: {
+		let data = {f1: "foo"}
+		(#PutOut1 & {
+			in: (#GetF1 & {
+				in: data
+			}).out
+		}).out
+	}
+}
+
+-- out/compile --
+--- in.cue
+{
+  conjunct: {
+    t1: ({
+      #early: (*"X"|string)
+      〈0;#early〉
+    } & {
+      #early: (*"X"|string)
+      string
+    })
+  }
+  conjunct: {
+    t2: {
+      #early: (*"X"|string)
+      〈0;#early〉
+    }
+  }
+  conjunct: {
+    t2: {
+      #early: (*"X"|string)
+      string
+    }
+  }
+  conjunct: {
+    t3: (〈1;conjunct〉.t1 & 〈1;conjunct〉.t2)
+  }
+  handleComprehensions: {
+    if false {
+      subs: (〈1;#sub2〉 & 2)
+    }
+    #sub2: 2
+  }
+}
+--- issue2351.cue
+{
+  issue2351: {
+    let: {
+      let _param#1 = "foo"
+      {
+        param: (〈1;let _param#1〉 & [
+          {},
+        ])
+        gen: [
+          for _, p in 〈1;param〉 {
+            〈1;p〉
+          },
+        ]
+      }.gen
+    }
+  }
+  issue2351: {
+    hidden: {
+      _in1: [
+        "foo",
+      ]
+      {
+        in2: 〈1;_in1〉
+        out: [
+          for _, x in 〈1;in2〉 {
+            〈1;x〉
+          },
+        ]
+      }.out
+    }
+  }
+}
+--- issue2355.cue
+{
+  issue2355: {
+    #GetF1: {
+      in: _
+      out: 〈0;in〉.f1
+    }
+    #PutOut1: {
+      in: _
+      out: {
+        out1: "\(〈1;in〉)"
+      }
+    }
+    export: {
+      let data#2 = {
+        f1: "foo"
+      }
+      (〈1;#PutOut1〉 & {
+        in: (〈2;#GetF1〉 & {
+          in: 〈2;let data#2〉
+        }).out
+      }).out
+    }
+  }
+}

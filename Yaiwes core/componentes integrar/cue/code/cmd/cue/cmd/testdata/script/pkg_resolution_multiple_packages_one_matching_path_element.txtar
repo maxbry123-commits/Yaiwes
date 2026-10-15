@@ -1,0 +1,34 @@
+# Test that a relative package path functions the same as an absolute package path
+# when there are multiple packages in the directory where one has a name
+# that matches the final element of the import path.
+
+exec cue eval root.cue
+cmp stdout stdout.golden
+exec cue eval mod.com/x
+cmp stdout stdout.golden
+exec cue eval mod.com/x/
+cmp stdout stdout.golden
+exec cue eval ./x
+cmp stdout stdout.golden
+exec cue eval ./x/
+cmp stdout stdout.golden
+
+-- stdout.golden --
+x: 5
+-- cue.mod/module.cue --
+module: "mod.com"
+language: version: "v0.9.0"
+-- root.cue --
+package root
+
+import "mod.com/x"
+
+x
+-- x/x.cue --
+package x
+
+x: 5
+-- x/y.cue --
+package y
+
+y: 5

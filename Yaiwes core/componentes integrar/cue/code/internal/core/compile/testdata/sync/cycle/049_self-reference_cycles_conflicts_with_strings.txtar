@@ -1,0 +1,19 @@
+#name: self-reference cycles conflicts with strings
+#evalPartial
+-- in.cue --
+a: {
+	x: y + "?"
+	y: x + "!"
+}
+a: x: "hey"
+-- out/compile --
+--- in.cue
+{
+  a: {
+    x: (〈0;y〉 + "?")
+    y: (〈0;x〉 + "!")
+  }
+  a: {
+    x: "hey"
+  }
+}

@@ -1,0 +1,220 @@
+// Copyright 2020 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package adt
+
+type ValidateConfig struct {
+	// Concrete, if true, requires that all values be concrete.
+	Concrete bool
+
+	// Final, if true, checks that there are no required fields left.
+	Final bool
+
+	// DisallowCycles indicates that there may not be cycles.
+	DisallowCycles bool
+
+	// ReportIncomplete reports an incomplete error even when concrete is not
+	// requested.
+	ReportIncomplete bool
+
+	// TODO: omitOptional, if this is becomes relevant.
+}
+
+// Validate checks that a value has certain properties. The value must have
+// been evaluated. It stops at the first error; use [ValidateAll] to find all
+// errors.
+func Validate(ctx *OpContext, v *Vertex, cfg *ValidateConfig) *Bottom {
+	if cfg == nil {
+		cfg = &ValidateConfig{}
+	}
+	x := validator{ValidateConfig: *cfg, ctx: ctx}
+	x.validate(v)
+	return x.err
+}
+
+// ValidateAll is like [Validate], but it continues descending into a Vertex
+// even if errors are found, and returns each error separately, keeping its
+// own error code.
+func ValidateAll(ctx *OpContext, v *Vertex, cfg *ValidateConfig) []*Bottom {
+	if cfg == nil {
+		cfg = &ValidateConfig{}
+	}
+	x := validator{ValidateConfig: *cfg, ctx: ctx, all: true}
+	x.validate(v)
+	return x.errs
+}
+
+// validateValue checks that a value has certain properties. The value must have
+// been evaluated.
+func validateValue(ctx *OpContext, v Value, cfg *ValidateConfig) *Bottom {
+	if cfg == nil {
+		cfg = &ValidateConfig{}
+	}
+
+	if v.Concreteness() > Concrete {
+		return &Bottom{
+			Code: IncompleteError,
+			Err:  ctx.Newf("non-concrete value '%v'", v),
+			Node: ctx.vertex,
+		}
+	}
+
+	if x, ok := v.(*Vertex); ok {
+		if v.Kind()&(StructKind|ListKind) != 0 {
+			x.Finalize(ctx)
+		}
+		return Validate(ctx, x, cfg)
+	}
+
+	return nil
+}
+
+type validator struct {
+	ValidateConfig
+	ctx          *OpContext
+	err          *Bottom
+	inDefinition int
+
+	// all collects every error in errs, rather than stopping at the first
+	// error in err.
+	all  bool
+	errs []*Bottom
+	seen map[*Bottom]bool // the errors in errs
+
+	sharedPositions []Node
+
+	// visited records how each structure-shared vertex has been validated.
+	// TODO: we could also keep track of the number of references to a
+	// shared vertex. This would allow us to report more than a single error
+	// per shared vertex.
+	visited map[*Vertex]sharedVisit
+}
+
+type sharedVisit uint8
+
+// A full visit performs the checks that only apply outside definitions,
+// such as concreteness, on top of those a partial visit performs.
+const (
+	partialVisit sharedVisit = 1 + iota
+	fullVisit
+)
+
+func (v *validator) checkConcrete() bool {
+	return v.Concrete && v.inDefinition == 0
+}
+
+func (v *validator) checkFinal() bool {
+	return (v.Concrete || v.Final) && v.inDefinition == 0
+}
+
+func (v *validator) add(b *Bottom) {
+	if !v.all {
+		v.err = CombineErrors(nil, v.err, b)
+		return
+	}
+	// A shared vertex may be reached both through a reference and at its
+	// own position.
+	if !b.ChildError && !v.seen[b] {
+		if v.seen == nil {
+			v.seen = make(map[*Bottom]bool)
+		}
+		v.seen[b] = true
+		v.errs = append(v.errs, b)
+	}
+}
+
+func (v *validator) validate(x *Vertex) {
+	defer v.ctx.PopArcAndLabel(v.ctx.PushArcAndLabel(x))
+
+	y := x
+
+	if x.IsShared {
+		saved := v.sharedPositions
+		// assume there is always a single conjunct: multiple references either
+		// result in the same shared value, or no sharing. And there has to be
+		// at least one to be able to share in the first place.
+		c, n := x.SingleConjunct()
+		if n >= 1 {
+			v.sharedPositions = append(v.sharedPositions, c.Elem())
+		}
+		defer func() { v.sharedPositions = saved }()
+	}
+	x = x.DerefValue()
+	if y != x {
+		// Process each dereferenced node at most once per kind of visit,
+		// which bounds the work and prevents cycles. The node may not be
+		// reachable in any other way, such as a let or an imported package
+		// referenced by a hidden field.
+		visit := partialVisit
+		if v.checkFinal() {
+			visit = fullVisit
+		}
+		if v.visited[x] >= visit {
+			return
+		}
+		if v.visited == nil {
+			v.visited = make(map[*Vertex]sharedVisit)
+		}
+		v.visited[x] = visit
+	}
+
+	if b := x.Bottom(); b != nil {
+		switch b.Code {
+		case CycleError:
+			if v.checkFinal() || v.DisallowCycles {
+				v.add(b)
+			}
+
+		case IncompleteError:
+			if v.ReportIncomplete || v.checkConcrete() {
+				v.add(b)
+			}
+
+		default:
+			v.add(b)
+		}
+		if !b.HasRecursive {
+			return
+		}
+
+	} else if v.checkConcrete() {
+		x = x.Default()
+		if !IsConcrete(x) {
+			v.add(NewIncompleteValueError(v.ctx, x, v.sharedPositions...))
+		}
+	}
+
+	for _, a := range x.Arcs {
+		if a.ArcType == ArcRequired && v.Final && v.inDefinition == 0 {
+			v.ctx.PushArcAndLabel(a)
+			v.add(NewRequiredNotPresentError(v.ctx, a, v.sharedPositions...))
+			v.ctx.PopArcAndLabel(a)
+			continue
+		}
+
+		if a.Label.IsLet() || !a.IsDefined(v.ctx) {
+			continue
+		}
+		if !v.all && v.err != nil {
+			break
+		}
+		if a.Label.IsRegular() {
+			v.validate(a)
+		} else {
+			v.inDefinition++
+			v.validate(a)
+			v.inDefinition--
+		}
+	}
+}

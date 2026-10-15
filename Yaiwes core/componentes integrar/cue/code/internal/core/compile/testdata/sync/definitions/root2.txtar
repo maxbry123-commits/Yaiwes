@@ -1,0 +1,17 @@
+# Pinned to v0.17.0: root-embedding series, covering how a closed
+# embedding constrains its siblings before explicitopen is stable.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- in.cue --
+root2: 1
+#Root2: {}
+#Root2
+
+-- out/compile --
+--- in.cue
+{
+  root2: 1
+  #Root2: {}
+  〈0;#Root2〉
+}

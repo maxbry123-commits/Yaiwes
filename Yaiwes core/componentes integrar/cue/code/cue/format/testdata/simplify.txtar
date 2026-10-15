@@ -1,0 +1,332 @@
+#simplify
+
+-- simplify.input --
+import "time"
+
+"foo": "bar": "str"
+
+a: "B": 42
+
+"a.b": "foo-": "cc_dd": x
+
+@attr(3)
+
+a:
+    b:
+        c: 3
+
+// references to bar are all shadowed and this can be safely turned into
+// an identifier.
+"bar": "str"
+
+// These references would be directly referred to if turned into an identifier.
+// The quotes should therefore not be removed.
+"baz1": 3
+"baz2": 3
+"baz3": 3 // TODO: could be simplified.
+
+// These string labels may be turned into an identifier.
+"qux": 4
+"quux": 5
+
+// TODO(legacy): Don't simplify "hidden" fields for now.
+"_foo": 3
+
+// Issue #294
+"\("x")": "x"
+
+(x): "foo"
+(x)?: "foo"
+(x)!: "foo"
+
+// (k4) refers to the outer k4, past the quoted "k4" in v, so those
+// quotes must stay.
+nestedLabelRefs: {
+    k4: "d"
+    v: {
+        "k4": "w"
+        nested: (k4): 3
+    }
+}
+
+a: {
+    [string]: _
+    foo: 2
+}
+
+"#A": dontSimplify
+
+// An unquoted label keeps its position on its own line.
+layout: {
+    "foo": 1 @attr()
+}
+
+quoting: {
+    // "#x" and "_y" are regular fields; unquoted, they would be a
+    // definition and a hidden field instead.
+    #x: 1
+    "#x": 2
+    _y: 1
+    "_y": 2
+}
+
+shadow: {
+    s1: 1
+    v: {
+        // A quoted label does not bind references, so result refers to
+        // the outer s1 and the quotes on "s1" in v must stay.
+        "s1": 2
+        child: {
+            "s1": int
+            result: s1
+        }
+    }
+}
+
+x: {
+@tag0(foo)
+    r1: baz1
+    bar: r2: bar
+    r3: bar
+    quux~(E): 3
+
+        @tag1(bar)
+    r4: quux
+    ["str"]~(baz2,_): 4
+    r5: baz2
+    ["bar"]~(baz3,_): name: baz3
+    "Time": time.Time
+}
+
+y: {
+    "a": {
+        "bar": "a-value"
+        [!="bar"]: {}
+    }
+
+    "b": {
+        "x": {
+            "bar": "bar"
+            "baz": "baz"
+            [!={
+                "a": "baz"
+            }.a & !="bar"]: {}
+        }
+
+        "y": {
+            "bar": "a-value"
+            ({
+                "a": "bar"
+            }.a): {}
+        }
+    }
+}
+
+{
+    foo: {}
+    bar: "foo": foo // removing the quotes would cause a cyclic reference
+}
+
+labelRefs: {
+    k1: "a"
+    k2: "b"
+    k3: "c"
+    v: {
+        // Label expressions reference fields in this scope, so these
+        // quotes must stay.
+        "k1": "x"
+        (k1): 1
+        "k2": "y"
+        "\(k2)z": 2
+        "k3": "z"
+        [k3]: string
+    }
+}
+
+// A pattern matching a single string is an optional field.
+patterns: {
+    ["^t"]: 5
+    ["opt"]: 6
+    ["ref"]: 7
+    r: ref
+    ["lbl"]: 12
+    (lbl): 13
+    #d: 14
+    ["#d"]: 15
+    #D: ["def"]: int
+
+    // These are not simple double-quoted strings, or the rewrite would
+    // lose an alias.
+    [=~"^t"]: 8
+    ["alias"]~(K,_): K
+    ['bytes']: 9
+    ['b']: 11
+    [#"raw"#]: 10
+}
+
+// An ellipsis has nowhere to put the attribute.
+patternAttr: {[string]: _ @foo(bar)}
+-- out/format/simplify.golden --
+import "time"
+
+foo: bar: "str"
+
+a: B: 42
+
+"a.b": "foo-": cc_dd: x
+
+@attr(3)
+
+a: b: c: 3
+
+// references to bar are all shadowed and this can be safely turned into
+// an identifier.
+bar: "str"
+
+// These references would be directly referred to if turned into an identifier.
+// The quotes should therefore not be removed.
+"baz1": 3
+"baz2": 3
+"baz3": 3 // TODO: could be simplified.
+
+// These string labels may be turned into an identifier.
+qux:  4
+quux: 5
+
+// TODO(legacy): Don't simplify "hidden" fields for now.
+"_foo": 3
+
+// Issue #294
+"\("x")": "x"
+
+(x):  "foo"
+(x)?: "foo"
+(x)!: "foo"
+
+// (k4) refers to the outer k4, past the quoted "k4" in v, so those
+// quotes must stay.
+nestedLabelRefs: {
+	k4: "d"
+	v: {
+		"k4": "w"
+		nested: (k4): 3
+	}
+}
+
+a: {
+	foo: 2
+	...
+}
+
+"#A": dontSimplify
+
+// An unquoted label keeps its position on its own line.
+layout: {
+	foo: 1 @attr()
+}
+
+quoting: {
+	// "#x" and "_y" are regular fields; unquoted, they would be a
+	// definition and a hidden field instead.
+	#x:   1
+	"#x": 2
+	_y:   1
+	"_y": 2
+}
+
+shadow: {
+	s1: 1
+	v: {
+		// A quoted label does not bind references, so result refers to
+		// the outer s1 and the quotes on "s1" in v must stay.
+		"s1": 2
+		child: {
+			"s1":   int
+			result: s1
+		}
+	}
+}
+
+x: {
+	@tag0(foo)
+	r1: baz1
+	bar: r2: bar
+	r3:       bar
+	quux~(E): 3
+
+	@tag1(bar)
+	r4:               quux
+	["str"]~(baz2,_): 4
+	r5:               baz2
+	["bar"]~(baz3,_): name: baz3
+	Time: time.Time
+}
+
+y: {
+	a: {
+		bar:       "a-value"
+		[!="bar"]: {}
+	}
+
+	b: {
+		x: {
+			bar: "bar"
+			baz: "baz"
+			[!={
+				"a": "baz"
+			}.a & !="bar"]: {}
+		}
+
+		y: {
+			bar: "a-value"
+			({
+				"a": "bar"
+			}.a): {}
+		}
+	}
+}
+
+{
+	foo: {}
+	bar: "foo": foo // removing the quotes would cause a cyclic reference
+}
+
+labelRefs: {
+	k1: "a"
+	k2: "b"
+	k3: "c"
+	v: {
+		// Label expressions reference fields in this scope, so these
+		// quotes must stay.
+		"k1":     "x"
+		(k1):     1
+		"k2":     "y"
+		"\(k2)z": 2
+		"k3":     "z"
+		[k3]:     string
+	}
+}
+
+// A pattern matching a single string is an optional field.
+patterns: {
+	"^t"?:  5
+	opt?:   6
+	"ref"?: 7
+	r:      ref
+	"lbl"?: 12
+	(lbl):  13
+	#d:     14
+	"#d"?:  15
+	#D: def?: int
+
+	// These are not simple double-quoted strings, or the rewrite would
+	// lose an alias.
+	[=~"^t"]:        8
+	["alias"]~(K,_): K
+	['bytes']:       9
+	['b']:           11
+	[#"raw"#]:       10
+}
+
+// An ellipsis has nowhere to put the attribute.
+patternAttr: {[string]: _ @foo(bar)}

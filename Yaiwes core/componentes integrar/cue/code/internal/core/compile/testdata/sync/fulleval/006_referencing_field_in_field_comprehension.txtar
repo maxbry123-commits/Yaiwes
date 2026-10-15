@@ -1,0 +1,25 @@
+-- in.cue --
+a: {b: c: 4}
+a: {
+	b: d: 5
+	for k, v in b {
+		"\(k)": v
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    b: {
+      c: 4
+    }
+  }
+  a: {
+    b: {
+      d: 5
+    }
+    for k, v in 〈0;b〉 {
+      "\(〈1;k〉)": 〈1;v〉
+    }
+  }
+}

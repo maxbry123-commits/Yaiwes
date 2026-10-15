@@ -1,0 +1,15 @@
+-- in.cue --
+dynamic: {
+	(a)~(X): 1
+	x:       X
+	a:       "name"
+}
+-- out/compile --
+--- in.cue
+{
+  dynamic: {
+    〈0;a〉: 1
+    x: 〈0;(〈0;a〉)〉
+    a: "name"
+  }
+}

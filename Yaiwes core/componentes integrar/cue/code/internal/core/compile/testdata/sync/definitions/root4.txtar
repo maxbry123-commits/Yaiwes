@@ -1,0 +1,28 @@
+# Pinned to v0.17.0: root-embedding series through a hidden field,
+# covering how a closed embedding constrains its siblings before
+# explicitopen is stable.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- in.cue --
+#schema: a!: bool
+_hidden & #schema // must fail here, but not elsewhere
+_hidden: {
+	"a": true,
+	notAllowed: true
+}
+allowed: true
+
+-- out/compile --
+--- in.cue
+{
+  #schema: {
+    a!: bool
+  }
+  (〈0;_hidden〉 & 〈0;#schema〉)
+  _hidden: {
+    a: true
+    notAllowed: true
+  }
+  allowed: true
+}

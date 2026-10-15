@@ -1,0 +1,197 @@
+// Copyright 2018 The CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/build"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/internal"
+	"cuelang.org/go/internal/encoding"
+	"cuelang.org/go/internal/filetypes"
+)
+
+// newEvalCmd creates a new eval command
+func newEvalCmd(c *Command) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "eval [flags] [inputs]",
+		Short: "evaluate and print a configuration",
+		Long: `eval evaluates, validates, and prints a configuration.
+
+Printing is skipped if validation fails.
+
+Input arguments can be CUE packages, CUE files, non-CUE files, or some
+combinations of those. See "cue help inputs" for more detail.
+
+The --expression flag is used to evaluate an expression within the
+configuration file, instead of the entire configuration file itself.
+
+Examples:
+
+  $ cat <<EOF > foo.cue
+  a: ["a", "b", "c"]
+  EOF
+
+  $ cue eval foo.cue -e a[0] -e a[2]
+  "a"
+  "c"
+`,
+		RunE: mkRunE(c, runEval),
+	}
+
+	addOutFlags(cmd)
+	addOrphanFlags(cmd)
+	addCUEOutputFlags(cmd)
+	addInjectionFlags(cmd)
+
+	cmd.Flags().StringArrayP(string(flagExpression), "e", nil, "evaluate this expression only")
+
+	cmd.Flags().BoolP(string(flagConcrete), "c", false,
+		"require the evaluation to be concrete")
+
+	cmd.Flags().BoolP(string(flagHidden), "H", false,
+		"display hidden fields")
+
+	cmd.Flags().BoolP(string(flagOptional), "O", false,
+		"display optional fields")
+
+	cmd.Flags().BoolP(string(flagAttributes), "A", false,
+		"display field attributes")
+
+	cmd.Flags().BoolP(string(flagAll), "a", false,
+		"show optional and hidden fields")
+
+	// TODO: Option to include comments in output.
+	return cmd
+}
+
+const (
+	flagConcrete   flagName = "concrete"
+	flagHidden     flagName = "show-hidden"
+	flagOptional   flagName = "show-optional"
+	flagAttributes flagName = "show-attributes"
+)
+
+func runEval(cmd *Command, args []string) error {
+	b, err := parseArgs(cmd, args, &config{mode: filetypes.Eval})
+	if err != nil {
+		return err
+	}
+
+	syn := []cue.Option{
+		cue.Final(), // for backwards compatibility
+		cue.Definitions(true),
+		cue.Attributes(flagAttributes.Bool(cmd)),
+		cue.Optional(flagAll.Bool(cmd) || flagOptional.Bool(cmd)),
+		cue.ErrorsAsValues(flagIgnore.Bool(cmd)),
+	}
+
+	// Keep for legacy reasons. Note that `cue eval` is to be deprecated by
+	// `cue` eventually.
+	// TODO use format.Indent("    ") once formatv2 is the only formatter;
+	// unlike these options, it would select formatv2 for this call.
+	opts := []format.Option{
+		format.IndentWidth(4),
+		format.TabIndent(false),
+	}
+	if flagSimplify.Bool(cmd) {
+		opts = append(opts, format.Simplify())
+	}
+	b.encConfig.Format = opts
+
+	e, err := encoding.NewEncoder(cmd.ctx, b.outFile, b.encConfig)
+	if err != nil {
+		return err
+	}
+
+	iter := b.instances()
+	defer iter.close()
+	for i := 0; iter.scan(); i++ {
+		id := ""
+		if len(b.insts) > 1 {
+			id = iter.id()
+		}
+		v, err := b.placeValue(iter.value())
+		if err != nil {
+			return err
+		}
+
+		errHeader := func() {
+			if id != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "// %s\n", id)
+			}
+		}
+		if b.outFile.Encoding != build.CUE {
+			err := e.Encode(v)
+			if err != nil {
+				errHeader()
+				printError(cmd, err)
+			}
+			continue
+		}
+
+		if flagConcrete.Bool(cmd) {
+			syn = append(syn, cue.Concrete(true))
+		}
+		if flagHidden.Bool(cmd) || flagAll.Bool(cmd) {
+			syn = append(syn, cue.Hidden(true))
+		}
+
+		if len(b.expressions) > 1 {
+			b, _ := format.Node(b.expressions[i%len(b.expressions)])
+			id = string(b)
+		}
+
+		if !flagIgnore.Bool(cmd) {
+			if err := v.Err(); err != nil {
+				if err = v.Validate(syn...); err != nil {
+					errHeader()
+					printError(cmd, err)
+					continue
+				}
+			}
+
+			// v.Syntax below reports non-concrete values as errors in the
+			// output rather than failing, so check for concreteness explicitly.
+			if e.IsConcrete() || flagConcrete.Bool(cmd) {
+				if err := v.Validate(cue.Concrete(true)); err != nil {
+					errHeader()
+					printError(cmd, err)
+					continue
+				}
+			}
+		}
+
+		f := internal.ToFile(v.Syntax(syn...), false)
+		f.Filename = id
+		err = e.EncodeFile(f)
+		if err != nil {
+			errHeader()
+			printError(cmd, err)
+		}
+	}
+	if err := iter.err(); err != nil {
+		return err
+	}
+	if cmd.hasErr {
+		// Errors were reported above; do not write a partial output file.
+		return nil
+	}
+	return e.Close()
+}

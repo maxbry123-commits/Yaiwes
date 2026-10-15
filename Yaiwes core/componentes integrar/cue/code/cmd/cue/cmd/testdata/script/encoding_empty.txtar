@@ -1,0 +1,75 @@
+# Test that the various encodings cope with empty files correctly.
+# Note that empty files or inputs have different meanings per encoding.
+# For example, in CUE and TOML they mean an empty struct or object,
+# in JSON they are invalid, and in JSONL they are a stream of zero values.
+
+# TODO(mvdan): cover more encodings: jsonschema, openapi, textproto, proto.
+
+exec cue export cue: empty
+cmp stdout as-cue.stdout
+! exec cue export json: empty
+cmp stderr empty-as-json.stderr
+exec cue export jsonl: empty
+cmp stdout as-jsonl.stdout
+exec cue export yaml: empty
+cmp stdout as-yaml.stdout
+exec cue export toml: empty
+cmp stdout as-toml.stdout
+
+# Also test inputs which are just whitespace, like newlines.
+
+exec cue export cue: newlines
+cmp stdout as-cue.stdout
+! exec cue export json: newlines
+cmp stderr newlines-as-json.stderr
+exec cue export jsonl: newlines
+cmp stdout as-jsonl.stdout
+exec cue export yaml: newlines
+cmp stdout as-yaml.stdout
+exec cue export toml: newlines
+cmp stdout as-toml.stdout
+
+# Also test inputs which are just comments.
+# Note that some languages support different syntaxes, or no comments at all.
+
+exec cue export cue: slash-comments
+cmp stdout as-cue.stdout
+! exec cue export json: slash-comments
+cmp stderr slash-comments-as-json.stderr
+! exec cue export jsonl: slash-comments
+cmp stderr slash-comments-as-jsonl.stderr
+exec cue export yaml: hash-comments
+cmp stdout as-yaml.stdout
+exec cue export toml: hash-comments
+cmp stdout as-toml.stdout
+
+-- as-cue.stdout --
+{}
+-- empty-as-json.stderr --
+invalid JSON: unexpected end of JSON input:
+    ./empty:1:1
+-- newlines-as-json.stderr --
+invalid JSON: unexpected end of JSON input:
+    ./newlines:3:1
+-- slash-comments-as-json.stderr --
+invalid JSON: invalid character '/' looking for beginning of value:
+    ./slash-comments:1:1
+-- slash-comments-as-jsonl.stderr --
+invalid JSON: invalid character '/' looking for beginning of value:
+    ./slash-comments:1:1
+-- as-jsonl.stdout --
+-- as-yaml.stdout --
+null
+-- as-toml.stdout --
+{}
+-- empty --
+-- newlines --
+
+
+
+-- slash-comments --
+// Just two lines
+// of comments.
+-- hash-comments --
+# Just two lines
+# of comments.

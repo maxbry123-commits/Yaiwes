@@ -1,0 +1,27 @@
+-- in.cue --
+#Foo: {
+	x: {
+		field: int
+
+		{a: 1} |
+		{b: 2}
+	}
+	x: c: 3
+}
+-- out/compile --
+--- in.cue
+{
+  #Foo: {
+    x: {
+      field: int
+      ({
+        a: 1
+      }|{
+        b: 2
+      })
+    }
+    x: {
+      c: 3
+    }
+  }
+}

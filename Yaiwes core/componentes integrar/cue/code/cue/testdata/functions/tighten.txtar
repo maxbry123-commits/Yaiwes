@@ -1,0 +1,653 @@
+# Tests unification of CUE function values with function types (bodyless
+# signatures, possibly partial/open) and of function types with each other.
+# Static checks at unification time cover only what is decidable from the
+# compiled signatures: parameter names, positions, closedness, and whether a
+# parameter declares a default. Requiredness combines as for struct fields
+# and is enforced when a call omits a parameter. Parameter and
+# result constraint conflicts and missing arguments remain dynamic and
+# surface when the function is called; two declared defaults for the same
+# parameter are unified when the signatures are.
+-- in.cue --
+@experiment(functions)
+
+tighten: {
+	T: func(a: int, ...) -> number
+
+	// The value declares an extra parameter b; T's signature is open, so
+	// the extra parameter is allowed and kept.
+	f: T & (func(a: int, b: int) -> int: a + b)
+	x: f(1, 2) @test(eq, 3)
+	y: f(1) @test(err, code=eval, contains="missing argument b")
+
+	// Order of unification does not matter.
+	fRev: (func(a: int, b: int) -> int: a + b) & T
+	xRev: fRev(1, 2) @test(eq, 3)
+
+	// The type's result constraint is enforced on calls through the
+	// tightened value.
+	r: (T & (func(a: int) -> int: a))(3) @test(eq, 3)
+	retConflict: ((func(a: int, ...) -> string) & (func(a: int) -> int: a))(3) @test(err, code=eval, contains="conflicting values")
+
+	// A parameter constraint conflict (int versus string) is not decidable
+	// from the signature shapes alone and surfaces when called, not when
+	// the type and value are unified.
+	s:    T & (func(a: string) -> int: 1)
+	sErr: s(1) @test(err, code=eval, contains="conflicting values")
+}
+
+closed: {
+	U: func(a: int) -> number
+
+	// An exact signature match tightens.
+	g:  U & (func(a: int) -> int: a)
+	gx: g(1) @test(eq, 1)
+
+	// A named type may add its contract label to an otherwise unnamed
+	// positional implementation slot.
+	gN:       U & (func(_~v: int) -> int: v)
+	gNx:      gN(1) @test(eq, 1)
+	gNByName: gN(a: 2) @test(eq, 2)
+
+	// Two different contract labels for the same positional slot conflict.
+	badName: U & (func(b: int) -> int: b) @test(err, code=eval, contains="conflicting parameter labels")
+
+	// The value requires an extra parameter b, which callers going through
+	// the closed type U can never provide.
+	bad2: U & (func(a: int, b: int) -> int: a+b) @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+
+	// An extra optional parameter is allowed even for a closed type.
+	ok3:  U & (func(a: int, b?: int) -> int: a)
+	ok3x: ok3(1) @test(eq, 1)
+}
+
+anonymous: {
+	// An anonymous type parameter matches the value's positional parameter
+	// in the same position, and its constraint applies to calls.
+	A:  func(int, ...) -> int
+	h:  A & (func(n: int) -> int: n + 1)
+	hx: h(1) @test(eq, 2)
+	he: h("x") @test(err, code=eval, contains="conflicting values")
+
+	// A named type parameter is positional too, so it is satisfied by an
+	// anonymous value parameter in the same position.
+	B:   func(m: int) -> int
+	bOk: B & (func(int) -> int: 1)
+	bx:  bOk(1) @test(eq, 1)
+
+	// A named positional parameter of the value may be covered by an
+	// anonymous parameter of a closed type in the same position.
+	C:   func(int) -> int
+	cOk: C & (func(n: int) -> int: n)
+	cx:  cOk(5) @test(eq, 5)
+
+	// A type constraint matched to an anonymous positional parameter of
+	// the value is enforced per call: the argument is bound to a synthetic
+	// parameter slot even though the body cannot reference it.
+	D:    func(<10, ...) -> int
+	d:    D & (func(int) -> int: 1)
+	dOk:  d(5) @test(eq, 1)
+	dOob: d(15) @test(err, code=eval, contains="invalid value 15 (out of bound <10)")
+
+	// The value's own constraint on an anonymous parameter is enforced on
+	// its argument as well.
+	f:    func(int) -> int: 1
+	fOk:  f(1) @test(eq, 1)
+	fBad: f("x") @test(err, code=eval, contains="conflicting values")
+
+	// Arity errors take precedence: missing and surplus arguments for
+	// anonymous parameters are still reported as such.
+	few:  f() @test(err, code=eval, contains="not enough arguments in function call")
+	many: f(1, 2) @test(err, code=eval, contains="too many positional arguments in function call")
+}
+
+contractLabels: {
+	// An attached signature supplies the contract label of the
+	// implementation's otherwise unnamed positional slot. The implementation
+	// may keep a separate body-local name.
+	add1: func(_~x: int) -> int: x + 1
+	add1: func(x: int) -> int
+	byLabel: add1(x: 2) @test(eq, 3)
+	byPosition: add1(2) @test(eq, 3)
+
+	// Another compatible signature may repeat the same contract label.
+	add1: func(x: <10) -> int
+	byRepeatedName: add1(x: 3) @test(eq, 4)
+
+	// Named and unnamed bodyless signatures compose in either order. Once a
+	// concrete implementation is attached, the single contract label names
+	// their shared slot.
+	Named:       func(x: int) -> int
+	Unnamed:     func(int) -> int
+	identity:    func(_~v: int) -> int: v
+	namedFirst:  Named & Unnamed & identity
+	unnamedFirst: Unnamed & Named & identity
+	namedCall:   namedFirst(x: 6) @test(eq, 6)
+	reverseCall: unnamedFirst(x: 7) @test(eq, 7)
+
+	// A constraint from a named signature attached to an unnamed slot follows
+	// the same positional match as its contract label.
+	limited: func(_~n: int) -> int: n
+	limited: func(input: <10) -> int
+	limitedOK: limited(input: 5) @test(eq, 5)
+
+	// A contributed contract label also binds partial applications.
+	sum: func(_~a: int, _~b: int) -> int: a + b
+	sum: func(x: int, y: int) -> int
+	addLeft: sum(x: 1, ...)
+	partial: addLeft(y: 2) @test(eq, 3)
+}
+
+meet: {
+	// The meet of two open types carries both signatures; the result is
+	// open only in the sense that both constituents are open.
+	n: (func(a: number, ...) -> number) & (func(a: int, ...) -> int)
+
+	// Calling a type, met or not, remains an error.
+	nc: n(1) @test(err, code=eval, contains="cannot call function without implementation")
+
+	// A value unified with the meet is constrained by both signatures.
+	v:  n & (func(a: int) -> int: a)
+	vx: v(3) @test(eq, 3)
+
+	// Both types' parameter constraints apply on calls: a string conflicts
+	// with both, a float only with the int signature.
+	w:   n & (func(a: _) -> _: a)
+	wx:  w("x") @test(err, code=eval, contains="conflicting values")
+	wx2: w(0.5) @test(err, code=eval, contains="conflicting values")
+
+	// Positional parameters align by ordinal, but two different contract
+	// labels for the same slot are incompatible.
+	badName: (func(a: int) -> int) & (func(b: int) -> int) @test(err, code=eval, contains="conflicting parameter labels")
+	badNameRev: (func(b: int) -> int) & (func(a: int) -> int) @test(err, code=eval, contains="conflicting parameter labels")
+
+	// A required or optional parameter and a positional parameter with the
+	// same label are the same parameter, in either signature. Requiredness
+	// combines as for struct fields: a plain parameter is stricter than a
+	// required one, which is stricter than an optional one.
+	reqNamed:     (func(a!: int) -> int) & (func(a: int, ...) -> int)
+	reqNamedV:    (reqNamed & (func(a: int) -> int: a))(2) @test(eq, 2)
+	optNamed:     (func(a: int) -> int) & (func(a?: int) -> int)
+	optNamedV:    (optNamed & (func(a: int) -> int: a))(a: 3) @test(eq, 3)
+	optNamedOmit: (optNamed & (func(a: int) -> int: a))() @test(err, code=eval, contains="missing argument a")
+	optReq:       (func(a?: int) -> int) & (func(a!: int) -> int)
+	optReqV:      (optReq & (func(a?: int) -> int: [if a != _|_ {a}, 0][0]))(a: 4) @test(eq, 4)
+	optReqOmit:   (optReq & (func(a?: int) -> int: [if a != _|_ {a}, 0][0]))() @test(err, code=eval, contains="missing required argument a")
+
+	// The result does not depend on the order of unification.
+	T1:     func(a: int) -> int
+	T2:     func(a?: int) -> int
+	vA:     func(a: int) -> int: a
+	orderL: ((T1 & T2) & vA)(1) @test(eq, 1)
+	orderR: (T1 & (T2 & vA))(1) @test(eq, 1)
+	orderV: ((T2 & vA) & T1)(1) @test(eq, 1)
+
+	// A positional parameter of a type still needs a positional parameter of
+	// the value, which decides how the function can be called.
+	posNameOnly: (func(a: int) -> int) & (func(a?: int) -> int: 1) @test(err, code=eval, contains="parameter a of function type not allowed by closed function")
+
+	// A parameter present in only one signature is allowed if the other
+	// signature is open.
+	wider:  (func(a: int, ...) -> int) & (func(a: int, b: int, ...) -> int)
+	widerV: wider & (func(a: int, b: int, c?: int) -> int: a + b)
+	widerX: widerV(1, 2) @test(eq, 3)
+}
+
+// An extra parameter is admitted against a closed signature iff it is
+// optional (?): while unmatched it contributes no parameter, but no call
+// needs it either. A sibling positional signature may expose the same label
+// and carry its constraint to a slot. One rule governs function tightening
+// (both directions), function type meets, and subsumption (see
+// internal/core/subsume); see builtins.txtar for builtins.
+optionalExtra: {
+	// Tightening: an extra optional parameter of the value against a
+	// closed type (also covered by closed.ok3).
+	V:   func(a: int) -> number
+	v1:  V & (func(a: int, b?: int) -> int: a)
+	v1x: v1(1) @test(eq, 1)
+
+	// Tightening: an extra optional parameter of the type against a
+	// closed value signature.
+	W:   func(a: int, b?: int) -> number
+	w1:  W & (func(a: int) -> int: a)
+	w1x: w1(1) @test(eq, 1)
+
+	// Tightening: an extra plain parameter remains rejected in both
+	// directions (see closed.bad2), as does a required one.
+	badT: (func(a: int, b: int) -> number) & (func(a: int) -> int: a) @test(err, code=eval, contains="parameter b of function type not allowed by closed function")
+	badV: (func(a: int) -> number) & (func(a: int, b: int) -> int: a) @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+	badR: (func(a: int) -> number) & (func(a: int, b!: int) -> int: a) @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+
+	// Meet: an extra optional parameter of one closed signature is
+	// admitted by the other; an extra plain parameter is not.
+	m1:   (func(a: int) -> number) & (func(a: int, b?: int) -> int)
+	m2:   (func(a: int, b?: int) -> int) & (func(a: int) -> number)
+	mBad: (func(a: int) -> number) & (func(a: int, b: int) -> int) @test(err, code=eval, contains="parameter b of function type not allowed by closed function type")
+
+	// A value unified with the meet is checked against, and calls are
+	// constrained by, both signatures, regardless of the meet's order.
+	m1v:  m1 & (func(a: int) -> int: a)
+	m1vx: m1v(1) @test(eq, 1)
+	m2v:  m2 & (func(a: int) -> int: a)
+	m2vx: m2v(1) @test(eq, 1)
+
+	// Against an open signature, any extra parameter is admitted.
+	o1:  (func(a: int, ...) -> number) & (func(a: int, b: int, ...) -> int)
+	o1v: o1 & (func(a: int, b: int, c?: int) -> int: a + b)
+	o1x: o1v(1, 2) @test(eq, 3)
+	o2:  (func(a: int, ...) -> number) & (func(a: int, b?: int) -> int: a)
+	o2x: o2(1) @test(eq, 1)
+}
+
+values: {
+	f: func(a: int) -> int: a
+	g: func(a: int) -> int: a
+
+	// Distinct function values compose (see compose below).
+	composed:  f & g
+	composedX: composed(1) @test(eq, 1)
+
+	// A function value unifies with itself.
+	same:  f & f
+	sameX: same(1) @test(eq, 1)
+
+	// Values tightened by the same type are equal and unify; the type
+	// constraint is recorded once.
+	T:     func(a: int, ...) -> number
+	t1:    T & f
+	t2:    T & f
+	both:  t1 & t2
+	bothX: both(1) @test(eq, 1)
+
+	// Equality of tightened values also holds for disjunction
+	// deduplication: t1 | t2 collapses to a single callable value.
+	pick:  t1 | t2
+	pickX: pick(1) @test(eq, 1)
+
+	// The order in which types tighten a value does not matter: the
+	// recorded type constraints compare as a set, so both orders unify
+	// and deduplicate in a disjunction.
+	U:      func(a: number, ...) -> number
+	o1:     T & U & f
+	o2:     U & T & f
+	both2:  o1 & o2
+	both2X: both2(1) @test(eq, 1)
+	pick2:  o1 | o2
+	pick2X: pick2(1) @test(eq, 1)
+}
+
+// Tightening must preserve all structural cycle semantics: the cycle
+// anchor and call-site identity remain those of the function value being
+// called.
+// Distinct function values with compatible signatures compose: a call
+// evaluates every implementation and unifies the results.
+compose: {
+	f: func(a: int) -> _: {in: a}
+	g: func(a~x: int) -> _: {out: x + 1}
+
+	fg:     f & g
+	fgX:    fg(1) @test(eq, {in: 1, out: 2})
+	fgL:    fg(a: 2) @test(eq, {in: 2, out: 3})
+	gf:     g & f
+	gfX:    gf(1) @test(eq, {in: 1, out: 2})
+	three:  f & g & (func(_~v: int) -> _: {w: v})
+	threeX: three(3) @test(eq, {in: 3, out: 4, w: 3})
+
+	// Composing a function again, in any order, does not add it twice.
+	again:  fg & gf & f
+	againX: again(1) @test(eq, {in: 1, out: 2})
+	pick:   fg | gf
+	pickX:  pick(1) @test(eq, {in: 1, out: 2})
+
+	// Two evaluations of the same literal in different environments are
+	// different values that compose: both give the same result.
+	_x: h: func(a: int) -> int: a + 1
+	envs:  _x.h & {_x}.h
+	envsX: envs(1) @test(eq, 2)
+
+	// Results that do not unify make the call fail, not the composition.
+	inc:     func(a: int) -> int: a + 1
+	id:      func(a: int) -> int: a
+	clash:   inc & id
+	clashX:  clash(1) @test(err, code=eval, contains="conflicting values 2 and 1")
+
+	// All constraints apply to every implementation.
+	lt:  func(a: <10) -> _: {lt: a}
+	ltf: lt & f
+	ltX: ltf(3) @test(eq, {in: 3, lt: 3})
+	ltE: ltf(30) @test(err, code=eval, contains="out of bound")
+
+	// A defaulted parameter of one function cannot be bound, as the other
+	// does not declare it: its default applies.
+	d:    func(a: int, b: int = 3, c?: int) -> _: {sum: a + b}
+	df:   d & f
+	dfX:  df(1) @test(eq, {in: 1, sum: 4})
+	dfB:  df(1, 2) @test(err, code=eval, contains="too many positional arguments")
+	dfC:  df(1, c: 2) @test(err, code=eval, contains="unknown argument c")
+	fd:   f & d
+	fdX:  fd(1) @test(eq, {in: 1, sum: 4})
+	fdB:  fd(1, 2) @test(err, code=eval, contains="too many positional arguments")
+	fdC:  fd(1, c: 2) @test(err, code=eval, contains="unknown argument c")
+
+	// Requiredness combines as for types.
+	req:    func(n!: int) -> _: {n1: n}
+	opt:    func(n?: int) -> _: {n2: n}
+	ro:     req & opt
+	roX:    ro(n: 4) @test(eq, {n1: 4, n2: 4})
+	roOmit: ro() @test(err, code=eval, contains="missing required argument n")
+
+	// A type tightens all implementations.
+	T:     func(a: int) -> {in: int, ...}
+	tfg:   T & fg
+	tfgX:  tfg(1) @test(eq, {in: 1, out: 2})
+
+	// Signatures must be compatible.
+	labels: f & (func(b: int) -> int: b) @test(err, code=eval, contains="conflicting parameter labels")
+	arity:  f & (func(a: int, b: int) -> int: a) @test(err, code=eval, contains="parameter b of function not allowed by closed function")
+	// Calls bind positional arguments through either function, so a
+	// positional parameter must match a positional one.
+	named:  f & (func(a!: int) -> int: a) @test(err, code=eval, contains="parameter a of function not allowed by closed function")
+
+	// Builtins do not compose with function values.
+	builtin: (func(x: number) -> number: x) & len @test(err, code=eval, contains="conflicting values")
+}
+
+cycles: {
+	T: func(n: int, ...) -> number
+
+	recursive: {
+		fn:  T & (func(n: int) -> int: fn(n))
+		out: fn(1) @test(err, code=structural_cycle, contains="structural cycle")
+	}
+
+	nesting: {
+		sum:   func(a: int, b: int) -> int: a + b
+		twice: T & (func(n: int) -> int: sum(n, n))
+		out:   twice(twice(2)) @test(eq, 8)
+		deep:  twice(twice(twice(2))) @test(eq, 16)
+	}
+}
+
+// Tightening narrows the values a call accepts and returns, beyond mere
+// kind checks: bounds and struct restrictions of the type apply to every
+// call of the tightened value.
+narrow: {
+	// The type narrows the parameter to a bound, resolved in the type's
+	// own scope.
+	lim: 10
+	T:   func(n: <lim, ...) -> number
+	f:   T & (func(n: int) -> int: n + 1)
+
+	ok:  f(5) @test(eq, 6)
+	oob: f(15) @test(err, code=eval, contains="invalid value 15 (out of bound <10)")
+
+	// The type narrows the result: the value's result must satisfy it per
+	// call.
+	R:  func(n: int, ...) -> <100
+	sq: R & (func(n: int) -> int: n * n)
+
+	small: sq(5) @test(eq, 25)
+	big:   sq(20) @test(err, code=eval, contains="invalid value 400 (out of bound <100)")
+
+	// The type restricts a struct parameter: a required field with a
+	// narrower type than the value itself demands.
+	S:    func(cfg: {name: string, port: >0 & <65536}, ...) -> string
+	srv:  S & (func(cfg: {...}) -> string: cfg.name)
+
+	good: srv({name: "db", port: 5432}) @test(eq, "db")
+	badField: srv({name: 42, port: 80}) @test(err, code=eval, contains="conflicting values string and 42")
+	badPort:  srv({name: "db", port: 0}) @test(err, code=eval, contains="invalid value 0 (out of bound >0)")
+
+	// Narrowing stacks across a chain of tightenings.
+	N:  func(n: >=0, ...) -> number
+	M:  func(n: <10, ...) -> number
+	g:  N & M & (func(n: int) -> int: n)
+
+	mid: g(5) @test(eq, 5)
+	neg: g(-1) @test(err, code=eval, contains="invalid value -1 (out of bound >=0)")
+	hi:  g(11) @test(err, code=eval, contains="invalid value 11 (out of bound <10)")
+}
+// Declared defaults are part of a signature. A default on one side carries
+// over to a call; defaults on both sides must unify and conflict when the
+// signatures are unified; a defaulted parameter is admitted beyond a closed
+// type like an optional one; a partial application keeps the defaults of the
+// parameters it leaves unbound.
+defaults: {
+	T: func(a: int = 2) -> int
+
+	// The type's default fills a value parameter that declares none.
+	fill:  T & (func(a: int) -> int: a)
+	fillX: fill() @test(eq, 2)
+	fillS: fill(5) @test(eq, 5)
+
+	// Order of unification does not matter.
+	fillRev:  (func(a: int) -> int: a) & T
+	fillRevX: fillRev() @test(eq, 2)
+
+	// Equal defaults agree.
+	same:  T & (func(a: int = 2) -> int: a)
+	sameX: same() @test(eq, 2)
+
+	// Differing defaults conflict when the signatures are unified.
+	differ: T & (func(a: int = 3) -> int: a) @test(err, code=eval, contains="conflicting defaults for parameter a")
+	differRev: (func(a: int = 3) -> int: a) & T @test(err, code=eval, contains="conflicting defaults for parameter a")
+
+	// Two types with defaults for different parameters: each one-sided
+	// default carries over, and a value's own default must agree with the
+	// type's for the same parameter.
+	A:      func(a: int = 2, ...) -> string
+	B:      func(a: int, b: string = "x") -> string
+	three:  A & B & (func(a: int, b: string) -> string: "\(a)\(b)")
+	threeX: three() @test(eq, "2x")
+	threeRev:  B & (func(a: int, b: string) -> string: "\(a)\(b)") & A
+	threeRevX: threeRev() @test(eq, "2x")
+	threeBad:  A & (func(a: int = 4, b: string) -> string: "\(a)\(b)") & B @test(err, code=eval, contains="conflicting defaults for parameter a")
+
+	// A value's extra defaulted parameter is admitted beyond a closed type,
+	// as an optional one is: no call through the type ever needs it.
+	C:      func(a: int) -> int
+	extra:  C & (func(a: int, b: int = 2) -> int: a + b)
+	extraX: extra(1) @test(eq, 3)
+	extraBad: C & (func(a: int, b: int) -> int: a + b) @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+
+	// The reverse: a type's defaulted parameter that the value does not
+	// declare is admitted like an optional one.
+	D:      func(a: int, b: int = 2) -> int
+	lacks:  D & (func(a: int) -> int: a)
+	lacksX: lacks(1) @test(eq, 1)
+
+	// A partial application binds arguments, not defaults: bound parameters
+	// lose their default, the remaining ones keep it until completion.
+	add3: func(a: int, b: int = 10, c: int = 100) -> int: a + b + c
+	f:    add3(1, ...)
+	all:  f() @test(eq, 111)
+	one:  f(2) @test(eq, 103)
+	lab:  f(c: 3) @test(eq, 14)
+	two:  add3(1, 2, ...)() @test(eq, 103)
+
+	// Agreement does not depend on the operand order, also when a named
+	// and a positional-only parameter share a slot.
+	Bn:     func(_~x: int = 3) -> int
+	orderX: T & Bn @test(err, code=eval, contains="conflicting defaults for parameter")
+	orderY: Bn & T @test(err, code=eval, contains="conflicting defaults for parameter")
+
+	// Admission beyond a closed type depends on the value's own declaration.
+	// A default declared only by another attached type does not admit the
+	// parameter, so the outcome does not depend on the order in which the
+	// signatures are attached: a closed type restricts the value whatever
+	// else is attached, as a closed struct restricts its fields.
+	v2:      func(a: int, b: int) -> int: a + b
+	D2:      func(a: int, b: int = 2) -> int
+	C2:      func(a: int) -> int
+	orderDC: (v2 & D2) & C2 @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+	orderCD: (v2 & C2) & D2 @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+	orderTV: C2 & D2 & v2 @test(err, code=eval, contains="parameter b of function not allowed by closed function type")
+
+	// The value's own default admits it, in any order, and the two types
+	// agree with each other on their own: D2's default admits b beyond C2.
+	v3:    func(a: int, b: int = 2) -> int: a + b
+	ownDC: ((v3 & D2) & C2)(1) @test(eq, 3)
+	ownCD: ((v3 & C2) & D2)(1) @test(eq, 3)
+	ownTV: ((C2 & D2) & v3)(1) @test(eq, 3)
+
+	// A default attached by a type carries into a call made as the argument
+	// of another call.
+	id:           func(x: int) -> int: x
+	nestedDirect: fill() @test(eq, 2)
+	nestedCall:   id(fill()) @test(eq, 2)
+}
+-- out/errors.txt --
+[eval] tighten.y: missing argument b:
+    ./in.cue:10:5
+[eval] conflicting values string and int (mismatched types string and int):
+    ./in.cue:19:38
+    ./in.cue:19:65
+[eval] a: conflicting values 1 and string (mismatched types int and string):
+    ./in.cue:24:21
+    ./in.cue:25:10
+[eval] closed.badName: conflicting parameter labels a and b for positional parameter 1 in function type and function:
+    ./in.cue:29:5
+    ./in.cue:42:16
+[eval] closed.bad2: parameter b of function not allowed by closed function type:
+    ./in.cue:29:5
+    ./in.cue:46:13
+[eval] n: conflicting values "x" and int (mismatched types string and int):
+    ./in.cue:57:19
+    ./in.cue:59:8
+[eval] arg0: invalid value 15 (out of bound <10):
+    ./in.cue:76:13
+    ./in.cue:79:10
+[eval] arg0: conflicting values "x" and int (mismatched types string and int):
+    ./in.cue:83:13
+    ./in.cue:85:10
+[eval] anonymous.few: not enough arguments in function call:
+    ./in.cue:89:8
+[eval] anonymous.many: too many positional arguments in function call:
+    ./in.cue:90:8
+[eval] meet.nc: cannot call function without implementation:
+    ./in.cue:136:6
+[eval] conflicting values int and "x" (mismatched types int and string):
+    ./in.cue:133:62
+    ./in.cue:144:29
+    ./in.cue:145:9
+[eval] conflicting values int and 0.5 (mismatched types int and float):
+    ./in.cue:133:62
+    ./in.cue:144:29
+    ./in.cue:146:9
+[eval] meet.badName: conflicting parameter labels b and a for positional parameter 1 in function type and function type:
+    ./in.cue:150:36
+    ./in.cue:150:12
+[eval] meet.badNameRev: conflicting parameter labels a and b for positional parameter 1 in function type and function type:
+    ./in.cue:151:39
+    ./in.cue:151:15
+[eval] meet.optNamedOmit: missing argument a:
+    ./in.cue:161:16
+[eval] meet.optReqOmit: missing required argument a:
+    ./in.cue:164:16
+[eval] meet.posNameOnly: parameter a of function type not allowed by closed function:
+    ./in.cue:176:40
+    ./in.cue:176:16
+[eval] optionalExtra.badT: parameter b of function type not allowed by closed function:
+    ./in.cue:206:44
+    ./in.cue:206:9
+[eval] optionalExtra.badV: parameter b of function not allowed by closed function type:
+    ./in.cue:207:36
+    ./in.cue:207:9
+[eval] optionalExtra.badR: parameter b of function not allowed by closed function type:
+    ./in.cue:208:36
+    ./in.cue:208:9
+[eval] optionalExtra.mBad: parameter b of function type not allowed by closed function type:
+    ./in.cue:214:36
+    ./in.cue:214:9
+[eval] conflicting values 2 and 1:
+    ./in.cue:298:32
+    ./in.cue:299:32
+    ./in.cue:301:17
+[eval] in: invalid value 30 (out of bound <10):
+    ./in.cue:304:15
+    ./in.cue:307:11
+[eval] compose.dfB: too many positional arguments in function call:
+    ./in.cue:314:8
+[eval] compose.dfC: unknown argument c:
+    ./in.cue:315:8
+[eval] compose.fdB: too many positional arguments in function call:
+    ./in.cue:318:8
+[eval] compose.fdC: unknown argument c:
+    ./in.cue:319:8
+[eval] compose.roOmit: missing required argument n:
+    ./in.cue:326:10
+[eval] compose.labels: conflicting parameter labels a and b for positional parameter 1 in function and function:
+    ./in.cue:274:5
+    ./in.cue:334:15
+[eval] compose.arity: parameter b of function not allowed by closed function:
+    ./in.cue:274:5
+    ./in.cue:335:15
+[eval] compose.named: parameter a of function not allowed by closed function:
+    ./in.cue:274:5
+    ./in.cue:338:15
+[eval] compose.builtin: conflicting values func(x: number) -> number: ... and len:
+    ./in.cue:341:12
+[structural_cycle] structural cycle:
+    ./in.cue:348:34
+[eval] n: invalid value 15 (out of bound <10):
+    ./in.cue:367:15
+    ./in.cue:371:9
+[eval] invalid value 400 (out of bound <100):
+    ./in.cue:375:27
+    ./in.cue:376:32
+[eval] conflicting values string and 42 (mismatched types string and int):
+    ./in.cue:383:61
+    ./in.cue:384:41
+    ./in.cue:387:23
+[eval] cfg.port: invalid value 0 (out of bound >0):
+    ./in.cue:383:39
+    ./in.cue:388:35
+[eval] invalid value -1 (out of bound >=0):
+    ./in.cue:391:14
+    ./in.cue:396:9
+[eval] invalid value 11 (out of bound <10):
+    ./in.cue:392:14
+    ./in.cue:397:9
+[eval] conflicting defaults for parameter a: conflicting values 3 and 2:
+    ./in.cue:405:19
+    ./in.cue:421:10
+    ./in.cue:421:29
+[eval] conflicting defaults for parameter a: conflicting values 3 and 2:
+    ./in.cue:405:19
+    ./in.cue:422:28
+    ./in.cue:422:44
+[eval] conflicting defaults for parameter a: conflicting values 4 and 2:
+    ./in.cue:427:24
+    ./in.cue:433:13
+    ./in.cue:433:32
+[eval] defaults.extraBad: parameter b of function not allowed by closed function type:
+    ./in.cue:437:10
+    ./in.cue:440:17
+[eval] conflicting defaults for parameter x: conflicting values 2 and 3:
+    ./in.cue:459:26
+    ./in.cue:405:19
+    ./in.cue:460:14
+[eval] conflicting defaults for parameter a: conflicting values 3 and 2:
+    ./in.cue:405:19
+    ./in.cue:459:26
+    ./in.cue:461:15
+[eval] defaults.orderDC: parameter b of function not allowed by closed function type:
+    ./in.cue:470:11
+    ./in.cue:468:11
+[eval] defaults.orderCD: parameter b of function not allowed by closed function type:
+    ./in.cue:470:11
+    ./in.cue:468:11
+[eval] defaults.orderTV: parameter b of function not allowed by closed function type:
+    ./in.cue:468:11
+    ./in.cue:470:11
+-- out/eval/stats --
+Leaks:  9
+Freed:  746
+Reused: 683
+Allocs: 72
+Retain: 0
+
+Unifications: 722
+Conjuncts:    2539
+Disjuncts:    6
+
+NumCloseIDs: 385

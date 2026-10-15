@@ -1,0 +1,56 @@
+-- in.cue --
+#def: {
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {c: string}
+    {} | {a: string}
+}
+x: #def
+x: c: "foo"
+
+-- out/compile --
+--- in.cue
+{
+  #def: {
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      c: string
+    })
+    ({}|{
+      a: string
+    })
+  }
+  x: 〈0;#def〉
+  x: {
+    c: "foo"
+  }
+}

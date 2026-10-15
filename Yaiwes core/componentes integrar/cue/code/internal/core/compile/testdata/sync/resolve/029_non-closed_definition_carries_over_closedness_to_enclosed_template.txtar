@@ -1,0 +1,67 @@
+-- in.cue --
+#S: {
+	[string]: {a: int}
+}
+a: #S & {
+	v: {b: int}
+}
+#Q: {
+	[string]: {a: int} | {b: int}
+}
+b: #Q & {
+	w: {c: int}
+}
+// NOTE: the above test is marked at w, not w.c, because it fails both
+// disjunctions. We probably want to record it at c, or at least give a better
+// error message.
+
+#R: {
+	[string]: [{a: int}, {b: int}]
+}
+c: #R & {
+	w: [{d: int}, ...]
+}
+-- out/compile --
+--- in.cue
+{
+  #S: {
+    [string]: {
+      a: int
+    }
+  }
+  a: (〈0;#S〉 & {
+    v: {
+      b: int
+    }
+  })
+  #Q: {
+    [string]: ({
+      a: int
+    }|{
+      b: int
+    })
+  }
+  b: (〈0;#Q〉 & {
+    w: {
+      c: int
+    }
+  })
+  #R: {
+    [string]: [
+      {
+        a: int
+      },
+      {
+        b: int
+      },
+    ]
+  }
+  c: (〈0;#R〉 & {
+    w: [
+      {
+        d: int
+      },
+      ...,
+    ]
+  })
+}

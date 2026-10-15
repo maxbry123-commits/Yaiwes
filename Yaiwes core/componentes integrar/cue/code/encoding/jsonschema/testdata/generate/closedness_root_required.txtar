@@ -1,0 +1,27 @@
+# Tests for root-level definition reference with required fields.
+#
+# Issue 4356: same as closedness_root but with required fields.
+-- test.cue --
+package test
+
+#T
+
+#T: {
+	a!: int
+	b!: int
+}
+-- out/generate-v3/schema --
+{
+	$schema: "https://json-schema.org/draft/2020-12/schema"
+	$defs: T: {
+		type:                 "object"
+		additionalProperties: false
+		properties: {
+			a: type: "integer"
+			b: type: "integer"
+		}
+		required: ["a", "b"]
+	}
+	type: "object"
+	$ref: "#/$defs/T"
+}

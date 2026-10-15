@@ -1,0 +1,21 @@
+-- in.cue --
+a: 1 & int
+b: number & 1
+c: 1.0
+c: float
+d: int & float
+e: "4" & string
+f: true
+f: bool
+-- out/compile --
+--- in.cue
+{
+  a: (1 & int)
+  b: (number & 1)
+  c: 1.0
+  c: float
+  d: (int & float)
+  e: ("4" & string)
+  f: true
+  f: bool
+}

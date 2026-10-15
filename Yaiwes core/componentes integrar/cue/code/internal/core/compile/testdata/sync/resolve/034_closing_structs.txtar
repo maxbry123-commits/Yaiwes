@@ -1,0 +1,100 @@
+-- in.cue --
+op: {x: int} // {x: int}
+ot: {x: int, ...} // {x: int, ...}
+cp: close({x: int}) // closed({x: int})
+ct: close({x: int, ...})
+
+opot: op & ot // {x: int, ...}
+otop: ot & op // {x: int, ...}
+opcp: op & cp
+cpop: cp & op
+opct: op & ct
+ctop: ct & op
+otcp: ot & cp
+cpot: cp & ot
+otct: ot & ct
+ctot: ct & ot
+cpct: cp & ct
+ctcp: ct & cp
+ctct: ct & ct
+
+// An ellipsis only opens the struct it is part of, also below the top level.
+nested: {
+	#cp: a: {x: int}
+	#ct: a: {x: int, ...}
+
+	otcp: #cp
+	otcp: a: {...}
+	opct: #ct
+	opct: a: {x: 1}
+	otct: #ct
+	otct: a: {...}
+	cpct: #cp & #ct
+	cpct: a: _
+}
+-- out/compile --
+--- in.cue
+{
+  op: {
+    x: int
+  }
+  ot: {
+    x: int
+    ...
+  }
+  cp: close({
+    x: int
+  })
+  ct: close({
+    x: int
+    ...
+  })
+  opot: (〈0;op〉 & 〈0;ot〉)
+  otop: (〈0;ot〉 & 〈0;op〉)
+  opcp: (〈0;op〉 & 〈0;cp〉)
+  cpop: (〈0;cp〉 & 〈0;op〉)
+  opct: (〈0;op〉 & 〈0;ct〉)
+  ctop: (〈0;ct〉 & 〈0;op〉)
+  otcp: (〈0;ot〉 & 〈0;cp〉)
+  cpot: (〈0;cp〉 & 〈0;ot〉)
+  otct: (〈0;ot〉 & 〈0;ct〉)
+  ctot: (〈0;ct〉 & 〈0;ot〉)
+  cpct: (〈0;cp〉 & 〈0;ct〉)
+  ctcp: (〈0;ct〉 & 〈0;cp〉)
+  ctct: (〈0;ct〉 & 〈0;ct〉)
+  nested: {
+    #cp: {
+      a: {
+        x: int
+      }
+    }
+    #ct: {
+      a: {
+        x: int
+        ...
+      }
+    }
+    otcp: 〈0;#cp〉
+    otcp: {
+      a: {
+        ...
+      }
+    }
+    opct: 〈0;#ct〉
+    opct: {
+      a: {
+        x: 1
+      }
+    }
+    otct: 〈0;#ct〉
+    otct: {
+      a: {
+        ...
+      }
+    }
+    cpct: (〈0;#cp〉 & 〈0;#ct〉)
+    cpct: {
+      a: _
+    }
+  }
+}

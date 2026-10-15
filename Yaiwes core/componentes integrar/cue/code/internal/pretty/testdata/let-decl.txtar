@@ -1,0 +1,10 @@
+-- in --
+{
+	let X = foo
+}
+-- out/relpos --
+{
+	let X = foo
+}
+-- out/norelpos --
+{let X = foo}

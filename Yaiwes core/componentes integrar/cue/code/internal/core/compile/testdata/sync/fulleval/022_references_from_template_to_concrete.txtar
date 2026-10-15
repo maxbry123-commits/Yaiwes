@@ -1,0 +1,32 @@
+-- in.cue --
+// res is a list containing t; res[0] shares t's vertex.
+res: [t]
+t: {
+	[string]~(X,_): {
+		a: c + b.str
+		b: str: string
+		c: "X"
+	}
+	x: {b: str: "DDDD"}
+}
+-- out/compile --
+--- in.cue
+{
+  res: [
+    〈1;t〉,
+  ]
+  t: {
+    [string]: {
+      a: (〈0;c〉 + 〈0;b〉.str)
+      b: {
+        str: string
+      }
+      c: "X"
+    }
+    x: {
+      b: {
+        str: "DDDD"
+      }
+    }
+  }
+}

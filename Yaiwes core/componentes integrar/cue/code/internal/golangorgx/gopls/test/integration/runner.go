@@ -1,0 +1,358 @@
+// Copyright 2020 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"cuelang.org/go/internal/golangorgx/gopls/lsprpc"
+	"cuelang.org/go/internal/golangorgx/gopls/settings"
+	"cuelang.org/go/internal/golangorgx/gopls/test/integration/fake"
+	"cuelang.org/go/internal/golangorgx/tools/jsonrpc2"
+	"cuelang.org/go/internal/golangorgx/tools/jsonrpc2/servertest"
+	"cuelang.org/go/internal/lsp/cache"
+	"github.com/go-quicktest/qt"
+)
+
+// Mode is a bitmask that defines for which execution modes a test should run.
+//
+// Each mode controls several aspects of gopls' configuration:
+//   - Whether to use a shared cache
+//   - Whether to use a shared server
+//   - Whether to run the server in-process or in a separate process
+//
+// The behavior of each mode with respect to these aspects is summarized below.
+// TODO(rfindley, cleanup): rather than using arbitrary names for these modes,
+// we can compose them explicitly out of the features described here, allowing
+// individual tests more freedom in constructing problematic execution modes.
+// For example, a test could assert on a certain behavior when running with
+// experimental options on a separate process. Moreover, we could unify 'Modes'
+// with 'Options', and use RunMultiple rather than a hard-coded loop through
+// modes.
+//
+// Mode            | Shared Cache? | Shared Server? | In-process?
+// ------------------------------------------------------------
+// Default         | Y             | N              | Y
+// Forwarded       | Y             | Y              | Y
+// SeparateProcess | Y             | Y              | N
+type Mode int
+
+const (
+	// Default mode runs gopls with the default options, communicating over pipes
+	// to emulate the lsp sidecar execution mode, which communicates over
+	// stdin/stdout.
+	//
+	// It uses separate servers for each test, but a shared cache, to avoid
+	// duplicating work when processing GOROOT.
+	Default Mode = 1 << iota
+
+	// Forwarded uses the default options, but forwards connections to a shared
+	// in-process gopls server.
+	Forwarded
+
+	// SeparateProcess uses the default options, but forwards connection to an
+	// external gopls daemon.
+	//
+	// Only supported on GOOS=linux.
+	SeparateProcess
+)
+
+func (m Mode) String() string {
+	switch m {
+	case Default:
+		return "default"
+	case Forwarded:
+		return "forwarded"
+	case SeparateProcess:
+		return "separate process"
+	default:
+		return "unknown mode"
+	}
+}
+
+// A Runner runs tests in gopls execution environments, as specified by its
+// modes. For modes that share state (for example, a shared cache or common
+// remote), any tests that execute on the same Runner will share the same
+// state.
+type Runner struct {
+	// Configuration
+	DefaultModes             Mode                    // modes to run for each test
+	Timeout                  time.Duration           // per-test timeout, if set
+	PrintGoroutinesOnFailure bool                    // whether to dump goroutines on test failure
+	SkipCleanup              bool                    // if set, don't delete test data directories when the test exits
+	OptionsHook              func(*settings.Options) // if set, use these options when creating gopls sessions
+
+	// Immutable state shared across test invocations
+	cuePath string // path to the cue executable (for SeparateProcess mode)
+	tempDir string // shared parent temp directory
+
+	// Lazily allocated resources
+	tsOnce sync.Once
+	ts     *servertest.TCPServer // shared in-process test server ("forwarded" mode)
+
+	startRemoteOnce sync.Once
+	remoteSocket    string // unix domain socket for shared daemon ("separate process" mode)
+	remoteErr       error
+	cancelRemote    func()
+}
+
+type TestFunc func(t *testing.T, env *Env)
+
+// Run executes the test function in the default configured gopls execution
+// modes. For each a test run, a new workspace is created containing the
+// un-txtared files specified by filedata.
+func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOption) {
+	// TODO(rfindley): this function has gotten overly complicated, and warrants
+	// refactoring.
+	t.Helper()
+
+	tests := []struct {
+		name      string
+		mode      Mode
+		getServer func(runConfig, func(*settings.Options)) jsonrpc2.StreamServer
+	}{
+		{"default", Default, r.defaultServer},
+		{"forwarded", Forwarded, r.forwardedServer},
+		{"separate_process", SeparateProcess, r.separateProcessServer},
+	}
+
+	for _, tc := range tests {
+		config := defaultConfig()
+		for _, opt := range opts {
+			opt.set(&config)
+		}
+		modes := r.DefaultModes
+		if config.modes != 0 {
+			modes = config.modes
+		}
+		if modes&tc.mode == 0 {
+			continue
+		}
+
+		t.Run(tc.name, func(t *testing.T) {
+			// TODO(rfindley): once jsonrpc2 shutdown is fixed, we should not leak
+			// goroutines in this test function.
+			// stacktest.NoLeak(t)
+
+			ctx := context.Background()
+			if r.Timeout != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+				defer cancel()
+			} else if d, ok := t.Deadline(); ok {
+				timeout := time.Until(d) * 19 / 20 // Leave an arbitrary 5% for cleanup.
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+
+			rootDir := filepath.Join(r.tempDir, filepath.FromSlash(t.Name()))
+			if err := os.MkdirAll(rootDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			files := fake.UnpackTxt(files)
+			if config.editor.WindowsLineEndings {
+				for name, data := range files {
+					files[name] = bytes.ReplaceAll(data, []byte("\n"), []byte("\r\n"))
+				}
+			}
+			config.sandbox.Files = files
+			config.sandbox.RootDir = rootDir
+			sandbox, err := fake.NewSandbox(&config.sandbox)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if !r.SkipCleanup {
+					if err := sandbox.Close(); err != nil {
+						pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
+						t.Errorf("closing the sandbox: %v", err)
+					}
+				}
+			}()
+
+			ss := tc.getServer(config, r.OptionsHook)
+
+			framer := jsonrpc2.NewRawStream
+			ls := &loggingFramer{}
+			framer = ls.framer(jsonrpc2.NewRawStream)
+			ts := servertest.NewPipeServer(ss, framer)
+
+			awaiter := NewAwaiter(sandbox.Workdir)
+			const skipApplyEdits = false
+			editor, err := fake.NewEditor(sandbox, config.editor).Connect(ctx, ts, awaiter.Hooks(), skipApplyEdits)
+
+			// Were we expecting an error?
+			if config.initializeErrorMatches != "" {
+				qt.Assert(t, qt.ErrorMatches(err, config.initializeErrorMatches))
+				// at this point we are done
+				return
+
+			} else {
+				qt.Assert(t, qt.IsNil(err))
+			}
+
+			env := &Env{
+				T:       t,
+				Ctx:     ctx,
+				Sandbox: sandbox,
+				Editor:  editor,
+				Server:  ts,
+				Awaiter: awaiter,
+			}
+			defer func() {
+				if t.Failed() && r.PrintGoroutinesOnFailure {
+					pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
+				}
+				if t.Failed() || *printLogs {
+					ls.printBuffers(t.Name(), os.Stderr)
+				}
+				// For tests that failed due to a timeout, don't fail to shutdown
+				// because ctx is done.
+				//
+				// There is little point to setting an arbitrary timeout for closing
+				// the editor: in general we want to clean up before proceeding to the
+				// next test, and if there is a deadlock preventing closing it will
+				// eventually be handled by the `go test` timeout.
+				if err := editor.Close(context.WithoutCancel(ctx)); err != nil {
+					t.Errorf("closing editor: %v", err)
+				}
+			}()
+			// Always await the initial workspace load.
+			env.Await(InitialWorkspaceLoad)
+			test(t, env)
+		})
+	}
+}
+
+// defaultServer handles the Default execution mode.
+func (r *Runner) defaultServer(config runConfig, optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+	c, err := newCache(config)
+	if err != nil {
+		panic(err)
+	}
+	return lsprpc.NewStreamServer(c, false, optsHook)
+}
+
+// forwardedServer handles the Forwarded execution mode.
+func (r *Runner) forwardedServer(config runConfig, optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+	if config.reg != nil {
+		// This is because the server may be long-lived and used for
+		// several tests, possibly even in parallel. So we cannot allow
+		// tests to attempt to reconfigure the server.
+		panic("explicit registry cannot be set for separate process execution mode")
+	}
+	r.tsOnce.Do(func() {
+		c, err := newCache(config)
+		if err != nil {
+			panic(err)
+		}
+		ctx := context.Background()
+		ss := lsprpc.NewStreamServer(c, false, optsHook)
+		r.ts = servertest.NewTCPServer(ctx, ss, nil)
+	})
+	return newForwarder("tcp", r.ts.Addr)
+}
+
+func newCache(config runConfig) (*cache.Cache, error) {
+	if config.reg == nil {
+		return cache.New(nil)
+	} else {
+		return cache.NewWithRegistry(nil, config.reg), nil
+	}
+}
+
+// runTestAsCueLspEnvvar triggers TestMain to run cue lsp instead of
+// running tests. It's a trick to allow tests to find a binary to use
+// to start a cue lsp subprocess.
+const runTestAsCueLspEnvvar = "_CUELSP_TEST_BINARY_RUN_AS_CUELSP"
+
+// separateProcessServer handles the SeparateProcess execution mode.
+func (r *Runner) separateProcessServer(config runConfig, optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+	if runtime.GOOS != "linux" {
+		panic("separate process execution mode is only supported on linux")
+	}
+	if config.reg != nil {
+		panic("explicit registry cannot be set for separate process execution mode")
+	}
+
+	r.startRemoteOnce.Do(func() {
+		socketDir, err := os.MkdirTemp(r.tempDir, "cue-lsp-test-socket")
+		if err != nil {
+			r.remoteErr = err
+			return
+		}
+		r.remoteSocket = filepath.Join(socketDir, "cue-lsp-test-daemon")
+
+		// The server should be killed by when the test runner exits, but to be
+		// conservative also set a listen timeout.
+		args := []string{"lsp", "serve", "--listen", "unix;" + r.remoteSocket, "--listen-timeout", "1m"}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := exec.CommandContext(ctx, r.cuePath, args...)
+		cmd.Env = append(os.Environ(), runTestAsCueLspEnvvar+"=true")
+
+		// Start the external cue process. This is still somewhat racy,
+		// as we don't know when cue binds to the socket, but the cue
+		// forwarder client has built-in retry behavior that should
+		// mostly mitigate this problem (and if it doesn't, we probably
+		// want to improve the retry behavior).
+		if err := cmd.Start(); err != nil {
+			cancel()
+			r.remoteSocket = ""
+			r.remoteErr = err
+		} else {
+			r.cancelRemote = cancel
+			// Spin off a goroutine to wait, so that we free up resources when the
+			// server exits.
+			go cmd.Wait()
+		}
+	})
+
+	return newForwarder("unix", r.remoteSocket)
+}
+
+func newForwarder(network, address string) jsonrpc2.StreamServer {
+	server, err := lsprpc.NewForwarder(network+";"+address, nil)
+	if err != nil {
+		// This should never happen, as we are passing an explicit address.
+		panic(fmt.Sprintf("internal error: unable to create forwarder: %v", err))
+	}
+	return server
+}
+
+// Close cleans up resource that have been allocated to this workspace.
+func (r *Runner) Close() error {
+	var errmsgs []string
+	if r.ts != nil {
+		if err := r.ts.Close(); err != nil {
+			errmsgs = append(errmsgs, err.Error())
+		}
+	}
+	if r.cancelRemote != nil {
+		r.cancelRemote()
+	}
+	if !r.SkipCleanup {
+		if err := os.RemoveAll(r.tempDir); err != nil {
+			errmsgs = append(errmsgs, err.Error())
+		}
+	}
+	if len(errmsgs) > 0 {
+		return fmt.Errorf("errors closing the test runner:\n\t%s", strings.Join(errmsgs, "\n\t"))
+	}
+	return nil
+}

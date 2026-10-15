@@ -1,0 +1,135 @@
+-- in.cue --
+intIndex:    [2][0]
+stringIndex: {foo: "bar"}["foo"]
+
+stringOfNumberIndex: {"3": 3}["3"]
+
+indexToDefault:         (*[0] | {})[0]
+outOfBoundsDisjunction: (*[] | {})[1]
+
+// Ensure these are errors.
+indexDoesNotDistribute: (*[] | [1])[0]
+doesNotDistributeType: {
+	l: []
+	a: (*l | {"3": 3})["3"]
+}
+
+stringIndexToList: [2][""]
+indexOutOfBounds2: 2[2]
+booleanIndex:      [][true]
+indexOutOfBounds3: [1, 2, 3][4]
+negativeIndex:     [1, 2, 3][-1]
+
+varIndexTooLarge: {
+	n: 3
+	a: [1, 2, 3][n]
+}
+
+varNegativeIndex: {
+	n: -1
+	a: [1, 2, 3][n]
+}
+
+// A failed lookup also reports where the value that was searched is declared,
+// not just the failing selector, so that a mapping table missing an entry can
+// be pointed at. Every declaration of the table is reported.
+declaredAt: {
+	_table: one: "1"
+	_table: two: "2"
+	key: "three"
+	a:   _table[key]
+	b:   [1, 2][5]
+}
+
+// An integer index into a value that can never be a list reports a fatal
+// invalid-index error rather than a misleading out-of-range one.
+intIndexToStruct: {foo: "bar"}[0]
+intIndexToOpenStruct: {foo: "bar", ...}[0]
+intIndexToStructRef: {
+	s: {a: 1}
+	i: s[0]
+}
+-- out/compile --
+--- in.cue
+{
+  intIndex: [
+    2,
+  ][0]
+  stringIndex: {
+    foo: "bar"
+  }["foo"]
+  stringOfNumberIndex: {
+    "3": 3
+  }["3"]
+  indexToDefault: (*[
+    0,
+  ]|{})[0]
+  outOfBoundsDisjunction: (*[]|{})[1]
+  indexDoesNotDistribute: (*[]|[
+    1,
+  ])[0]
+  doesNotDistributeType: {
+    l: []
+    a: (*〈0;l〉|{
+      "3": 3
+    })["3"]
+  }
+  stringIndexToList: [
+    2,
+  ][""]
+  indexOutOfBounds2: 2[2]
+  booleanIndex: [][true]
+  indexOutOfBounds3: [
+    1,
+    2,
+    3,
+  ][4]
+  negativeIndex: [
+    1,
+    2,
+    3,
+  ][-1]
+  varIndexTooLarge: {
+    n: 3
+    a: [
+      1,
+      2,
+      3,
+    ][〈0;n〉]
+  }
+  varNegativeIndex: {
+    n: -1
+    a: [
+      1,
+      2,
+      3,
+    ][〈0;n〉]
+  }
+  declaredAt: {
+    _table: {
+      one: "1"
+    }
+    _table: {
+      two: "2"
+    }
+    key: "three"
+    a: 〈0;_table〉[〈0;key〉]
+    b: [
+      1,
+      2,
+    ][5]
+  }
+  intIndexToStruct: {
+    foo: "bar"
+  }[0]
+  intIndexToOpenStruct: {
+    foo: "bar"
+    ...
+  }[0]
+  intIndexToStructRef: {
+    s: {
+      a: 1
+    }
+    i: 〈0;s〉[0]
+  }
+}

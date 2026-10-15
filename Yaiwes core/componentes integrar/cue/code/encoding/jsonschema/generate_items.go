@@ -1,0 +1,1256 @@
+// Copyright 2025 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package jsonschema
+
+import (
+	"cmp"
+	"fmt"
+	"hash/maphash"
+	"maps"
+	"net/url"
+	"reflect"
+	"slices"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/cue/token"
+	"cuelang.org/go/encoding/json"
+	"cuelang.org/go/internal/anyunique"
+)
+
+// TODO use a defined order when keywords are marshaled
+// so that we always put $schema at the start, for example.
+
+// item represents a JSON Schema constraint or structure that can be
+// converted to an AST representation for serialization.
+type item interface {
+	// generate returns the AST representation of this item.
+	generate(g *generator) ast.Expr
+
+	// apply invokes f on each sub-item, replacing each with the item
+	// returned, and returns the new item (or the same if nothing has
+	// changed). Note that it does not call f on the item itself. It can
+	// use u to create new unique items.
+	apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item
+
+	// hash writes the hash of the item to h; it should use u.writeHash
+	// to write the hash value for any items it contains.
+	hash(h *maphash.Hash, u *uniqueItems)
+}
+
+// itemTrue represents a schema that accepts any value (true schema)
+type itemTrue struct{}
+
+func (i *itemTrue) generate(g *generator) ast.Expr {
+	return ast.NewBool(true)
+}
+
+func (it *itemTrue) hash(h *maphash.Hash, u *uniqueItems) {
+}
+
+func (i *itemTrue) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemFalse represents a schema that accepts no values (false schema)
+type itemFalse struct{}
+
+func (i *itemFalse) generate(g *generator) ast.Expr {
+	return ast.NewBool(false)
+}
+
+func (it *itemFalse) hash(h *maphash.Hash, u *uniqueItems) {
+}
+
+func (i *itemFalse) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemAllOf represents an allOf combinator
+type itemAllOf struct {
+	elems []internItem
+}
+
+func (it *itemAllOf) hash(h *maphash.Hash, u *uniqueItems) {
+	for _, it := range it.elems {
+		u.writeHash(h, it)
+	}
+}
+
+func (i *itemAllOf) add(it internItem) {
+	i.elems = append(i.elems, it)
+}
+
+var _ elementsItem = (*itemAllOf)(nil)
+
+// elements implements [elementsItem].
+func (i *itemAllOf) elements() []internItem {
+	return i.elems
+}
+
+func (i *itemAllOf) generate(g *generator) ast.Expr {
+	// Because a single json schema object is essentially an allOf itself,
+	// we can merge objects that don't share keywords
+	// but we also have to be careful not to merge keywords
+	// that interact with one another (for example `properties` and `patternProperties`).
+	var unmerged []ast.Expr
+	var finalFields []ast.Decl
+	finalFieldNames := make(map[string]bool)
+
+	for _, e := range i.elems {
+		expr := e.Value().generate(g)
+		if lit, ok := expr.(*ast.BasicLit); ok {
+			switch lit.Kind {
+			case token.TRUE:
+				// true does nothing, so can be ignored.
+				continue
+			case token.FALSE:
+				// false means everything is false.
+				return expr
+			}
+		}
+
+		// Try to extract struct literal fields for merging
+		st, ok := expr.(*ast.StructLit)
+		if !ok {
+			// A schema should only ever encode to a bool or a struct.
+			panic(fmt.Errorf("unexpected expression in itemAllOf: %T", expr))
+		}
+
+		// Check if we can merge these fields with existing ones.
+		// A $ref is kept separate for dialects that ignore keywords
+		// adjacent to $ref, so that the other conjuncts remain in
+		// effect as siblings of the enclosing allOf.
+		avoidMerging := !g.dialect.refComposesWithSiblings && structHasField(st, "$ref")
+	loop:
+		for _, decl := range st.Elts {
+			if avoidMerging {
+				break
+			}
+			name := fieldLabel(decl)
+			if name == "" {
+				panic(fmt.Errorf("unexpected element in struct %#v", decl))
+			}
+			if finalFieldNames[name] {
+				// Field already exists in merge target.
+				avoidMerging = true
+				break
+			}
+			for _, ik := range keywordInteractions[name] {
+				if finalFieldNames[ik] {
+					// Field interacts with one of the other fields in merge target.
+					avoidMerging = true
+					break loop
+				}
+			}
+		}
+
+		if avoidMerging {
+			unmerged = append(unmerged, expr)
+			continue
+		}
+		// Merge the fields
+		for _, decl := range st.Elts {
+			finalFieldNames[fieldLabel(decl)] = true
+			finalFields = append(finalFields, decl)
+		}
+	}
+
+	if len(unmerged) == 0 {
+		return makeSchemaStructLit(finalFields...)
+	}
+
+	// Add the merged fields as one element if non-empty
+	if len(finalFields) > 0 {
+		unmerged = append(unmerged, makeSchemaStructLit(finalFields...))
+	}
+	// A single conjunct needs no allOf wrapper. This happens when a $ref
+	// is the only surviving element (the others having been the trivially
+	// true schema).
+	if len(unmerged) == 1 {
+		return unmerged[0]
+	}
+
+	return singleKeyword("allOf", ast.NewList(unmerged...))
+}
+
+func (i *itemAllOf) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	elems, changed := applyElems(i.elems, f, u)
+	if !changed {
+		return i
+	}
+	return &itemAllOf{elems: elems}
+}
+
+// itemOneOf represents a oneOf combinator
+type itemOneOf struct {
+	elems []internItem
+}
+
+func (it *itemOneOf) hash(h *maphash.Hash, u *uniqueItems) {
+	for _, it := range it.elems {
+		u.writeHash(h, it)
+	}
+}
+
+func (i *itemOneOf) generate(g *generator) ast.Expr {
+	return singleKeyword("oneOf", generateList(g, i.elems))
+}
+
+func (i *itemOneOf) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	elems, changed := applyElems(i.elems, f, u)
+	if !changed {
+		return i
+	}
+	return &itemOneOf{elems: elems}
+}
+
+var _ elementsItem = (*itemOneOf)(nil)
+
+// elements implements [elementsItem].
+func (i *itemOneOf) elements() []internItem {
+	return i.elems
+}
+
+// itemAnyOf represents an anyOf combinator
+type itemAnyOf struct {
+	elems []internItem
+}
+
+func (it *itemAnyOf) hash(h *maphash.Hash, u *uniqueItems) {
+	for _, it := range it.elems {
+		u.writeHash(h, it)
+	}
+}
+
+func (i *itemAnyOf) generate(g *generator) ast.Expr {
+	if g.dialect.nullViaNullable {
+		// In dialects that express nullability with a nullable keyword
+		// (OpenAPI 3.0), a disjunction such as `string | null` is folded
+		// into a single nullable schema (type: string, nullable: true)
+		// rather than an anyOf with a separate null arm. This is only done
+		// when there's exactly one non-null arm: nullable is well-defined
+		// only as a modifier of a sibling type keyword, so its interaction
+		// with anyOf is underspecified and tools disagree. With several
+		// arms there's no single type to extend, so the explicit null arm
+		// (rendered as enum: [null]) is kept instead. See
+		// https://github.com/OAI/OpenAPI-Specification/blob/main/proposals/2019-10-31-Clarify-Nullable.md
+		if expr, ok := i.generateNullable(g); ok {
+			return expr
+		}
+	}
+	return singleKeyword("anyOf", generateList(g, i.elems))
+}
+
+// generateNullable folds a lone null-type arm of the disjunction into a
+// nullable: true keyword on the single remaining arm, for dialects that
+// express nullability via the nullable keyword. It reports whether the
+// fold applied.
+func (i *itemAnyOf) generateNullable(g *generator) (ast.Expr, bool) {
+	var rest internItem
+	foundNull := false
+	for _, e := range i.elems {
+		if t, ok := e.Value().(*itemType); ok && len(t.kinds) == 1 && t.kinds[0] == "null" {
+			foundNull = true
+			continue
+		}
+		if rest.Value() != nil {
+			// More than one non-null arm.
+			return nil, false
+		}
+		rest = e
+	}
+	if !foundNull || rest.Value() == nil {
+		return nil, false
+	}
+	st, ok := rest.Value().generate(g).(*ast.StructLit)
+	if !ok {
+		// The remaining arm is a bool literal, which has no room for a
+		// nullable keyword; fall back to the anyOf form.
+		return nil, false
+	}
+	st.Elts = append(st.Elts, makeField("nullable", ast.NewBool(true)))
+	return isolateRef(g, makeSchemaStructLit(st.Elts...)), true
+}
+
+func (i *itemAnyOf) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	elems, changed := applyElems(i.elems, f, u)
+	if !changed {
+		return i
+	}
+	return &itemAnyOf{elems: elems}
+}
+
+var _ elementsItem = (*itemAnyOf)(nil)
+
+// elements implements [elementsItem].
+func (i *itemAnyOf) elements() []internItem {
+	return i.elems
+}
+
+// itemNot represents a not combinator
+type itemNot struct {
+	elem internItem
+}
+
+func (it *itemNot) hash(h *maphash.Hash, u *uniqueItems) {
+	u.writeHash(h, it.elem)
+}
+
+func (i *itemNot) generate(g *generator) ast.Expr {
+	return singleKeyword("not", i.elem.Value().generate(g))
+}
+
+func (i *itemNot) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	elem := f(i.elem, u)
+	if elem == i.elem {
+		return i
+	}
+	return &itemNot{elem: elem}
+}
+
+// itemConst represents a constant value constraint.
+// The value represents the actual constant in question as an AST expression.
+type itemConst struct {
+	value ast.Expr
+}
+
+func (it *itemConst) hash(h *maphash.Hash, u *uniqueItems) {
+	writeExprHash(h, it.value)
+}
+
+func (i *itemConst) generate(g *generator) ast.Expr {
+	if !g.dialect.supportsConst {
+		// Dialects without const (OpenAPI 3.0) express a constant as a
+		// single-valued enum.
+		return singleKeyword("enum", ast.NewList(i.value))
+	}
+	return singleKeyword("const", i.value)
+}
+
+func (i *itemConst) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemEnum represents an "enum" constraint.
+// Each value represents one possible value of the enum.
+type itemEnum struct {
+	values []ast.Expr
+}
+
+func (it *itemEnum) hash(h *maphash.Hash, u *uniqueItems) {
+	for _, v := range it.values {
+		writeExprHash(h, v)
+	}
+}
+
+func (i *itemEnum) generate(g *generator) ast.Expr {
+	return singleKeyword("enum", ast.NewList(i.values...))
+}
+
+func (i *itemEnum) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// CUERef represents a reference within CUE source.
+type CUERef struct {
+	// Inst holds the package where the reference is.
+	Inst cue.Value
+
+	// Path holds the path within Inst.
+	Path cue.Path
+
+	// Name holds the name to use for the reference within
+	// the generated JSON Schema. It is the responsibility
+	// of the [GenerateConfig.NamesFunc] to set this.
+	Name string
+}
+
+func (it *CUERef) hash(h *maphash.Hash, u *uniqueItems) {
+	h.WriteString(it.Name)
+}
+
+func (i *CUERef) generate(g *generator) ast.Expr {
+	// Note: we might need to escape the fragment to produce
+	// a valid URI. Also, if the definition name itself contains
+	// a slash, it should be treated as a literal slash not as a JSON Pointer
+	// separator.
+	tokens := append(slices.Clip(g.dialect.refPrefix), i.Name)
+	jptr := json.PointerFromTokens(slices.Values(tokens))
+	u := &url.URL{
+		Fragment: string(jptr),
+	}
+	return singleKeyword("$ref", ast.NewString(u.String()))
+}
+
+func (i *CUERef) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+type itemDescription struct {
+	description string
+	elem        internItem
+}
+
+func (i *itemDescription) hash(h *maphash.Hash, u *uniqueItems) {
+	h.WriteString(i.description)
+	u.writeHash(h, i.elem)
+}
+
+func (i *itemDescription) generate(g *generator) ast.Expr {
+	expr := i.elem.Value().generate(g)
+	switch expr := expr.(type) {
+	case *ast.StructLit:
+		expr.Elts = append(expr.Elts, makeField("description", ast.NewString(i.description)))
+		slices.SortFunc(expr.Elts, func(a, b ast.Decl) int {
+			return cmpSchemaLabels(fieldLabel(a), fieldLabel(b))
+		})
+		return isolateRef(g, expr)
+	case *ast.BasicLit:
+		if expr.Kind == token.TRUE {
+			return makeSchemaStructLit(makeField("description", ast.NewString(i.description)))
+		}
+		return expr
+	default:
+		// All item generate methods return either *ast.StructLit
+		// (via makeSchemaStructLit or singleKeyword) or *ast.BasicLit
+		// (ast.NewBool in itemTrue and itemFalse), so this is unreachable.
+		panic(fmt.Errorf("unexpected expression type in itemDescription: %T", expr))
+	}
+}
+
+func (i *itemDescription) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	newElem := f(i.elem, u)
+	if newElem == i.elem {
+		return i
+	}
+	return &itemDescription{description: i.description, elem: newElem}
+}
+
+// itemType represents a type constraint
+type itemType struct {
+	kinds []string
+}
+
+func (it *itemType) hash(h *maphash.Hash, u *uniqueItems) {
+	for _, k := range it.kinds {
+		h.WriteString(k)
+	}
+}
+
+func (i *itemType) generate(g *generator) ast.Expr {
+	d := g.dialect
+	kinds := i.kinds
+	nullable := false
+	if d.nullViaNullable {
+		// Represent null via the nullable keyword rather than as a
+		// member of the type set.
+		if j := slices.Index(kinds, "null"); j >= 0 {
+			nullable = true
+			// Remove null from kinds; note: i.kinds is shared by the interned
+			// item, so we can't mutate it.
+			kinds = slices.Concat(kinds[:j], kinds[j+1:])
+		}
+	}
+	if nullable && len(kinds) == 0 {
+		// A bare null type. The nullable keyword has no effect without a
+		// sibling type, so constrain precisely with a single-valued enum.
+		return singleKeyword("enum", ast.NewList(ast.NewNull()))
+	}
+
+	var fields []ast.Decl
+	switch {
+	case len(kinds) == 1:
+		fields = append(fields, makeField("type", ast.NewString(kinds[0])))
+	case d.allowTypeArray:
+		exprs := make([]ast.Expr, len(kinds))
+		for i, k := range kinds {
+			exprs[i] = ast.NewString(k)
+		}
+		fields = append(fields, makeField("type", ast.NewList(exprs...)))
+	default:
+		// No type-array support: widen to an anyOf of single-type schemas.
+		exprs := make([]ast.Expr, len(kinds))
+		for i, k := range kinds {
+			exprs[i] = singleKeyword("type", ast.NewString(k))
+		}
+		fields = append(fields, makeField("anyOf", ast.NewList(exprs...)))
+	}
+	if nullable {
+		fields = append(fields, makeField("nullable", ast.NewBool(true)))
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+func (i *itemType) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemFormat represents a format constraint
+type itemFormat struct {
+	format string
+}
+
+func (it *itemFormat) hash(h *maphash.Hash, u *uniqueItems) {
+	h.WriteString(it.format)
+}
+
+func (i *itemFormat) generate(g *generator) ast.Expr {
+	return singleKeyword("format", ast.NewString(i.format))
+}
+
+func (i *itemFormat) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemBytes represents a CUE bytes value. Bytes are base64-encoded on the
+// JSON wire, so it generates a string constrained by the dialect's encoding
+// `keyword: format: byte` for OpenAPI 3.0, `contentEncoding: base64` otherwise.
+type itemBytes struct{}
+
+func (it *itemBytes) hash(h *maphash.Hash, u *uniqueItems) {
+}
+
+func (i *itemBytes) generate(g *generator) ast.Expr {
+	fields := []ast.Decl{makeField("type", ast.NewString("string"))}
+	if g.dialect.bytesViaContentEncoding {
+		fields = append(fields, makeField("contentEncoding", ast.NewString("base64")))
+	} else {
+		fields = append(fields, makeField("format", ast.NewString("byte")))
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+func (i *itemBytes) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemSizedNumber represents a sized numeric builtin type (int32, int64,
+// float32, float64) rendered as a type plus an OpenAPI format keyword.
+type itemSizedNumber struct {
+	typ    string
+	format string
+}
+
+func (it *itemSizedNumber) hash(h *maphash.Hash, u *uniqueItems) {
+	h.WriteString(it.typ)
+	h.WriteString(it.format)
+}
+
+func (i *itemSizedNumber) generate(g *generator) ast.Expr {
+	return makeSchemaStructLit(
+		makeField("type", ast.NewString(i.typ)),
+		makeField("format", ast.NewString(i.format)),
+	)
+}
+
+func (i *itemSizedNumber) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemPattern represents a pattern constraint
+type itemPattern struct {
+	regexp string
+}
+
+func (it *itemPattern) hash(h *maphash.Hash, u *uniqueItems) {
+	h.WriteString(it.regexp)
+}
+
+func (i *itemPattern) generate(g *generator) ast.Expr {
+	return singleKeyword("pattern", ast.NewString(i.regexp))
+}
+
+func (i *itemPattern) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemBounds represents numeric bounds constraints
+type itemBounds struct {
+	constraint cue.Op // LessThanEqualOp, LessThanOp, GreaterThanEqualOp, GreaterThanOp
+	n          ast.Expr
+}
+
+func (it *itemBounds) hash(h *maphash.Hash, u *uniqueItems) {
+	maphash.WriteComparable(h, it.constraint)
+	writeExprHash(h, it.n)
+}
+
+func (i *itemBounds) generate(g *generator) ast.Expr {
+	num := i.n
+	if !g.dialect.numericExclusive {
+		// Exclusive bounds are expressed as a boolean keyword
+		// accompanying minimum/maximum (draft-04 and OpenAPI 3.0).
+		switch i.constraint {
+		case cue.LessThanOp:
+			return makeSchemaStructLit(
+				makeField("maximum", num),
+				makeField("exclusiveMaximum", ast.NewBool(true)),
+			)
+		case cue.GreaterThanOp:
+			return makeSchemaStructLit(
+				makeField("minimum", num),
+				makeField("exclusiveMinimum", ast.NewBool(true)),
+			)
+		}
+	}
+	var keyword string
+	switch i.constraint {
+	case cue.LessThanOp:
+		keyword = "exclusiveMaximum"
+	case cue.LessThanEqualOp:
+		keyword = "maximum"
+	case cue.GreaterThanOp:
+		keyword = "exclusiveMinimum"
+	case cue.GreaterThanEqualOp:
+		keyword = "minimum"
+	default:
+		panic(fmt.Errorf("unexpected bound operand %v", i.constraint))
+	}
+	return singleKeyword(keyword, num)
+}
+
+func (i *itemBounds) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemMultipleOf represents a multipleOf constraint
+type itemMultipleOf struct {
+	n float64
+}
+
+func (it *itemMultipleOf) hash(h *maphash.Hash, u *uniqueItems) {
+	maphash.WriteComparable(h, it.n)
+}
+
+func (i *itemMultipleOf) generate(g *generator) ast.Expr {
+	return singleKeyword("multipleOf", ast.NewLit(token.FLOAT, fmt.Sprint(i.n)))
+}
+
+func (i *itemMultipleOf) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemLengthBounds represents string length constraints
+type itemLengthBounds struct {
+	constraint cue.Op // LessThanEqualOp, GreaterThanEqualOp
+	n          int
+}
+
+func (it *itemLengthBounds) hash(h *maphash.Hash, u *uniqueItems) {
+	maphash.WriteComparable(h, it.constraint)
+	maphash.WriteComparable(h, it.n)
+}
+
+func (i *itemLengthBounds) generate(g *generator) ast.Expr {
+	var keyword string
+	switch i.constraint {
+	case cue.LessThanEqualOp:
+		keyword = "maxLength"
+	case cue.GreaterThanEqualOp:
+		keyword = "minLength"
+	default:
+		panic("unexpected constraint in length bounds")
+	}
+
+	return singleKeyword(keyword, ast.NewLit(token.INT, fmt.Sprint(i.n)))
+}
+
+func (i *itemLengthBounds) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemItemsBounds represents array length constraints
+type itemItemsBounds struct {
+	constraint cue.Op // LessThanEqualOp, GreaterThanEqualOp
+	n          int
+}
+
+func (it *itemItemsBounds) hash(h *maphash.Hash, u *uniqueItems) {
+	maphash.WriteComparable(h, it.constraint)
+	maphash.WriteComparable(h, it.n)
+}
+
+func (i *itemItemsBounds) generate(g *generator) ast.Expr {
+	var keyword string
+	switch i.constraint {
+	case cue.LessThanEqualOp:
+		keyword = "maxItems"
+	case cue.GreaterThanEqualOp:
+		keyword = "minItems"
+	default:
+		panic("unexpected constraint in items bounds")
+	}
+	return singleKeyword(keyword, ast.NewLit(token.INT, fmt.Sprint(i.n)))
+}
+
+func (i *itemItemsBounds) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemPropertyBounds represents object property count constraints
+type itemPropertyBounds struct {
+	constraint cue.Op // LessThanEqualOp, GreaterThanEqualOp
+	n          int
+}
+
+func (it *itemPropertyBounds) hash(h *maphash.Hash, u *uniqueItems) {
+	maphash.WriteComparable(h, it.constraint)
+	maphash.WriteComparable(h, it.n)
+}
+
+func (i *itemPropertyBounds) generate(g *generator) ast.Expr {
+	var keyword string
+	switch i.constraint {
+	case cue.LessThanEqualOp:
+		keyword = "maxProperties"
+	case cue.GreaterThanEqualOp:
+		keyword = "minProperties"
+	default:
+		panic("unexpected constraint in property bounds")
+	}
+	return singleKeyword(keyword, ast.NewLit(token.INT, fmt.Sprint(i.n)))
+}
+
+func (i *itemPropertyBounds) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemItems represents the items and prefixItems constraint for arrays.
+type itemItems struct {
+	// known prefix.
+	prefix []internItem
+	// all elements beyond the prefix.
+	rest internItem
+}
+
+func (it *itemItems) hash(h *maphash.Hash, u *uniqueItems) {
+	for _, p := range it.prefix {
+		u.writeHash(h, p)
+	}
+	u.writeHash(h, it.rest)
+}
+
+func (i *itemItems) generate(g *generator) ast.Expr {
+	switch g.dialect.tuples {
+	case tupleItemsArray:
+		return i.generateItemsArray(g)
+	case tupleWiden:
+		return i.generateWiden(g)
+	}
+	// tuplePrefixItems (2020-12 and later).
+	fields := make([]ast.Decl, 0, 2)
+	if len(i.prefix) > 0 {
+		items := make([]ast.Expr, len(i.prefix))
+		for i, e := range i.prefix {
+			items[i] = e.Value().generate(g)
+		}
+		fields = append(fields, makeField("prefixItems", &ast.ListLit{
+			Elts: items,
+		}))
+	}
+	if i.rest.Value() != nil {
+		fields = append(fields, makeField("items", i.rest.Value().generate(g)))
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+// generateItemsArray renders a tuple as an array-valued items keyword
+// plus additionalItems (drafts up to and including draft-07).
+func (i *itemItems) generateItemsArray(g *generator) ast.Expr {
+	if len(i.prefix) == 0 {
+		if i.rest.Value() == nil {
+			return makeSchemaStructLit()
+		}
+		return singleKeyword("items", i.rest.Value().generate(g))
+	}
+	items := make([]ast.Expr, len(i.prefix))
+	for j, e := range i.prefix {
+		items[j] = e.Value().generate(g)
+	}
+	fields := []ast.Decl{makeField("items", &ast.ListLit{Elts: items})}
+	if i.rest.Value() != nil {
+		fields = append(fields, makeField("additionalItems", i.rest.Value().generate(g)))
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+// generateWiden renders a tuple by widening all positional schemas and
+// the rest schema into a single items schema, for dialects with no tuple
+// support (OpenAPI 3.0). Positional typing is lost; the result validates
+// a superset of the original.
+func (i *itemItems) generateWiden(g *generator) ast.Expr {
+	var schemas []ast.Expr
+	for _, e := range i.prefix {
+		schemas = append(schemas, e.Value().generate(g))
+	}
+	if i.rest.Value() != nil {
+		schemas = append(schemas, i.rest.Value().generate(g))
+	}
+	switch len(schemas) {
+	case 0:
+		return makeSchemaStructLit()
+	case 1:
+		return singleKeyword("items", schemas[0])
+	}
+	return singleKeyword("items", makeSchemaStructLit(makeField("anyOf", ast.NewList(schemas...))))
+}
+
+func (i *itemItems) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	rest := i.rest
+	if rest.Value() != nil {
+		rest = f(rest, u)
+	}
+	prefix, changed := applyElems(i.prefix, f, u)
+	if !changed && rest == i.rest {
+		return i
+	}
+	return &itemItems{prefix: prefix, rest: rest}
+}
+
+// itemUniqueItems represents the uniqueItems constraint for arrays.
+type itemUniqueItems struct{}
+
+func (it *itemUniqueItems) hash(h *maphash.Hash, u *uniqueItems) {
+}
+
+func (i *itemUniqueItems) generate(g *generator) ast.Expr {
+	return singleKeyword("uniqueItems", ast.NewBool(true))
+}
+
+func (i *itemUniqueItems) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	return i
+}
+
+// itemContains represents a contains constraint for arrays
+type itemContains struct {
+	elem internItem
+	min  *int64
+	max  *int64
+}
+
+func (it *itemContains) hash(h *maphash.Hash, u *uniqueItems) {
+	u.writeHash(h, it.elem)
+	maphash.WriteComparable(h, it.min == nil)
+	if it.min != nil {
+		maphash.WriteComparable(h, *it.min)
+	}
+	maphash.WriteComparable(h, it.max == nil)
+	if it.max != nil {
+		maphash.WriteComparable(h, *it.max)
+	}
+}
+
+func (i *itemContains) generate(g *generator) ast.Expr {
+	if !g.dialect.supportsContains {
+		// No contains support (OpenAPI 3.0): drop the constraint (lenient).
+		return makeSchemaStructLit()
+	}
+	fields := []ast.Decl{makeField("contains", i.elem.Value().generate(g))}
+	if g.dialect.supportsMinMaxContains {
+		if i.min != nil {
+			fields = append(fields, makeField("minContains", ast.NewLit(token.INT, fmt.Sprint(*i.min))))
+		}
+		if i.max != nil {
+			fields = append(fields, makeField("maxContains", ast.NewLit(token.INT, fmt.Sprint(*i.max))))
+		}
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+func (i *itemContains) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	elem := f(i.elem, u)
+	if elem == i.elem {
+		return i
+	}
+	return &itemContains{elem: elem, min: i.min, max: i.max}
+}
+
+// property represents an object property
+type property struct {
+	name string
+	item item
+}
+
+// itemProperties represents object properties and associated keywords.
+type itemProperties struct {
+	properties           map[string]internItem
+	required             []string
+	additionalProperties internItem
+	patternProperties    map[string]internItem
+}
+
+func (it *itemProperties) hash(h *maphash.Hash, u *uniqueItems) {
+	writeMapHash(h, it.properties, u)
+	for _, name := range slices.Sorted(slices.Values(it.required)) {
+		h.WriteString(name)
+	}
+	u.writeHash(h, it.additionalProperties)
+	writeMapHash(h, it.patternProperties, u)
+}
+
+func (i *itemProperties) generate(g *generator) ast.Expr {
+	fields := []ast.Decl{}
+	if len(i.properties) > 0 {
+		propFields := make([]ast.Decl, 0, len(i.properties))
+		for name, it := range i.properties {
+			propFields = append(propFields, makeField(name, it.Value().generate(g)))
+		}
+		slices.SortFunc(propFields, func(a, b ast.Decl) int {
+			return cmp.Compare(fieldLabel(a), fieldLabel(b))
+		})
+		fields = append(fields, makeField("properties", &ast.StructLit{Elts: propFields}))
+	}
+	if len(i.required) > 0 {
+		reqExprs := make([]ast.Expr, len(i.required))
+		for j, r := range i.required {
+			reqExprs[j] = ast.NewString(r)
+		}
+		fields = append(fields, makeField("required", ast.NewList(reqExprs...)))
+	}
+	if i.additionalProperties.Value() != nil {
+		fields = append(fields, makeField("additionalProperties", i.additionalProperties.Value().generate(g)))
+	}
+	if len(i.patternProperties) > 0 && g.dialect.supportsPatternProperties {
+		pp := &ast.StructLit{}
+		for _, p := range slices.Sorted(maps.Keys(i.patternProperties)) {
+			pp.Elts = append(pp.Elts, makeField(p, i.patternProperties[p].Value().generate(g)))
+		}
+		fields = append(fields, makeField("patternProperties", pp))
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+func (i *itemProperties) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	properties, changed0 := applyMap(i.properties, f, u)
+	patternProperties, changed1 := applyMap(i.patternProperties, f, u)
+	changed := changed0 || changed1
+	additionalProperties := i.additionalProperties
+	if additionalProperties.Value() != nil {
+		if ap := f(additionalProperties, u); ap != additionalProperties {
+			additionalProperties = ap
+			changed = true
+		}
+	}
+	if !changed {
+		return i
+	}
+	return &itemProperties{
+		properties:           properties,
+		required:             i.required,
+		additionalProperties: additionalProperties,
+		patternProperties:    patternProperties,
+	}
+}
+
+// itemIfThenElse represents if/then/else constraints
+type itemIfThenElse struct {
+	ifElem   internItem
+	thenElem internItem
+	elseElem internItem
+}
+
+func (it *itemIfThenElse) hash(h *maphash.Hash, u *uniqueItems) {
+	u.writeHash(h, it.ifElem)
+	u.writeHash(h, it.thenElem)
+	u.writeHash(h, it.elseElem)
+}
+
+func (i *itemIfThenElse) generate(g *generator) ast.Expr {
+	if !g.dialect.supportsIfThenElse {
+		// No if/then/else support (OpenAPI 3.0): drop the constraint (lenient).
+		return makeSchemaStructLit()
+	}
+	fields := []ast.Decl{makeField("if", i.ifElem.Value().generate(g))}
+	if i.thenElem.Value() != nil {
+		fields = append(fields, makeField("then", i.thenElem.Value().generate(g)))
+	}
+	if i.elseElem.Value() != nil {
+		fields = append(fields, makeField("else", i.elseElem.Value().generate(g)))
+	}
+	return makeSchemaStructLit(fields...)
+}
+
+func (i *itemIfThenElse) apply(f func(internItem, *uniqueItems) internItem, u *uniqueItems) item {
+	ifElem := f(i.ifElem, u)
+	var thenElem, elseElem internItem
+	if i.thenElem.Value() != nil {
+		thenElem = f(i.thenElem, u)
+	}
+	if i.elseElem.Value() != nil {
+		elseElem = f(i.elseElem, u)
+	}
+
+	if ifElem == i.ifElem && thenElem == i.thenElem && elseElem == i.elseElem {
+		return i
+	}
+	return &itemIfThenElse{ifElem: ifElem, thenElem: thenElem, elseElem: elseElem}
+}
+
+func generateList(g *generator, items []internItem) ast.Expr {
+	exprs := make([]ast.Expr, len(items))
+	for i, it := range items {
+		exprs[i] = it.Value().generate(g)
+	}
+	return ast.NewList(exprs...)
+}
+
+func singleKeyword(name string, val ast.Expr) ast.Expr {
+	return makeSchemaStructLit(makeField(name, val))
+}
+
+// keywordGroups holds sets of JSON Schema keywords that
+// interact directly with one another and therefore should not
+// be merged with other keywords in the same group.
+var keywordGroups = [][]string{
+	{"properties", "patternProperties", "additionalProperties"},
+	{"contains", "maxContains", "minContains"},
+	{"items", "additionalItems", "prefixItems"},
+	{"if", "then", "else"},
+}
+
+// keywordInteractions maps from a keyword to the set of
+// keywords it interacts with (including itself).
+var keywordInteractions = func() map[string][]string {
+	m := make(map[string][]string)
+	for _, ks := range keywordGroups {
+		for _, k := range ks {
+			m[k] = ks
+		}
+	}
+	return m
+}()
+
+// fieldLabel extracts the field label name from a declaration.
+func fieldLabel(d ast.Decl) string {
+	if f, ok := d.(*ast.Field); ok {
+		if name, _, _ := ast.LabelName(f.Label); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// makeField creates a field with a string label and given value.
+func makeField(name string, value ast.Expr) *ast.Field {
+	return &ast.Field{
+		Label: ast.NewStringLabel(name),
+		Value: value,
+	}
+}
+
+// structHasField reports whether the struct literal has a field with the
+// given name.
+func structHasField(st *ast.StructLit, name string) bool {
+	for _, d := range st.Elts {
+		if fieldLabel(d) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// isolateRef ensures that, for dialects that ignore keywords adjacent to a
+// $ref (draft-07 and OpenAPI 3.0), a $ref does not share its schema object
+// with other keywords. A schema object {$ref, X...} is rewritten as
+// {X..., allOf: [{$ref}]} so that X is honored as a sibling of allOf rather
+// than of $ref. Schema objects without a $ref, or with nothing but a $ref,
+// are returned unchanged.
+func isolateRef(g *generator, expr ast.Expr) ast.Expr {
+	if g.dialect.refComposesWithSiblings {
+		return expr
+	}
+	st, ok := expr.(*ast.StructLit)
+	if !ok || !structHasField(st, "$ref") {
+		return expr
+	}
+	// A $ref with no sibling keywords needs no isolation.
+	if len(st.Elts) == 1 {
+		return expr
+	}
+	for i, d := range st.Elts {
+		if fieldLabel(d) == "$ref" {
+			st.Elts[i] = makeField("allOf", ast.NewList(makeSchemaStructLit(d)))
+		}
+	}
+	return st
+}
+
+// makeNestedField creates a chain of nested single-field structs for the
+// given path, with value at the leaf. For example a path of
+// {"components", "schemas"} yields {components: schemas: value}.
+func makeNestedField(path []string, value ast.Expr) *ast.Field {
+	for i := len(path) - 1; i > 0; i-- {
+		value = &ast.StructLit{Elts: []ast.Decl{makeField(path[i], value)}}
+	}
+	return makeField(path[0], value)
+}
+
+// makeSchemaStructLit creates a struct literal representing a JSON Schema
+// schema, with fields in schema-centric order.
+func makeSchemaStructLit(fields ...ast.Decl) *ast.StructLit {
+	slices.SortFunc(fields, func(a, b ast.Decl) int {
+		return cmpSchemaLabels(fieldLabel(a), fieldLabel(b))
+	})
+	return &ast.StructLit{
+		Elts: fields,
+	}
+}
+
+func cmpSchemaLabels(l1, l2 string) int {
+	return cmp.Or(cmp.Compare(labelPriority(l1), labelPriority(l2)), cmp.Compare(l1, l2))
+}
+
+// labelPriorityValues holds priority groups for sorting label names.
+var labelPriorityValues = func() map[string]int {
+	// Always put these keywords at the start.
+	m := map[string]int{
+		"$schema":     0,
+		"$defs":       1,
+		"definitions": 1,
+		"components":  1,
+		"type":        2,
+		"nullable":    2,
+		"description": 3,
+	}
+	// It's nice to group related keywords together.
+	n := len(m)
+	for i, g := range keywordGroups {
+		for _, name := range g {
+			m[name] = n + i + 1
+		}
+	}
+	// Anything else gets put at the end in lexical order.
+	return m
+}()
+
+func labelPriority(s string) int {
+	if pri, ok := labelPriorityValues[s]; ok {
+		return pri
+	}
+	return 1000
+}
+
+func writeMapHash[K cmp.Ordered](h *maphash.Hash, m map[K]internItem, u *uniqueItems) {
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		maphash.WriteComparable(h, k)
+		u.writeHash(h, m[k])
+	}
+}
+
+// writeExprHash hashes an AST expression using its formatted representation.
+// This is a simple approach that ensures structurally equivalent expressions
+// hash to the same value.
+func writeExprHash(h *maphash.Hash, expr ast.Expr) {
+	// Use the formatted string representation of the expression for hashing.
+	// This ensures that expressions that format the same way will hash the same.
+	data, err := format.Node(expr, format.Simplify())
+	if err != nil {
+		panic(fmt.Errorf("invalid ast Expr: %v", err))
+	}
+	h.Write(data)
+}
+
+type uniqueItems struct {
+	items *anyunique.Store[item, *uniqueItems]
+}
+
+func newUniqueItems() *uniqueItems {
+	u := &uniqueItems{}
+	u.items = anyunique.New[item, *uniqueItems](u)
+	return u
+}
+
+func (u *uniqueItems) writeHash(h *maphash.Hash, it internItem) {
+	u.items.WriteHash(h, it)
+}
+
+func (u *uniqueItems) apply(it internItem, f func(internItem, *uniqueItems) internItem) internItem {
+	it1 := it.Value().apply(f, u)
+	if it1 == it.Value() {
+		return it
+	}
+	return u.items.Make(it1)
+}
+
+type internItem = anyunique.Handle[item]
+
+func (u *uniqueItems) intern(it item) internItem {
+	return u.items.Make(it)
+}
+
+// Hash implements [anyunique.Hasher.Hash].
+func (u *uniqueItems) Hash(h *maphash.Hash, x item) {
+	maphash.WriteComparable(h, reflect.TypeOf(x))
+	x.hash(h, u)
+}
+
+// Equal implements [anyunique.Hasher.Equal] for two
+// items x0 and x1.
+func (u *uniqueItems) Equal(x0, x1 item) bool {
+	if x0 == x1 {
+		return true
+	}
+	// TODO although this is typically only called when items are
+	// identical (because hash collisions are rare), it could made more
+	// efficient. It would be better to have custom equality methods for
+	// each type, or at least a reflect-based equality checker that
+	// avoids unexported fields and compares [anyunique.Handle] values
+	// without descending into them.
+	return reflect.DeepEqual(x0, x1)
+}
+
+func applyMap(m map[string]internItem, f func(internItem, *uniqueItems) internItem, u *uniqueItems) (map[string]internItem, bool) {
+	var m1 map[string]internItem
+	for key, e := range m {
+		e1 := f(e, u)
+		if e1 == e {
+			continue
+		}
+		if m1 == nil {
+			m1 = make(map[string]internItem)
+		}
+		m1[key] = e1
+	}
+	if m1 == nil {
+		return m, false
+	}
+	if len(m1) == len(m) {
+		return m1, true
+	}
+	for key, e := range m {
+		if _, ok := m1[key]; !ok {
+			m1[key] = e
+		}
+	}
+	return m1, true
+}
+
+func applyElems(elems []internItem, f func(internItem, *uniqueItems) internItem, u *uniqueItems) ([]internItem, bool) {
+	changed := false
+	for i, e := range elems {
+		e1 := f(e, u)
+		if e1 == e {
+			continue
+		}
+		if !changed {
+			elems = slices.Clone(elems)
+			changed = true
+		}
+		elems[i] = e1
+	}
+	return elems, changed
+}

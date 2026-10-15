@@ -1,0 +1,47 @@
+# An @embed attribute requires the file-level @extern(embed) declaration,
+# and a missing declaration is reported at the attribute.
+# See https://cuelang.org/issue/4010.
+
+# Without the @extern(embed) declaration, using @embed is an error.
+! exec cue export ./withoutextern
+! stdout .
+cmp stderr out/err
+
+# Adding the @extern(embed) declaration makes it work as intended.
+exec cue export ./withextern
+cmp stdout out/withextern
+
+-- cue.mod/module.cue --
+module: "mod.com"
+language: version: "v0.11.0"
+
+-- withoutextern/x.cue --
+package withoutextern
+
+obj: a: txt: string
+obj: a: {
+	txt: _ @embed(file=b.txt, type=text)
+}
+-- withoutextern/b.txt --
+hello
+-- withextern/x.cue --
+@extern(embed)
+package withextern
+
+obj: a: txt: string
+obj: a: {
+	txt: _ @embed(file=b.txt, type=text)
+}
+-- withextern/b.txt --
+hello
+-- out/err --
+@embed attribute requires a file-level @extern(embed) declaration:
+    ./withoutextern/x.cue:5:9
+-- out/withextern --
+{
+    "obj": {
+        "a": {
+            "txt": "hello\n"
+        }
+    }
+}

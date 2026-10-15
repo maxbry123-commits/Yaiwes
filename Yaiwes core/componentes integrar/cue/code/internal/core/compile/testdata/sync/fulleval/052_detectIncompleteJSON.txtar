@@ -1,0 +1,41 @@
+#name: detectIncompleteJSON
+#evalFull
+-- in.cue --
+package foobar
+
+import "encoding/json"
+
+#Spec: {
+	_vars: {something: string}
+	data: {
+		#foo: {
+			use: _vars.something
+		}
+		baz:    json.Marshal(_vars.something)
+		foobar: json.Marshal(#foo)
+	}
+}
+Val: #Spec & {
+	_vars: something: "var-string"
+}
+-- out/compile --
+--- in.cue
+{
+  #Spec: {
+    _vars(:foobar): {
+      something: string
+    }
+    data: {
+      #foo: {
+        use: 〈2;_vars(:foobar)〉.something
+      }
+      baz: 〈import;"encoding/json"〉.Marshal(〈1;_vars(:foobar)〉.something)
+      foobar: 〈import;"encoding/json"〉.Marshal(〈0;#foo〉)
+    }
+  }
+  Val: (〈0;#Spec〉 & {
+    _vars(:foobar): {
+      something: "var-string"
+    }
+  })
+}

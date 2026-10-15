@@ -1,0 +1,15 @@
+-- in.cue --
+r: {
+	a?: 3
+	b:  a
+	c:  r["a"]
+}
+-- out/compile --
+--- in.cue
+{
+  r: {
+    a?: 3
+    b: 〈0;a〉
+    c: 〈1;r〉["a"]
+  }
+}

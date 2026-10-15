@@ -1,0 +1,21 @@
+-- in.cue --
+#S: {
+	[string]: {a: int}
+}
+a: #S & {
+	v: {b: int}
+}
+-- out/compile --
+--- in.cue
+{
+  #S: {
+    [string]: {
+      a: int
+    }
+  }
+  a: (〈0;#S〉 & {
+    v: {
+      b: int
+    }
+  })
+}

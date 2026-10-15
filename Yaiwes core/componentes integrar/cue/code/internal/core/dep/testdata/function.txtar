@@ -1,0 +1,63 @@
+-- in.cue --
+@experiment(functions)
+
+import "strconv"
+
+// Dependencies inside function literals: parameter constraints, the return
+// type, and the body are all expressions that may reference outer features.
+a: {
+	b: fn(2)
+	fn: func(x: T) -> R: x + offset + strconv.Atoi(str)
+
+	// A function literal in an inline call: the literal itself occurs in the
+	// conjuncts of the field.
+	c: (func(x: int) -> int: x + offset)(1)
+
+	// Selecting into a call result reaches the inline result vertex, whose
+	// conjunct is the call reference carrying the function's expressions.
+	mk: func(x: int) -> {out: int}: {out: x + offset}
+	d: mk(1).out
+
+	// A parameter default is an expression of the signature too, resolved
+	// in the closure scope like the constraint.
+	withDefault: func(x: int = dflt) -> int: x
+	e: withDefault()
+}
+
+T: int
+R: int
+offset: 3
+str: "5"
+dflt: 4
+-- out/dependencies/field --
+line  reference    path of resulting vertex
+8:    fn        => a.fn
+-- out/dependencies/all --
+line  reference       path of resulting vertex
+9:    T            => T
+9:    R            => R
+9:    offset       => offset
+9:    strconv.Atoi => "strconv".Atoi
+9:    str          => str
+13:   offset       => offset
+17:   offset       => offset
+22:   dflt         => dflt
+-- out/dependencies/dynamic --
+line  reference       path of resulting vertex
+8:    fn           => a.fn
+9:    T            => T
+9:    R            => R
+9:    offset       => offset
+9:    strconv.Atoi => "strconv".Atoi
+9:    str          => str
+13:   offset       => offset
+17:   x            => **non-rooted**
+17:   offset       => offset
+22:   dflt         => dflt
+23:   withDefault  => a.withDefault
+-- out/dependencies-v3/stats/field --
+// COUNT: 1
+-- out/dependencies-v3/stats/all --
+// COUNT: 17
+-- out/dependencies-v3/stats/dynamic --
+// COUNT: 32

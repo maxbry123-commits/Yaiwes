@@ -1,0 +1,37 @@
+-- in.cue --
+S: {
+	A: {
+		a: 1
+	}
+	B: A & {
+		b: 2
+	}
+}
+T: S & {// S == { A: { a:1 }, B: { a:1, b:2 } }
+	A: {
+		c: 3
+	}
+	B: {
+		d: 4 // Combines constraints S.A, S.B, T.A, and T.B // S.B & A
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  S: {
+    A: {
+      a: 1
+    }
+    B: (〈0;A〉 & {
+      b: 2
+    })
+  }
+  T: (〈0;S〉 & {
+    A: {
+      c: 3
+    }
+    B: {
+      d: 4
+    }
+  })
+}

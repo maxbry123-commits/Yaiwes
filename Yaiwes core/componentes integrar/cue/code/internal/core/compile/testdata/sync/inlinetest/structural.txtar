@@ -1,0 +1,70 @@
+-- in.cue --
+// Tests converted from structural form to inline form.
+
+// ── error-only ─────────────────────────
+
+errOnly: 1 & 2
+
+errWithCode: string & 1
+
+// ── eq: computed struct ────────────────
+
+eqBasic: {a: 1, b: 2}
+
+eqComputed: {
+	x: 10
+	y: x * 2
+}
+
+// ── skip ──────────────────────────────
+
+skippedTest: {a: 1}
+
+// ── desc ──────────────────────────────
+
+descTest: {v: "ok"}
+
+// ── version-specific ──────────────────
+
+versionOverride: {x: 1}
+
+// ── plain fixture field + references ──────────────────
+
+// A plain field with no @test is accessible but not a sub-test.
+plainFixture: {
+	x: 42
+}
+
+refsFixture: plainFixture.x
+
+// ── mixed inline ──────────────────────
+
+mixedInline: 42
+-- out/compile --
+--- in.cue
+{
+  errOnly: (1 & 2)
+  errWithCode: (string & 1)
+  eqBasic: {
+    a: 1
+    b: 2
+  }
+  eqComputed: {
+    x: 10
+    y: (〈0;x〉 * 2)
+  }
+  skippedTest: {
+    a: 1
+  }
+  descTest: {
+    v: "ok"
+  }
+  versionOverride: {
+    x: 1
+  }
+  plainFixture: {
+    x: 42
+  }
+  refsFixture: 〈0;plainFixture〉.x
+  mixedInline: 42
+}

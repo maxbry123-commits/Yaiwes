@@ -1,0 +1,93 @@
+# Recursive closedness of the root value should propagate to nested
+# structs; see cuelang.org/issue/4349.
+#
+# Explicitly open structs stay open, so unlike the closed empty struct f,
+# they are not constants. The spread operator does not leave a struct open
+# within a definition by itself, as g shows; h adds an ellipsis to stay open.
+#path: #Schema
+-- test.cue --
+package test
+
+#Schema: {
+	a?: string
+	b?: b2?: string
+	c?: {...}
+	d?: {x?: int, ...}
+	e?: x!: {...}
+	f?: {}
+	g?: #Closed...
+	h?: y!: {#Closed..., ...}
+}
+
+#Closed: x!: 1
+-- datatest/tests.cue --
+package datatest
+
+errorClosedEmptyStruct: {
+	data: f: x: 1
+	error: true
+}
+errorSpreadInDefinition: {
+	data: g: {x: 1, anything: 1}
+	error: true
+}
+openStructs: {
+	data: {
+		c: {anything: 1}
+		d: {x: 1, y: "z"}
+		e: x: anything: 1
+		h: y: {x: 1, anything: 1}
+	}
+}
+-- out/generate-v3/schema --
+{
+	$schema:              "https://json-schema.org/draft/2020-12/schema"
+	type:                 "object"
+	additionalProperties: false
+	properties: {
+		a: type: "string"
+		b: {
+			type:                 "object"
+			additionalProperties: false
+			properties: b2: type: "string"
+		}
+		c: {
+			type:                 "object"
+			additionalProperties: true
+		}
+		d: {
+			type:                 "object"
+			additionalProperties: true
+			properties: x: type: "integer"
+		}
+		e: {
+			type:                 "object"
+			additionalProperties: false
+			properties: x: {
+				type:                 "object"
+				additionalProperties: true
+			}
+			required: ["x"]
+		}
+		f: const: {}
+		g: const: x: 1
+		h: {
+			type:                 "object"
+			additionalProperties: false
+			properties: y: {
+				type:                 "object"
+				additionalProperties: true
+				properties: x: const: 1
+				required: ["x"]
+			}
+			required: ["y"]
+		}
+	}
+}
+-- out/generate-v3/errorClosedEmptyStruct --
+errorClosedEmptyStruct.data.f.x: field not allowed:
+    ./datatest/tests.cue:4:11
+-- out/generate-v3/openStructs --
+-- out/generate-v3/errorSpreadInDefinition --
+errorSpreadInDefinition.data.g.anything: field not allowed:
+    ./datatest/tests.cue:8:18

@@ -1,0 +1,211 @@
+# Test the various kinds of wildcard patterns that we do not support.
+
+# Patterns on modules other than the current module are not supported,
+# even though one valid package could be matched.
+! exec cue eval example.com/foo/...
+cmp stderr external.stderr
+exec cue eval example.com/foo
+stdout -count=1 '^self: "example.com/foo"$'
+
+# The "all", "cmd", and "std" patterns were inherited from Go,
+# but they do nothing useful right now.
+# TODO: decide whether to support or reject these.
+! exec cue eval all
+cmp stderr all.stderr
+! exec cue eval cmd
+cmp stderr cmd.stderr
+! exec cue eval std
+cmp stderr std.stderr
+
+# A lone wildcard, perhaps equivalent to "all", is not supported for now.
+# TODO: much like "all", decide whether to support or reject this.
+! exec cue eval ...
+cmp stderr dots.stderr
+
+# Patterns with a leading wildcard are not supported either,
+# as they could match any module ever published,
+# even though one valid package could be matched.
+! exec cue eval .../leaf
+cmp stderr dots-prefix.stderr
+exec cue eval ./alpha1/leaf
+stdout -count=1 '^self: "mod.com/alpha1/leaf"$'
+
+# A wildcard in the middle of a pattern matches only those packages whose
+# path matches the pattern in full, not every package under the directory
+# prefix before the wildcard. Following Go's package patterns, the wildcard
+# and its neighboring slash must match at least one path element,
+# so the top-level "leaf" directory is not included.
+exec cue eval ./.../leaf
+cmp stdout dots-middle.stdout
+
+# The directory prefix before the wildcard restricts the matches;
+# as above, "beta1/leaf" itself is not matched by "beta1/.../leaf".
+exec cue eval ./beta1/.../leaf
+cmp stdout beta1-dots-middle.stdout
+
+# A pattern may contain multiple wildcards. All pattern elements must be
+# matched: "alpha1/mid/other" lacks a "leaf" element, so only
+# "alpha1/leaf/mid/other" is included.
+exec cue eval ./.../leaf/.../other
+cmp stdout two-wildcards.stdout
+
+# A pattern with both a middle and a trailing wildcard; the trailing
+# "/..." also matches "blah/foo" itself.
+exec cue eval ./.../foo/...
+cmp stdout mid-trailing-wildcards.stdout
+
+# A pattern element must not consume the text matching a later element:
+# the two "foo" pattern elements match the first and last "foo"
+# elements in "blah/foo/x/foo".
+exec cue eval ./.../foo/.../foo
+cmp stdout repeated-element.stdout
+
+# Wildcards are not restricted to whole path elements; they can match
+# part of an element, or span across multiple elements.
+exec cue eval ./...1/leaf
+cmp stdout partial-element.stdout
+exec cue eval ./b...2/leaf
+cmp stdout spanning-elements.stdout
+
+# Text between two wildcards need not span a whole element either:
+# "./...foo..." matches any package path containing "foo",
+# including inside an element such as "AfooB".
+exec cue eval ./...foo...
+cmp stdout embedded-element.stdout
+
+# A pattern which matches no packages is an error.
+! exec cue eval ./.../nonexistent
+cmp stderr dots-middle-nomatch.stderr
+
+# Directories excluded by the pattern must not affect the result,
+# even when loading them would fail; here, "multi" contains
+# two packages, which is an error for a wildcard match.
+cd multimod
+exec cue eval ./.../leaf
+cmp stdout ../multimod-dots-middle.stdout
+cd ..
+
+# TODO: Unlike other cases, this still returns a "matched no packages" error.
+! exec cue eval mod.com/.../leaf
+cmp stderr current-dots-middle.stderr
+
+# A wildcard in the middle of a pattern, with a dependency module as a prefix.
+! exec cue eval example.com/foo/.../bar
+cmp stderr external-dots-middle.stderr
+
+# Matching many external modules, which could mean registry requests.
+! exec cue eval example.com/...
+cmp stderr external-dots-multimod.stderr
+
+-- external.stderr --
+pattern not allowed in external package path "example.com/foo/..."
+-- all.stderr --
+cue: "all" matched no packages
+-- cmd.stderr --
+cue: "cmd" matched no packages
+-- std.stderr --
+cue: "std" matched no packages
+-- dots.stderr --
+pattern not allowed in external package path "..."
+-- dots-prefix.stderr --
+pattern not allowed in external package path ".../leaf"
+-- dots-middle.stdout --
+self: "mod.com/alpha1/leaf"
+// ---
+self: "mod.com/beta1/beta2/leaf"
+// ---
+self: "mod.com/beta1/leaf"
+-- beta1-dots-middle.stdout --
+self: "mod.com/beta1/beta2/leaf"
+-- two-wildcards.stdout --
+self: "mod.com/alpha1/leaf/mid/other"
+-- mid-trailing-wildcards.stdout --
+self: "mod.com/blah/foo"
+// ---
+self: "mod.com/blah/foo/x/foo"
+-- repeated-element.stdout --
+self: "mod.com/blah/foo/x/foo"
+-- partial-element.stdout --
+self: "mod.com/alpha1/leaf"
+// ---
+self: "mod.com/beta1/leaf"
+-- spanning-elements.stdout --
+self: "mod.com/beta1/beta2/leaf"
+-- embedded-element.stdout --
+self: "mod.com/blah/foo"
+// ---
+self: "mod.com/blah/foo/x/foo"
+// ---
+self: "mod.com/y/AfooB/z"
+-- dots-middle-nomatch.stderr --
+cue: "./.../nonexistent" matched no packages
+-- multimod-dots-middle.stdout --
+self: "multi.example/sub/leaf"
+-- current-dots-middle.stderr --
+cue: "mod.com/.../leaf" matched no packages
+-- external-dots-middle.stderr --
+pattern not allowed in external package path "example.com/foo/.../bar"
+-- external-dots-multimod.stderr --
+pattern not allowed in external package path "example.com/..."
+-- cue.mod/module.cue --
+module: "mod.com"
+
+language: version: "v0.9.0"
+
+deps: "example.com/foo": v: "v0.0.1"
+-- root.cue --
+package root
+
+import "example.com/foo"
+
+foo.self
+-- leaf/leaf.cue --
+package leaf
+self: "mod.com/leaf"
+-- alpha1/leaf/leaf.cue --
+package leaf
+self: "mod.com/alpha1/leaf"
+-- alpha1/leaf/mid/other/other.cue --
+package other
+self: "mod.com/alpha1/leaf/mid/other"
+-- alpha1/mid/other/other.cue --
+package other
+self: "mod.com/alpha1/mid/other"
+-- blah/foo/bar.cue --
+package bar
+self: "mod.com/blah/foo"
+-- blah/foo/x/foo/foo.cue --
+package foo
+self: "mod.com/blah/foo/x/foo"
+-- y/AfooB/z/z.cue --
+package z
+self: "mod.com/y/AfooB/z"
+-- beta1/leaf/leaf.cue --
+package leaf
+self: "mod.com/beta1/leaf"
+-- beta1/beta2/leaf/leaf.cue --
+package leaf
+self: "mod.com/beta1/beta2/leaf"
+-- multimod/cue.mod/module.cue --
+module: "multi.example"
+
+language: version: "v0.9.0"
+-- multimod/multi/a.cue --
+package a
+self: "a"
+-- multimod/multi/b.cue --
+package b
+self: "b"
+-- multimod/sub/leaf/leaf.cue --
+package leaf
+self: "multi.example/sub/leaf"
+-- _registry/example.com_foo_v0.0.1/cue.mod/module.cue --
+module: "example.com/foo@v0"
+language: version: "v0.8.0"
+
+-- _registry/example.com_foo_v0.0.1/foo.cue --
+package foo
+self: "example.com/foo"
+-- _registry/example.com_foo_v0.0.1/bar/bar.cue --
+package bar
+self: "example.com/foo/bar"

@@ -1,0 +1,94 @@
+# Tests that list.Sort with complex type definitions involving defaults works.
+# Issue: https://cuelang.org/issue/4000
+-- in.cue --
+import "list"
+
+items: list.Sort(#List.items, {
+	x:    {}
+	y:    {}
+	less: x.kind < y.kind
+})
+
+#List: items: list.Concat(_items)
+
+_items: [#VMRuleList]
+
+// This is an alternative way of writing sharing.
+
+#VMRuleList: [...null | #VMRule] & [{
+	spec: [{
+		rules: [{expr: "x"}]
+	}]
+}, {
+	spec: [{
+		rules: [{expr: "y"}]
+	}]
+}]
+
+#RuleGroup: rules: [...#Rule]
+
+#Rule: expr: string
+
+#VMRule: {
+	#TypeMeta... // spread, as spec is not one of its fields
+	spec: [...#RuleGroup]
+}
+#TypeMeta: kind: string | *"default"
+-- out/compile --
+--- in.cue
+{
+  items: 〈import;list〉.Sort(〈0;#List〉.items, {
+    x: {}
+    y: {}
+    less: (〈0;x〉.kind < 〈0;y〉.kind)
+  })
+  #List: {
+    items: 〈import;list〉.Concat(〈1;_items〉)
+  }
+  _items: [
+    〈1;#VMRuleList〉,
+  ]
+  #VMRuleList: ([
+    ...(null|〈1;#VMRule〉),
+  ] & [
+    {
+      spec: [
+        {
+          rules: [
+            {
+              expr: "x"
+            },
+          ]
+        },
+      ]
+    },
+    {
+      spec: [
+        {
+          rules: [
+            {
+              expr: "y"
+            },
+          ]
+        },
+      ]
+    },
+  ])
+  #RuleGroup: {
+    rules: [
+      ...〈2;#Rule〉,
+    ]
+  }
+  #Rule: {
+    expr: string
+  }
+  #VMRule: {
+    〈1;#TypeMeta〉...
+    spec: [
+      ...〈2;#RuleGroup〉,
+    ]
+  }
+  #TypeMeta: {
+    kind: (string|*"default")
+  }
+}

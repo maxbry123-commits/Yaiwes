@@ -1,0 +1,271 @@
+-- in.cue --
+// All these cases whose name end with cycle should fail with a structural
+// error. These are all uncommon code paths, triggered when container types
+// are evalated within a nested expression such as as an argument to a
+// function call.
+//
+// The builtins are typically used to trigger the uncommon path. The choice of
+// builtin is irrelevant, as long as they don't finalize args before processing.
+
+import "list"
+
+// This is a resolvable reference cycle, were b is equated to c.
+letCycleOK: t1: {
+	b: c
+	let X = b
+	c: X
+}
+
+// The let has structural cycle, but it is only used in a way that the
+// structural cycle is avoided.
+letCycleOK: t2: {
+	a: {
+		b: 1
+		let X = a
+		c: X.b
+	}
+}
+
+// Ensure that the cycle exemption algorithm does not bypass actual structural
+// cycles.
+letCycleFail: t1: {
+	a: {
+		b: 1
+		let X = a
+		c: X
+	}
+}
+
+// Cycles should also be detected in evaluation paths that descend into
+// recursion at non-field boundaries.
+letCycleFail: t2: {
+	a: {
+		let X = a
+		if X == _|_ { }
+		x: y: ""
+	}
+	// TODO(eval): not sure if it really should fail here, so this may be okay.
+}
+
+listCycleOK: {
+	a: b
+	b: and([c])
+	c: a
+}
+
+disjunctionCycle: {
+	a: b
+	b: and(1 | c)
+	c: a
+}
+
+forCycle: {
+	#A: a: #B // TODO(errors): Correct error position, or at all.
+	#B: or([for x in #A { b: x }])
+}
+
+letCycleWithAnd: {
+	a: d: b
+	b: and([for x in a let y = x { y }])
+	c: a
+}
+
+closeCycle: {
+	a: b
+	b: close({d: c})
+	c: a
+}
+
+structCycle: {
+	a: b
+	b: and([{d: c}])
+	c: a
+}
+
+embedCycle: {
+	a: b
+	b: close({c})
+	c: a
+}
+
+listAddCycle: {
+	a: b
+	b: list.Concat([[c], [c]])
+	c: a
+}
+
+listMulCycle: {
+	a: b
+	b: list.Repeat([{a: b: c}], 3)
+	c: a
+}
+
+// consult the correct closeness info in the face of it being passed down
+// from parent.
+closeFail: {
+	#T: [_]: _
+	#T: close({"a": string})
+	x:  #T
+	x: b: "foo"
+}
+
+printCycle: {
+	a: {
+		X: a
+		if X {
+		}
+	}
+}
+-- self.cue --
+issue3978: {
+	a: {
+		let this = self
+		if this.missing != _|_ {}
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  letCycleOK: {
+    t1: {
+      b: 〈0;c〉
+      let X#1 = 〈0;b〉
+      c: 〈0;let X#1〉
+    }
+  }
+  letCycleOK: {
+    t2: {
+      a: {
+        b: 1
+        let X#2 = 〈1;a〉
+        c: 〈0;let X#2〉.b
+      }
+    }
+  }
+  letCycleFail: {
+    t1: {
+      a: {
+        b: 1
+        let X#3 = 〈1;a〉
+        c: 〈0;let X#3〉
+      }
+    }
+  }
+  letCycleFail: {
+    t2: {
+      a: {
+        let X#4 = 〈1;a〉
+        if (〈0;let X#4〉 == _|_(explicit error (_|_ literal) in source)) {}
+        x: {
+          y: ""
+        }
+      }
+    }
+  }
+  listCycleOK: {
+    a: 〈0;b〉
+    b: and([
+      〈1;c〉,
+    ])
+    c: 〈0;a〉
+  }
+  disjunctionCycle: {
+    a: 〈0;b〉
+    b: and((1|〈0;c〉))
+    c: 〈0;a〉
+  }
+  forCycle: {
+    #A: {
+      a: 〈1;#B〉
+    }
+    #B: or([
+      for _, x in 〈1;#A〉 {
+        b: 〈1;x〉
+      },
+    ])
+  }
+  letCycleWithAnd: {
+    a: {
+      d: 〈1;b〉
+    }
+    b: and([
+      for _, x in 〈1;a〉 let y = 〈0;x〉 {
+        〈1;y〉
+      },
+    ])
+    c: 〈0;a〉
+  }
+  closeCycle: {
+    a: 〈0;b〉
+    b: close({
+      d: 〈1;c〉
+    })
+    c: 〈0;a〉
+  }
+  structCycle: {
+    a: 〈0;b〉
+    b: and([
+      {
+        d: 〈2;c〉
+      },
+    ])
+    c: 〈0;a〉
+  }
+  embedCycle: {
+    a: 〈0;b〉
+    b: close({
+      〈1;c〉
+    })
+    c: 〈0;a〉
+  }
+  listAddCycle: {
+    a: 〈0;b〉
+    b: 〈import;list〉.Concat([
+      [
+        〈2;c〉,
+      ],
+      [
+        〈2;c〉,
+      ],
+    ])
+    c: 〈0;a〉
+  }
+  listMulCycle: {
+    a: 〈0;b〉
+    b: 〈import;list〉.Repeat([
+      {
+        a: {
+          b: 〈3;c〉
+        }
+      },
+    ], 3)
+    c: 〈0;a〉
+  }
+  closeFail: {
+    #T: {
+      [_]: _
+    }
+    #T: close({
+      a: string
+    })
+    x: 〈0;#T〉
+    x: {
+      b: "foo"
+    }
+  }
+  printCycle: {
+    a: {
+      X: 〈1;a〉
+      if 〈0;X〉 {}
+    }
+  }
+}
+--- self.cue
+{
+  issue3978: {
+    a: {
+      let this#5 = 〈1〉
+      if (〈0;let this#5〉.missing != _|_(explicit error (_|_ literal) in source)) {}
+    }
+  }
+}

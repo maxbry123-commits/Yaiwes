@@ -1,0 +1,11 @@
+# Tests that a float value conflicting with a disjunction of an int value and int type
+# reports an empty disjunction error. Issue: regression test for early evaluator behavior.
+-- in.cue --
+a: 8000.9
+a: 7080 | int
+-- out/compile --
+--- in.cue
+{
+  a: 8000.9
+  a: (7080|int)
+}

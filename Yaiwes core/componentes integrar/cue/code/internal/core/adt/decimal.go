@@ -1,0 +1,179 @@
+// Copyright 2020 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package adt
+
+import (
+	"cuelang.org/go/internal"
+	"github.com/cockroachdb/apd/v3"
+)
+
+func (n *Num) Impl() *apd.Decimal {
+	return &n.X
+}
+
+func (n *Num) Negative() bool {
+	return n.X.Negative
+}
+
+func (a *Num) Cmp(b *Num) int {
+	return a.X.Cmp(&b.X)
+}
+
+func (c *OpContext) Add(a, b *Num) Value {
+	return c.numResult(NumAdd(a, b))
+}
+
+func (c *OpContext) Sub(a, b *Num) Value {
+	return c.numResult(NumSub(a, b))
+}
+
+func (c *OpContext) Mul(a, b *Num) Value {
+	return c.numResult(NumMul(a, b))
+}
+
+func (c *OpContext) Quo(a, b *Num) Value {
+	return c.numResult(NumQuo(a, b))
+}
+
+// numResult turns the result of an arithmetic function into a value, giving
+// it the position of the expression being evaluated.
+func (c *OpContext) numResult(n *Num, err error) Value {
+	if err != nil {
+		return c.NewErrf("failed arithmetic: %v", err)
+	}
+	if c.HasErr() {
+		return c.Err()
+	}
+	n.Src = c.src
+	return n
+}
+
+// NumAdd returns x + y as the arithmetic operators define it: an integer
+// computed without rounding when both operands are integers, and a float
+// rounded to the decimal context otherwise. Builtins which do arithmetic on
+// their arguments use these functions so that they follow the same rules.
+func NumAdd(x, y *Num) (*Num, error) {
+	return numOp((*internal.Context).Add, numKind(x, y), x, y)
+}
+
+// NumSub returns x - y; see [NumAdd].
+func NumSub(x, y *Num) (*Num, error) {
+	return numOp((*internal.Context).Sub, numKind(x, y), x, y)
+}
+
+// NumMul returns x * y; see [NumAdd].
+func NumMul(x, y *Num) (*Num, error) {
+	return numOp((*internal.Context).Mul, numKind(x, y), x, y)
+}
+
+// NumQuo returns x / y; see [NumAdd].
+func NumQuo(a, b *Num) (*Num, error) {
+	// doc/ref/spec.md: the quotient of two integers is an integer when it
+	// can be represented as one, which a zero remainder reports. Testing a
+	// decimal quotient for integrality instead would not do, as it is
+	// rounded to the context's precision first. numOp handles a zero
+	// divisor, telling 1 / 0 from the undefined 0 / 0, and an infinite
+	// operand, which has no coefficient to divide.
+	if a.Kind()&FloatKind == 0 && b.Kind()&FloatKind == 0 && !b.X.IsZero() &&
+		a.X.Form == apd.Finite && b.X.Form == apd.Finite {
+		var x, y, d apd.Decimal
+		var rem apd.BigInt
+		d.Coeff.QuoRem(intOperand(&x, a), intOperand(&y, b), &rem)
+		if rem.Sign() == 0 {
+			return intNum(&d), nil
+		}
+	}
+	return numOp((*internal.Context).Quo, FloatKind, a, b)
+}
+
+// numKind returns the kind of an arithmetic result over a and b: the kind they
+// share, or a float if they share none.
+func numKind(a, b *Num) Kind {
+	k := a.Kind() & b.Kind()
+	if k == 0 {
+		k = FloatKind
+	}
+	return k
+}
+
+type numFunc func(c *internal.Context, z, x, y *apd.Decimal) (apd.Condition, error)
+
+// numOp applies fn to x and y, giving the result kind k.
+//
+// An integer result is computed without rounding, so that it keeps the
+// arbitrary precision doc/ref/spec.md requires. Only operations which are
+// exact over the integers may yield one, which rules out division: a quotient
+// such as 1/3 has no finite decimal representation, and apd refuses to divide
+// at all in a context with no precision to round to.
+func numOp(fn numFunc, k Kind, x, y *Num) (*Num, error) {
+	ctx := internal.BaseContext
+	if k&FloatKind == 0 {
+		ctx = internal.ExactContext
+	}
+
+	n := &Num{K: k}
+	if _, err := fn(&ctx, &n.X, &x.X, &y.X); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (c *OpContext) IntDiv(a, b *Num) Value {
+	return intDivOp(c, (*apd.BigInt).Div, a, b)
+}
+
+func (c *OpContext) IntMod(a, b *Num) Value {
+	return intDivOp(c, (*apd.BigInt).Mod, a, b)
+}
+
+func (c *OpContext) IntQuo(a, b *Num) Value {
+	return intDivOp(c, (*apd.BigInt).Quo, a, b)
+}
+
+func (c *OpContext) IntRem(a, b *Num) Value {
+	return intDivOp(c, (*apd.BigInt).Rem, a, b)
+}
+
+type intFunc func(z, x, y *apd.BigInt) *apd.BigInt
+
+func intDivOp(c *OpContext, fn intFunc, a, b *Num) Value {
+	if b.X.IsZero() {
+		return c.NewErrf("division by zero")
+	}
+	var x, y, d apd.Decimal
+	fn(&d.Coeff, intOperand(&x, a), intOperand(&y, b))
+	return c.numResult(intNum(&d), nil)
+}
+
+// intOperand returns the value of the integer n as a signed big integer, using
+// d as scratch space. Rounding to an integral value brings the exponent to
+// zero, so that the coefficient alone is the magnitude.
+func intOperand(d *apd.Decimal, n *Num) *apd.BigInt {
+	_, _ = internal.ExactContext.RoundToIntegralValue(d, &n.X)
+	if d.Negative {
+		d.Coeff.Neg(&d.Coeff)
+	}
+	return &d.Coeff
+}
+
+// intNum returns d, whose coefficient holds a signed integer, as an integer
+// value.
+func intNum(d *apd.Decimal) *Num {
+	if d.Coeff.Sign() < 0 {
+		d.Coeff.Neg(&d.Coeff)
+		d.Negative = true
+	}
+	return &Num{X: *d, K: IntKind}
+}

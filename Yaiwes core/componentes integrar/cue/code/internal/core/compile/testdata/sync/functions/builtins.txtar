@@ -1,0 +1,388 @@
+# Tests that builtins satisfy function types: unifying a builtin with a
+# compatible function type succeeds and yields the builtin, with the type's
+# parameter and result constraints additionally enforced on every ordinary
+# full call. The legacy validator-constructor form remains a separate path.
+# A builtin binds its raw arguments by position. Positional type parameters
+# align with those raw slots by ordinal; a plain name supplies a contract label
+# only when the slot does not already have a different one. A required or
+# optional parameter of a type is the builtin parameter with its label, as
+# named by the builtin's signatures; an optional one that matches nothing
+# contributes no slot or label. Defaults declared by the signatures fill
+# omitted arguments and must agree with the builtin's own defaults.
+# Statically checked at unification time are parameter matching, arity, and
+# kind-level compatibility where the constraint is literally a basic type;
+# all other constraints surface when the tightened builtin is called.
+-- in.cue --
+@experiment(functions)
+
+import (
+	"list"
+	"path"
+	"strings"
+)
+
+tighten: {
+	T:  func(string, ...) -> string
+	up: T & strings.ToUpper
+	x:  up("hi")
+
+	// Order of unification does not matter.
+	upRev: strings.ToUpper & T
+	xRev:  upRev("hi")
+
+	// An open type with no parameters is satisfied by any builtin.
+	O:  func(...) -> string
+	o:  O & strings.ToUpper
+	ox: o("hi")
+
+	// The generated signature names this raw positional slot s; the same
+	// contract label may be repeated by a compatible type.
+	named: (func(s: string) -> string) & strings.ToUpper
+	nx:    named("hi")
+	nxLabel: named(s: "bye")
+}
+
+static: {
+	// Arity is checked statically in both directions: the type must not
+	// declare more positional parameters than the builtin accepts, and a
+	// closed type must cover every defaultless parameter of the builtin.
+	tooMany: (func(string, string, ...) -> string) & strings.ToUpper
+	tooFew:  (func() -> string) & strings.ToUpper
+
+	// Kind-level conflicts that are decidable from the compiled signature
+	// (the constraint is literally a basic type) are rejected statically.
+	badParam:  (func(int, ...) -> string) & strings.ToUpper
+	badResult: (func(string, ...) -> int) & strings.ToUpper
+
+	// A builtin never unifies with a proper function value.
+	f:        func(a: string) -> string: a
+	conflict: f & strings.ToUpper
+}
+
+// Constraints that are not decidable from the signatures alone are enforced
+// dynamically, on every ordinary full call through the tightened builtin.
+dynamic: {
+	// The type narrows the parameter to a bound.
+	P:  func(<="m", ...) -> string
+	up: P & strings.ToUpper
+
+	ok:  up("hi")
+	oob: up("zz")
+
+	// The type narrows the result.
+	R:   func(string, ...) -> "HI"
+	up2: R & strings.ToUpper
+
+	good: up2("hi")
+	bad:  up2("no")
+
+	// Narrowing stacks across a chain of tightenings.
+	A:   func(string, ...) -> string
+	B:   func(<="m", ...) -> _
+	up3: A & B & strings.ToUpper
+
+	mid: up3("hi")
+	hi:  up3("zz")
+}
+
+// An extra parameter is admitted against a closed signature iff it is
+// optional. An unmatched optional name-only parameter contributes no slot or
+// label, but no call needs it either. A builtin parameter that a closed type
+// does not cover is admitted only if the builtin has a default for it.
+optionalExtra: {
+	O:  func(string, sep?: string) -> string
+	up: O & strings.ToUpper
+	x:  up("hi")
+
+	// An unmatched optional name-only constraint contributes no raw slot.
+	OnlyExtra: func(extra?: int, ...) -> string
+	upExtra:   OnlyExtra & strings.ToUpper
+	y:         upExtra("hi")
+
+	// A required parameter must name a parameter of the builtin.
+	bad: (func(string, sep!: string) -> string) & strings.ToUpper
+}
+
+// A required or optional parameter of a type and the builtin parameter with
+// the same label are the same parameter, so the type covers it.
+labelMatch: {
+	opt:     strings.Repeat & (func(string, count?: <3) -> string)
+	optOK:   opt("x", 2)
+	optBad:  opt("x", 5)
+	req:     strings.Repeat & (func(string, count!: int) -> string)
+	reqOK:   req("x", count: 2)
+	// A label that names no builtin parameter is rejected.
+	unknown: strings.Repeat & (func(string, times!: int) -> string)
+
+	// The builtin's labels are known however its uses are unified, also
+	// when a type labeling another parameter is unified first.
+	split: strings.Repeat
+	split: func(s: string, count!: int) -> string
+	splitOK: split("a", count: 3)
+}
+
+// Tightened builtins are equal when derived from the same builtin with the
+// same type constraints: disjunction deduplication collapses them to a
+// single callable value.
+disjunction: {
+	T:    func(string, ...) -> string
+	t1:   T & strings.ToUpper
+	t2:   T & strings.ToUpper
+	pick: t1 | t2
+	x:    pick("hi")
+}
+
+// Partial application of builtins is not supported: a call with a trailing
+// "..." reports a clear error instead of silently dropping the "..." (len)
+// or morphing into a validator (strings.Contains).
+partial: {
+	contains: strings.Contains("abcd", ...)
+	length:   len([1, 2], ...)
+}
+
+// len is polymorphic over strings, bytes, lists, and structs; its kind-level
+// signature is compatible with a type over any of these.
+polymorphic: {
+	L: func(_, ...) -> int
+	l: L & len
+
+	str:  l("foo")
+	list: l([1, 2])
+
+	// The type may narrow the accepted arguments to a subset of the kinds
+	// the builtin accepts; the narrowing applies per call.
+	S:    func(string, ...) -> int
+	ls:   S & len
+	sOk:  ls("foo")
+	sBad: ls([1, 2])
+
+	// A statically incompatible result kind is rejected.
+	bad: (func(_, ...) -> string) & len
+}
+
+// A labeled argument binds through the contract labels of the builtin's
+// declared signature; the call proceeds with the arguments in positional
+// order. Generated, signature-bearing standard-library functions ordinarily
+// carry attached labels which are callable.
+labeled: {
+	import1: {
+		named:   list.Drop(x: [1, 2, 3], n: 1)
+		swapped: list.Drop(n: 1, x: [1, 2, 3])
+		mixed:   strings.Repeat("ab", count: 2)
+	}
+
+	errors: {
+		// A label no attached signature declares does not bind.
+		unknown: list.Drop(lst: [1], n: 0)
+
+		// A parameter cannot be given both positionally and by label.
+		dup: strings.Repeat("ab", s: "x")
+
+		// Labels cannot leave a hole before a bound position.
+		hole: list.Slice([1, 2, 3], j: 2)
+	}
+
+	// An anonymous user type remains compatible with the builtin's named
+	// declaration. The declaration's contract label stays callable.
+	user: {
+		T: func(s: string, sep: string) -> [...string]
+		f: T & strings.SplitN
+
+		U:  func(string, ...) -> string
+		up: U & strings.ToUpper
+		x:  up(s: "hi")
+
+		// A second contract name for the already named slot conflicts.
+		badName: (func(text: string, ...) -> string) & strings.ToUpper
+	}
+}
+// Defaults are part of CUE signatures, for builtins as for function
+// literals: a default declared by a function type unified with a builtin
+// fills an omitted argument, and it must agree with the builtin's own
+// default.
+typeDefaults: {
+	Rep:     func(s: string, count: int = 2) -> string
+	rep:     Rep & strings.Repeat
+	repX:    rep("ab", 3)
+	repOmit: rep("ab")
+
+	// Two types attached to the builtin must still agree on their defaults,
+	// as they would without it: ignoring a default when completing the
+	// builtin's arguments does not make conflicting declarations compatible.
+	Rep3:       func(s: string, count: int = 3) -> string
+	repTypes:   Rep & Rep3
+	repBoth:    strings.Repeat & Rep & Rep3
+	repBothRev: Rep3 & strings.Repeat & Rep
+	repSame:    (Rep & strings.Repeat & Rep)("ab", 3)
+
+	// A declared default must agree with the builtin's own default.
+	Join:   func(elem: [...string], os: string = "windows") -> string
+	join:   Join & path.Join
+
+	// A default declared on a type fills an omitted argument of a builtin
+	// as it would for a function value.
+	_rep: strings.Repeat
+	_rep: func(s: string, count: int = 3) -> string
+	split: _rep("a")
+	Unix:   func(elem: [...string], os: string = "unix") -> string
+	unix:   Unix & path.Join
+	unixX:  unix(["a", "b"])
+	unixOS: unix(["a", "b"], "windows")
+}
+-- out/compile --
+--- in.cue
+{
+  tighten: {
+    T: func(string, ...) -> string
+    up: (〈0;T〉 & 〈import;strings〉.ToUpper)
+    x: 〈0;up〉("hi")
+    upRev: (〈import;strings〉.ToUpper & 〈0;T〉)
+    xRev: 〈0;upRev〉("hi")
+    O: func(...) -> string
+    o: (〈0;O〉 & 〈import;strings〉.ToUpper)
+    ox: 〈0;o〉("hi")
+    named: (func(s: string) -> string & 〈import;strings〉.ToUpper)
+    nx: 〈0;named〉("hi")
+    nxLabel: 〈0;named〉(s: "bye")
+  }
+  static: {
+    tooMany: (func(string, string, ...) -> string & 〈import;strings〉.ToUpper)
+    tooFew: (func() -> string & 〈import;strings〉.ToUpper)
+    badParam: (func(int, ...) -> string & 〈import;strings〉.ToUpper)
+    badResult: (func(string, ...) -> int & 〈import;strings〉.ToUpper)
+    f: func(a: string) -> string: 〈0;a〉
+    conflict: (〈0;f〉 & 〈import;strings〉.ToUpper)
+  }
+  dynamic: {
+    P: func(<="m", ...) -> string
+    up: (〈0;P〉 & 〈import;strings〉.ToUpper)
+    ok: 〈0;up〉("hi")
+    oob: 〈0;up〉("zz")
+    R: func(string, ...) -> "HI"
+    up2: (〈0;R〉 & 〈import;strings〉.ToUpper)
+    good: 〈0;up2〉("hi")
+    bad: 〈0;up2〉("no")
+    A: func(string, ...) -> string
+    B: func(<="m", ...) -> _
+    up3: ((〈0;A〉 & 〈0;B〉) & 〈import;strings〉.ToUpper)
+    mid: 〈0;up3〉("hi")
+    hi: 〈0;up3〉("zz")
+  }
+  optionalExtra: {
+    O: func(string, sep?: string) -> string
+    up: (〈0;O〉 & 〈import;strings〉.ToUpper)
+    x: 〈0;up〉("hi")
+    OnlyExtra: func(extra?: int, ...) -> string
+    upExtra: (〈0;OnlyExtra〉 & 〈import;strings〉.ToUpper)
+    y: 〈0;upExtra〉("hi")
+    bad: (func(string, sep!: string) -> string & 〈import;strings〉.ToUpper)
+  }
+  labelMatch: {
+    opt: (〈import;strings〉.Repeat & func(string, count?: <3) -> string)
+    optOK: 〈0;opt〉("x", 2)
+    optBad: 〈0;opt〉("x", 5)
+    req: (〈import;strings〉.Repeat & func(string, count!: int) -> string)
+    reqOK: 〈0;req〉("x", count: 2)
+    unknown: (〈import;strings〉.Repeat & func(string, times!: int) -> string)
+    split: 〈import;strings〉.Repeat
+    split: func(s: string, count!: int) -> string
+    splitOK: 〈0;split〉("a", count: 3)
+  }
+  disjunction: {
+    T: func(string, ...) -> string
+    t1: (〈0;T〉 & 〈import;strings〉.ToUpper)
+    t2: (〈0;T〉 & 〈import;strings〉.ToUpper)
+    pick: (〈0;t1〉|〈0;t2〉)
+    x: 〈0;pick〉("hi")
+  }
+  partial: {
+    contains: 〈import;strings〉.Contains("abcd")
+    length: len([
+      1,
+      2,
+    ])
+  }
+  polymorphic: {
+    L: func(_, ...) -> int
+    l: (〈0;L〉 & len)
+    str: 〈0;l〉("foo")
+    list: 〈0;l〉([
+      1,
+      2,
+    ])
+    S: func(string, ...) -> int
+    ls: (〈0;S〉 & len)
+    sOk: 〈0;ls〉("foo")
+    sBad: 〈0;ls〉([
+      1,
+      2,
+    ])
+    bad: (func(_, ...) -> string & len)
+  }
+  labeled: {
+    import1: {
+      named: 〈import;list〉.Drop(x: [
+        1,
+        2,
+        3,
+      ], n: 1)
+      swapped: 〈import;list〉.Drop(n: 1, x: [
+        1,
+        2,
+        3,
+      ])
+      mixed: 〈import;strings〉.Repeat("ab", count: 2)
+    }
+    errors: {
+      unknown: 〈import;list〉.Drop(lst: [
+        1,
+      ], n: 0)
+      dup: 〈import;strings〉.Repeat("ab", s: "x")
+      hole: 〈import;list〉.Slice([
+        1,
+        2,
+        3,
+      ], j: 2)
+    }
+    user: {
+      T: func(s: string, sep: string) -> [
+        ...string,
+      ]
+      f: (〈0;T〉 & 〈import;strings〉.SplitN)
+      U: func(string, ...) -> string
+      up: (〈0;U〉 & 〈import;strings〉.ToUpper)
+      x: 〈0;up〉(s: "hi")
+      badName: (func(text: string, ...) -> string & 〈import;strings〉.ToUpper)
+    }
+  }
+  typeDefaults: {
+    Rep: func(s: string, count: int = 2) -> string
+    rep: (〈0;Rep〉 & 〈import;strings〉.Repeat)
+    repX: 〈0;rep〉("ab", 3)
+    repOmit: 〈0;rep〉("ab")
+    Rep3: func(s: string, count: int = 3) -> string
+    repTypes: (〈0;Rep〉 & 〈0;Rep3〉)
+    repBoth: ((〈import;strings〉.Repeat & 〈0;Rep〉) & 〈0;Rep3〉)
+    repBothRev: ((〈0;Rep3〉 & 〈import;strings〉.Repeat) & 〈0;Rep〉)
+    repSame: ((〈0;Rep〉 & 〈import;strings〉.Repeat) & 〈0;Rep〉)("ab", 3)
+    Join: func(elem: [
+      ...string,
+    ], os: string = "windows") -> string
+    join: (〈0;Join〉 & 〈import;path〉.Join)
+    _rep: 〈import;strings〉.Repeat
+    _rep: func(s: string, count: int = 3) -> string
+    split: 〈0;_rep〉("a")
+    Unix: func(elem: [
+      ...string,
+    ], os: string = "unix") -> string
+    unix: (〈0;Unix〉 & 〈import;path〉.Join)
+    unixX: 〈0;unix〉([
+      "a",
+      "b",
+    ])
+    unixOS: 〈0;unix〉([
+      "a",
+      "b",
+    ], "windows")
+  }
+}

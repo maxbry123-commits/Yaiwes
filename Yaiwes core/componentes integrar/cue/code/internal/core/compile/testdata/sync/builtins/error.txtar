@@ -1,0 +1,224 @@
+-- cue.mod/module.cue --
+module: "cuelang.org/error"
+language: version: "v0.15.0"
+-- in.cue --
+selection: {
+	dropError: 1 | error("drop me")
+
+	useCustomError: 1&2 | error("use me")
+
+	twoCustomErrors: 1&2 | error("error one") | error("error two")
+
+	x: int
+	dropIncomplete: x + 1 | error("user msg: x + 1 failed")
+}
+
+interpolation: {
+	a: {b: int}
+	world: "world"
+
+	substituteAll: a.notExist | error("hello \(world)")
+
+	substituteFail: a.b + 1 | a.notExist | error("reference failed: \(a.b) | \(a.notExist)")
+
+	// When the error() message itself contains an error,
+	// the custom error should not be thrown away.
+	// For comparison, without interpolation:
+	errorNoInterpolation: "a" | "b" | error("custom")
+	errorNoInterpolation: "c"
+
+	// When the struct interpolation fails, the custom error should
+	// still be shown rather than being replaced by the interpolation error.
+	errorStructInterpolation: "a" | "b" | error("custom: \({x: 1})")
+	errorStructInterpolation: "c"
+
+	// When the interpolation always results in an error, the custom
+	// error should still be shown.
+	errorBottomInterpolation: "a" | "b" | error("custom: \(1 & 2)")
+	errorBottomInterpolation: "c"
+}
+indirect: {
+	x: error
+	y: x("msg")
+}
+-- incomplete.cue --
+import "struct"
+
+// The custom error should not alter the type of error.
+minFields: struct.MinFields(2) | error("should remain incomplete")
+maxFields: a: 1
+
+multi: struct.MinFields(2) | error("should remain incomplete") | error("second")
+multi: a: 1
+
+-- self.cue --
+@experiment(aliasv2)
+
+// When error() interpolates "self" which is the enclosing struct
+// containing the error value itself (a cycle), the custom error
+// should still be shown, with the nested copy of the error elided.
+errorSelf: {
+	v: "x" | "y" | error("bad: \(self)")
+	v: "z"
+}
+
+// issue4240: self in a field which is not a struct refers to the enclosing
+// struct, not to the value being validated. Wrapping the value in a struct
+// makes self refer to the value itself. https://cuelang.org/issue/4240
+issue4240: {
+	#options: "one" | "two" | "three" | error("invalid option \(self)")
+	bad: #options & "four"
+
+	#optionsSelf: {"one" | "two" | "three" | error("invalid option \(self)")}
+	good: #optionsSelf & "four"
+}
+
+// A validator interpolating the enclosing struct should show its other
+// fields, which identify the offending value.
+errorSelfStruct: {
+	#V: {name: string, kind: "x" | error("bad kind in \(self)")}
+	item: #V
+	item: {
+		name: "n"
+		kind: "q"
+	}
+}
+
+// A value which contains the error without being an ancestor of it,
+// such as a sibling referring to the erroring field, elides the error too.
+errorSibling: {
+	v: "x" | error("bad: \(w)")
+	v: "z"
+	w: x: v
+}
+-- issues.cue --
+import "list"
+
+// issue4001: Tests that error() text is shown correctly when the message uses
+// string concatenation with interpolation. https://cuelang.org/issue/4001
+issue4001: {
+	a: "b"
+	a: int | error("error: "+"a='\(a)'")
+}
+// issue3983: Tests that multiple error() disjunctions aggregate all user-defined
+// error messages correctly. https://cuelang.org/issue/3983
+issue3983: {
+	x: int | error("I wanted an integer")
+	x: >10 | error("I wanted more than 10")
+	x: <20 | error("I wanted less than 20")
+
+	x: 3
+}
+// issue3984: Tests that error() shows all relevant source locations when the
+// error builtin is used in a disjunction. https://cuelang.org/issue/3984
+issue3984: {
+	v: "a" | error("must be a")
+	v: "b"
+}
+// issue4490: Tests that a user error wrapped by a builtin is reported when the
+// same disjunction also fails with a regular error.
+// https://cuelang.org/issue/4490
+issue4490: {
+	a: 1 | list.Concat([[error("boom")]])
+	a: 2
+}
+-- out/compile --
+--- in.cue
+{
+  selection: {
+    dropError: (1|error("drop me"))
+    useCustomError: ((1 & 2)|error("use me"))
+    twoCustomErrors: ((1 & 2)|error("error one")|error("error two"))
+    x: int
+    dropIncomplete: ((〈0;x〉 + 1)|error("user msg: x + 1 failed"))
+  }
+  interpolation: {
+    a: {
+      b: int
+    }
+    world: "world"
+    substituteAll: (〈0;a〉.notExist|error("hello \(〈0;world〉)"))
+    substituteFail: ((〈0;a〉.b + 1)|〈0;a〉.notExist|error("reference failed: \(〈0;a〉.b) | \(〈0;a〉.notExist)"))
+    errorNoInterpolation: ("a"|"b"|error("custom"))
+    errorNoInterpolation: "c"
+    errorStructInterpolation: ("a"|"b"|error("custom: \({
+      x: 1
+    })"))
+    errorStructInterpolation: "c"
+    errorBottomInterpolation: ("a"|"b"|error("custom: \((1 & 2))"))
+    errorBottomInterpolation: "c"
+  }
+  indirect: {
+    x: error
+    y: 〈0;x〉("msg")
+  }
+}
+--- incomplete.cue
+{
+  minFields: (〈import;struct〉.MinFields(2)|error("should remain incomplete"))
+  maxFields: {
+    a: 1
+  }
+  multi: (〈import;struct〉.MinFields(2)|error("should remain incomplete")|error("second"))
+  multi: {
+    a: 1
+  }
+}
+--- issues.cue
+{
+  issue4001: {
+    a: "b"
+    a: (int|error(("error: " + "a='\(〈0;a〉)'")))
+  }
+  issue3983: {
+    x: (int|error("I wanted an integer"))
+    x: (>10|error("I wanted more than 10"))
+    x: (<20|error("I wanted less than 20"))
+    x: 3
+  }
+  issue3984: {
+    v: ("a"|error("must be a"))
+    v: "b"
+  }
+  issue4490: {
+    a: (1|〈import;list〉.Concat([
+      [
+        error("boom"),
+      ],
+    ]))
+    a: 2
+  }
+}
+--- self.cue
+{
+  errorSelf: {
+    v: ("x"|"y"|error("bad: \(〈1〉)"))
+    v: "z"
+  }
+  issue4240: {
+    #options: ("one"|"two"|"three"|error("invalid option \(〈1〉)"))
+    bad: (〈0;#options〉 & "four")
+    #optionsSelf: {
+      ("one"|"two"|"three"|error("invalid option \(〈1〉)"))
+    }
+    good: (〈0;#optionsSelf〉 & "four")
+  }
+  errorSelfStruct: {
+    #V: {
+      name: string
+      kind: ("x"|error("bad kind in \(〈1〉)"))
+    }
+    item: 〈0;#V〉
+    item: {
+      name: "n"
+      kind: "q"
+    }
+  }
+  errorSibling: {
+    v: ("x"|error("bad: \(〈0;w〉)"))
+    v: "z"
+    w: {
+      x: 〈1;v〉
+    }
+  }
+}

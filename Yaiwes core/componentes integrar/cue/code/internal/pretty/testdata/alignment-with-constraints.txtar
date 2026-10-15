@@ -1,0 +1,21 @@
+#width: 20
+
+# Optional/required markers are part of the key column.
+-- in --
+{
+	name: string
+age?:     int
+	id!:  string
+}
+-- out/relpos --
+{
+	name: string
+	age?: int
+	id!:  string
+}
+-- out/norelpos --
+{
+	name: string
+	age?: int
+	id!:  string
+}

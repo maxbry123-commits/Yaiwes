@@ -1,0 +1,566 @@
+-- in.cue --
+a: close({
+	a: b: int
+})
+
+b: a & {x: int} // err
+c: a & {a: c: int} // okay (non-recursive close)
+
+inDisjunctions: {
+	x: [string]: #Def
+	#Def: [string]: {
+		a: b: true
+		let X = a
+		// The embedded disjunction is spread, as either disjunct would
+		// otherwise close this struct and deny the a field above.
+		(close({uint: a: b: X.b}) | close({string: a: b: true}))...
+	}
+	x: socket: string: {}
+	x: syslog: x.socket
+	x: syslog: xxx: {}
+
+}
+
+// issue642: Tests that close() with merged struct patterns (concrete fields and
+// bulk optional) correctly allows subfields. https://cuelang.org/issue/642
+issue642: {
+	test: close({
+		a: _
+		b: x: _
+	} & {
+		[string]: y: _
+	})
+
+	test: a: x: _
+	test: b: x: _
+
+}
+
+// Issue 642
+withSubfields: {
+	test: close({
+		a: _
+		b: x:        _
+		[string]: y: _
+	})
+
+	test: a: x: _
+	test: b: x: _
+
+}
+
+// issue3572: Tests that close({...}) allows additional fields when unified
+// with an open struct. https://cuelang.org/issue/3572
+issue3572: {
+  t1: close({...}) & {a: 5}
+
+  e: close({...})
+
+  t2: e & {a: 5}
+}
+
+// issue3580: Tests that close() does not panic when a field inside the closed
+// struct references another field of the same struct. https://cuelang.org/issue/3580
+issue3580: {
+	x: close({
+		a: _
+		b: x.a
+	})
+}
+
+// The closing applies to each disjunct of a struct which embeds a
+// disjunction.
+embeddedDisjunction: {
+	v: close({({a: 1} | {b: 1})..., c: 2})
+	t1: v & {a: 1}
+	t2: v & {d: 3}
+}
+
+// issue3963: close over a disjunction closes each disjunct, so unifying the
+// result selects the disjunct which admits the added field, and a field no
+// disjunct admits is denied. https://cuelang.org/issue/3963
+issue3963: {
+	#A: a: string
+	#B: b: string
+
+	disjunction: (#A | #B) & {a: "x"}
+	closed:      close(#A | #B) & {a: "x"}
+	denied:      close(#A | #B) & {c: "x"}
+
+	#D: #A | #B
+	definition: #D & {a: "x"}
+}
+
+// close over a disjunction closes each disjunct as the value it evaluated
+// to: its optional and required fields, pattern constraints, and ellipsis
+// carry over along with its regular fields.
+disjunctValue: {
+	v: close({a?: int} | *{b?: int})
+	t1: v & {b: 1}
+	t2: v & {a: 1}
+	t3: v & {c: 1}
+
+	required: close({a!: int} | {b!: int}) & {b: 1}
+	pattern:  close({[string]: int} | *{b: int, [=~"^c"]: string}) & {b: 1, c: "x"}
+	ellipsis: close({a: 1, ...} | {b: 1}) & {c: 2}
+}
+-- embed.cue --
+// The old embedding opened the embedded value along the paths the
+// enclosing literal declares itself. As cue fix rewrites it, the extended
+// label is declared in the nested closed literal, so that foo.allowed stays
+// allowed while foo.other and a sibling field stay denied.
+nestedEmbedded: base: close({
+	{foo?: close({foo?: _, allowed?: _})}
+	foo: allowed: 5
+})
+nestedEmbedded: t1: close({
+	{{foo?: close({foo?: _, allowed?: _})}}
+	foo: allowed: 5
+})
+nestedEmbedded: t2: close({
+	{{{foo?: close({foo?: _, allowed?: _})}}}
+	foo: allowed: 5
+})
+// The original input, under the strict embedding of v0.18.0: the embedded
+// literal closes foo to its own fields, so the field the old semantics
+// admitted is denied.
+nestedEmbedded: strict: {
+	close({ foo?: close({ foo?: _ }) })
+	foo: allowed: 5
+}
+unified: base: {
+	x: close({ foo?: close({ foo?: _ }) })
+	x: foo: disallowed: 5
+}
+unified: t1: {
+	x: { close({ foo?: close({ foo?: _ }) }) }
+	x: foo: disallowed: 5
+}
+unified: t2: {
+	x: {{ close({ foo?: close({ foo?: _ }) }) }}
+	x: foo: disallowed: 5
+}
+nestedWithSelfReference: t1: {
+	_schema: close({
+		foo?: _schema
+	})
+	// TODO(inline): make work for hidden fields.
+	// @test(err, at=_schema.foo, code=structural_cycle)
+	// @test(shareID=S, at=x.foo.foo)
+
+	x: {_schema}
+	x: foo: disallowed: 5
+}
+nestedWithSelfReference: t2: {
+	_schema: close({
+		foo?: _schema
+	})
+	// TODO(inline): make work for hidden fields.
+	// @test(err, at=foo, code=structural_cycle)
+	x: {{_schema}}
+	x: foo: disallowed: 5
+}
+// issue1206: close() used to resolve an embedded disjunction before the
+// enclosing struct was unified with its concrete fields, so the default arm
+// was picked too early. https://cuelang.org/issue/1206
+issue1206: defaults: {
+	parameters: close({
+		name: string
+		port: int
+
+		{
+			name: "custom-port"
+		} | *{
+			port: 8080
+			name: "default-port"
+		}
+	})
+
+	// The concrete port selects the non-default arm, as it does when
+	// parameters is written as a definition instead.
+	custom: parameters & {
+		port: 9999
+	}
+}
+issue1206: elimination: {
+	x: close({
+		{
+			name: int
+		} | {
+			name: string
+		}
+	})
+
+	// Unifying with a concrete name leaves a single disjunct: only x is
+	// unresolved, which is what "cue eval -c" reports.
+	y: x & {
+		name: "Hello"
+	}
+}
+
+-- out/compile --
+--- embed.cue
+{
+  nestedEmbedded: {
+    base: close({
+      {
+        foo?: close({
+          foo?: _
+          allowed?: _
+        })
+      }
+      foo: {
+        allowed: 5
+      }
+    })
+  }
+  nestedEmbedded: {
+    t1: close({
+      {
+        {
+          foo?: close({
+            foo?: _
+            allowed?: _
+          })
+        }
+      }
+      foo: {
+        allowed: 5
+      }
+    })
+  }
+  nestedEmbedded: {
+    t2: close({
+      {
+        {
+          {
+            foo?: close({
+              foo?: _
+              allowed?: _
+            })
+          }
+        }
+      }
+      foo: {
+        allowed: 5
+      }
+    })
+  }
+  nestedEmbedded: {
+    strict: {
+      close({
+        foo?: close({
+          foo?: _
+        })
+      })
+      foo: {
+        allowed: 5
+      }
+    }
+  }
+  unified: {
+    base: {
+      x: close({
+        foo?: close({
+          foo?: _
+        })
+      })
+      x: {
+        foo: {
+          disallowed: 5
+        }
+      }
+    }
+  }
+  unified: {
+    t1: {
+      x: {
+        close({
+          foo?: close({
+            foo?: _
+          })
+        })
+      }
+      x: {
+        foo: {
+          disallowed: 5
+        }
+      }
+    }
+  }
+  unified: {
+    t2: {
+      x: {
+        {
+          close({
+            foo?: close({
+              foo?: _
+            })
+          })
+        }
+      }
+      x: {
+        foo: {
+          disallowed: 5
+        }
+      }
+    }
+  }
+  nestedWithSelfReference: {
+    t1: {
+      _schema: close({
+        foo?: 〈1;_schema〉
+      })
+      x: {
+        〈1;_schema〉
+      }
+      x: {
+        foo: {
+          disallowed: 5
+        }
+      }
+    }
+  }
+  nestedWithSelfReference: {
+    t2: {
+      _schema: close({
+        foo?: 〈1;_schema〉
+      })
+      x: {
+        {
+          〈2;_schema〉
+        }
+      }
+      x: {
+        foo: {
+          disallowed: 5
+        }
+      }
+    }
+  }
+  issue1206: {
+    defaults: {
+      parameters: close({
+        name: string
+        port: int
+        ({
+          name: "custom-port"
+        }|*{
+          port: 8080
+          name: "default-port"
+        })
+      })
+      custom: (〈0;parameters〉 & {
+        port: 9999
+      })
+    }
+  }
+  issue1206: {
+    elimination: {
+      x: close({
+        ({
+          name: int
+        }|{
+          name: string
+        })
+      })
+      y: (〈0;x〉 & {
+        name: "Hello"
+      })
+    }
+  }
+}
+--- in.cue
+{
+  a: close({
+    a: {
+      b: int
+    }
+  })
+  b: (〈0;a〉 & {
+    x: int
+  })
+  c: (〈0;a〉 & {
+    a: {
+      c: int
+    }
+  })
+  inDisjunctions: {
+    x: {
+      [string]: 〈1;#Def〉
+    }
+    #Def: {
+      [string]: {
+        a: {
+          b: true
+        }
+        let X#1 = 〈0;a〉
+        (close({
+          uint: {
+            a: {
+              b: 〈3;let X#1〉.b
+            }
+          }
+        })|close({
+          string: {
+            a: {
+              b: true
+            }
+          }
+        }))...
+      }
+    }
+    x: {
+      socket: {
+        string: {}
+      }
+    }
+    x: {
+      syslog: 〈1;x〉.socket
+    }
+    x: {
+      syslog: {
+        xxx: {}
+      }
+    }
+  }
+  issue642: {
+    test: close(({
+      a: _
+      b: {
+        x: _
+      }
+    } & {
+      [string]: {
+        y: _
+      }
+    }))
+    test: {
+      a: {
+        x: _
+      }
+    }
+    test: {
+      b: {
+        x: _
+      }
+    }
+  }
+  withSubfields: {
+    test: close({
+      a: _
+      b: {
+        x: _
+      }
+      [string]: {
+        y: _
+      }
+    })
+    test: {
+      a: {
+        x: _
+      }
+    }
+    test: {
+      b: {
+        x: _
+      }
+    }
+  }
+  issue3572: {
+    t1: (close({
+      ...
+    }) & {
+      a: 5
+    })
+    e: close({
+      ...
+    })
+    t2: (〈0;e〉 & {
+      a: 5
+    })
+  }
+  issue3580: {
+    x: close({
+      a: _
+      b: 〈1;x〉.a
+    })
+  }
+  embeddedDisjunction: {
+    v: close({
+      ({
+        a: 1
+      }|{
+        b: 1
+      })...
+      c: 2
+    })
+    t1: (〈0;v〉 & {
+      a: 1
+    })
+    t2: (〈0;v〉 & {
+      d: 3
+    })
+  }
+  issue3963: {
+    #A: {
+      a: string
+    }
+    #B: {
+      b: string
+    }
+    disjunction: ((〈0;#A〉|〈0;#B〉) & {
+      a: "x"
+    })
+    closed: (close((〈0;#A〉|〈0;#B〉)) & {
+      a: "x"
+    })
+    denied: (close((〈0;#A〉|〈0;#B〉)) & {
+      c: "x"
+    })
+    #D: (〈0;#A〉|〈0;#B〉)
+    definition: (〈0;#D〉 & {
+      a: "x"
+    })
+  }
+  disjunctValue: {
+    v: close(({
+      a?: int
+    }|*{
+      b?: int
+    }))
+    t1: (〈0;v〉 & {
+      b: 1
+    })
+    t2: (〈0;v〉 & {
+      a: 1
+    })
+    t3: (〈0;v〉 & {
+      c: 1
+    })
+    required: (close(({
+      a!: int
+    }|{
+      b!: int
+    })) & {
+      b: 1
+    })
+    pattern: (close(({
+      [string]: int
+    }|*{
+      b: int
+      [=~"^c"]: string
+    })) & {
+      b: 1
+      c: "x"
+    })
+    ellipsis: (close(({
+      a: 1
+      ...
+    }|{
+      b: 1
+    })) & {
+      c: 2
+    })
+  }
+}

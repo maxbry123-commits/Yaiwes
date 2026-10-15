@@ -1,0 +1,14 @@
+// NOTE: do not add more tests to this file, as it may obfuscate the test case.
+-- in.cue --
+a: #A
+a: c: 1
+#A: {}
+-- out/compile --
+--- in.cue
+{
+  a: 〈0;#A〉
+  a: {
+    c: 1
+  }
+  #A: {}
+}

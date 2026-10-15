@@ -1,0 +1,389 @@
+-- in.cue --
+import "list"
+
+expr: error1: {
+	a: 3
+	a: a + 1
+}
+expr: error2: {
+	a: a + 1
+	a: 3
+}
+listConcat: error1: {
+	a: ["1", "2"]
+	a: list.Concat([a, ["3"]])
+}
+
+listConcat: error2: {
+	a: list.Concat([["3"], a])
+	a: ["1", "2"]
+}
+
+selfEmbed: ok1: {
+	a: x
+	Y: x
+	x: {Y}
+}
+
+selfEmbed: ok2: {
+	Y: x.b
+	a: x
+	x: b: {Y}
+}
+
+selfEmbed: ok3: {
+	Y: x
+	a: x
+	x: {Y}
+}
+
+selfEmbed: ok4: {
+	a: x
+	x: {Y}
+	Y: x
+}
+
+selfEmbed: ok5: {
+	x: {Y}
+	a: x
+	Y: x
+}
+
+selfEmbed: ok6: {
+	x: b: {Y}
+	Y: x.b
+	a: x
+}
+
+
+disjSelf: ok1: {
+	#A: string | #A
+	x: #A
+}
+
+disjSelf: ok2: {
+	x: #A
+	#A: string | #A
+}
+
+disjSelf: ok3: {
+	#A: #A | string
+	x: #A
+}
+
+disjSelf: ok4: {
+	x: #A
+	#A: #A | string
+}
+
+disjEmbed: ok1: {
+	#A: string | {#A}
+	x: #A
+}
+
+disjEmbed: ok2: {
+	x: #A
+	#A: string | {#A}
+}
+
+disjEmbed: ok3: {
+	#A: {#A} | string
+	x: #A
+}
+
+disjEmbed: ok4: {
+	x: #A
+	#A: {#A} | string
+}
+
+// x and #A should yield the same result.
+disjList: _
+disjList: ok1: {
+	#A: string | [#A]
+	x: #A
+
+	y: x
+	y: [[[[string]]]]
+}
+
+disjList: ok2: {
+	x: #A
+	#A: string | [#A]
+}
+
+disjList: ok3: {
+	#A: [#A] | string
+	x: #A
+}
+
+disjList: ok4: {
+	x: #A
+	#A: [#A] | string
+}
+
+-- selfnew.cue --
+issue4125: t1_self: {
+	let Root = self
+	a: Root.a
+}
+// A struct literal that only embeds an expression has no value of its own, so
+// a reference to the enclosing field from within it is a cycle, as for the
+// bare ref fields; both as an operand and as a call argument. Optional fields
+// and patterns give it no value either: its kind is that of the embedding.
+structEmbed: cycle: {
+	ref1: ref1 + 1
+	ref2: div(ref2, 2)
+
+	lit1: {lit1 + 1}
+	lit2: {div(lit2, 2)}
+	lit3: {2 * div(lit3, 2)}
+	lit4: {b?: int, lit4 + 1}
+	val:  {b?: int, 3}
+}
+
+// A struct literal with a regular field, or without embeddings, is a struct:
+// an operation on it from within an embedding is a type error, not a cycle.
+structEmbed: struct: {
+	a: {}
+	a: a + 1
+}
+
+-- out/compile --
+--- in.cue
+{
+  expr: {
+    error1: {
+      a: 3
+      a: (〈0;a〉 + 1)
+    }
+  }
+  expr: {
+    error2: {
+      a: (〈0;a〉 + 1)
+      a: 3
+    }
+  }
+  listConcat: {
+    error1: {
+      a: [
+        "1",
+        "2",
+      ]
+      a: 〈import;list〉.Concat([
+        〈1;a〉,
+        [
+          "3",
+        ],
+      ])
+    }
+  }
+  listConcat: {
+    error2: {
+      a: 〈import;list〉.Concat([
+        [
+          "3",
+        ],
+        〈1;a〉,
+      ])
+      a: [
+        "1",
+        "2",
+      ]
+    }
+  }
+  selfEmbed: {
+    ok1: {
+      a: 〈0;x〉
+      Y: 〈0;x〉
+      x: {
+        〈1;Y〉
+      }
+    }
+  }
+  selfEmbed: {
+    ok2: {
+      Y: 〈0;x〉.b
+      a: 〈0;x〉
+      x: {
+        b: {
+          〈2;Y〉
+        }
+      }
+    }
+  }
+  selfEmbed: {
+    ok3: {
+      Y: 〈0;x〉
+      a: 〈0;x〉
+      x: {
+        〈1;Y〉
+      }
+    }
+  }
+  selfEmbed: {
+    ok4: {
+      a: 〈0;x〉
+      x: {
+        〈1;Y〉
+      }
+      Y: 〈0;x〉
+    }
+  }
+  selfEmbed: {
+    ok5: {
+      x: {
+        〈1;Y〉
+      }
+      a: 〈0;x〉
+      Y: 〈0;x〉
+    }
+  }
+  selfEmbed: {
+    ok6: {
+      x: {
+        b: {
+          〈2;Y〉
+        }
+      }
+      Y: 〈0;x〉.b
+      a: 〈0;x〉
+    }
+  }
+  disjSelf: {
+    ok1: {
+      #A: (string|〈0;#A〉)
+      x: 〈0;#A〉
+    }
+  }
+  disjSelf: {
+    ok2: {
+      x: 〈0;#A〉
+      #A: (string|〈0;#A〉)
+    }
+  }
+  disjSelf: {
+    ok3: {
+      #A: (〈0;#A〉|string)
+      x: 〈0;#A〉
+    }
+  }
+  disjSelf: {
+    ok4: {
+      x: 〈0;#A〉
+      #A: (〈0;#A〉|string)
+    }
+  }
+  disjEmbed: {
+    ok1: {
+      #A: (string|{
+        〈1;#A〉
+      })
+      x: 〈0;#A〉
+    }
+  }
+  disjEmbed: {
+    ok2: {
+      x: 〈0;#A〉
+      #A: (string|{
+        〈1;#A〉
+      })
+    }
+  }
+  disjEmbed: {
+    ok3: {
+      #A: ({
+        〈1;#A〉
+      }|string)
+      x: 〈0;#A〉
+    }
+  }
+  disjEmbed: {
+    ok4: {
+      x: 〈0;#A〉
+      #A: ({
+        〈1;#A〉
+      }|string)
+    }
+  }
+  disjList: _
+  disjList: {
+    ok1: {
+      #A: (string|[
+        〈1;#A〉,
+      ])
+      x: 〈0;#A〉
+      y: 〈0;x〉
+      y: [
+        [
+          [
+            [
+              string,
+            ],
+          ],
+        ],
+      ]
+    }
+  }
+  disjList: {
+    ok2: {
+      x: 〈0;#A〉
+      #A: (string|[
+        〈1;#A〉,
+      ])
+    }
+  }
+  disjList: {
+    ok3: {
+      #A: ([
+        〈1;#A〉,
+      ]|string)
+      x: 〈0;#A〉
+    }
+  }
+  disjList: {
+    ok4: {
+      x: 〈0;#A〉
+      #A: ([
+        〈1;#A〉,
+      ]|string)
+    }
+  }
+}
+--- selfnew.cue
+{
+  issue4125: {
+    t1_self: {
+      let Root#1 = 〈1〉
+      a: 〈0;let Root#1〉.a
+    }
+  }
+  structEmbed: {
+    cycle: {
+      ref1: (〈0;ref1〉 + 1)
+      ref2: div(〈0;ref2〉, 2)
+      lit1: {
+        (〈1;lit1〉 + 1)
+      }
+      lit2: {
+        div(〈1;lit2〉, 2)
+      }
+      lit3: {
+        (2 * div(〈1;lit3〉, 2))
+      }
+      lit4: {
+        b?: int
+        (〈1;lit4〉 + 1)
+      }
+      val: {
+        b?: int
+        3
+      }
+    }
+  }
+  structEmbed: {
+    struct: {
+      a: {}
+      a: (〈0;a〉 + 1)
+    }
+  }
+}

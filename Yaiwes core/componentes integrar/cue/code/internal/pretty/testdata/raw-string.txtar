@@ -1,0 +1,10 @@
+-- in --
+{
+x:      #"a raw string"#
+}
+-- out/relpos --
+{
+	x: #"a raw string"#
+}
+-- out/norelpos --
+{x: #"a raw string"#}

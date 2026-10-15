@@ -1,0 +1,24 @@
+# Tests that close() correctly rejects fields not present in the closed struct
+# when the closed value is later unified with an open struct adding new fields.
+# https://cuelang.org/issue/490
+-- test.cue --
+A: close({
+	a: 1
+	b: 2
+})
+
+B: A & {
+	c: 3
+}
+
+-- out/compile --
+--- test.cue
+{
+  A: close({
+    a: 1
+    b: 2
+  })
+  B: (〈0;A〉 & {
+    c: 3
+  })
+}

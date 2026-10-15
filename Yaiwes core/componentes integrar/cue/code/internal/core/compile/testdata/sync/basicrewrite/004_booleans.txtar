@@ -1,0 +1,17 @@
+-- in.cue --
+t: true
+t: !false
+f: false
+f: !t
+e: true
+e: !true
+-- out/compile --
+--- in.cue
+{
+  t: true
+  t: !false
+  f: false
+  f: !〈0;t〉
+  e: true
+  e: !true
+}

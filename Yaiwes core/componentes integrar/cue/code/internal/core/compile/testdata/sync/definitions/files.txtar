@@ -1,0 +1,61 @@
+// Treat fields of different files as belonging to the same struct.
+// This means that a closed embedding in one file should not restrict the
+// fields of another.
+# Pinned to v0.17.0: the subject is how a closed embedding in one file
+# constrains another file before explicitopen is stable.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- in.cue --
+package foo
+
+#theme: {
+	color:   string
+	ctermbg: string
+}
+dark: #theme & {
+	color:   "dark"
+	ctermbg: "239"
+}
+
+light: #theme & {
+	color:   "light"
+	ctermbg: "254"
+}
+
+#Config: {
+	console: dark | *light
+}
+-- box.cue --
+package foo
+
+#Config & {
+	console: dark
+}
+
+
+-- out/compile --
+--- box.cue
+{
+  (〈0;#Config〉 & {
+    console: 〈1;dark〉
+  })
+}
+--- in.cue
+{
+  #theme: {
+    color: string
+    ctermbg: string
+  }
+  dark: (〈0;#theme〉 & {
+    color: "dark"
+    ctermbg: "239"
+  })
+  light: (〈0;#theme〉 & {
+    color: "light"
+    ctermbg: "254"
+  })
+  #Config: {
+    console: (〈1;dark〉|*〈1;light〉)
+  }
+}

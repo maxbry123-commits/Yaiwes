@@ -1,0 +1,972 @@
+In this file we test cases where references are shadowed:
+- x: x: x
+- a newly created dynamic field which ends up shadowing an existing field.
+
+-- in.cue --
+shadowRef: t1: {
+	x: "x": x | null
+}
+
+shadowRef: t2: {
+	x: "x": "x": x | null
+}
+
+shadowRef: t3: {
+	x: "x": x: "x": x | null
+}
+
+shadowRef: t4: {
+	x~(X): {
+		x: X | null
+		y: x
+	}
+}
+
+shadowRef: t5: {
+	x~(X): x: X | null
+}
+
+shadowRef: e1: {
+	x: "x": x // structural error, but should still print ok.
+	x: {}
+}
+
+shadowAlias: t1: {
+	y: "outer"
+	a: {
+		key:       "y"
+		(key)~(X): "inner"
+
+		refs: {
+			"y"~(Z): 1
+			outer:   y
+			mid:     X
+			inner:   Z
+
+		}
+	}
+}
+
+shadowAlias: t2: {
+	a: {
+		key:       "y"
+		(key)~(X): "inner"
+
+		refs: {
+			"y"~(Z): 1
+			outer:   y
+			mid:     X
+			inner:   Z
+
+		}
+	}
+	y: "outer"
+}
+
+shadowField: t1: {
+	z: {
+		b~(A): 0
+		d: {
+			b: 1
+			c: A
+		}
+	}
+}
+
+shadowField: t2: {
+	z: {
+		b~(A): 0
+		d: {
+			b: 1
+			c: A
+		}
+	}
+	z: d: {A: 1}
+}
+
+shadowField: t4: {
+	merge: {
+		z: {
+			b~(A): 0
+			d: {
+				b: 1
+				c: A
+			}
+		}
+	}
+
+	merge: {
+		z: {
+			b~(A): 0
+			d: {
+				b: 1
+				c: A
+			}
+		}
+		z: d: {A: 1}
+	}
+}
+
+shadowField: t5: {
+	merge: {
+		b~(A): 0
+		d: {
+			b: 1
+			c: A
+		}
+	}
+	merge: {
+		b: 0
+		d: b: 1
+	}
+}
+
+// TODO: could be simplified to:
+// 		A=b: 0
+//  	c:   A
+// or even
+// 		b: 0
+//  	c: b
+shadowField: t6: {
+	x: {
+		b~(A): 0
+		c:     A
+	}
+	x: b: 0
+}
+
+shadowField: issue2378: {
+	a: {
+		b~(A): 0
+		d: {
+			b: 1
+			c: A & a.z
+		}
+	}
+}
+
+// The structs declaring the alias of a are exported from their arcs,
+// so y must not reference the label a, which b.a shadows.
+shadowField: recursive: {
+	T: {
+		a~(A): int
+		n?: {
+			T
+			b: {
+				a: string
+				y: A
+			}
+		}
+	}
+	v: T & {n: {}}
+}
+
+// The let clause is first used, and thus exported, where b is shadowed.
+shadowLet: {
+	b: 1
+	a: {
+		b: 10
+		let L = b
+		c: {
+			b: 20
+			d: L
+		}
+	}
+}
+-- out/definition --
+shadowRef: {
+	t1: x~(x_9): x: x_9 | null
+	t2: x~(x_B): x: x: x_B | null
+	t3: x: x: x~(x_6): x: x_6 | null
+	t4:
+		x~(X): {
+			x: X | null
+			y: x
+		}
+	t5:
+		x~(X): x: X | null
+	e1: x~(x_0): x: x_0
+}
+shadowAlias: {
+	t1: {
+		y: "outer"
+		a: {
+			key:       "y"
+			(key)~(X): "inner"
+			refs: {
+				"y"~(Z): 1
+				outer:   y
+				mid:     X
+				inner:   Z
+			}
+		}
+	}
+	t2: {
+		a: {
+			key:         "y"
+			(key)~(X_1): "inner"
+			refs: {
+				"y"~(Z): 1
+				outer:   y
+				mid:     X_1
+				inner:   Z
+			}
+		}
+		y: "outer"
+	}
+}
+shadowField: {
+	t1: z: {
+		b~(A): 0
+		d: {
+			b: 1
+			c: A
+		}
+	}
+	t2: z: {
+		{
+			b~(A): 0
+			d: {
+				b: 1
+				c: A
+			}
+		}
+		d: A: 1
+	}
+	t4: merge: z: {
+		{
+			b~(A): 0
+			d: {
+				b: 1
+				c: A
+			}
+		}
+		{
+			b~(A): 0
+			d: {
+				b: 1
+				c: A
+			}
+		}
+		d: A: 1
+	}
+	t5: merge: {
+		{
+			b~(A): 0
+			d: {
+				b: 1
+				c: A
+			}
+		}
+		b: 0
+		d: b: 1
+	}
+
+	// TODO: could be simplified to:
+	// 		A=b: 0
+	//  	c:   A
+	// or even
+	// 		b: 0
+	//  	c: b
+	t6: x: {
+		{
+			b~(A): 0
+			c:     A
+		}
+		b: 0
+	}
+	issue2378: a: {
+		b~(A): 0
+		d: {
+			b: 1
+			c: A & a.z
+		}
+	}
+
+	// The structs declaring the alias of a are exported from their arcs,
+	// so y must not reference the label a, which b.a shadows.
+	recursive: {
+		T: {
+			a~(A): int
+			n?: {
+				T
+				b: {
+					a: string
+					y: A
+				}
+			}
+		}
+		v: T & {n: {}}
+	}
+}
+
+// The let clause is first used, and thus exported, where b is shadowed.
+shadowLet: {
+	b: 1
+	a: {
+		let L = b
+		b: 10
+		c: {
+			b: 20
+			d: L
+		}
+	}
+}
+-- out/doc --
+[]
+[shadowRef]
+[shadowRef t1]
+[shadowRef t1 x]
+[shadowRef t1 x x]
+[shadowRef t2]
+[shadowRef t2 x]
+[shadowRef t2 x x]
+[shadowRef t2 x x x]
+[shadowRef t3]
+[shadowRef t3 x]
+[shadowRef t3 x x]
+[shadowRef t3 x x x]
+[shadowRef t3 x x x x]
+[shadowRef t4]
+[shadowRef t4 x]
+[shadowRef t4 x x]
+[shadowRef t4 x y]
+[shadowRef t5]
+[shadowRef t5 x]
+[shadowRef t5 x x]
+[shadowRef e1]
+[shadowRef e1 x]
+[shadowRef e1 x x]
+[shadowAlias]
+[shadowAlias t1]
+[shadowAlias t1 y]
+[shadowAlias t1 a]
+[shadowAlias t1 a key]
+[shadowAlias t1 a refs]
+[shadowAlias t1 a refs y]
+[shadowAlias t1 a refs outer]
+[shadowAlias t1 a refs mid]
+[shadowAlias t1 a refs inner]
+[shadowAlias t1 a y]
+[shadowAlias t2]
+[shadowAlias t2 a]
+[shadowAlias t2 a key]
+[shadowAlias t2 a refs]
+[shadowAlias t2 a refs y]
+[shadowAlias t2 a refs outer]
+[shadowAlias t2 a refs mid]
+[shadowAlias t2 a refs inner]
+[shadowAlias t2 a y]
+[shadowAlias t2 y]
+[shadowField]
+[shadowField t1]
+[shadowField t1 z]
+[shadowField t1 z b]
+[shadowField t1 z d]
+[shadowField t1 z d b]
+[shadowField t1 z d c]
+[shadowField t2]
+[shadowField t2 z]
+[shadowField t2 z b]
+[shadowField t2 z d]
+[shadowField t2 z d b]
+[shadowField t2 z d c]
+[shadowField t2 z d A]
+[shadowField t4]
+[shadowField t4 merge]
+[shadowField t4 merge z]
+[shadowField t4 merge z b]
+[shadowField t4 merge z d]
+[shadowField t4 merge z d b]
+[shadowField t4 merge z d c]
+[shadowField t4 merge z d A]
+[shadowField t5]
+[shadowField t5 merge]
+[shadowField t5 merge b]
+[shadowField t5 merge d]
+[shadowField t5 merge d b]
+[shadowField t5 merge d c]
+[shadowField t6]
+- TODO: could be simplified to:
+		A=b: 0
+ 	c:   A
+or even
+		b: 0
+ 	c: b
+
+[shadowField t6 x]
+[shadowField t6 x b]
+[shadowField t6 x c]
+[shadowField issue2378]
+[shadowField issue2378 a]
+[shadowField issue2378 a b]
+[shadowField issue2378 a d]
+[shadowField issue2378 a d b]
+[shadowField issue2378 a d c]
+[shadowField recursive]
+- The structs declaring the alias of a are exported from their arcs,
+so y must not reference the label a, which b.a shadows.
+
+[shadowField recursive T]
+[shadowField recursive T a]
+[shadowField recursive T n]
+[shadowField recursive T n b]
+[shadowField recursive T n b a]
+[shadowField recursive T n b y]
+[shadowField recursive T n a]
+[shadowField recursive T n n]
+[shadowField recursive v]
+[shadowField recursive v n]
+[shadowField recursive v n b]
+[shadowField recursive v n b a]
+[shadowField recursive v n b y]
+[shadowField recursive v n a]
+[shadowField recursive v n n]
+[shadowField recursive v n n b]
+[shadowField recursive v n n b a]
+[shadowField recursive v n n b y]
+[shadowField recursive v n n a]
+[shadowField recursive v n n n]
+[shadowField recursive v a]
+[shadowLet]
+- The let clause is first used, and thus exported, where b is shadowed.
+
+[shadowLet b]
+[shadowLet a]
+[shadowLet a b]
+[shadowLet a L]
+[shadowLet a c]
+[shadowLet a c b]
+[shadowLet a c d]
+-- out/value-v3 --
+== Simplified
+_|_ // shadowRef.e1.x.x: structural cycle
+== Raw
+_|_ // shadowRef.e1.x.x: structural cycle
+== Final
+_|_ // shadowRef.e1.x.x: structural cycle
+== All
+{
+	shadowRef: {
+		t1: x: x: null
+		t2: x: x: x: null
+		t3: x: x: x: x: null
+		t4: x: {
+			x: null
+			y: null
+		}
+		t5: x: x: null
+		e1: x: x: _|_ // shadowRef.e1.x.x: structural cycle
+	}
+	shadowAlias: {
+		t1: {
+			y: "outer"
+			a: {
+				key: "y"
+				y:   "inner"
+				refs: {
+					y:     1
+					outer: "outer"
+					mid:   "inner"
+					inner: 1
+				}
+			}
+		}
+		t2: {
+			a: {
+				key: "y"
+				y:   "inner"
+				refs: {
+					y:     1
+					outer: "outer"
+					mid:   "inner"
+					inner: 1
+				}
+			}
+			y: "outer"
+		}
+	}
+	shadowField: {
+		t1: z: {
+			b: 0
+			d: {
+				b: 1
+				c: 0
+			}
+		}
+		t2: z: {
+			b: 0
+			d: {
+				b: 1
+				c: 0
+				A: 1
+			}
+		}
+		t4: merge: z: {
+			b: 0
+			d: {
+				b: 1
+				c: 0
+				A: 1
+			}
+		}
+		t5: merge: {
+			b: 0
+			d: {
+				b: 1
+				c: 0
+			}
+		}
+
+		// TODO: could be simplified to:
+		// 		A=b: 0
+		//  	c:   A
+		// or even
+		// 		b: 0
+		//  	c: b
+		t6: x: {
+			b: 0
+			c: 0
+		}
+		issue2378: a: {
+			b: 0
+			d: {
+				b: 1
+				c: A & a.z
+			}
+		}
+
+		// The structs declaring the alias of a are exported from their arcs,
+		// so y must not reference the label a, which b.a shadows.
+		recursive: {
+			T: {
+				a: int
+				n?: {
+					a: int
+					n?: {
+						T
+						b: {
+							a: string
+							y: A
+						}
+					}
+					b: {
+						a: string
+						y: int
+					}
+				}
+			}
+			v: {
+				a: int
+				n: {
+					a: int
+					n?: {
+						a: int
+						b: {
+							a: string
+							y: int
+						}
+						n?: {
+							T
+							b: {
+								a: string
+								y: A
+							}
+						}
+					}
+					b: {
+						a: string
+						y: int
+					}
+				}
+			}
+		}
+	}
+
+	// The let clause is first used, and thus exported, where b is shadowed.
+	shadowLet: {
+		b: 1
+		a: {
+			b: 10
+			c: {
+				b: 20
+				d: 10
+			}
+		}
+	}
+}
+== Eval
+_|_ // shadowRef.e1.x.x: structural cycle
+-- diff/-out/value-v3<==>+out/value --
+diff old new
+--- old
++++ new
+@@ -1,49 +1,21 @@
+ == Simplified
+-_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
++_|_ // shadowRef.e1.x.x: structural cycle
+ == Raw
+-_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
++_|_ // shadowRef.e1.x.x: structural cycle
+ == Final
+-_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
++_|_ // shadowRef.e1.x.x: structural cycle
+ == All
+ {
+ 	shadowRef: {
+-		t1: {
+-			x: {
+-				x: null
+-			}
+-		}
+-		t2: {
+-			x: {
+-				x: {
+-					x: null
+-				}
+-			}
+-		}
+-		t3: {
+-			x: {
+-				x: {
+-					x: {
+-						x: null
+-					}
+-				}
+-			}
+-		}
+-		t4: {
+-			x: {
+-				x: null
+-				y: null
+-			}
+-		}
+-		t5: {
+-			x: {
+-				x: null
+-			}
+-		}
+-		e1: {
+-			x: {
+-				x: _|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
+-			}
+-		}
++		t1: x: x: null
++		t2: x: x: x: null
++		t3: x: x: x: x: null
++		t4: x: {
++			x: null
++			y: null
++		}
++		t5: x: x: null
++		e1: x: x: _|_ // shadowRef.e1.x.x: structural cycle
+ 	}
+ 	shadowAlias: {
+ 		t1: {
+@@ -74,44 +46,34 @@
+ 		}
+ 	}
+ 	shadowField: {
+-		t1: {
+-			z: {
+-				b: 0
+-				d: {
+-					b: 1
+-					c: 0
+-				}
+-			}
+-		}
+-		t2: {
+-			z: {
+-				b: 0
+-				d: {
+-					b: 1
+-					c: 0
+-					A: 1
+-				}
+-			}
+-		}
+-		t4: {
+-			merge: {
+-				z: {
+-					b: 0
+-					d: {
+-						b: 1
+-						c: 0
+-						A: 1
+-					}
+-				}
+-			}
+-		}
+-		t5: {
+-			merge: {
+-				b: 0
+-				d: {
+-					b: 1
+-					c: 0
+-				}
++		t1: z: {
++			b: 0
++			d: {
++				b: 1
++				c: 0
++			}
++		}
++		t2: z: {
++			b: 0
++			d: {
++				b: 1
++				c: 0
++				A: 1
++			}
++		}
++		t4: merge: z: {
++			b: 0
++			d: {
++				b: 1
++				c: 0
++				A: 1
++			}
++		}
++		t5: merge: {
++			b: 0
++			d: {
++				b: 1
++				c: 0
+ 			}
+ 		}
+ 
+@@ -121,22 +83,76 @@
+ 		// or even
+ 		// 		b: 0
+ 		//  	c: b
+-		t6: {
+-			x: {
+-				b: 0
+-				c: 0
+-			}
+-		}
+-		issue2378: {
+-			a: {
+-				b: 0
+-				d: {
+-					b: 1
+-					c: A & a.z
+-				}
++		t6: x: {
++			b: 0
++			c: 0
++		}
++		issue2378: a: {
++			b: 0
++			d: {
++				b: 1
++				c: A & a.z
++			}
++		}
++
++		// The structs declaring the alias of a are exported from their arcs,
++		// so y must not reference the label a, which b.a shadows.
++		recursive: {
++			T: {
++				a: int
++				n?: {
++					a: int
++					n?: {
++						T
++						b: {
++							a: string
++							y: A
++						}
++					}
++					b: {
++						a: string
++						y: int
++					}
++				}
++			}
++			v: {
++				a: int
++				n: {
++					a: int
++					n?: {
++						a: int
++						b: {
++							a: string
++							y: int
++						}
++						n?: {
++							T
++							b: {
++								a: string
++								y: A
++							}
++						}
++					}
++					b: {
++						a: string
++						y: int
++					}
++				}
++			}
++		}
++	}
++
++	// The let clause is first used, and thus exported, where b is shadowed.
++	shadowLet: {
++		b: 1
++		a: {
++			b: 10
++			c: {
++				b: 20
++				d: 10
+ 			}
+ 		}
+ 	}
+ }
+ == Eval
+-_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
++_|_ // shadowRef.e1.x.x: structural cycle
+-- out/value --
+== Simplified
+_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
+== Raw
+_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
+== Final
+_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
+== All
+{
+	shadowRef: {
+		t1: {
+			x: {
+				x: null
+			}
+		}
+		t2: {
+			x: {
+				x: {
+					x: null
+				}
+			}
+		}
+		t3: {
+			x: {
+				x: {
+					x: {
+						x: null
+					}
+				}
+			}
+		}
+		t4: {
+			x: {
+				x: null
+				y: null
+			}
+		}
+		t5: {
+			x: {
+				x: null
+			}
+		}
+		e1: {
+			x: {
+				x: _|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)
+			}
+		}
+	}
+	shadowAlias: {
+		t1: {
+			y: "outer"
+			a: {
+				key: "y"
+				y:   "inner"
+				refs: {
+					y:     1
+					outer: "outer"
+					mid:   "inner"
+					inner: 1
+				}
+			}
+		}
+		t2: {
+			a: {
+				key: "y"
+				y:   "inner"
+				refs: {
+					y:     1
+					outer: "outer"
+					mid:   "inner"
+					inner: 1
+				}
+			}
+			y: "outer"
+		}
+	}
+	shadowField: {
+		t1: {
+			z: {
+				b: 0
+				d: {
+					b: 1
+					c: 0
+				}
+			}
+		}
+		t2: {
+			z: {
+				b: 0
+				d: {
+					b: 1
+					c: 0
+					A: 1
+				}
+			}
+		}
+		t4: {
+			merge: {
+				z: {
+					b: 0
+					d: {
+						b: 1
+						c: 0
+						A: 1
+					}
+				}
+			}
+		}
+		t5: {
+			merge: {
+				b: 0
+				d: {
+					b: 1
+					c: 0
+				}
+			}
+		}
+
+		// TODO: could be simplified to:
+		// 		A=b: 0
+		//  	c:   A
+		// or even
+		// 		b: 0
+		//  	c: b
+		t6: {
+			x: {
+				b: 0
+				c: 0
+			}
+		}
+		issue2378: {
+			a: {
+				b: 0
+				d: {
+					b: 1
+					c: A & a.z
+				}
+			}
+		}
+	}
+}
+== Eval
+_|_ // shadowRef.e1.x.x: structural cycle (and 1 more errors)

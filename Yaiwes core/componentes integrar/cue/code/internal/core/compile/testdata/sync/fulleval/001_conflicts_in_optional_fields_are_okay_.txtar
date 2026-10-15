@@ -1,0 +1,20 @@
+#name: conflicts in optional fields are okay
+#evalFull
+-- in.cue --
+d: {a: 1, b?: 3} | {a: 2}
+
+// the following conjunction should not eliminate any disjuncts
+c: d & {b?: 4}
+-- out/compile --
+--- in.cue
+{
+  d: ({
+    a: 1
+    b?: 3
+  }|{
+    a: 2
+  })
+  c: (〈0;d〉 & {
+    b?: 4
+  })
+}

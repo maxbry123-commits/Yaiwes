@@ -1,0 +1,17 @@
+# Tests that unifying a struct with a disjunction where neither branch matches reports
+# an empty disjunction error. Issue #23.
+-- in.cue --
+x: {a: 1} | {a: 2}
+y: x & {a: 3}
+-- out/compile --
+--- in.cue
+{
+  x: ({
+    a: 1
+  }|{
+    a: 2
+  })
+  y: (〈0;x〉 & {
+    a: 3
+  })
+}

@@ -1,0 +1,11 @@
+-- in.cue --
+a: *"a" | "b"
+b: *"b" | "a"
+c: a & b
+-- out/compile --
+--- in.cue
+{
+  a: (*"a"|"b")
+  b: (*"b"|"a")
+  c: (〈0;a〉 & 〈0;b〉)
+}
