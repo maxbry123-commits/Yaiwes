@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1307913,
+  "bundle_sha256": "1e547e822acd354e2a48099fd86a1b9ee8c4958302ef452590454b91347d636f",
+  "extracted_tree": {
+    "bytes": 3783610,
+    "files": 337,
+    "sha256": "577665b6f78a51824f36a49a1354c92204527afee5c9b3636f87e099e442fd2b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1307913,
+      "name": "BehaviorTree.CPP.bundle.zip.part-0001",
+      "sha256": "1e547e822acd354e2a48099fd86a1b9ee8c4958302ef452590454b91347d636f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "BehaviorTree.CPP",
+  "source_bytes": 3783610,
+  "source_commit": "03ec870a07b384f0766bbfe81f77c64a9f994a2b",
+  "source_files": 337,
+  "source_ref": "master",
+  "source_repo": "BehaviorTree/BehaviorTree.CPP",
+  "source_tree": {
+    "bytes": 3783610,
+    "files": 337,
+    "sha256": "577665b6f78a51824f36a49a1354c92204527afee5c9b3636f87e099e442fd2b"
+  }
+}
