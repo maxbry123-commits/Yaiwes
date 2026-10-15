@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 15494841,
+  "bundle_sha256": "54f2e601788b2d8bc38992b0aa1b999c03e4fa0e5d2585f892732dddf4c18a81",
+  "extracted_tree": {
+    "bytes": 35088569,
+    "files": 594,
+    "sha256": "b32e44dc92a52c05d3a1ffc1e8e615efe3f3421c7798be8cc5d39fc28938c145"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "Dream.bundle.zip.part-0001",
+      "sha256": "f5ea2fb4dd5334aa10209f685eb9f8ea91b816203e9238e94d400dc5cbd9bb2a"
+    },
+    {
+      "bytes": 2911929,
+      "name": "Dream.bundle.zip.part-0002",
+      "sha256": "eeaf507e2c9f0702ea29a951a5df8f699ded04f8c4851a189f8ee9ec2b5eebf2"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "Dream",
+  "source_bytes": 35088569,
+  "source_commit": "31f94a60d187e3fd481fee3bbc2c732eb94a879c",
+  "source_files": 594,
+  "source_ref": "main",
+  "source_repo": "DreamLM/Dream",
+  "source_tree": {
+    "bytes": 35088569,
+    "files": 594,
+    "sha256": "b32e44dc92a52c05d3a1ffc1e8e615efe3f3421c7798be8cc5d39fc28938c145"
+  }
+}
