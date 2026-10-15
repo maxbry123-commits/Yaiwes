@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 364336,
+  "bundle_sha256": "7fc1b74d57fb3c55f150be1e9b67c9b065d3cf7fa5b7948b30f87f0fa97dec8d",
+  "extracted_tree": {
+    "bytes": 1473656,
+    "files": 82,
+    "sha256": "a828e83f6ab9052706aff245be29190840d5146196f9c17d0a8fc27937c27bc6"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 364336,
+      "name": "recurrent-pretraining.bundle.zip.part-0001",
+      "sha256": "7fc1b74d57fb3c55f150be1e9b67c9b065d3cf7fa5b7948b30f87f0fa97dec8d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "recurrent-pretraining",
+  "source_bytes": 1473656,
+  "source_commit": "1ea7220ec7eb42d13e89db0663df254d0bcdc28e",
+  "source_files": 82,
+  "source_ref": "main",
+  "source_repo": "seal-rg/recurrent-pretraining",
+  "source_tree": {
+    "bytes": 1473656,
+    "files": 82,
+    "sha256": "a828e83f6ab9052706aff245be29190840d5146196f9c17d0a8fc27937c27bc6"
+  }
+}
