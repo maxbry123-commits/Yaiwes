@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 3288778,
+  "bundle_sha256": "1595d56da3e082db3cbac5407aa47538d275032ad1c72be4f54381309e83a3c0",
+  "extracted_tree": {
+    "bytes": 9773773,
+    "files": 545,
+    "sha256": "9908bd833eb1615113c442f9ee941a68e9c403dae4850bba98f057225752760e"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 3288778,
+      "name": "android_world.bundle.zip.part-0001",
+      "sha256": "1595d56da3e082db3cbac5407aa47538d275032ad1c72be4f54381309e83a3c0"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "android_world",
+  "source_bytes": 9773773,
+  "source_commit": "30583e22b9fbb8f32f109d3214153517b6f9b8e4",
+  "source_files": 545,
+  "source_ref": "main",
+  "source_repo": "google-research/android_world",
+  "source_tree": {
+    "bytes": 9773773,
+    "files": 545,
+    "sha256": "9908bd833eb1615113c442f9ee941a68e9c403dae4850bba98f057225752760e"
+  }
+}
