@@ -1,0 +1,50 @@
+{
+  "bundle_bytes": 43160695,
+  "bundle_sha256": "edf4f2b7754f0bb7b5b9d72e060f800e845a60870c93068ff377a6ea880a3002",
+  "extracted_tree": {
+    "bytes": 88567450,
+    "files": 5445,
+    "sha256": "a4342f4a770bd6cafa51474848101c58aeacbc5c80ffde0d74f81bb44526ab30"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "prefect.bundle.zip.part-0001",
+      "sha256": "a39bb7ebc2e4d5ed0dc4666050bd2bb10615fc4603933769ff940a22ec121606"
+    },
+    {
+      "bytes": 12582912,
+      "name": "prefect.bundle.zip.part-0002",
+      "sha256": "80b76f313c9ca4e291f1c24cf07de101e2613a80625c239582915eb4da1266ab"
+    },
+    {
+      "bytes": 12582912,
+      "name": "prefect.bundle.zip.part-0003",
+      "sha256": "fb0952124e0fbae6bfa16ad573756b878d445cb34d6698f54e941e9214634b17"
+    },
+    {
+      "bytes": 5411959,
+      "name": "prefect.bundle.zip.part-0004",
+      "sha256": "27b7c5369a0a74c9f95aa124de273402fe85032ed9e00898c9e31588961d27d7"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "prefect",
+  "source_bytes": 88567450,
+  "source_commit": "302beb37eb79cd6ba37fcaa9fa002c4429b45702",
+  "source_files": 5445,
+  "source_ref": "main",
+  "source_repo": "PrefectHQ/prefect",
+  "source_tree": {
+    "bytes": 88567450,
+    "files": 5445,
+    "sha256": "a4342f4a770bd6cafa51474848101c58aeacbc5c80ffde0d74f81bb44526ab30"
+  }
+}
