@@ -1,0 +1,86 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package errors
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/usecases/license"
+	"github.com/weaviate/weaviate/usecases/namespaces"
+	"github.com/weaviate/weaviate/usecases/schema/namespacing"
+)
+
+// HTTPStatusForNamespaceErr maps a missing license key to 403, a resuming
+// namespace to 503, and the other lifecycle errors (deleting, not-empty,
+// invalid-state, suspended, invalid-transition) to 422. ok is false for any other err.
+func HTTPStatusForNamespaceErr(err error) (status int, ok bool) {
+	switch {
+	case errors.Is(err, license.ErrRequired):
+		return http.StatusForbidden, true
+	case errors.Is(err, namespaces.ErrNamespaceResuming):
+		return http.StatusServiceUnavailable, true
+	case errors.Is(err, namespaces.ErrNamespaceDeleting),
+		errors.Is(err, namespaces.ErrNamespaceNotEmpty),
+		errors.Is(err, namespaces.ErrInvalidState),
+		errors.Is(err, namespaces.ErrNamespaceSuspended),
+		errors.Is(err, namespaces.ErrCollectionSuspended),
+		errors.Is(err, namespaces.ErrInvalidStateTransition):
+		return http.StatusUnprocessableEntity, true
+	default:
+		return 0, false
+	}
+}
+
+// NamespaceErrRendersUnprocessable reports whether err is a namespace-state
+// error the caller should see as a 422 rather than a 500. A resuming namespace
+// is excluded: it asks for 503, which most operations have no responder for.
+func NamespaceErrRendersUnprocessable(err error) bool {
+	// HTTPStatusForNamespaceErr reports ok=false for ErrNamespaceGone, which
+	// would otherwise fall through to a 500 instead of a 422.
+	if errors.Is(err, namespaces.ErrNamespaceGone) {
+		return true
+	}
+	status, ok := HTTPStatusForNamespaceErr(err)
+	return ok && status == http.StatusUnprocessableEntity
+}
+
+// ErrPayloadFromSingleErr builds a single-message ErrorResponse with the
+// principal's own namespace prefix stripped from err. Pass nil for global
+// callers to leave the message unchanged. A nil err is tolerated and yields
+// fmt's standard "<nil>" rendering rather than panicking, since this helper
+// sits on dozens of REST error paths and a missed err-guard upstream should
+// not crash the handler. The namespace is stripped before the docs link is
+// appended: a namespace named "https" must not cut the link's scheme.
+func ErrPayloadFromSingleErr(principal *models.Principal, err error) *models.ErrorResponse {
+	msg := namespacing.StripErrorMessage(principal, fmt.Sprintf("%v", err))
+	return &models.ErrorResponse{Error: []*models.ErrorResponseErrorItems0{{
+		Message: enterrors.AppendDocsLink(msg, err),
+	}}}
+}
+
+// ErrRestrictionViolation wraps a non-restriction error into the
+// same RestrictionViolationResponse shape so handlers can return both
+// 422 cases through the same swagger-generated payload type. Like
+// ErrPayloadFromSingleErr, the namespace is stripped before the docs
+// link is appended.
+func ErrRestrictionViolation(principal *models.Principal, err error) *models.RestrictionViolationResponse {
+	msg := namespacing.StripErrorMessage(principal, fmt.Sprintf("%v", err))
+	return &models.RestrictionViolationResponse{
+		Error: []*models.RestrictionViolationResponseErrorItems0{{
+			Message: enterrors.AppendDocsLink(msg, err),
+		}},
+	}
+}

@@ -1,0 +1,462 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package v1
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/usecases/auth/authorization"
+	"github.com/weaviate/weaviate/usecases/monitoring"
+	"github.com/weaviate/weaviate/usecases/queryadmission"
+	"github.com/weaviate/weaviate/usecases/schema"
+	"github.com/weaviate/weaviate/usecases/schema/namespacing"
+
+	"github.com/sirupsen/logrus"
+	"github.com/weaviate/weaviate/adapters/handlers/grpc/v1/auth"
+	"github.com/weaviate/weaviate/adapters/handlers/grpc/v1/batch"
+	restCtx "github.com/weaviate/weaviate/adapters/handlers/rest/context"
+	"github.com/weaviate/weaviate/adapters/handlers/rest/state"
+	"github.com/weaviate/weaviate/adapters/repos/db/helpers"
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+
+	"github.com/weaviate/weaviate/usecases/config"
+
+	"github.com/weaviate/weaviate/usecases/objects"
+
+	"github.com/weaviate/weaviate/entities/additional"
+	"github.com/weaviate/weaviate/entities/dto"
+	schemaEnt "github.com/weaviate/weaviate/entities/schema"
+	pb "github.com/weaviate/weaviate/grpc/generated/protocol/v1"
+	"github.com/weaviate/weaviate/usecases/auth/authentication/composer"
+	"github.com/weaviate/weaviate/usecases/traverser"
+)
+
+var (
+	NUMCPU                     = runtime.GOMAXPROCS(0)
+	MaxBatchObjectsConcurrency = int64(4 * NUMCPU)
+)
+
+type Service struct {
+	pb.UnimplementedWeaviateServer
+	traverser            *traverser.Traverser
+	authComposer         composer.TokenFunc
+	allowAnonymousAccess bool
+	schemaManager        *schema.Manager
+	batchManager         *objects.BatchManager
+	config               *config.Config
+	authorizer           authorization.Authorizer
+	logger               logrus.FieldLogger
+	qualifier            namespacing.Qualifier
+
+	authenticator      *auth.Handler
+	batchHandler       batch.Batcher
+	batchStreamHandler *batch.StreamHandler
+	batchObjectsSem    *semaphore.Weighted
+}
+
+func NewService(allowAnonymous bool, authComposer composer.TokenFunc, state *state.State) (*Service, batch.Drain) {
+	authenticator := auth.NewHandler(allowAnonymous, authComposer)
+	batchHandler := batch.NewHandler(
+		state.Authorizer,
+		state.BatchManager,
+		state.Logger,
+		authenticator,
+		state.SchemaManager,
+		state.NamespaceQualifier,
+	)
+	batchStreamHandler, batchDrain := batch.Start(
+		authenticator,
+		state.Authorizer,
+		batchHandler,
+		state.SchemaManager,
+		prometheus.DefaultRegisterer,
+		state.ServerConfig.Config.BatchStream.Workers(),
+		state.Logger,
+		state.NamespaceQualifier,
+		batch.WithStreamConfig(state.ServerConfig.Config.BatchStream),
+	)
+	return &Service{
+		traverser:            state.Traverser,
+		authComposer:         authComposer,
+		allowAnonymousAccess: state.ServerConfig.Config.Authentication.AnonymousAccess.Enabled,
+		schemaManager:        state.SchemaManager,
+		batchManager:         state.BatchManager,
+		config:               &state.ServerConfig.Config,
+		logger:               state.Logger,
+		authorizer:           state.Authorizer,
+		qualifier:            state.NamespaceQualifier,
+		authenticator:        authenticator,
+		batchHandler:         batchHandler,
+		batchStreamHandler:   batchStreamHandler,
+		batchObjectsSem:      semaphore.NewWeighted(MaxBatchObjectsConcurrency),
+	}, batchDrain
+}
+
+func (s *Service) Aggregate(ctx context.Context, req *pb.AggregateRequest) (*pb.AggregateReply, error) {
+	var result *pb.AggregateReply
+	var errInner error
+
+	if err := enterrors.GoWrapperWithBlock(func() {
+		result, errInner = s.aggregate(ctx, req)
+	}, s.logger); err != nil {
+		return nil, err
+	}
+
+	// Aggregations are not admitted themselves, but a cross-reference in the
+	// where filter runs a nested object search that is.
+	if grpcErr := admissionToGRPCError(errInner); grpcErr != nil {
+		return nil, grpcErr
+	}
+
+	return result, errInner
+}
+
+func (s *Service) aggregate(ctx context.Context, req *pb.AggregateRequest) (reply *pb.AggregateReply, retErr error) {
+	before := time.Now()
+
+	principal, err := s.authenticator.PrincipalFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("extract auth: %w", err)
+	}
+	defer func() { retErr = namespacing.StripErrForPrincipal(principal, retErr) }()
+	ctx = restCtx.AddPrincipalToContext(ctx, principal)
+
+	if req.Collection, _, err = namespacing.Resolve(principal, s.schemaManager, s.qualifier, req.Collection); err != nil {
+		return nil, err
+	}
+
+	getClass := s.classGetterWithAuthzFunc(ctx, principal, req.Tenant)
+	parser := NewAggregateParser(
+		getClass,
+		s.qualifier,
+		principal,
+	)
+
+	params, err := parser.Aggregate(req)
+	if err != nil {
+		return nil, fmt.Errorf("parse params: %w", err)
+	}
+
+	res, err := s.traverser.Aggregate(restCtx.AddPrincipalToContext(ctx, principal), principal, params)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate: %w", err)
+	}
+
+	replier := NewAggregateReplier(
+		principal,
+		getClass,
+		params,
+	)
+	reply, err = replier.Aggregate(res, params.GroupBy != nil)
+	if err != nil {
+		return nil, fmt.Errorf("prepare reply: %w", err)
+	}
+
+	reply.Took = float32(time.Since(before).Seconds())
+	return reply, nil
+}
+
+func (s *Service) TenantsGet(ctx context.Context, req *pb.TenantsGetRequest) (reply *pb.TenantsGetReply, retErr error) {
+	before := time.Now()
+
+	principal, err := s.authenticator.PrincipalFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("extract auth: %w", err)
+	}
+	defer func() { retErr = namespacing.StripErrForPrincipal(principal, retErr) }()
+	ctx = restCtx.AddPrincipalToContext(ctx, principal)
+
+	retTenants, err := s.tenantsGet(ctx, principal, req)
+	if err != nil {
+		return nil, fmt.Errorf("get tenants: %w", err)
+	}
+
+	result := &pb.TenantsGetReply{
+		Took:    float32(time.Since(before).Seconds()),
+		Tenants: retTenants,
+	}
+	return result, nil
+}
+
+func (s *Service) BatchDelete(ctx context.Context, req *pb.BatchDeleteRequest) (*pb.BatchDeleteReply, error) {
+	batch.CountConsistencyLevel(monitoring.ConsistencyLevelWrite, req.ConsistencyLevel)
+	var result *pb.BatchDeleteReply
+	var errInner error
+
+	if err := enterrors.GoWrapperWithBlock(func() {
+		result, errInner = s.batchDelete(ctx, req)
+	}, s.logger); err != nil {
+		return nil, err
+	}
+
+	return result, errInner
+}
+
+func (s *Service) batchDelete(ctx context.Context, req *pb.BatchDeleteRequest) (reply *pb.BatchDeleteReply, retErr error) {
+	before := time.Now()
+	principal, err := s.authenticator.PrincipalFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("extract auth: %w", err)
+	}
+	defer func() { retErr = namespacing.StripErrForPrincipal(principal, retErr) }()
+	ctx = restCtx.AddPrincipalToContext(ctx, principal)
+
+	replicationProperties := extractReplicationProperties(req.ConsistencyLevel)
+
+	tenant := ""
+	if req.Tenant != nil {
+		tenant = *req.Tenant
+	}
+
+	if req.Collection, _, err = namespacing.Resolve(principal, s.schemaManager, s.qualifier, req.Collection); err != nil {
+		return nil, err
+	}
+
+	if err := s.authorizer.Authorize(ctx, principal, authorization.DELETE, authorization.ShardsData(req.Collection, tenant)...); err != nil {
+		return nil, err
+	}
+
+	// classGetterWithAuthzFunc's READ also requires an active namespace, so a missing DELETE is refused first.
+	params, err := batchDeleteParamsFromProto(req, s.classGetterWithAuthzFunc(ctx, principal, tenant), s.qualifier, principal)
+	if err != nil {
+		return nil, fmt.Errorf("batch delete params: %w", err)
+	}
+
+	response, err := s.batchManager.DeleteObjectsFromGRPCAfterAuth(ctx, principal, params, replicationProperties, tenant)
+	if err != nil {
+		return nil, fmt.Errorf("batch delete: %w", err)
+	}
+
+	result, err := batchDeleteReplyFromObjects(response, req.Verbose, principal)
+	if err != nil {
+		return nil, fmt.Errorf("batch delete reply: %w", err)
+	}
+	result.Took = float32(time.Since(before).Seconds())
+
+	return result, nil
+}
+
+// BatchObjects handles end-to-end batch object creation. It accepts N objects in the request and forwards them to the internal
+// batch objects logic. It blocks until a response is retrieved from the internal APIs whereupon it returns the response to the client.
+//
+// It is intended to be used in isolation and therefore is not dependent on BatchSend/BatchStream.
+func (s *Service) BatchObjects(ctx context.Context, req *pb.BatchObjectsRequest) (*pb.BatchObjectsReply, error) {
+	batch.CountConsistencyLevel(monitoring.ConsistencyLevelWrite, req.ConsistencyLevel)
+	var result *pb.BatchObjectsReply
+	var errInner error
+
+	if err := s.batchObjectsSem.Acquire(ctx, 1); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	defer s.batchObjectsSem.Release(1)
+
+	if err := enterrors.GoWrapperWithBlock(func() {
+		result, errInner = s.batchHandler.BatchObjects(ctx, req)
+	}, s.logger); err != nil {
+		return nil, err
+	}
+
+	return result, errInner
+}
+
+// BatchObjects handles end-to-end batch reference creation. It accepts N references in the request and forwards them to the internal
+// batch references logic. It blocks until a response is retrieved from the internal APIs whereupon it returns the response to the client.
+//
+// It is intended to be used in isolation and therefore is not dependent on BatchSend/BatchStream.
+func (s *Service) BatchReferences(ctx context.Context, req *pb.BatchReferencesRequest) (*pb.BatchReferencesReply, error) {
+	batch.CountConsistencyLevel(monitoring.ConsistencyLevelWrite, req.ConsistencyLevel)
+	var result *pb.BatchReferencesReply
+	var errInner error
+
+	if err := enterrors.GoWrapperWithBlock(func() {
+		result, errInner = s.batchHandler.BatchReferences(ctx, req)
+	}, s.logger); err != nil {
+		return nil, err
+	}
+
+	return result, errInner
+}
+
+// BatchStream defines a StreamStream gRPC method whereby the server streams messages back to the client in order to
+// asynchronously report on any errors that have occurred during the automatic batching process.
+//
+// The initial request contains the consistency level that is desired when batch inserting in this processing context.
+//
+// The first message send to the client contains the stream ID for the overall stream. All subsequent messages, besides the final one,
+// correspond to errors emitted by the internal batching APIs, e.g. validation errors of the objects/references. The final
+// message sent to the client is a confirmation that the batch processing has completed successfully and that the client can hangup.
+//
+// In addition, there is also the shutdown logic that is sent via the stream from the server to the client. In the event that
+// the node handling the batch processing must be shutdown, e.g. there's a rolling restart occurring on the cluster, then the
+// stream will notify the client that it is shutting down allowing for all the internal queues to be drained and waited on. Once the final
+// shutdown message is sent and received by the client, the client can then safely hangup and reconnect to the cluster in an effort to
+// reconnect to a different available node. At that point, the batching process resumes on the other node as if nothing happened.
+//
+// It should be used as part of the automatic batching process provided in clients.
+func (s *Service) BatchStream(stream pb.Weaviate_BatchStreamServer) error {
+	return s.batchStreamHandler.Handle(stream)
+}
+
+func (s *Service) Search(ctx context.Context, req *pb.SearchRequest) (*pb.SearchReply, error) {
+	batch.CountConsistencyLevel(monitoring.ConsistencyLevelRead, req.ConsistencyLevel)
+	var result *pb.SearchReply
+	var errInner error
+
+	if err := enterrors.GoWrapperWithBlock(func() {
+		result, errInner = s.search(ctx, req)
+	}, s.logger); err != nil {
+		return nil, err
+	}
+
+	if grpcErr := admissionToGRPCError(errInner); grpcErr != nil {
+		return nil, grpcErr
+	}
+
+	return result, errInner
+}
+
+// admissionToGRPCError maps an admission shed to gRPC ResourceExhausted. This
+// is the public API, so the error reaches the client directly; our clients do
+// not retry ResourceExhausted, so under sustained saturation the caller sees
+// it as an error. Cross-node sheds are retried on the internal cluster path
+// (adapters/clients), before reaching this handler.
+func admissionToGRPCError(err error) error {
+	if errors.Is(err, queryadmission.ErrOverloaded) {
+		return status.Error(codes.ResourceExhausted, err.Error())
+	}
+	return nil
+}
+
+func (s *Service) search(ctx context.Context, req *pb.SearchRequest) (reply *pb.SearchReply, retErr error) {
+	before := time.Now()
+
+	principal, err := s.authenticator.PrincipalFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("extract auth: %w", err)
+	}
+	defer func() { retErr = namespacing.StripErrForPrincipal(principal, retErr) }()
+	ctx = restCtx.AddPrincipalToContext(ctx, principal)
+
+	if req.Collection, _, err = namespacing.Resolve(principal, s.schemaManager, s.qualifier, req.Collection); err != nil {
+		return nil, err
+	}
+
+	getClass := s.classGetterWithAuthzFunc(ctx, principal, req.Tenant)
+	parser := NewParser(
+		req.Uses_127Api,
+		getClass,
+		principal,
+		s.qualifier,
+	)
+	replier := NewReplier(
+		req.Uses_127Api,
+		parser.generative,
+		principal,
+		s.logger,
+	)
+
+	searchParams, err := parser.Search(req, s.config)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.validateClassAndProperty(getClass, searchParams); err != nil {
+		return nil, err
+	}
+
+	// Own the collector here so the profile outlives the result set: the deeper inits
+	// are idempotent and will write into this one.
+	if searchParams.AdditionalProperties.QueryProfile {
+		ctx = helpers.InitQueryProfileCollector(ctx)
+	}
+
+	res, err := s.traverser.GetClass(restCtx.AddPrincipalToContext(ctx, principal), principal, searchParams)
+	if err != nil {
+		return nil, err
+	}
+
+	return replier.Search(ctx, res, before, searchParams, newSchemaResolver(getClass))
+}
+
+func (s *Service) validateClassAndProperty(getClass classGetterWithAuthzFunc, searchParams dto.GetParams) error {
+	class, err := getClass(searchParams.ClassName)
+	if err != nil {
+		return err
+	}
+
+	for _, prop := range searchParams.Properties {
+		_, err := schemaEnt.GetPropertyByName(class, prop.Name)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type classGetterWithAuthzFunc func(string) (*models.Class, error)
+
+// classGetterWithAuthzFunc returns a getter that memoizes each (class, tenant)
+// lookup for one request. A cache hit skips AuthorizeAndRequireActiveNamespace,
+// so the memo key must fully identify the authorized resource or one class's
+// decision leaks to another. Not concurrency-safe; scoped to a single request.
+func (s *Service) classGetterWithAuthzFunc(ctx context.Context, principal *models.Principal, tenant string) classGetterWithAuthzFunc {
+	authorizedCollections := map[string]*models.Class{}
+
+	return func(name string) (*models.Class, error) {
+		classTenantName := name + "#" + tenant
+		class, ok := authorizedCollections[classTenantName]
+		if !ok {
+			resources := authorization.CollectionsData(name)
+			if tenant != "" {
+				resources = authorization.ShardsData(name, tenant)
+			}
+			// having data access is enough for querying as we dont leak any info from the collection config that you cannot get via data access anyways
+			if err := s.authorizer.AuthorizeAndRequireActiveNamespace(ctx, principal, authorization.READ, name, resources...); err != nil {
+				return nil, err
+			}
+			class = s.schemaManager.ReadOnlyClass(name)
+			authorizedCollections[classTenantName] = class
+		}
+		if class == nil {
+			return nil, fmt.Errorf("could not find class %s in schema", name)
+		}
+		return class, nil
+	}
+}
+
+func extractReplicationProperties(level *pb.ConsistencyLevel) *additional.ReplicationProperties {
+	if level == nil {
+		return nil
+	}
+
+	switch *level {
+	case pb.ConsistencyLevel_CONSISTENCY_LEVEL_ONE:
+		return &additional.ReplicationProperties{ConsistencyLevel: "ONE"}
+	case pb.ConsistencyLevel_CONSISTENCY_LEVEL_QUORUM:
+		return &additional.ReplicationProperties{ConsistencyLevel: "QUORUM"}
+	case pb.ConsistencyLevel_CONSISTENCY_LEVEL_ALL:
+		return &additional.ReplicationProperties{ConsistencyLevel: "ALL"}
+	default:
+		return nil
+	}
+}

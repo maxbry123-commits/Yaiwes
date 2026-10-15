@@ -1,0 +1,145 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package lsmkv
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+
+	"github.com/pkg/errors"
+)
+
+func (p *commitloggerParser) doCollection() error {
+	for {
+		if ok, err := p.doCollectionOnce(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
+
+		if err := p.cutChunkIfFull(p.memtable.Size()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *commitloggerParser) doCollectionOnce() (ok bool, err error) {
+	var commitType CommitType
+
+	err = binary.Read(p.checksumReader, binary.LittleEndian, &commitType)
+	if errors.Is(err, io.EOF) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.Wrap(err, "read commit type")
+	}
+
+	if !CommitTypeCollection.Is(commitType) {
+		return false, errors.Errorf("found a %s commit on a collection bucket", commitType.String())
+	}
+
+	var version uint8
+
+	err = binary.Read(p.checksumReader, binary.LittleEndian, &version)
+	if err != nil {
+		return false, errors.Wrap(err, "read commit version")
+	}
+
+	switch version {
+	case 0:
+		{
+			err = p.parseCollectionNodeV0()
+		}
+	case 1:
+		{
+			err = p.parseCollectionNodeV1()
+		}
+	default:
+		{
+			return false, fmt.Errorf("unsupported commit version %d", version)
+		}
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *commitloggerParser) parseCollectionNodeV0() error {
+	return p.parseCollectionNode(p.reader)
+}
+
+func (p *commitloggerParser) parseCollectionNodeV1() error {
+	reader, err := p.doRecord()
+	if err != nil {
+		return err
+	}
+
+	return p.parseCollectionNode(reader)
+}
+
+func (p *commitloggerParser) parseCollectionNode(reader io.Reader) error {
+	n, err := ParseCollectionNode(reader)
+	if err != nil {
+		return err
+	}
+
+	// Commit log nodes are the same for MapCollection and Inverted strategies
+	if p.strategy == StrategyMapCollection || p.strategy == StrategyInverted {
+		return p.parseMapNode(n)
+	}
+
+	return p.memtable.append(n.primaryKey, n.values)
+}
+
+func (p *commitloggerParser) parseMapNode(n segmentCollectionNode) error {
+	if p.memtable.strategy == StrategyInverted {
+		return p.parseInvertedNode(n)
+	}
+
+	for _, val := range n.values {
+		mp := MapPair{}
+		if err := mp.FromBytes(val.value, false); err != nil {
+			return err
+		}
+		mp.Tombstone = val.tombstone
+
+		if err := p.memtable.appendMapSorted(n.primaryKey, mp); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *commitloggerParser) parseInvertedNode(n segmentCollectionNode) error {
+	var ip invertedPair
+	for _, val := range n.values {
+		if err := ip.decodeCommitLog(val.value, val.tombstone); err != nil {
+			return err
+		}
+
+		if ip.tombstone {
+			if err := p.memtable.SetTombstone(ip.docID); err != nil {
+				return err
+			}
+		}
+
+		if err := p.memtable.appendInverted(n.primaryKey, ip); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}

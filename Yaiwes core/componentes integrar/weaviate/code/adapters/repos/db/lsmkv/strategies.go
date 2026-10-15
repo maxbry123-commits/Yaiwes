@@ -1,0 +1,116 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package lsmkv
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/weaviate/weaviate/adapters/repos/db/lsmkv/segmentindex"
+)
+
+const (
+	// StrategyReplace allows for idem-potent PUT where the latest takes presence
+	StrategyReplace         = "replace"
+	StrategySetCollection   = "setcollection"
+	StrategyMapCollection   = "mapcollection"
+	StrategyRoaringSet      = "roaringset"
+	StrategyRoaringSetRange = "roaringsetrange"
+	StrategyInverted        = "inverted"
+)
+
+var allStrategies = []string{
+	StrategyReplace,
+	StrategySetCollection,
+	StrategyMapCollection,
+	StrategyRoaringSet,
+	StrategyRoaringSetRange,
+	StrategyInverted,
+}
+
+// strategyUsesSharedIndexWriter reports whether a strategy's flush routes its
+// keys through the shared index writer, which is the only thing that emits a
+// secondary-index offsets table. Memtable.flush gates that writer on this, and
+// NewBucket refuses a secondary index to the strategies it excludes, so the two
+// answers cannot drift apart.
+func strategyUsesSharedIndexWriter(strategy string) bool {
+	switch strategy {
+	case StrategyRoaringSet, StrategyRoaringSetRange, StrategyInverted:
+		return false
+	default:
+		return true
+	}
+}
+
+func SegmentStrategyFromString(in string) segmentindex.Strategy {
+	switch in {
+	case StrategyReplace:
+		return segmentindex.StrategyReplace
+	case StrategySetCollection:
+		return segmentindex.StrategySetCollection
+	case StrategyMapCollection:
+		return segmentindex.StrategyMapCollection
+	case StrategyRoaringSet:
+		return segmentindex.StrategyRoaringSet
+	case StrategyRoaringSetRange:
+		return segmentindex.StrategyRoaringSetRange
+	case StrategyInverted:
+		return segmentindex.StrategyInverted
+	default:
+		panic("unsupported strategy")
+	}
+}
+
+func IsExpectedStrategy(strategy string, expectedStrategies ...string) bool {
+	if len(expectedStrategies) == 0 {
+		expectedStrategies = allStrategies
+	}
+	return slices.Contains(expectedStrategies, strategy)
+}
+
+func CheckExpectedStrategy(strategy string, expectedStrategies ...string) error {
+	if len(expectedStrategies) == 0 {
+		expectedStrategies = allStrategies
+	}
+	if IsExpectedStrategy(strategy, expectedStrategies...) {
+		return nil
+	}
+	if len(expectedStrategies) == 1 {
+		return fmt.Errorf("strategy %q expected, got %q", expectedStrategies[0], strategy)
+	}
+	// the slice is joined rather than passed to Errorf: an Errorf argument would
+	// make every caller's variadic slice escape to the heap
+	return fmt.Errorf("one of strategies [%s] expected, got %q",
+		strings.Join(expectedStrategies, " "), strategy)
+}
+
+func MustBeExpectedStrategy(strategy string, expectedStrategies ...string) {
+	if err := CheckExpectedStrategy(strategy, expectedStrategies...); err != nil {
+		panic(err)
+	}
+}
+
+func CheckStrategyRoaringSet(strategy string) error {
+	return CheckExpectedStrategy(strategy, StrategyRoaringSet)
+}
+
+func CheckStrategyRoaringSetRange(strategy string) error {
+	return CheckExpectedStrategy(strategy, StrategyRoaringSetRange)
+}
+
+func DefaultSearchableStrategy(useInvertedSearchable bool) string {
+	if useInvertedSearchable {
+		return StrategyInverted
+	}
+	return StrategyMapCollection
+}

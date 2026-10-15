@@ -1,0 +1,168 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package roaringset
+
+import (
+	"sync"
+
+	"github.com/weaviate/sroar"
+)
+
+func NewBitmap(values ...uint64) *sroar.Bitmap {
+	bm := sroar.NewBitmap()
+	bm.SetMany(values)
+	return bm
+}
+
+// defaultIdIncrement  is the amount of bits greater than <maxId>
+// to reduce the amount of times BitmapFactory has to reallocate.
+const defaultIdIncrement = uint64(1024)
+
+// DocIDCountGetterFunc reports how many doc IDs have been allocated, one past
+// the highest ever allocated; deletion does not lower it. Exclusive rather than
+// inclusive so that "none" has its own value: an inclusive last-ID getter has to
+// report something for a shard holding nothing, and every candidate either
+// underflows or names a document.
+type DocIDCountGetterFunc func() uint64
+
+// BitmapFactory exists to provide prefilled bitmaps using pool (reducing allocation of memory)
+// and favor cloning (faster) over prefilling bitmap from scratch each time bitmap is requested
+type BitmapFactory struct {
+	bufPool        BitmapBufPool
+	countGetter    DocIDCountGetterFunc
+	lock           *sync.RWMutex
+	prefilled      *sroar.Bitmap
+	prefilledMaxId uint64
+}
+
+func NewBitmapFactory(bufPool BitmapBufPool, countGetter DocIDCountGetterFunc) *BitmapFactory {
+	prefilledMaxId := countGetter() + defaultIdIncrement
+
+	return &BitmapFactory{
+		bufPool:        bufPool,
+		countGetter:    countGetter,
+		lock:           new(sync.RWMutex),
+		prefilled:      sroar.Prefill(prefilledMaxId),
+		prefilledMaxId: prefilledMaxId,
+	}
+}
+
+// BufPool returns the underlying buffer pool used by this factory.
+func (bmf *BitmapFactory) BufPool() BitmapBufPool {
+	return bmf.bufPool
+}
+
+// DocIDCount returns how many doc IDs have ever been allocated — deletion does
+// not lower it — for a caller sizing a worst-case bitmap footprint. It reads the
+// same getter GetBitmap reads, at a different instant, so a write landing
+// between the two makes them differ.
+func (bmf *BitmapFactory) DocIDCount() uint64 {
+	return bmf.countGetter()
+}
+
+// GetBitmap returns a prefilled bitmap, which is cloned from a shared internal.
+// This method is safe to call concurrently. The purpose behind sharing an
+// internal bitmap, is that a Clone() operation is cheaper than prefilling
+// a bitmap up to count.
+//
+// The universe is the half-open range [0, count), so a shard that has allocated
+// no doc ID gets an empty bitmap rather than one holding a document that does
+// not exist.
+func (bmf *BitmapFactory) GetBitmap() (cloned *sroar.Bitmap, release func()) {
+	var count, prefilledMaxId uint64
+
+	cloned, release = func() (*sroar.Bitmap, func()) {
+		bmf.lock.RLock()
+		defer bmf.lock.RUnlock()
+
+		count = bmf.countGetter()
+		prefilledMaxId = bmf.prefilledMaxId
+
+		// No need to expand, the whole range is covered
+		if count <= prefilledMaxId {
+			return bmf.bufPool.CloneToBuf(bmf.prefilled)
+		}
+		return nil, nil
+	}()
+
+	if cloned == nil {
+		cloned, release = func() (*sroar.Bitmap, func()) {
+			bmf.lock.Lock()
+			defer bmf.lock.Unlock()
+
+			count = bmf.countGetter()
+			prefilledMaxId = bmf.prefilledMaxId
+
+			// 2nd check to ensure bitmap wasn't expanded by
+			// concurrent request white waiting for write lock
+			if count <= prefilledMaxId {
+				return bmf.bufPool.CloneToBuf(bmf.prefilled)
+			}
+
+			// expand bitmap with additional ids
+			prefilledMaxId = count + defaultIdIncrement
+			bmf.prefilled.FillUp(prefilledMaxId)
+			bmf.prefilledMaxId = prefilledMaxId
+			return bmf.bufPool.CloneToBuf(bmf.prefilled)
+		}()
+	}
+	cloned.RemoveRange(count, prefilledMaxId+1)
+	return cloned, release
+}
+
+func (bmf *BitmapFactory) Remove(ids *sroar.Bitmap) {
+	bmf.lock.Lock()
+	defer bmf.lock.Unlock()
+
+	bmf.prefilled.AndNot(ids)
+}
+
+func (bmf *BitmapFactory) RemoveIds(ids ...uint64) {
+	bmf.lock.Lock()
+	defer bmf.lock.Unlock()
+
+	for _, id := range ids {
+		bmf.prefilled.Remove(id)
+	}
+}
+
+// ----------------------------------------------------------------------------
+
+type Iterator struct {
+	bm      *sroar.Bitmap
+	it      *sroar.Iterator
+	started bool
+}
+
+func NewIterator(bm *sroar.Bitmap) *Iterator {
+	return &Iterator{
+		bm:      bm,
+		it:      bm.NewIterator(),
+		started: false,
+	}
+}
+
+func (it *Iterator) Next() (val uint64, ok bool) {
+	val = it.it.Next()
+
+	if !it.started {
+		it.started = true
+		return val, val != 0 || !it.bm.IsEmpty()
+	}
+	return val, val != 0
+}
+
+func (it *Iterator) Reset() *Iterator {
+	it.started = false
+	it.it = it.bm.NewIterator()
+	return it
+}

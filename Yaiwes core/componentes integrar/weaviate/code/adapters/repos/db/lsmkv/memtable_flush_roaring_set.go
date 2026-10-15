@@ -1,0 +1,125 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package lsmkv
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+
+	"github.com/weaviate/weaviate/adapters/repos/db/compactor"
+	"github.com/weaviate/weaviate/adapters/repos/db/lsmkv/segmentindex"
+	"github.com/weaviate/weaviate/adapters/repos/db/roaringset"
+)
+
+// flushDataRoaringSet reserves a header, streams the nodes and their index past it,
+// then seeks back and writes the real header.
+func (m *Memtable) flushDataRoaringSet(f *segmentindex.SegmentFile,
+	ogF io.WriteSeeker, bufw *bufio.Writer,
+) error {
+	// compactor.WriteHeader below is passed a literal 0, so a non-zero count would be
+	// dropped rather than recorded, and every later Header.SecondaryIndex on the
+	// segment would fail.
+	if m.secondaryIndices != 0 {
+		return fmt.Errorf("roaring set flush cannot write %d secondary indexes",
+			m.secondaryIndices)
+	}
+
+	// compactor.WriteHeader overwrites these once the index start is known.
+	if _, err := bufw.Write(make([]byte, segmentindex.HeaderSize)); err != nil {
+		return fmt.Errorf("reserve header: %w", err)
+	}
+
+	keys, err := m.writeRoaringSetNodes(f)
+	if err != nil {
+		return err
+	}
+
+	if _, err := segmentindex.MarshalSortedKeys(f.BodyWriter(), keys,
+		segmentindex.HeaderSize); err != nil {
+		return fmt.Errorf("write roaring set index: %w", err)
+	}
+
+	indexStart := uint64(segmentindex.HeaderSize)
+	if len(keys) > 0 {
+		indexStart = uint64(keys[len(keys)-1].ValueEnd)
+	}
+
+	// WriteHeader ends in bufw.Reset, which discards anything still buffered.
+	if err := bufw.Flush(); err != nil {
+		return fmt.Errorf("flush buffered: %w", err)
+	}
+
+	if err := compactor.WriteHeader(nil, ogF, bufw, f, 0,
+		segmentindex.ChooseHeaderVersion(m.enableChecksumValidation), 0, indexStart,
+		segmentindex.StrategyRoaringSet); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+
+	return nil
+}
+
+func (m *Memtable) writeRoaringSetNodes(f *segmentindex.SegmentFile) ([]segmentindex.KeyRedux, error) {
+	// The cursor hands out the tree's own bitmaps, which the roaringSet* writers
+	// mutate under m.Lock(), so the lock covers the whole walk rather than a copy.
+	m.RLock()
+	defer m.RUnlock()
+
+	keys := make([]segmentindex.KeyRedux, 0, m.roaringSet.Count())
+	cursor := roaringset.NewBinarySearchTreeCursorNoCopy(m.roaringSet)
+
+	totalWritten := segmentindex.HeaderSize
+	// Scratch for the node under construction, grown when one needs more and
+	// reused by the next. Safe because the node is written out before the loop
+	// comes round again, and because keys[i].Key does not alias this buffer.
+	var (
+		nodeScratch []byte
+		sn          roaringset.SegmentNode
+	)
+	// A nil key is the end of the walk, and the bucket refuses one as a key, so
+	// no node can carry it. A zero-length key is a node the tree can hold, which
+	// is why the test is nil rather than a length.
+	for key, layer, err := cursor.First(); ; key, layer, err = cursor.Next() {
+		if err != nil {
+			return nil, fmt.Errorf("walk memtable: %w", err)
+		}
+		if key == nil {
+			break
+		}
+
+		// Compacting straight into the node buffer keeps the segment free of the
+		// container slack the memtable's bitmaps carry.
+		sn, nodeScratch, err = roaringset.NewSegmentNodeCompacted(key,
+			layer.Additions, layer.Deletions, nodeScratch)
+		if err != nil {
+			return nil, fmt.Errorf("create segment node: %w", err)
+		}
+
+		n, err := f.BodyWriter().Write(sn.ToBuffer())
+		if err != nil {
+			return nil, fmt.Errorf("write node %d: %w", len(keys), err)
+		}
+		totalWritten += n
+
+		// The key is the tree's, which outlives the flush: the node's own copy
+		// would alias the reused buffer and go stale once the next node fills it.
+		keys = append(keys, segmentindex.KeyRedux{Key: key, ValueEnd: totalWritten})
+	}
+
+	// A walk that ends early would rename a short segment into place and delete
+	// the commit log behind it, so the count is checked rather than assumed.
+	if want := m.roaringSet.Count(); len(keys) != want {
+		return nil, fmt.Errorf("walked %d of %d roaring set nodes", len(keys), want)
+	}
+
+	return keys, nil
+}

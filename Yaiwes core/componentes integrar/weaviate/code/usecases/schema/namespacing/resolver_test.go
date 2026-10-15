@@ -1,0 +1,1597 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package namespacing_test
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/go-openapi/strfmt"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/weaviate/weaviate/cluster/schema/local"
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/schema"
+	"github.com/weaviate/weaviate/entities/schema/crossref"
+	autherrs "github.com/weaviate/weaviate/usecases/auth/authorization/errors"
+	"github.com/weaviate/weaviate/usecases/license"
+	"github.com/weaviate/weaviate/usecases/schema/namespacing"
+	wlnamespaces "github.com/weaviate/weaviate/wl/namespaces"
+)
+
+// deepCopyJSON returns a fully independent clone via JSON round-trip, so
+// no-mutation assertions can catch in-place edits through shared pointers.
+func deepCopyJSON[T any](t *testing.T, src *T) *T {
+	t.Helper()
+	if src == nil {
+		return nil
+	}
+	b, err := json.Marshal(src)
+	require.NoError(t, err)
+	out := new(T)
+	require.NoError(t, json.Unmarshal(b, out))
+	return out
+}
+
+// fakeSchemaManager implements SchemaManager for testing
+type fakeSchemaManager struct {
+	// Left unset: only the methods defined below are expected.
+	local.AliasReader
+	aliases map[string]string
+}
+
+func (f *fakeSchemaManager) ResolveAlias(alias string) string {
+	return f.aliases[alias]
+}
+
+func TestQualifiedName(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		entity    string
+		out       string
+	}{
+		{name: "empty namespace returns name verbatim", namespace: "", entity: "alice", out: "alice"},
+		{name: "namespace + name joins with separator", namespace: "customer1", entity: "alice", out: "customer1:alice"},
+		{name: "empty name", namespace: "customer1", entity: "", out: "customer1:"},
+		{name: "both empty", namespace: "", entity: "", out: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.out, namespacing.QualifiedName(tt.namespace, tt.entity))
+		})
+	}
+}
+
+func TestNamespaceFromQualified(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "no separator returns empty", in: "MyClass", want: ""},
+		{name: "qualified name returns namespace", in: "alpha:MyClass", want: "alpha"},
+		{name: "empty input returns empty", in: "", want: ""},
+		{name: "leading separator returns empty namespace prefix", in: ":MyClass", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, namespacing.NamespaceFromQualified(tc.in))
+		})
+	}
+}
+
+func TestStripQualification(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "no separator returns input unchanged", in: "MyClass", want: "MyClass"},
+		{name: "qualified name returns entity portion", in: "alpha:MyClass", want: "MyClass"},
+		{name: "empty input returns empty", in: "", want: ""},
+		{name: "trailing separator returns empty entity", in: "alpha:", want: ""},
+		{name: "leading separator returns input after separator", in: ":MyClass", want: "MyClass"},
+		{name: "multiple separators split only on first", in: "alpha:beta:MyClass", want: "beta:MyClass"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, namespacing.StripQualification(tc.in))
+		})
+	}
+}
+
+func TestQualifyUserIDForLookup(t *testing.T) {
+	tests := []struct {
+		name              string
+		namespacesEnabled bool
+		principal         *models.Principal
+		raw               string
+		want              string
+	}{
+		{
+			name:              "ns-disabled passes through bare",
+			namespacesEnabled: false,
+			principal:         &models.Principal{Namespace: ""},
+			raw:               "alice",
+			want:              "alice",
+		},
+		{
+			name:              "ns-disabled passes through even with namespaced principal",
+			namespacesEnabled: false,
+			principal:         &models.Principal{Namespace: "ns1"},
+			raw:               "alice",
+			want:              "alice",
+		},
+		{
+			name:              "ns-enabled global principal passes through bare",
+			namespacesEnabled: true,
+			principal:         &models.Principal{Namespace: ""},
+			raw:               "alice",
+			want:              "alice",
+		},
+		{
+			name:              "ns-enabled global principal passes through qualified",
+			namespacesEnabled: true,
+			principal:         &models.Principal{Namespace: ""},
+			raw:               "ns1:alice",
+			want:              "ns1:alice",
+		},
+		{
+			name:              "ns-enabled namespaced principal qualifies short name",
+			namespacesEnabled: true,
+			principal:         &models.Principal{Namespace: "ns1"},
+			raw:               "alice",
+			want:              "ns1:alice",
+		},
+		{
+			// Lookups never reject — double-qualify just misses downstream.
+			name:              "ns-enabled namespaced principal double-qualifies an already-qualified name",
+			namespacesEnabled: true,
+			principal:         &models.Principal{Namespace: "ns1"},
+			raw:               "ns1:alice",
+			want:              "ns1:ns1:alice",
+		},
+		{
+			name:              "ns-enabled nil principal passes through",
+			namespacesEnabled: true,
+			principal:         nil,
+			raw:               "alice",
+			want:              "alice",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, namespacing.QualifyUserIDForLookup(tc.principal, tc.namespacesEnabled, tc.raw))
+		})
+	}
+}
+
+func TestQualifyClass(t *testing.T) {
+	cases := []struct {
+		testName  string
+		principal *models.Principal
+		q         namespacing.Qualifier
+		input     string
+		want      string
+	}{
+		{
+			testName:  "namespaced principal lowercase short input is uppercased and qualified",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "movies",
+			want:      "customer1:Movies",
+		},
+		{
+			testName:  "operator full name preserves namespace and uppercases only the class",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "customer1:movies",
+			want:      "customer1:Movies",
+		},
+		{
+			testName:  "operator already-uppercase full name passthrough",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "customer1:Movies",
+			want:      "customer1:Movies",
+		},
+		{
+			testName:  "operator with stray namespace stays unconfined",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true, Namespace: "customer1"},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "movies",
+			want:      "Movies",
+		},
+		{
+			testName:  "ns disabled lowercase input still uppercased",
+			principal: &models.Principal{Username: "u"},
+			q:         namespacing.Disabled,
+			input:     "movies",
+			want:      "Movies",
+		},
+		{
+			testName:  "alias-shaped input is not resolved (qualified, not retargeted)",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "films",
+			want:      "customer1:Films",
+		},
+		{
+			testName:  "alias-shaped raw input on ns-disabled is not resolved",
+			principal: &models.Principal{Username: "u"},
+			q:         namespacing.Disabled,
+			input:     "films",
+			want:      "Films",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.testName, func(t *testing.T) {
+			got, err := namespacing.QualifyClass(tc.principal, tc.q, tc.input)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestQualifyClass_RejectsInvalidNamespacePrefix verifies that a wrong-case
+// namespace prefix from a global operator on an NS-enabled cluster surfaces
+// the specific "invalid namespace prefix" message so they can correct the
+// request, rather than propagating through the resolver into lookup.
+func TestQualifyClass_RejectsInvalidNamespacePrefix(t *testing.T) {
+	cases := []struct {
+		testName string
+		input    string
+	}{
+		{testName: "uppercase prefix", input: "Customer1:Movies"},
+		{testName: "mixed-case prefix", input: "Customer1:movies"},
+		{testName: "uppercase in middle of prefix", input: "cusTomer1:Movies"},
+		{testName: "leading-hyphen prefix", input: "-customer1:Movies"},
+		{testName: "trailing-hyphen prefix", input: "customer1-:Movies"},
+		{testName: "empty prefix", input: ":Movies"},
+		{testName: "too-short prefix", input: "ab:Movies"},
+	}
+	principal := &models.Principal{Username: "admin", IsGlobalOperator: true}
+	for _, tc := range cases {
+		t.Run(tc.testName, func(t *testing.T) {
+			_, err := namespacing.QualifyClass(principal, wlnamespaces.NewPrefixing(), tc.input)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "invalid namespace prefix")
+		})
+	}
+}
+
+// TestQualifyClass_NamespacedPrincipalSeesClassNameError verifies the
+// transparency contract: a namespaced caller who mistakenly includes a ":"
+// in their input gets a generic class-name error instead of one that
+// mentions namespaces.
+func TestQualifyClass_NamespacedPrincipalSeesClassNameError(t *testing.T) {
+	principal := &models.Principal{Username: "u", Namespace: "customer1"}
+	cases := []string{"Customer2:Movies", "customer2:Movies", "FOO:bar"}
+	for _, input := range cases {
+		t.Run(input, func(t *testing.T) {
+			_, err := namespacing.QualifyClass(principal, wlnamespaces.NewPrefixing(), input)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "is not a valid class name")
+			require.NotContains(t, err.Error(), "namespace")
+		})
+	}
+}
+
+// TestQualifyClass_NSDisabledSeesClassNameError verifies that on
+// NS-disabled clusters the resolver does not mention namespaces — the
+// concept simply does not exist for the operator there.
+func TestQualifyClass_NSDisabledSeesClassNameError(t *testing.T) {
+	principal := &models.Principal{Username: "admin", IsGlobalOperator: true}
+	_, err := namespacing.QualifyClass(principal, namespacing.Disabled, "customer1:Movies")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "is not a valid class name")
+	require.NotContains(t, err.Error(), "namespace")
+}
+
+func TestResolve(t *testing.T) {
+	cases := []struct {
+		testName  string
+		principal *models.Principal
+		sm        local.AliasReader
+		q         namespacing.Qualifier
+		input     string
+		wantClass string
+		wantAlias string
+	}{
+		{
+			testName:  "namespaced principal resolves to qualified name",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "Movies",
+			wantClass: "customer1:Movies",
+			wantAlias: "",
+		},
+		{
+			testName:  "namespaced principal with alias",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{"customer1:Films": "customer1:Movies"}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "Films",
+			wantClass: "customer1:Movies",
+			wantAlias: "customer1:Films",
+		},
+		{
+			testName:  "global principal passthrough",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true},
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "Movies",
+			wantClass: "Movies",
+			wantAlias: "",
+		},
+		{
+			testName:  "global principal qualified input with alias hit resolves normally",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true},
+			sm:        &fakeSchemaManager{aliases: map[string]string{"customer1:Movies": "customer1:ActualMovies"}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "customer1:Movies",
+			wantClass: "customer1:ActualMovies",
+			wantAlias: "customer1:Movies",
+		},
+		{
+			testName:  "nil principal passthrough",
+			principal: nil,
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "Movies",
+			wantClass: "Movies",
+			wantAlias: "",
+		},
+		{
+			testName:  "namespaced principal with alias that resolves to target",
+			principal: &models.Principal{Username: "u", Namespace: "ns1"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{"ns1:MyAlias": "ns1:MyClass"}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "MyAlias",
+			wantClass: "ns1:MyClass",
+			wantAlias: "ns1:MyAlias",
+		},
+		{
+			testName:  "ns disabled ignores principal namespace",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         namespacing.Disabled,
+			input:     "Movies",
+			wantClass: "Movies",
+			wantAlias: "",
+		},
+		{
+			testName:  "ns disabled resolves alias on raw input for non-namespaced principal",
+			principal: &models.Principal{Username: "u"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{"Films": "Movies"}},
+			q:         namespacing.Disabled,
+			input:     "Films",
+			wantClass: "Movies",
+			wantAlias: "Films",
+		},
+		{
+			testName:  "lowercase short input is uppercased before qualification",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "movies",
+			wantClass: "customer1:Movies",
+			wantAlias: "",
+		},
+		{
+			testName:  "lowercase qualified input uppercases only the class portion",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true},
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         wlnamespaces.NewPrefixing(),
+			input:     "customer1:movies",
+			wantClass: "customer1:Movies",
+			wantAlias: "",
+		},
+		{
+			testName:  "ns disabled still uppercases lowercase input",
+			principal: &models.Principal{Username: "u"},
+			sm:        &fakeSchemaManager{aliases: map[string]string{}},
+			q:         namespacing.Disabled,
+			input:     "movies",
+			wantClass: "Movies",
+			wantAlias: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.testName, func(t *testing.T) {
+			gotClass, gotAlias, err := namespacing.Resolve(tc.principal, tc.sm, tc.q, tc.input)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantClass, gotClass)
+			assert.Equal(t, tc.wantAlias, gotAlias)
+		})
+	}
+}
+
+// TestResolve_RejectsInvalidNamespacePrefix mirrors the QualifyClass guard
+// on the read path so list/get/aggregate/search callers also surface a 4xx
+// instead of routing the wrong-case input into schema/alias lookup.
+func TestResolve_RejectsInvalidNamespacePrefix(t *testing.T) {
+	sm := &fakeSchemaManager{aliases: map[string]string{}}
+	principal := &models.Principal{Username: "admin", IsGlobalOperator: true}
+	unlicensed := namespacing.Refusing(license.Required("namespaces"))
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		q         namespacing.Qualifier
+		input     string
+		wantErr   string
+	}{
+		{name: "Customer1:Movies", principal: principal, q: wlnamespaces.NewPrefixing(), input: "Customer1:Movies", wantErr: "invalid namespace prefix"},
+		{name: "FOO:bar", principal: principal, q: wlnamespaces.NewPrefixing(), input: "FOO:bar", wantErr: "invalid namespace prefix"},
+		{name: "-bad:Movies", principal: principal, q: wlnamespaces.NewPrefixing(), input: "-bad:Movies", wantErr: "invalid namespace prefix"},
+		{name: ":Movies", principal: principal, q: wlnamespaces.NewPrefixing(), input: ":Movies", wantErr: "invalid namespace prefix"},
+		{name: "unlicensed operator's malformed prefix", principal: principal, q: unlicensed, input: "Bad_NS:Foo", wantErr: "invalid namespace prefix"},
+		{name: "unlicensed namespaced principal's prefix", principal: namespacedPrincipal, q: unlicensed, input: "ns1:Foo", wantErr: "is not a valid class name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := namespacing.Resolve(tc.principal, sm, tc.q, tc.input)
+			require.ErrorContains(t, err, tc.wantErr)
+			require.NotErrorIs(t, err, license.ErrRequired)
+		})
+	}
+}
+
+var (
+	namespacedPrincipal  = &models.Principal{Username: "u", Namespace: "customer1"}
+	globalPrincipal      = &models.Principal{Username: "admin", IsGlobalOperator: true}
+	noNamespacePrincipal = &models.Principal{Username: "u"}
+)
+
+// fullyNestedClass returns a class with every namespace-strippable surface
+// covered: own-NS class name, properties with own-NS / foreign / mixed /
+// primitive DataType, and recursive NestedProperties.
+func fullyNestedClass() *models.Class {
+	return &models.Class{
+		Class: "customer1:Movies",
+		Properties: []*models.Property{
+			{Name: "title", DataType: []string{"text"}},
+			{Name: "director", DataType: []string{"customer1:Person"}},
+			{Name: "foreign", DataType: []string{"customer2:Person"}},
+			{Name: "multi", DataType: []string{"customer1:Person", "customer2:Person", "text"}},
+			{
+				Name: "details", DataType: []string{"object"},
+				NestedProperties: []*models.NestedProperty{
+					{Name: "studio", DataType: []string{"customer1:Studio"}},
+					{
+						Name: "deep", DataType: []string{"object"},
+						NestedProperties: []*models.NestedProperty{
+							{Name: "city", DataType: []string{"customer1:City"}},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func fullyNestedClassStripped() *models.Class {
+	return &models.Class{
+		Class: "Movies",
+		Properties: []*models.Property{
+			{Name: "title", DataType: []string{"text"}},
+			{Name: "director", DataType: []string{"Person"}},
+			{Name: "foreign", DataType: []string{"customer2:Person"}},
+			{Name: "multi", DataType: []string{"Person", "customer2:Person", "text"}},
+			{
+				Name: "details", DataType: []string{"object"},
+				NestedProperties: []*models.NestedProperty{
+					{Name: "studio", DataType: []string{"Studio"}},
+					{
+						Name: "deep", DataType: []string{"object"},
+						NestedProperties: []*models.NestedProperty{
+							{Name: "city", DataType: []string{"City"}},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestStripClassResponse(t *testing.T) {
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        *models.Class
+		want      *models.Class
+		wantSame  bool // result should be the same pointer as in (pass-through path)
+	}{
+		{
+			name:      "namespaced principal strips class + recursive datatypes; foreign prefix preserved",
+			principal: namespacedPrincipal,
+			in:        fullyNestedClass(),
+			want:      fullyNestedClassStripped(),
+		},
+		{
+			name:      "class without own prefix returns short-named copy",
+			principal: namespacedPrincipal,
+			in:        &models.Class{Class: "Movies"},
+			want:      &models.Class{Class: "Movies"},
+		},
+		{
+			name:      "global principal passes through",
+			principal: globalPrincipal,
+			in:        &models.Class{Class: "customer1:Movies"},
+			want:      &models.Class{Class: "customer1:Movies"},
+			wantSame:  true,
+		},
+		{
+			name:      "nil principal passes through",
+			principal: nil,
+			in:        &models.Class{Class: "customer1:Movies"},
+			want:      &models.Class{Class: "customer1:Movies"},
+			wantSame:  true,
+		},
+		{
+			name:      "empty namespace passes through",
+			principal: noNamespacePrincipal,
+			in:        &models.Class{Class: "customer1:Movies"},
+			want:      &models.Class{Class: "customer1:Movies"},
+			wantSame:  true,
+		},
+		{
+			name:      "nil src returns nil",
+			principal: namespacedPrincipal,
+			in:        nil,
+			want:      nil,
+			wantSame:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := deepCopyJSON(t, tc.in)
+			got := namespacing.StripClassResponse(tc.principal, tc.in)
+			assert.Equal(t, tc.want, got)
+			if tc.wantSame {
+				assert.Same(t, tc.in, got)
+			} else if tc.in != nil {
+				assert.NotSame(t, tc.in, got)
+			}
+			assert.Equal(t, snapshot, tc.in, "input must not be mutated")
+		})
+	}
+}
+
+func TestQualifyPropertyDataTypes(t *testing.T) {
+	cases := []struct {
+		name          string
+		principal     *models.Principal
+		q             namespacing.Qualifier
+		className     string
+		in            []*models.Property
+		want          []*models.Property
+		wantErrSubstr string
+	}{
+		{
+			name:      "namespaced principal qualifies short cross-ref",
+			principal: namespacedPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in:        []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+			want:      []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+		},
+		{
+			name:      "multi-target refs all qualified",
+			principal: namespacedPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in:        []*models.Property{{Name: "related", DataType: []string{"Movies", "Books"}}},
+			want:      []*models.Property{{Name: "related", DataType: []string{"customer1:Movies", "customer1:Books"}}},
+		},
+		{
+			name:      "primitive DataType passes through",
+			principal: namespacedPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in:        []*models.Property{{Name: "title", DataType: []string{"text"}}},
+			want:      []*models.Property{{Name: "title", DataType: []string{"text"}}},
+		},
+		{
+			name:      "nested object DataType passes through",
+			principal: namespacedPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in: []*models.Property{
+				{Name: "meta", DataType: []string{"object"}},
+				{Name: "metas", DataType: []string{"object[]"}},
+			},
+			want: []*models.Property{
+				{Name: "meta", DataType: []string{"object"}},
+				{Name: "metas", DataType: []string{"object[]"}},
+			},
+		},
+		{
+			name:          "already-qualified own-namespace rejected",
+			principal:     namespacedPrincipal,
+			q:             wlnamespaces.NewPrefixing(),
+			className:     "customer1:Zoo",
+			in:            []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+			wantErrSubstr: "not a valid class name",
+		},
+		{
+			name:          "already-qualified foreign-namespace rejected",
+			principal:     namespacedPrincipal,
+			q:             wlnamespaces.NewPrefixing(),
+			className:     "customer1:Zoo",
+			in:            []*models.Property{{Name: "watched", DataType: []string{"customer2:Movies"}}},
+			wantErrSubstr: "not a valid class name",
+		},
+		{
+			name:      "global principal keeps a target in the class's namespace",
+			principal: globalPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in:        []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+			want:      []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+		},
+		{
+			name:      "global principal short target gets the class's namespace",
+			principal: globalPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in:        []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+			want:      []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+		},
+		{
+			name:          "global principal target in another namespace rejected",
+			principal:     globalPrincipal,
+			q:             wlnamespaces.NewPrefixing(),
+			className:     "customer1:Zoo",
+			in:            []*models.Property{{Name: "watched", DataType: []string{"customer2:Movies"}}},
+			wantErrSubstr: "'customer2:Movies' is not a valid class name",
+		},
+		{
+			name:          "global principal one of several targets in another namespace rejected",
+			principal:     globalPrincipal,
+			q:             wlnamespaces.NewPrefixing(),
+			className:     "customer1:Zoo",
+			in:            []*models.Property{{Name: "related", DataType: []string{"customer1:Movies", "customer2:Books"}}},
+			wantErrSubstr: "'customer2:Books' is not a valid class name",
+		},
+		{
+			name:          "global principal malformed namespace prefix rejected",
+			principal:     globalPrincipal,
+			q:             wlnamespaces.NewPrefixing(),
+			className:     "customer1:Zoo",
+			in:            []*models.Property{{Name: "watched", DataType: []string{"Customer1:Movies"}}},
+			wantErrSubstr: "invalid namespace prefix",
+		},
+		{
+			name:      "global principal on an unnamespaced class keeps a short target",
+			principal: globalPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "Zoo",
+			in:        []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+			want:      []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+		},
+		{
+			name:          "global principal on an unnamespaced class rejects a namespaced target",
+			principal:     globalPrincipal,
+			q:             wlnamespaces.NewPrefixing(),
+			className:     "Zoo",
+			in:            []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+			wantErrSubstr: "'customer1:Movies' is not a valid class name",
+		},
+		{
+			name:      "nil principal short target gets the class's namespace",
+			principal: nil,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in:        []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+			want:      []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+		},
+		{
+			name:      "NS disabled passes through",
+			principal: namespacedPrincipal,
+			q:         namespacing.Disabled,
+			className: "Zoo",
+			in:        []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+			want:      []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+		},
+		{
+			name:      "empty DataType slice and nil property no-op",
+			principal: namespacedPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in: []*models.Property{
+				nil,
+				{Name: "empty", DataType: []string{}},
+				{Name: "watched", DataType: []string{"Movies"}},
+			},
+			want: []*models.Property{
+				nil,
+				{Name: "empty", DataType: []string{}},
+				{Name: "watched", DataType: []string{"customer1:Movies"}},
+			},
+		},
+		{
+			name:      "mixed primitive and ref in same call",
+			principal: namespacedPrincipal,
+			q:         wlnamespaces.NewPrefixing(),
+			className: "customer1:Zoo",
+			in: []*models.Property{
+				{Name: "title", DataType: []string{"text"}},
+				{Name: "watched", DataType: []string{"Movies"}},
+			},
+			want: []*models.Property{
+				{Name: "title", DataType: []string{"text"}},
+				{Name: "watched", DataType: []string{"customer1:Movies"}},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := namespacing.QualifyPropertyDataTypes(tc.principal, tc.q, tc.className, tc.in)
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				return
+			}
+			require.NoError(t, err)
+			// Mutation in-place is intentional — assert via the input slice.
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestStripPropertyDataTypes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []*models.Property
+		want []*models.Property
+	}{
+		{
+			name: "qualified cross-ref stripped",
+			in:   []*models.Property{{Name: "watched", DataType: []string{"customer1:Movies"}}},
+			want: []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+		},
+		{
+			name: "multi-target refs all stripped",
+			in:   []*models.Property{{Name: "related", DataType: []string{"customer1:Movies", "customer1:Books"}}},
+			want: []*models.Property{{Name: "related", DataType: []string{"Movies", "Books"}}},
+		},
+		{
+			name: "already-short cross-ref passes through",
+			in:   []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+			want: []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+		},
+		{
+			name: "foreign-namespace prefix also stripped (graduation flattens every namespace)",
+			in:   []*models.Property{{Name: "watched", DataType: []string{"customer2:Movies"}}},
+			want: []*models.Property{{Name: "watched", DataType: []string{"Movies"}}},
+		},
+		{
+			name: "primitive DataType passes through",
+			in:   []*models.Property{{Name: "title", DataType: []string{"text"}}},
+			want: []*models.Property{{Name: "title", DataType: []string{"text"}}},
+		},
+		{
+			name: "nested object DataType passes through",
+			in: []*models.Property{
+				{Name: "meta", DataType: []string{"object"}},
+				{Name: "metas", DataType: []string{"object[]"}},
+			},
+			want: []*models.Property{
+				{Name: "meta", DataType: []string{"object"}},
+				{Name: "metas", DataType: []string{"object[]"}},
+			},
+		},
+		{
+			name: "empty DataType slice and nil property no-op",
+			in: []*models.Property{
+				nil,
+				{Name: "empty", DataType: []string{}},
+				{Name: "watched", DataType: []string{"customer1:Movies"}},
+			},
+			want: []*models.Property{
+				nil,
+				{Name: "empty", DataType: []string{}},
+				{Name: "watched", DataType: []string{"Movies"}},
+			},
+		},
+		{
+			name: "mixed primitive and ref in same call",
+			in: []*models.Property{
+				{Name: "title", DataType: []string{"text"}},
+				{Name: "watched", DataType: []string{"customer1:Movies"}},
+			},
+			want: []*models.Property{
+				{Name: "title", DataType: []string{"text"}},
+				{Name: "watched", DataType: []string{"Movies"}},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			namespacing.StripPropertyDataTypes(tc.in)
+			// Mutation in-place is intentional — assert via the input slice.
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestStripPropertyResponse(t *testing.T) {
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        *models.Property
+		want      *models.Property
+		wantSame  bool
+	}{
+		{
+			name:      "namespaced principal strips datatypes recursively",
+			principal: namespacedPrincipal,
+			in: &models.Property{
+				Name:     "owner",
+				DataType: []string{"customer1:Person", "customer2:Person", "text"},
+				NestedProperties: []*models.NestedProperty{
+					{Name: "deep", DataType: []string{"customer1:Studio"}},
+				},
+			},
+			want: &models.Property{
+				Name:     "owner",
+				DataType: []string{"Person", "customer2:Person", "text"},
+				NestedProperties: []*models.NestedProperty{
+					{Name: "deep", DataType: []string{"Studio"}},
+				},
+			},
+		},
+		{
+			name:      "global principal passes through",
+			principal: globalPrincipal,
+			in:        &models.Property{Name: "p", DataType: []string{"customer1:Person"}},
+			want:      &models.Property{Name: "p", DataType: []string{"customer1:Person"}},
+			wantSame:  true,
+		},
+		{
+			name:      "nil principal passes through",
+			principal: nil,
+			in:        &models.Property{Name: "p", DataType: []string{"customer1:Person"}},
+			want:      &models.Property{Name: "p", DataType: []string{"customer1:Person"}},
+			wantSame:  true,
+		},
+		{
+			name:      "nil src returns nil",
+			principal: namespacedPrincipal,
+			in:        nil,
+			want:      nil,
+			wantSame:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := deepCopyJSON(t, tc.in)
+			got := namespacing.StripPropertyResponse(tc.principal, tc.in)
+			assert.Equal(t, tc.want, got)
+			if tc.wantSame {
+				assert.Same(t, tc.in, got)
+			} else if tc.in != nil {
+				assert.NotSame(t, tc.in, got)
+			}
+			assert.Equal(t, snapshot, tc.in, "input must not be mutated")
+		})
+	}
+}
+
+func TestStripAliasResponse(t *testing.T) {
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        *models.Alias
+		want      *models.Alias
+		wantSame  bool
+	}{
+		{
+			name:      "namespaced principal strips alias and class",
+			principal: namespacedPrincipal,
+			in:        &models.Alias{Alias: "customer1:Films", Class: "customer1:Movies"},
+			want:      &models.Alias{Alias: "Films", Class: "Movies"},
+		},
+		{
+			name:      "foreign prefix preserved on both fields",
+			principal: namespacedPrincipal,
+			in:        &models.Alias{Alias: "customer2:Films", Class: "customer2:Movies"},
+			want:      &models.Alias{Alias: "customer2:Films", Class: "customer2:Movies"},
+		},
+		{
+			name:      "global principal passes through",
+			principal: globalPrincipal,
+			in:        &models.Alias{Alias: "customer1:Films", Class: "customer1:Movies"},
+			want:      &models.Alias{Alias: "customer1:Films", Class: "customer1:Movies"},
+			wantSame:  true,
+		},
+		{
+			name:      "nil src returns nil",
+			principal: namespacedPrincipal,
+			in:        nil,
+			want:      nil,
+			wantSame:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := deepCopyJSON(t, tc.in)
+			got := namespacing.StripAliasResponse(tc.principal, tc.in)
+			assert.Equal(t, tc.want, got)
+			if tc.wantSame {
+				assert.Same(t, tc.in, got)
+			} else if tc.in != nil {
+				assert.NotSame(t, tc.in, got)
+			}
+			assert.Equal(t, snapshot, tc.in, "input must not be mutated")
+		})
+	}
+}
+
+func TestStripObjectResponseClass(t *testing.T) {
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        *models.Object
+		want      string // expected obj.Class after the call ("" when in == nil)
+	}{
+		{
+			name:      "in-place strip of own prefix",
+			principal: namespacedPrincipal,
+			in:        &models.Object{Class: "customer1:Movies"},
+			want:      "Movies",
+		},
+		{
+			name:      "foreign prefix left intact",
+			principal: namespacedPrincipal,
+			in:        &models.Object{Class: "customer2:Movies"},
+			want:      "customer2:Movies",
+		},
+		{
+			name:      "global principal no-op",
+			principal: globalPrincipal,
+			in:        &models.Object{Class: "customer1:Movies"},
+			want:      "customer1:Movies",
+		},
+		{
+			name:      "nil principal no-op",
+			principal: nil,
+			in:        &models.Object{Class: "customer1:Movies"},
+			want:      "customer1:Movies",
+		},
+		{
+			name:      "nil obj no-op",
+			principal: namespacedPrincipal,
+			in:        nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			namespacing.StripObjectResponseClass(tc.principal, tc.in)
+			if tc.in != nil {
+				assert.Equal(t, tc.want, tc.in.Class)
+			}
+		})
+	}
+}
+
+// uuid used for the beacon path component in the table-driven tests.
+const refBeaconUUID = "11111111-2222-3333-4444-555555555555"
+
+func TestStripRefSourceBeacon(t *testing.T) {
+	mkSrc := func(class string) *crossref.RefSource {
+		return crossref.NewSource(schema.ClassName(class), "hasAnimals", strfmt.UUID(refBeaconUUID))
+	}
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        *crossref.RefSource
+		want      strfmt.URI
+	}{
+		{
+			name:      "namespaced caller: own prefix stripped from From beacon",
+			principal: namespacedPrincipal,
+			in:        mkSrc("customer1:Zoo"),
+			want:      strfmt.URI("weaviate://localhost/Zoo/" + refBeaconUUID + "/hasAnimals"),
+		},
+		{
+			name:      "namespaced caller: foreign prefix left intact",
+			principal: namespacedPrincipal,
+			in:        mkSrc("customer2:Zoo"),
+			want:      strfmt.URI("weaviate://localhost/customer2:Zoo/" + refBeaconUUID + "/hasAnimals"),
+		},
+		{
+			name:      "namespaced caller: already-short class unchanged",
+			principal: namespacedPrincipal,
+			in:        mkSrc("Zoo"),
+			want:      strfmt.URI("weaviate://localhost/Zoo/" + refBeaconUUID + "/hasAnimals"),
+		},
+		{
+			name:      "global principal: qualified class preserved as-is",
+			principal: globalPrincipal,
+			in:        mkSrc("customer1:Zoo"),
+			want:      strfmt.URI("weaviate://localhost/customer1:Zoo/" + refBeaconUUID + "/hasAnimals"),
+		},
+		{
+			name:      "IsGlobalOperator with own-NS namespace set still skips strip",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true, Namespace: "customer1"},
+			in:        mkSrc("customer1:Zoo"),
+			want:      strfmt.URI("weaviate://localhost/customer1:Zoo/" + refBeaconUUID + "/hasAnimals"),
+		},
+		{
+			name:      "nil principal: pass-through (NS-disabled cluster)",
+			principal: nil,
+			in:        mkSrc("customer1:Zoo"),
+			want:      strfmt.URI("weaviate://localhost/customer1:Zoo/" + refBeaconUUID + "/hasAnimals"),
+		},
+		{
+			name:      "nil RefSource yields empty URI",
+			principal: namespacedPrincipal,
+			in:        nil,
+			want:      "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := ""
+			if tc.in != nil {
+				before = string(tc.in.Class)
+			}
+			got := namespacing.StripRefSourceBeacon(tc.principal, tc.in)
+			assert.Equal(t, tc.want, got)
+			if tc.in != nil {
+				assert.Equal(t, before, string(tc.in.Class),
+					"input RefSource must not be mutated")
+			}
+		})
+	}
+}
+
+func TestStripRefBeacon(t *testing.T) {
+	mkRef := func(class string) *crossref.Ref {
+		return &crossref.Ref{Local: true, PeerName: "localhost", Class: class, TargetID: strfmt.UUID(refBeaconUUID)}
+	}
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        *crossref.Ref
+		want      strfmt.URI
+	}{
+		{
+			name:      "namespaced caller: own prefix stripped from To beacon",
+			principal: namespacedPrincipal,
+			in:        mkRef("customer1:Animal"),
+			want:      strfmt.URI("weaviate://localhost/Animal/" + refBeaconUUID),
+		},
+		{
+			name:      "namespaced caller: short target unchanged (production path)",
+			principal: namespacedPrincipal,
+			in:        mkRef("Animal"),
+			want:      strfmt.URI("weaviate://localhost/Animal/" + refBeaconUUID),
+		},
+		{
+			name:      "namespaced caller: foreign prefix left intact",
+			principal: namespacedPrincipal,
+			in:        mkRef("customer2:Animal"),
+			want:      strfmt.URI("weaviate://localhost/customer2:Animal/" + refBeaconUUID),
+		},
+		{
+			name:      "global principal: qualified class preserved as-is",
+			principal: globalPrincipal,
+			in:        mkRef("customer1:Animal"),
+			want:      strfmt.URI("weaviate://localhost/customer1:Animal/" + refBeaconUUID),
+		},
+		{
+			name:      "IsGlobalOperator with own-NS namespace set still skips strip",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true, Namespace: "customer1"},
+			in:        mkRef("customer1:Animal"),
+			want:      strfmt.URI("weaviate://localhost/customer1:Animal/" + refBeaconUUID),
+		},
+		{
+			name:      "nil principal: pass-through (NS-disabled cluster)",
+			principal: nil,
+			in:        mkRef("customer1:Animal"),
+			want:      strfmt.URI("weaviate://localhost/customer1:Animal/" + refBeaconUUID),
+		},
+		{
+			name:      "nil Ref yields empty URI",
+			principal: namespacedPrincipal,
+			in:        nil,
+			want:      "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := ""
+			if tc.in != nil {
+				before = tc.in.Class
+			}
+			got := namespacing.StripRefBeacon(tc.principal, tc.in)
+			assert.Equal(t, tc.want, got)
+			if tc.in != nil {
+				assert.Equal(t, before, tc.in.Class,
+					"input Ref must not be mutated")
+			}
+		})
+	}
+}
+
+func TestStripPointingTo(t *testing.T) {
+	const beaconUUID = "11111111-2222-3333-4444-555555555555"
+	mkURI := func(class string) string {
+		return "weaviate://localhost/" + class + "/" + beaconUUID
+	}
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		in        []string
+		want      []string
+	}{
+		{
+			name:      "URI shape: own-NS stripped, foreign + short preserved",
+			principal: namespacedPrincipal,
+			in:        []string{mkURI("customer1:Animal"), mkURI("customer2:Animal"), mkURI("Global")},
+			want:      []string{mkURI("Animal"), mkURI("customer2:Animal"), mkURI("Global")},
+		},
+		{
+			// TypeAggregator path: traverser_aggregate.go sets
+			// PointingTo = property.DataType, which is qualified on NS clusters.
+			name:      "bare class shape (DataType): own-NS stripped, foreign + short preserved",
+			principal: namespacedPrincipal,
+			in:        []string{"customer1:Animal", "customer2:Plant", "Global"},
+			want:      []string{"Animal", "customer2:Plant", "Global"},
+		},
+		{
+			name:      "mixed URI + bare class shapes both stripped",
+			principal: namespacedPrincipal,
+			in:        []string{mkURI("customer1:Animal"), "customer1:Plant"},
+			want:      []string{mkURI("Animal"), "Plant"},
+		},
+		{
+			name:      "global principal: pass-through preserves qualified view",
+			principal: globalPrincipal,
+			in:        []string{mkURI("customer1:Animal"), "customer1:Plant"},
+			want:      []string{mkURI("customer1:Animal"), "customer1:Plant"},
+		},
+		{
+			name:      "IsGlobalOperator with own-NS namespace set still skips strip",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true, Namespace: "customer1"},
+			in:        []string{mkURI("customer1:Animal"), "customer1:Plant"},
+			want:      []string{mkURI("customer1:Animal"), "customer1:Plant"},
+		},
+		{
+			name:      "nil principal: pass-through (NS-disabled cluster)",
+			principal: nil,
+			in:        []string{mkURI("customer1:Animal"), "customer1:Plant"},
+			want:      []string{mkURI("customer1:Animal"), "customer1:Plant"},
+		},
+		{
+			name:      "empty slice returned as-is",
+			principal: namespacedPrincipal,
+			in:        []string{},
+			want:      []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var before []string
+			if len(tc.in) > 0 {
+				before = make([]string, len(tc.in))
+				copy(before, tc.in)
+			}
+			got := namespacing.StripPointingTo(tc.principal, tc.in)
+			assert.Equal(t, tc.want, got)
+			if len(tc.in) > 0 {
+				assert.Equal(t, before, tc.in, "input slice must not be mutated")
+			}
+		})
+	}
+}
+
+func TestStripErrorMessage(t *testing.T) {
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		msg       string
+		want      string
+	}{
+		{
+			name:      "own prefix single occurrence",
+			principal: namespacedPrincipal,
+			msg:       "collection customer1:Movies not found",
+			want:      "collection Movies not found",
+		},
+		{
+			name:      "own prefix multiple occurrences",
+			principal: namespacedPrincipal,
+			msg:       "customer1:Movies references customer1:Person",
+			want:      "Movies references Person",
+		},
+		{
+			name:      "foreign prefix passthrough",
+			principal: namespacedPrincipal,
+			msg:       "cannot read customer2:Movies",
+			want:      "cannot read customer2:Movies",
+		},
+		{
+			name:      "mixed own and foreign",
+			principal: namespacedPrincipal,
+			msg:       "customer1:Movies cannot reference customer2:Person",
+			want:      "Movies cannot reference customer2:Person",
+		},
+		{
+			name:      "empty namespace passthrough",
+			principal: noNamespacePrincipal,
+			msg:       "customer1:Movies not found",
+			want:      "customer1:Movies not found",
+		},
+		{
+			name:      "global principal passthrough",
+			principal: globalPrincipal,
+			msg:       "customer1:Movies not found",
+			want:      "customer1:Movies not found",
+		},
+		{
+			name:      "nil principal passthrough",
+			principal: nil,
+			msg:       "customer1:Movies not found",
+			want:      "customer1:Movies not found",
+		},
+		{
+			name:      "empty message",
+			principal: namespacedPrincipal,
+			msg:       "",
+			want:      "",
+		},
+		{
+			name:      "username and resource in Forbidden.Error() shape",
+			principal: namespacedPrincipal,
+			msg:       "authorization, forbidden action: user 'customer1:apiuser' has insufficient permissions to update [data/customer1:Movies]",
+			want:      "authorization, forbidden action: user 'apiuser' has insufficient permissions to update [data/Movies]",
+		},
+		{
+			name:      "JSON-embedded class name",
+			principal: namespacedPrincipal,
+			msg:       `{"class":"customer1:Movies","id":"abc"}`,
+			want:      `{"class":"Movies","id":"abc"}`,
+		},
+		{
+			name:      "namespace as substring without separator passes through",
+			principal: namespacedPrincipal,
+			msg:       "customer1Movies is invalid",
+			want:      "customer1Movies is invalid",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, namespacing.StripErrorMessage(tc.principal, tc.msg))
+		})
+	}
+}
+
+func TestStripErrForPrincipal(t *testing.T) {
+	forbiddenErr := autherrs.NewForbidden(
+		&models.Principal{Username: "customer1:apiuser"},
+		"update", "data/customer1:Movies",
+	)
+	wrappedForbidden := fmt.Errorf("doing something: %w", autherrs.NewForbidden(
+		&models.Principal{Username: "customer1:apiuser"},
+		"read", "data/customer1:Movies",
+	))
+	unauthErr := autherrs.NewUnauthenticated()
+
+	type outcome int
+	const (
+		wantNil outcome = iota
+		wantSame
+		wantStripped
+	)
+
+	cases := []struct {
+		name      string
+		principal *models.Principal
+		err       error
+		want      outcome
+		wantMsg   string // when want == wantStripped (may be empty to skip equality check)
+		extra     func(t *testing.T, got error)
+	}{
+		{
+			name:      "nil error returns nil",
+			principal: namespacedPrincipal,
+			err:       nil,
+			want:      wantNil,
+		},
+		{
+			name:      "nil principal returns original",
+			principal: nil,
+			err:       errors.New("collection customer1:Movies not found"),
+			want:      wantSame,
+		},
+		{
+			name:      "global principal returns original",
+			principal: globalPrincipal,
+			err:       errors.New("collection customer1:Movies not found"),
+			want:      wantSame,
+		},
+		{
+			name:      "empty namespace returns original",
+			principal: noNamespacePrincipal,
+			err:       errors.New("collection customer1:Movies not found"),
+			want:      wantSame,
+		},
+		{
+			name:      "no own-prefix returns original",
+			principal: namespacedPrincipal,
+			err:       errors.New("collection customer2:Movies not found"),
+			want:      wantSame,
+		},
+		{
+			name:      "own-prefix stripped",
+			principal: namespacedPrincipal,
+			err:       errors.New("collection customer1:Movies not found"),
+			want:      wantStripped,
+			wantMsg:   "collection Movies not found",
+		},
+		{
+			name:      "multiple own-prefix occurrences stripped",
+			principal: namespacedPrincipal,
+			err:       errors.New("customer1:Movies references customer1:Person"),
+			want:      wantStripped,
+			wantMsg:   "Movies references Person",
+		},
+		{
+			name:      "foreign prefix left intact",
+			principal: namespacedPrincipal,
+			err:       errors.New("customer1:Movies references customer2:Person"),
+			want:      wantStripped,
+			wantMsg:   "Movies references customer2:Person",
+		},
+		{
+			name:      "Forbidden preserved via errors.As after strip",
+			principal: namespacedPrincipal,
+			err:       forbiddenErr,
+			want:      wantStripped,
+			wantMsg:   "authorization, forbidden action: user 'apiuser' has insufficient permissions to update [data/Movies]",
+			extra: func(t *testing.T, got error) {
+				var target autherrs.Forbidden
+				require.True(t, errors.As(got, &target))
+			},
+		},
+		{
+			// Unauthenticated's message has no prefix; the function short-circuits
+			// to the original error, but errors.As must still match.
+			name:      "Unauthenticated preserved via errors.As",
+			principal: namespacedPrincipal,
+			err:       unauthErr,
+			want:      wantSame,
+			extra: func(t *testing.T, got error) {
+				var target autherrs.Unauthenticated
+				require.True(t, errors.As(got, &target))
+			},
+		},
+		{
+			name:      "wrapped Forbidden preserved via Unwrap chain",
+			principal: namespacedPrincipal,
+			err:       wrappedForbidden,
+			want:      wantStripped,
+			extra: func(t *testing.T, got error) {
+				var target autherrs.Forbidden
+				require.True(t, errors.As(got, &target))
+				assert.NotContains(t, got.Error(), "customer1:")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := namespacing.StripErrForPrincipal(tc.principal, tc.err)
+			switch tc.want {
+			case wantNil:
+				assert.Nil(t, got)
+			case wantSame:
+				assert.Equal(t, tc.err, got)
+			case wantStripped:
+				require.NotNil(t, got)
+				if tc.wantMsg != "" {
+					assert.Equal(t, tc.wantMsg, got.Error())
+				}
+			}
+			if tc.extra != nil {
+				tc.extra(t, got)
+			}
+		})
+	}
+}
+
+func TestStripOwnNamespace(t *testing.T) {
+	cases := []struct {
+		testName  string
+		principal *models.Principal
+		input     string
+		want      string
+	}{
+		{
+			testName:  "own-prefix stripped",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			input:     "customer1:Movies",
+			want:      "Movies",
+		},
+		{
+			testName:  "foreign prefix passes through unchanged",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			input:     "customer2:Movies",
+			want:      "customer2:Movies",
+		},
+		{
+			testName:  "short input passes through unchanged",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			input:     "Movies",
+			want:      "Movies",
+		},
+		{
+			testName:  "global principal passes through unchanged",
+			principal: &models.Principal{Username: "admin", IsGlobalOperator: true},
+			input:     "customer1:Movies",
+			want:      "customer1:Movies",
+		},
+		{
+			testName:  "nil principal passes through unchanged",
+			principal: nil,
+			input:     "customer1:Movies",
+			want:      "customer1:Movies",
+		},
+		{
+			testName:  "empty namespace passes through unchanged",
+			principal: &models.Principal{Username: "u"},
+			input:     "customer1:Movies",
+			want:      "customer1:Movies",
+		},
+		{
+			testName:  "exact match strips to empty",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			input:     "customer1:",
+			want:      "",
+		},
+		{
+			testName:  "namespace as substring without separator passes through",
+			principal: &models.Principal{Username: "u", Namespace: "customer1"},
+			input:     "customer1Movies",
+			want:      "customer1Movies",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.testName, func(t *testing.T) {
+			got := namespacing.StripOwnNamespace(tc.principal, tc.input)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestStripHelpers_GlobalOperatorDominatesNamespace pins that every strip
+// helper short-circuits when IsGlobalOperator=true, even if Namespace is set.
+// Today's invariant is "globals have empty namespace"; this gate makes the
+// helpers safe if that invariant ever drifts.
+func TestStripHelpers_GlobalOperatorDominatesNamespace(t *testing.T) {
+	op := &models.Principal{Username: "admin", IsGlobalOperator: true, Namespace: "customer1"}
+
+	t.Run("StripOwnNamespace", func(t *testing.T) {
+		assert.Equal(t, "customer1:Movies", namespacing.StripOwnNamespace(op, "customer1:Movies"))
+	})
+	t.Run("StripErrorMessage", func(t *testing.T) {
+		assert.Equal(t, "class customer1:Movies not found",
+			namespacing.StripErrorMessage(op, "class customer1:Movies not found"))
+	})
+	t.Run("StripClassResponse", func(t *testing.T) {
+		got := namespacing.StripClassResponse(op, &models.Class{Class: "customer1:Movies"})
+		assert.Equal(t, "customer1:Movies", got.Class)
+	})
+	t.Run("StripPropertyResponse", func(t *testing.T) {
+		got := namespacing.StripPropertyResponse(op, &models.Property{
+			Name: "ref", DataType: []string{"customer1:Movies"},
+		})
+		assert.Equal(t, []string{"customer1:Movies"}, got.DataType)
+	})
+	t.Run("StripAliasResponse", func(t *testing.T) {
+		got := namespacing.StripAliasResponse(op, &models.Alias{Alias: "customer1:Films", Class: "customer1:Movies"})
+		assert.Equal(t, "customer1:Films", got.Alias)
+		assert.Equal(t, "customer1:Movies", got.Class)
+	})
+	t.Run("StripObjectResponseClass", func(t *testing.T) {
+		obj := &models.Object{Class: "customer1:Movies"}
+		namespacing.StripObjectResponseClass(op, obj)
+		assert.Equal(t, "customer1:Movies", obj.Class)
+	})
+}
+
+func TestQualifyRefTarget(t *testing.T) {
+	ns := &models.Principal{Username: "u", Namespace: "customer1"}
+	admin := &models.Principal{Username: "admin"}
+
+	cases := []struct {
+		name           string
+		principal      *models.Principal
+		q              namespacing.Qualifier
+		sourceClass    string
+		target         string
+		wantQualified  string
+		wantShort      string
+		wantErr        bool
+		wantErrContent string
+	}{
+		// Non-NS cluster: pass-through, short==qualified==target.
+		{
+			name:      "NS-disabled passes target through",
+			principal: admin, q: namespacing.Disabled,
+			sourceClass:   "Zoo",
+			target:        "Animal",
+			wantQualified: "Animal", wantShort: "Animal",
+		},
+
+		// Namespaced principal, short target — qualified with source NS.
+		{
+			name:      "namespaced principal short target qualifies via source",
+			principal: ns, q: wlnamespaces.NewPrefixing(),
+			sourceClass:   "customer1:Zoo",
+			target:        "Animal",
+			wantQualified: "customer1:Animal", wantShort: "Animal",
+		},
+		// Namespaced principal must never type any prefix — even their own.
+		{
+			name:      "namespaced principal own-NS qualified target is rejected",
+			principal: ns, q: wlnamespaces.NewPrefixing(),
+			sourceClass: "customer1:Zoo",
+			target:      "customer1:Animal",
+			wantErr:     true,
+		},
+		{
+			name:      "namespaced principal foreign-NS target is rejected",
+			principal: ns, q: wlnamespaces.NewPrefixing(),
+			sourceClass: "customer1:Zoo",
+			target:      "customer2:Animal",
+			wantErr:     true,
+		},
+
+		// Admin typo — syntactically invalid namespace prefix. Caught by the
+		// ValidateNamespacePrefix safeguard at the top of QualifyRefTarget,
+		// which surfaces the specific "invalid namespace prefix" error
+		// rather than the generic cross-NS rejection.
+		{
+			name:      "admin syntactically invalid NS prefix is rejected with specific error",
+			principal: admin, q: wlnamespaces.NewPrefixing(),
+			sourceClass:    "customer1:Zoo",
+			target:         "BadCase:Animal",
+			wantErr:        true,
+			wantErrContent: "invalid namespace prefix",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			qualified, short, err := namespacing.QualifyRefTarget(tc.principal, tc.q, tc.sourceClass, tc.target)
+			if tc.wantErr {
+				require.Error(t, err)
+				if tc.wantErrContent != "" {
+					assert.Contains(t, err.Error(), tc.wantErrContent)
+				}
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantQualified, qualified, "qualified")
+			assert.Equal(t, tc.wantShort, short, "short")
+		})
+	}
+}

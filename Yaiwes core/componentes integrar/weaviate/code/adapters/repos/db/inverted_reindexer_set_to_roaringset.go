@@ -1,0 +1,94 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package db
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/weaviate/weaviate/adapters/repos/db/helpers"
+	"github.com/weaviate/weaviate/adapters/repos/db/lsmkv"
+	"github.com/weaviate/weaviate/entities/storobj"
+)
+
+type ShardInvertedReindexTaskSetToRoaringSet struct{}
+
+func (t *ShardInvertedReindexTaskSetToRoaringSet) GetPropertiesToReindex(ctx context.Context,
+	shard ShardLike,
+) ([]ReindexableProperty, error) {
+	reindexableProperties := []ReindexableProperty{}
+
+	bucketOptions := []lsmkv.BucketOption{
+		lsmkv.WithDirtyThreshold(time.Duration(shard.Index().Config.MemtablesFlushDirtyAfter) * time.Second),
+	}
+
+	for name, bucket := range shard.Store().GetBucketsByName() {
+		if bucket.Strategy() == lsmkv.StrategySetCollection &&
+			bucket.DesiredStrategy() == lsmkv.StrategyRoaringSet {
+
+			propName, indexType := GetPropNameAndIndexTypeFromBucketName(name)
+			switch indexType {
+			case IndexTypePropValue:
+				reindexableProperties = append(reindexableProperties,
+					ReindexableProperty{
+						PropertyName:    propName,
+						IndexType:       IndexTypePropValue,
+						DesiredStrategy: lsmkv.StrategyRoaringSet,
+						BucketOptions:   bucketOptions,
+					},
+				)
+			case IndexTypePropLength:
+				reindexableProperties = append(reindexableProperties,
+					ReindexableProperty{
+						PropertyName:    propName,
+						IndexType:       IndexTypePropLength,
+						DesiredStrategy: lsmkv.StrategyRoaringSet,
+						BucketOptions:   bucketOptions,
+					},
+				)
+			case IndexTypePropNull:
+				reindexableProperties = append(reindexableProperties,
+					ReindexableProperty{
+						PropertyName:    propName,
+						IndexType:       IndexTypePropNull,
+						DesiredStrategy: lsmkv.StrategyRoaringSet,
+						BucketOptions:   bucketOptions,
+					},
+				)
+			default:
+				// skip remaining
+			}
+		}
+	}
+
+	return reindexableProperties, nil
+}
+
+func (t *ShardInvertedReindexTaskSetToRoaringSet) OnPostResumeStore(ctx context.Context, shard ShardLike) error {
+	return nil
+}
+
+func (t *ShardInvertedReindexTaskSetToRoaringSet) ObjectsIterator(shard ShardLike) objectsIterator {
+	return func(ctx context.Context, fn func(object *storobj.Object) error) error {
+		// pinned for the whole iteration: the cursor underneath reads the
+		// bucket's segments, and an unpinned pointer can be shut down between
+		// the lookup and the scan
+		bucket, release := shard.Store().AcquireBucketForRead(helpers.ObjectsBucketLSM)
+		if bucket == nil {
+			return fmt.Errorf("objects bucket of shard %q: %w", shard.Name(), lsmkv.ErrBucketNotFound)
+		}
+		defer release()
+
+		return bucket.IterateObjects(ctx, fn)
+	}
+}

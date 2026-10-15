@@ -1,0 +1,43 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package types
+
+import (
+	"context"
+
+	"github.com/weaviate/weaviate/cluster/proto/api"
+	"github.com/weaviate/weaviate/cluster/schema/leader"
+	"github.com/weaviate/weaviate/cluster/schema/local"
+)
+
+type FSMUpdater interface {
+	leader.TenantWriter
+	local.UpdateWaiter
+	ReplicationAddReplicaToShard(ctx context.Context, collection string, shard string, nodeId string, opId uint64) (uint64, error)
+	DeleteReplicaFromShard(ctx context.Context, collection string, shard string, nodeId string) (uint64, error)
+	ReplicationUpdateReplicaOpStatus(ctx context.Context, id uint64, state api.ShardReplicationState) error
+	ReplicationRegisterError(ctx context.Context, id uint64, errorToRegister string) error
+	ReplicationRemoveReplicaOp(ctx context.Context, id uint64) error
+	ReplicationCancellationComplete(ctx context.Context, id uint64) error
+	ReplicationGetReplicaOpStatus(ctx context.Context, id uint64) (api.ShardReplicationState, error)
+	ReplicationStoreSchemaVersion(ctx context.Context, id uint64, schemaVersion uint64) error
+	ReplicationAllPeersAtLeast(opID uint64, target api.ShardReplicationState) (bool, error)
+	// ReplicationLocalOpCancelState reads the op from this node's FSM; ErrReplicationOperationNotFound once it is gone.
+	ReplicationLocalOpCancelState(opID uint64) (OpCancelState, error)
+}
+
+// OpCancelState is the op's state and cancel flags as this node's FSM last applied them.
+type OpCancelState struct {
+	State         api.ShardReplicationState
+	ShouldCancel  bool
+	UnCancellable bool
+}
