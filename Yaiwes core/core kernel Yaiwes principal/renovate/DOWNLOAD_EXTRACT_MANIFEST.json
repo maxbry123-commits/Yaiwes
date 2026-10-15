@@ -1,15 +1,26 @@
 {
- "schema": "yaiwes.core.manual-nolfs-import.v1",
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
  "source_repo": "renovatebot/renovate",
  "source_commit": "ab622825b595f1c62544ff7cfaf9672f0c965410",
- "imported_at": "2026-10-15T04:48:17.038624-05:00",
- "method": "shallow clone depth=1 sin LFS (punteros LFS se dejan como punteros); index git directo; sin _archives",
- "files": 3968,
- "lfs_pointers_left_as_pointers": [],
- "excluded": {
-  "docs/usage/docker.md": "GitHub push protection: Google Cloud Service Account Credentials (línea 409, ejemplo de documentación)"
+ "slug": "renovate",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 3968,
+  "sha256": "16df6f3d38efa367416694eaf919e9aa49c68f17a9882228643a4cc92d385077"
  },
- "skipped_symlinks_submodules": [
+ "extracted_tree": {
+  "files": 3968,
+  "sha256": "16df6f3d38efa367416694eaf919e9aa49c68f17a9882228643a4cc92d385077"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [],
+ "gitattributes_lfs_removed": [],
+ "excluded_non_lfs": {
+  "docs/usage/docker.md": "GitHub push protection (Google Cloud Service Account Credentials, línea 409); no es LFS"
+ },
+ "skipped_symlinks": [
   "CLAUDE.md"
- ]
+ ],
+ "no_lfs": true
 }
