@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements. See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership. The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License. You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied. See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.uima</groupId>
+    <artifactId>uimaj-parent-internal</artifactId>
+    <version>3.7.0-SNAPSHOT</version>
+    <relativePath>../uimaj-parent-internal/pom.xml</relativePath>
+  </parent>
+
+  <artifactId>uimaj-ep-launcher</artifactId>
+  <packaging>jar</packaging>
+  <name>Apache UIMA Eclipse: ${project.artifactId}</name>
+  <!-- continuation lines need to start in col 1 else manifest has extra blanks -->
+  <description>Adds launch support for Analysis Engines </description>
+  <url>${uimaWebsiteUrl}</url>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.uima</groupId>
+      <artifactId>uimaj-core</artifactId>
+      <version>${project.parent.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.jdt.debug.ui</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.jface</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.swt.win32.win32.x86_64</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.equinox.common</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.jdt.launching</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.osgi</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.ui.workbench</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.debug.ui</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.core.resources</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.core.runtime</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.debug.core</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${eclipseP2RepoId}</groupId>
+      <artifactId>org.eclipse.ui.ide</artifactId>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.felix</groupId>
+        <artifactId>maven-bundle-plugin</artifactId>
+        <configuration>
+          <manifestLocation>META-INF</manifestLocation>
+          <instructions>
+            <Bundle-SymbolicName>org.apache.uima.launcher;singleton:=true</Bundle-SymbolicName>
+            <Bundle-Activator>org.apache.uima.ep_launcher.LauncherPlugin</Bundle-Activator>
+            <Plugin-Class>org.apache.uima.ep_launcher.LauncherPlugin</Plugin-Class>
+            <Eclipse-AutoStart>true</Eclipse-AutoStart>
+            <Bundle-RequiredExecutionEnvironment>${execution.environment}</Bundle-RequiredExecutionEnvironment>
+            <Export-Package>
+              org.apache.uima.ep_launcher
+            </Export-Package>
+            <!-- 
+              - Need to enforce not having the "common" attribute here, otherwise we get wired to the wrong bundle
+              - ("org.eclipse.equinox.common" instead of "org.eclipse.core.runtime").
+              - Cf. https://bnd.bndtools.org/heads/import_package.html
+              -->
+            <Import-Package>
+              org.eclipse.ui.dialogs;ui.workbench=!,
+              org.eclipse.ui.model;ui.workbench=!,
+              org.eclipse.core.runtime;common=!,
+              *
+            </Import-Package>
+          </instructions>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

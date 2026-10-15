@@ -1,0 +1,17 @@
+.classpath
+.project
+.settings
+.vscode/
+target
+checkpoint_synchPoint.xml
+checkpoint_synchPoint.xml.prev
+checkpoint.dat
+checkpoint.dat.prev
+api-change-report
+.factorypath
+issuesFixed
+.idea
+*.iml
+.tycho-consumer-pom.xml
+dependency-reduced-pom.xml
+scratch

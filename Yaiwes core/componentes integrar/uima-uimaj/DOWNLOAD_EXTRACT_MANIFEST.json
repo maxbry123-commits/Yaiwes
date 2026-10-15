@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 16976633,
+  "bundle_sha256": "635beca8ec81ccfbc70b23e0d017a9723da295f80efeb2fb25141284b6190217",
+  "extracted_tree": {
+    "bytes": 38141821,
+    "files": 5755,
+    "sha256": "c1c0871c35253a71243a22a9a7654349463748bb6c0a12f2b5c6cc94a4c2330c"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "uima-uimaj.bundle.zip.part-0001",
+      "sha256": "fbb91a5202c94e347b36f0b8313a7d95ca4002e1af63dbe86de26a4286e6e0c3"
+    },
+    {
+      "bytes": 4393721,
+      "name": "uima-uimaj.bundle.zip.part-0002",
+      "sha256": "9f161ce28cd784dd54f170ded3fa65a2bccfb8a15ca9e2c5eb6ae10a5ea8979f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "uima-uimaj",
+  "source_bytes": 38141821,
+  "source_commit": "b928223493af16aaa09ea3f2b9a5193a693c973b",
+  "source_files": 5755,
+  "source_ref": "main",
+  "source_repo": "apache/uima-uimaj",
+  "source_tree": {
+    "bytes": 38141821,
+    "files": 5755,
+    "sha256": "c1c0871c35253a71243a22a9a7654349463748bb6c0a12f2b5c6cc94a4c2330c"
+  }
+}
