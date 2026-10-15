@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 935910,
+  "bundle_sha256": "790a97fd66b3d581f24e8571e0f93beddcbd6b1e8be3e9e59935cd228cf3cedb",
+  "extracted_tree": {
+    "bytes": 1670575,
+    "files": 138,
+    "sha256": "dfd73865fb231e974fc87c558e80115b99cb9158830c1a75b456023264f313e9"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 935910,
+      "name": "agentskills.bundle.zip.part-0001",
+      "sha256": "790a97fd66b3d581f24e8571e0f93beddcbd6b1e8be3e9e59935cd228cf3cedb"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "CLAUDE.md"
+  ],
+  "skipped_special_count": 1,
+  "slug": "agentskills",
+  "source_bytes": 1670575,
+  "source_commit": "69ef37e9424c0a7ea9dd2293b559e43ec8176379",
+  "source_files": 138,
+  "source_ref": "main",
+  "source_repo": "agentskills/agentskills",
+  "source_tree": {
+    "bytes": 1670575,
+    "files": 138,
+    "sha256": "dfd73865fb231e974fc87c558e80115b99cb9158830c1a75b456023264f313e9"
+  }
+}
