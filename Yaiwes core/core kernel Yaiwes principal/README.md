@@ -11,8 +11,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 1. ECC
 1. Nombre: ECC (affaan-m/ECC)
 2. URL visible: https://github.com/affaan-m/ECC
-3. Micro resumen: The agent harness performance optimization system. Skills, instincts, memory, security, and research-first development for Claude Code, Codex, Opencode, Cursor and beyond.
-4. LOOP: ENTRADA → ECC → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Biblioteca de skills, agentes, hooks, reglas, memoria y workflows. YAIWES debería extraerlos y compilarlos a software.
+4. LOOP: SKILLS/RULES/HOOKS → EXTRACT → COMPONENT-IR → PYTHON WORKFLOW/MOTOR
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/ECC — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 2. agentskills
@@ -39,36 +39,36 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 5. ajv
 1. Nombre: ajv (ajv-validator/ajv)
 2. URL visible: https://github.com/ajv-validator/ajv
-3. Micro resumen: The fastest JSON schema Validator. Supports JSON Schema draft-04/06/07/2019-09/2020-12 and JSON Type Definition (RFC8927)
-4. LOOP: ENTRADA → ajv → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Validador JSON Schema muy rápido para JS/TS.
+4. LOOP: JSON → COMPILED SCHEMA → VALIDATE → PASS/ERROR
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/ajv — movido desde los 115
 
 ## 6. openevolve
 1. Nombre: openevolve (algorithmicsuperintelligence/openevolve)
 2. URL visible: https://github.com/algorithmicsuperintelligence/openevolve
-3. Micro resumen: Open-source implementation of AlphaEvolve
-4. LOOP: ENTRADA → openevolve → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Evolución automática de programas/código mediante evaluación.
+4. LOOP: PROGRAM → MUTATE → EVALUATE → SCORE → SELECT → NEXT GENERATION
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/openevolve — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 7. syft
 1. Nombre: syft (anchore/syft)
 2. URL visible: https://github.com/anchore/syft
-3. Micro resumen: CLI tool and library for generating a Software Bill of Materials from container images and filesystems
-4. LOOP: ENTRADA → syft → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Genera SBOM de repos, archivos e imágenes.
+4. LOOP: SOURCE/IMAGE → DISCOVER PACKAGES → SBOM → REGISTRY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/syft — movido desde los 115
 
 ## 8. pouchdb
 1. Nombre: pouchdb (apache/pouchdb)
 2. URL visible: https://github.com/apache/pouchdb
-3. Micro resumen: :kangaroo: - PouchDB is a pocket-sized database.
-4. LOOP: ENTRADA → pouchdb → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Base local con capacidad de replicación/sincronización.
+4. LOOP: LOCAL DOC → DB → CHANGE LOG → OPTIONAL REPLICATION
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/pouchdb — movido desde los 115
 
 ## 9. ast-grep
 1. Nombre: ast-grep (ast-grep/ast-grep)
 2. URL visible: https://github.com/ast-grep/ast-grep
-3. Micro resumen: ⚡A CLI tool for code structural search, lint and rewriting. Written in Rust
-4. LOOP: ENTRADA → ast-grep → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Búsqueda y reescritura estructural usando AST.
+4. LOOP: CODE → AST PATTERN → MATCH → REPORT/REWRITE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/ast-grep — ya en shark imput (enlazado, no descargado)
 
 ## 10. semantic-router
@@ -81,8 +81,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 11. quickjs
 1. Nombre: quickjs (bellard/quickjs)
 2. URL visible: https://github.com/bellard/quickjs
-3. Micro resumen: Public repository of the QuickJS Javascript Engine.
-4. LOOP: ENTRADA → quickjs → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Motor JavaScript pequeño y embebible.
+4. LOOP: JS SCRIPT → QUICKJS VM → RESULT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/quickjs — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 12. litellm
@@ -102,36 +102,36 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 14. wasmtime
 1. Nombre: wasmtime (bytecodealliance/wasmtime)
 2. URL visible: https://github.com/bytecodealliance/wasmtime
-3. Micro resumen: A lightweight WebAssembly runtime that is fast, secure, and standards-compliant
-4. LOOP: ENTRADA → wasmtime → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Runtime WebAssembly aislado para ejecutar componentes en cuarentena.
+4. LOOP: COMPONENTE → WASM SANDBOX → RUN → TEST → PROMOTE/REJECT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/wasmtime — movido desde los 115
 
 ## 15. cel-go
 1. Nombre: cel-go (cel-expr/cel-go)
 2. URL visible: https://github.com/cel-expr/cel-go
-3. Micro resumen: Fast, portable, non-Turing complete expression evaluation with gradual typing (Go)
-4. LOOP: ENTRADA → cel-go → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Expresiones deterministas pequeñas para condiciones y triggers.
+4. LOOP: STATE + EXPRESSION → EVALUATE → TRUE/FALSE → TRANSITION
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/cel-go — movido desde los 115
 
 ## 16. celery
 1. Nombre: celery (celery/celery)
 2. URL visible: https://github.com/celery/celery
-3. Micro resumen: Distributed Task Queue (development branch)
-4. LOOP: ENTRADA → celery → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Cola distribuida de tareas Python. Útil como referencia de workers y resultados.
+4. LOOP: TASK → BROKER → WORKER → RESULT → RETRY/COMPLETE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/celery — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 17. agentic-harness-engineering
 1. Nombre: agentic-harness-engineering (china-qijizhifeng/agentic-harness-engineering)
 2. URL visible: https://github.com/china-qijizhifeng/agentic-harness-engineering
-3. Micro resumen: Official AHE code — Agentic Harness Engineering: observability-driven automatic evolution of coding-agent harnesses (concurrent w/ meta-harness). NexAU-AHE reaches 84.7% ± 2.1 pass@1 on Terminal-Bench 2 (GPT-5.5). Lifts GPT-5.4 69.7→77.0% over 10 iters, beats Codex/ACE/Training-Free GRPO; frozen harness transfers to SWE-bench-Verified.
-4. LOOP: ENTRADA → agentic-harness-engineering → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Investiga/evoluciona componentes de un harness usando evaluación y cambios controlados.
+4. LOOP: HARNESS → EVALUATE → TRACE ANALYSIS → MUTATE → TEST → ACCEPT/REJECT ↺
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/agentic-harness-engineering — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 18. sandpack
 1. Nombre: sandpack (codesandbox/sandpack)
 2. URL visible: https://github.com/codesandbox/sandpack
-3. Micro resumen: A component toolkit for creating live-running code editing experiences, using the power of CodeSandbox.
-4. LOOP: ENTRADA → sandpack → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Toolkit de editores/previews de código en navegador.
+4. LOOP: FILES/CODE → BUNDLER → PREVIEW → RESULT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/sandpack — movido desde los 115
 
 ## 19. huey
@@ -144,15 +144,15 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 20. cue
 1. Nombre: cue (cue-lang/cue)
 2. URL visible: https://github.com/cue-lang/cue
-3. Micro resumen: The home of the CUE language! Validate and define text-based and dynamic configuration
-4. LOOP: ENTRADA → cue → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Definición, unificación y validación de configuración/constraints.
+4. LOOP: MANIFEST + CONSTRAINTS → UNIFY → VALIDATE → VALID / ERROR
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/cue — movido desde los 115
 
 ## 21. dagger
 1. Nombre: dagger (dagger/dagger)
 2. URL visible: https://github.com/dagger/dagger
-3. Micro resumen: Automation engine to build, test and ship any codebase. Runs locally, in CI, or directly in the cloud
-4. LOOP: ENTRADA → dagger → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Motor programable para build, test, package y deploy.
+4. LOOP: SOURCE → BUILD → TEST → PACKAGE → ARTIFACT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/dagger — movido desde los 115
 
 ## 22. Bayesian-Agent
@@ -165,22 +165,22 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 23. deepseek-harness
 1. Nombre: deepseek-harness (deepseek-ai/deepseek-harness)
 2. URL visible: https://github.com/deepseek-ai/deepseek-harness
-3. Micro resumen: DeepSeek Harness: Everything is a Plugin.
-4. LOOP: ENTRADA → deepseek-harness → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Harness modular donde modelos, tools, loops y sesiones pueden ser plugins.
+4. LOOP: PROFILE → PLUGIN TREE → SERVICES/EVENTS → EXECUTION LOOP → RESULT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/deepseek-harness — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 24. haystack
 1. Nombre: haystack (deepset-ai/haystack)
 2. URL visible: https://github.com/deepset-ai/haystack
-3. Micro resumen: Open-source AI orchestration framework for building context-engineered, production-ready LLM applications. Design modular pipelines and agent workflows with explicit control over retrieval, routing, memory, and generation. Built for scalable agents, RAG, multimodal applications, semantic search, and conversational systems.
-4. LOOP: ENTRADA → haystack → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Componentes y pipelines modulares; interesante para convertir pipelines completos en capacidades.
+4. LOOP: COMPONENTS → PIPELINE → EXECUTE → OUTPUT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/haystack — movido desde los 115
 
 ## 25. Dexie.js
 1. Nombre: Dexie.js (dexie/Dexie.js)
 2. URL visible: https://github.com/dexie/Dexie.js
-3. Micro resumen: A Minimalistic Wrapper for IndexedDB
-4. LOOP: ENTRADA → Dexie.js → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Wrapper tipado/práctico de IndexedDB.
+4. LOOP: OBJECT → DEXIE → INDEXEDDB → QUERY/UPDATE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/Dexie.js — movido desde los 115
 
 ## 26. ponytail
@@ -193,22 +193,22 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 27. jsonforms
 1. Nombre: jsonforms (eclipsesource/jsonforms)
 2. URL visible: https://github.com/eclipsesource/jsonforms
-3. Micro resumen: Customizable JSON Schema-based forms with React, Angular and Vue support out of the box.
-4. LOOP: ENTRADA → jsonforms → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Genera formularios a partir de JSON Schema y UI Schema.
+4. LOOP: JSON SCHEMA + UI SCHEMA → RENDERER → FORM → DATA
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/jsonforms — movido desde los 115
 
 ## 28. AutoSkill
 1. Nombre: AutoSkill (ECNU-ICALK/AutoSkill)
 2. URL visible: https://github.com/ECNU-ICALK/AutoSkill
-3. Micro resumen: AutoSkill: Experience-Driven Lifelong Learning via Skill Self-Evolution
-4. LOOP: ENTRADA → AutoSkill → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Extrae experiencia y crea/mejora skills reutilizables.
+4. LOOP: TRAJECTORY → EXTRACT EXPERIENCE → CREATE/MERGE SKILL → EVALUATE → PROMOTE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/AutoSkill — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 29. gepa
 1. Nombre: gepa (gepa-ai/gepa)
 2. URL visible: https://github.com/gepa-ai/gepa
-3. Micro resumen: Optimize prompts, code, and more with AI-powered Reflective Optimization
-4. LOOP: ENTRADA → gepa → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Optimización evolutiva/reflexiva de prompts, código y configuraciones.
+4. LOOP: CANDIDATE → EXECUTE → TRACE → REFLECT → MUTATE → EVALUATE → SELECT ↺
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/gepa — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 30. timesfm
@@ -216,20 +216,20 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 2. URL visible: https://github.com/google-research/timesfm
 3. Micro resumen: TimesFM (Time Series Foundation Model) is a pretrained time-series foundation model developed by Google Research for time-series forecasting.
 4. LOOP: ENTRADA → timesfm → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/timesfm — descargado · completo (archivos faltantes recuperados desde _archives con motor_1)
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/timesfm — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · reglas filter=lfs quitadas: .gitattributes (archivo eliminado: solo tenía reglas LFS)
 
 ## 31. artemis
 1. Nombre: artemis (google/artemis)
 2. URL visible: https://github.com/google/artemis
-3. Micro resumen: ARTEMIS turns natural-language instructions into reliable Android automation. It automates end-to-end workflows, captures logs, and integrates seamlessly with AI coding assistants such as Antigravity, Codex, and Claude Code.  It also achieves 99%+ success rate on AndroidWorld Benchmark.
-4. LOOP: ENTRADA → artemis → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Automatización/pruebas de Android. Puede transformarse en AndroidEngine.
+4. LOOP: TASK → DEVICE STATE → ACTION → DEVICE → OBSERVE → VERIFY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/artemis — movido desde los 115
 
 ## 32. osv-scanner
 1. Nombre: osv-scanner (google/osv-scanner)
 2. URL visible: https://github.com/google/osv-scanner
-3. Micro resumen: Vulnerability scanner written in Go which uses the data provided by https://osv.dev
-4. LOOP: ENTRADA → osv-scanner → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Detecta vulnerabilidades conocidas en dependencias.
+4. LOOP: DEPENDENCIES/SBOM → OSV MATCH → VULNERABILITIES → POLICY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/osv-scanner — movido desde los 115
 
 ## 33. watchdog
@@ -242,29 +242,29 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 34. grapesjs
 1. Nombre: grapesjs (GrapesJS/grapesjs)
 2. URL visible: https://github.com/GrapesJS/grapesjs
-3. Micro resumen: Free and Open source Web Builder Framework. Next generation tool for building templates without coding
-4. LOOP: ENTRADA → grapesjs → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Editor visual web con componentes, estilos, commands y storage.
+4. LOOP: PAGE MODEL → ADD/MOVE/STYLE → STORAGE → HTML/CSS
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/grapesjs — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 35. CLI-Anything
 1. Nombre: CLI-Anything (HKUDS/CLI-Anything)
 2. URL visible: https://github.com/HKUDS/CLI-Anything
-3. Micro resumen: "CLI-Anything: Making ALL Software Agent-Native" -- CLI-Hub: https://clianything.cc/
-4. LOOP: ENTRADA → CLI-Anything → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Convierte software existente en CLI/harness programático. Muy importante para transformar software en motores YAIWES.
+4. LOOP: SOFTWARE → ANALIZAR OPERACIONES → CLI/HARNESS → COMMANDS → TEST → REGISTRY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/CLI-Anything — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1) · NO TOCAR
 
 ## 36. in-toto
 1. Nombre: in-toto (in-toto/in-toto)
 2. URL visible: https://github.com/in-toto/in-toto
-3. Micro resumen: in-toto is a framework to protect supply chain integrity.
-4. LOOP: ENTRADA → in-toto → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Registra la cadena de pasos y artefactos ejecutados.
+4. LOOP: INPUT → STEP → RECORD METADATA → NEXT STEP → VERIFY CHAIN
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/in-toto — movido desde los 115
 
 ## 37. capacitor
 1. Nombre: capacitor (ionic-team/capacitor)
 2. URL visible: https://github.com/ionic-team/capacitor
-3. Micro resumen: Build cross-platform Native Progressive Web Apps for iOS, Android, and the Web ⚡️
-4. LOOP: ENTRADA → capacitor → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Lleva aplicaciones web a Android/iOS y APIs nativas.
+4. LOOP: WEB APP → CAPACITOR BRIDGE → NATIVE APIs → APK/IOS
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/capacitor — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 38. SCOPE
@@ -284,36 +284,36 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 40. dgm
 1. Nombre: dgm (jennyzzt/dgm)
 2. URL visible: https://github.com/jennyzzt/dgm
-3. Micro resumen: Darwin Gödel Machine: Open-Ended Evolution of Self-Improving Agents
-4. LOOP: ENTRADA → dgm → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/dgm — movido desde los 115
+3. Micro resumen: Modificación iterativa de código validada mediante benchmarks.
+4. LOOP: CURRENT CODE → CANDIDATE MODIFICATION → BENCHMARK → BETTER? → PROMOTE/ARCHIVE
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/dgm — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · reglas filter=lfs quitadas: .gitattributes (archivo eliminado: solo tenía reglas LFS)
 
 ## 41. joern
 1. Nombre: joern (joernio/joern)
 2. URL visible: https://github.com/joernio/joern
-3. Micro resumen: Open-source code analysis platform for C/C++/Java/Binary/Javascript/Python/Kotlin based on code property graphs. Discord https://discord.gg/vv4MH284Hc
-4. LOOP: ENTRADA → joern → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Convierte código en Code Property Graph con relaciones de control y datos.
+4. LOOP: SOURCE → CPG → GRAPH QUERY → CALL/DATA/CONTROL RELATIONS
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/joern — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 42. EvolveR
 1. Nombre: EvolveR (KnowledgeXLab/EvolveR)
 2. URL visible: https://github.com/KnowledgeXLab/EvolveR
-3. Micro resumen: (ICML 2026) Self‑Evolving LLM Agents through an Experience‑Driven Lifecycle
-4. LOOP: ENTRADA → EvolveR → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Destila principios de trayectorias pasadas y los reutiliza.
+4. LOOP: TRAJECTORY → DISTILL PRINCIPLE → MEMORY → RETRIEVE → NEXT RUN
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/EvolveR — movido desde los 115
 
 ## 43. langchain
 1. Nombre: langchain (langchain-ai/langchain)
 2. URL visible: https://github.com/langchain-ai/langchain
-3. Micro resumen: The agent engineering platform.
-4. LOOP: ENTRADA → langchain → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Framework para modelos, tools y cadenas. Útil para estudiar wrappers/adapters.
+4. LOOP: INPUT → CHAIN/MODEL → TOOL → RESULT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/langchain — movido desde los 115
 
 ## 44. langgraph
 1. Nombre: langgraph (langchain-ai/langgraph)
 2. URL visible: https://github.com/langchain-ai/langgraph
-3. Micro resumen: Build resilient agents.
-4. LOOP: ENTRADA → langgraph → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Workflows/grafos con estado. Interesa su patrón, no darle autoridad sobre YAIWES.
+4. LOOP: STATE → NODE → EDGE/CONDITION → NODE → CHECKPOINT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/langgraph — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 45. RouteLLM
@@ -333,8 +333,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 47. localForage
 1. Nombre: localForage (localForage/localForage)
 2. URL visible: https://github.com/localForage/localForage
-3. Micro resumen: 💾 Offline storage, improved. Wraps IndexedDB, WebSQL, or localStorage using a simple but powerful API.
-4. LOOP: ENTRADA → localForage → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Almacenamiento web simple con fallback.
+4. LOOP: KEY/VALUE → LOCALFORAGE → STORAGE → VALUE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/localForage — movido desde los 115
 
 ## 48. manim
@@ -347,8 +347,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 49. meilisearch
 1. Nombre: meilisearch (meilisearch/meilisearch)
 2. URL visible: https://github.com/meilisearch/meilisearch
-3. Micro resumen: A lightning-fast search engine API bringing AI-powered hybrid search to your sites and applications.
-4. LOOP: ENTRADA → meilisearch → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Buscador ligero para fichas, componentes, errores y documentación.
+4. LOOP: FICHAS → INDEX → SEARCH → FILTER/RANK → TOP RESULTS
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/meilisearch — movido desde los 115
 
 ## 50. mem0
@@ -361,8 +361,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 51. Memento-Skills
 1. Nombre: Memento-Skills (Memento-Teams/Memento-Skills)
 2. URL visible: https://github.com/Memento-Teams/Memento-Skills
-3. Micro resumen: Memento-Skills: Let Agents Design Agents
-4. LOOP: ENTRADA → Memento-Skills → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Skills recuperables/persistentes con ciclos de ejecución y reflexión.
+4. LOOP: READ SKILL → EXECUTE → REFLECT → CANDIDATE → TEST → PROMOTE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/Memento-Skills — movido desde los 115
 
 ## 52. MemRL
@@ -375,16 +375,77 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 53. agent-framework
 1. Nombre: agent-framework (microsoft/agent-framework)
 2. URL visible: https://github.com/microsoft/agent-framework
-3. Micro resumen: A framework for building, orchestrating and deploying AI agents and multi-agent workflows with support for Python and .NET.
-4. LOOP: ENTRADA → agent-framework → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/agent-framework — importado sin LFS; 2 archivos LFS (python/packages/lab/lightning/assets/*.png) quedan como punteros
+3. Micro resumen: Framework actual de Microsoft para agents y workflows.
+4. LOOP: EXECUTORS → EDGES → WORKFLOW → RUN → CHECKPOINT
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/agent-framework — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · 2 punteros LFS eliminados · reglas filter=lfs quitadas: python/packages/lab/lightning/.gitattributes (archivo eliminado: solo tenía reglas LFS)
+<details><summary>Rutas LFS eliminadas (2)</summary>
+
+- `python/packages/lab/lightning/assets/train_math_agent.png`
+- `python/packages/lab/lightning/assets/train_tau2_agent.png`
+
+</details>
 
 ## 54. autogen
 1. Nombre: autogen (microsoft/autogen)
 2. URL visible: https://github.com/microsoft/autogen
-3. Micro resumen: A programming framework for agentic AI
-4. LOOP: ENTRADA → autogen → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/autogen — importado sin LFS; 51 archivos LFS (imágenes de docs) quedan como punteros
+3. Micro resumen: Framework multiagente legado para proyectos nuevos; útil como referencia.
+4. LOOP: AGENT → MESSAGE → AGENT/TOOL → RESPONSE → LOOP
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/autogen — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · 51 punteros LFS eliminados · reglas filter=lfs quitadas: .gitattributes (líneas filter=lfs quitadas); dotnet/test/AutoGen.Anthropic.Tests/images/.gitattributes (archivo eliminado: solo tenía reglas LFS)
+<details><summary>Rutas LFS eliminadas (51)</summary>
+
+- `autogen-landing.jpg`
+- `dotnet/nuget/icon.png`
+- `dotnet/resource/images/background.png`
+- `dotnet/resource/images/square.png`
+- `dotnet/samples/dev-team/docs/images/github-sk-dev-team.png`
+- `dotnet/samples/dev-team/docs/images/new-codespace.png`
+- `dotnet/samples/dev-team/docs/images/overview.png`
+- `dotnet/samples/dev-team/docs/images/solution-explorer.png`
+- `dotnet/test/AutoGen.Anthropic.Tests/images/square.png`
+- `dotnet/test/AutoGen.Ollama.Tests/images/image.png`
+- `dotnet/test/AutoGen.Ollama.Tests/images/square.png`
+- `dotnet/test/AutoGen.Tests/ApprovalTests/square.png`
+- `dotnet/website/images/articles/CreateAgentWithTools/single-turn-tool-call-with-auto-invoke.png`
+- `dotnet/website/images/articles/CreateAgentWithTools/single-turn-tool-call-without-auto-invoke.png`
+- `dotnet/website/images/articles/CreateUserProxyAgent/image-1.png`
+- `dotnet/website/images/articles/DynamicGroupChat/dynamicChat.gif`
+- `dotnet/website/images/articles/PrintMessageMiddleware/printMessage.png`
+- `dotnet/website/images/articles/PrintMessageMiddleware/streamingoutput.gif`
+- `dotnet/website/images/articles/SequentialGroupChat/SearcherSummarizer.gif`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/FinalStepsA.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/FinalStepsB.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/FinalStepsC.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/Step5.2OpenAIModel.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/Step5.3ModelNameAndURL.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/Step6.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/Step6b.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/Terminal.png`
+- `dotnet/website/images/articles/UseAutoGenAsModelinAGStudio/TheModelTab.png`
+- `python/docs/src/_static/images/logo/favicon-16x16.png`
+- `python/docs/src/_static/images/logo/favicon-32x32.png`
+- `python/docs/src/_static/images/logo/favicon-512x512.png`
+- `python/docs/src/images/autogen-magentic-one-agents.png`
+- `python/docs/src/images/autogen-magentic-one-example.png`
+- `python/docs/src/images/example-company.jpg`
+- `python/docs/src/images/example-literature.jpg`
+- `python/docs/src/images/example-travel.jpeg`
+- `python/docs/src/images/open-ai-telemetry-example.png`
+- `python/docs/src/user-guide/agentchat-user-guide/jaeger.png`
+- `python/docs/src/user-guide/autogenstudio-user-guide/jsoneditor.jpg`
+- `python/docs/src/user-guide/autogenstudio-user-guide/teambuilder.jpg`
+- `python/packages/autogen-ext/imgs/task_centric_memory.png`
+- `python/packages/autogen-ext/imgs/task_centric_memory_2.png`
+- `python/packages/autogen-ext/imgs/task_centric_memory_3.png`
+- `python/packages/autogen-studio/docs/ags_screen.png`
+- `python/packages/autogen-studio/frontend/src/images/icon.png`
+- `python/samples/core_distributed-group-chat/public/avatars/editor.png`
+- `python/samples/core_distributed-group-chat/public/avatars/group_chat_manager.png`
+- `python/samples/core_distributed-group-chat/public/avatars/user.png`
+- `python/samples/core_distributed-group-chat/public/avatars/writer.png`
+- `python/samples/core_distributed-group-chat/public/favicon.png`
+- `python/samples/core_distributed-group-chat/public/logo.png`
+
+</details>
 
 ## 55. LLMLingua
 1. Nombre: LLMLingua (microsoft/LLMLingua)
@@ -396,22 +457,22 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 56. playwright
 1. Nombre: playwright (microsoft/playwright)
 2. URL visible: https://github.com/microsoft/playwright
-3. Micro resumen: Playwright is a framework for Web Testing and Automation. It allows testing Chromium, Firefox and WebKit with a single API.
-4. LOOP: ENTRADA → playwright → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Browser automation y QA. Debe convertirse en BrowserEngine.
+4. LOOP: TRIGGER → BROWSER ACTION → DOM/PAGE → EVIDENCE → VERIFY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/playwright — ya en shark imput (enlazado, no descargado)
 
 ## 57. python-sdk
 1. Nombre: python-sdk (modelcontextprotocol/python-sdk)
 2. URL visible: https://github.com/modelcontextprotocol/python-sdk
-3. Micro resumen: The official Python SDK for Model Context Protocol servers and clients
-4. LOOP: ENTRADA → python-sdk → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Protocolo para exponer capacidades fuera de YAIWES. Debe vivir en el borde, no en el Kernel.
+4. LOOP: YAIWES CAPABILITY → MCP SERVER ↔ CLIENT → EXTERNAL SYSTEM
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/python-sdk — ya en shark imput (enlazado, no descargado)
 
 ## 58. AgentEvolver
 1. Nombre: AgentEvolver (modelscope/AgentEvolver)
 2. URL visible: https://github.com/modelscope/AgentEvolver
-3. Micro resumen: AgentEvolver: Towards Efficient Self-Evolving Agent System
-4. LOOP: ENTRADA → AgentEvolver → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Investigación de agentes que evolucionan usando experiencia acumulada.
+4. LOOP: EXPERIENCE → ATTRIBUTE → GENERATE/EVOLVE → EVALUATE → UPDATE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/AgentEvolver — movido desde los 115
 
 ## 59. memanto
@@ -419,7 +480,7 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 2. URL visible: https://github.com/moorcheh-ai/memanto
 3. Micro resumen: Memory that AI Agents Love!
 4. LOOP: ENTRADA → memanto → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/memanto — descargado · completo (archivos faltantes recuperados desde _archives con motor_1)
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/memanto — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · reglas filter=lfs quitadas: .gitattributes (archivo eliminado: solo tenía reglas LFS)
 
 ## 60. rea
 1. Nombre: rea (morluto/rea)
@@ -438,8 +499,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 62. nats-server
 1. Nombre: nats-server (nats-io/nats-server)
 2. URL visible: https://github.com/nats-io/nats-server
-3. Micro resumen: High-Performance server for NATS.io, the cloud and edge native messaging system.
-4. LOOP: ENTRADA → nats-server → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Bus ligero de eventos/mensajes para cuando YAIWES distribuya procesos.
+4. LOOP: EVENT PRODUCER → SUBJECT → NATS → SUBSCRIBER → HANDLER
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/nats-server — ya en shark imput (enlazado, no descargado)
 
 ## 63. txtai
@@ -459,36 +520,36 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 65. node-red
 1. Nombre: node-red (node-red/node-red)
 2. URL visible: https://github.com/node-red/node-red
-3. Micro resumen: Low-code programming for event-driven applications
-4. LOOP: ENTRADA → node-red → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Programación visual basada en eventos/nodos.
+4. LOOP: EVENT → NODE → WIRE → NODE → OUTPUT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/node-red — movido desde los 115
 
 ## 66. opa
 1. Nombre: opa (open-policy-agent/opa)
 2. URL visible: https://github.com/open-policy-agent/opa
-3. Micro resumen: Open Policy Agent (OPA) is an open source, general-purpose policy engine.
-4. LOOP: ENTRADA → opa → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Motor independiente de políticas allow/deny.
+4. LOOP: REQUEST + STATE + POLICY → EVALUATE → ALLOW / DENY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/opa — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 67. opentelemetry-collector
 1. Nombre: opentelemetry-collector (open-telemetry/opentelemetry-collector)
 2. URL visible: https://github.com/open-telemetry/opentelemetry-collector
-3. Micro resumen: OpenTelemetry Collector
-4. LOOP: ENTRADA → opentelemetry-collector → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Recoge traces, logs y métricas de motores y triggers.
+4. LOOP: EVENTS → COLLECT → PROCESS → EXPORT → OBSERVE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/opentelemetry-collector — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 68. openai-agents-python
 1. Nombre: openai-agents-python (openai/openai-agents-python)
 2. URL visible: https://github.com/openai/openai-agents-python
-3. Micro resumen: A lightweight, powerful framework for multi-agent workflows
-4. LOOP: ENTRADA → openai-agents-python → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Function tools, agents, handoffs, guardrails y outputs estructurados.
+4. LOOP: RUNNER → AGENT → TOOL/HANDOFF → GUARDRAIL → OUTPUT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/openai-agents-python — movido desde los 115
 
 ## 69. ort
 1. Nombre: ort (oss-review-toolkit/ort)
 2. URL visible: https://github.com/oss-review-toolkit/ort
-3. Micro resumen: A suite of tools to automate software compliance checks.
-4. LOOP: ENTRADA → ort → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Auditoría de dependencias, licencias y compliance.
+4. LOOP: REPO → DEPENDENCIES → LICENSE/POLICY → REPORT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/ort — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 70. gateway
@@ -508,29 +569,29 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 72. puck
 1. Nombre: puck (puckeditor/puck)
 2. URL visible: https://github.com/puckeditor/puck
-3. Micro resumen: The visual editor for React.
-4. LOOP: ENTRADA → puck → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Editor visual React basado en componentes configurables.
+4. LOOP: REGISTER COMPONENTS → DRAG/CONFIG → JSON DATA → RENDER
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/puck — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 73. PWABuilder
 1. Nombre: PWABuilder (pwa-builder/PWABuilder)
 2. URL visible: https://github.com/pwa-builder/PWABuilder
-3. Micro resumen: The simplest way to create progressive web apps across platforms and devices.  Start here. This repo is home to several projects in the PWABuilder family of tools.
-4. LOOP: ENTRADA → PWABuilder → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/PWABuilder — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
+3. Micro resumen: Empaquetado de PWA para plataformas instalables.
+4. LOOP: WEB/PWA → MANIFEST CHECK → PACKAGE → PLATFORM ARTIFACT
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/PWABuilder — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · reglas filter=lfs quitadas: apps/pwabuilder-microsoft-store/.gitattributes (archivo eliminado: solo tenía reglas LFS)
 
 ## 74. pydantic-ai
 1. Nombre: pydantic-ai (pydantic/pydantic-ai)
 2. URL visible: https://github.com/pydantic/pydantic-ai
-3. Micro resumen: How Python does AI. Agents, realtime voice, image generation, embeddings. Every model, every interface, typed end to end.
-4. LOOP: ENTRADA → pydantic-ai → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Toolsets y function tools agrupables en pools de capacidades.
+4. LOOP: PYTHON FUNCTIONS → TOOLSET → FILTER/EXPOSE → CALL → VALIDATE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/pydantic-ai — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 75. pyodide
 1. Nombre: pyodide (pyodide/pyodide)
 2. URL visible: https://github.com/pyodide/pyodide
-3. Micro resumen: Pyodide is a Python distribution for the browser and Node.js based on WebAssembly
-4. LOOP: ENTRADA → pyodide → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Python sobre WebAssembly para navegador.
+4. LOOP: PYTHON → WASM RUNTIME → EXECUTE → RESULT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/pyodide — movido desde los 115
 
 ## 76. pluggy
@@ -552,13 +613,18 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 2. URL visible: https://github.com/qdrant/qdrant
 3. Micro resumen: Qdrant - High-performance, massive-scale Vector Database and Vector Search Engine for the next generation of AI. Also available in the cloud https://cloud.qdrant.io/
 4. LOOP: ENTRADA → qdrant → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/qdrant — importado sin LFS; 1 archivo LFS queda como puntero (tests/e2e_tests/test_data/storage.tar.xz)
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/qdrant — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · 1 punteros LFS eliminados · reglas filter=lfs quitadas: .gitattributes (líneas filter=lfs quitadas)
+<details><summary>Rutas LFS eliminadas (1)</summary>
+
+- `tests/e2e_tests/test_data/storage.tar.xz`
+
+</details>
 
 ## 79. blockly
 1. Nombre: blockly (RaspberryPiFoundation/blockly)
 2. URL visible: https://github.com/RaspberryPiFoundation/blockly
-3. Micro resumen: The web-based visual programming editor.
-4. LOOP: ENTRADA → blockly → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Programación visual mediante bloques. Puede generar DSL/workflows.
+4. LOOP: BLOCKS → CONNECTION GRAPH → GENERATED DSL/CODE → EXECUTE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/blockly — movido desde los 115
 
 ## 80. one-skill-to-rule-them-all
@@ -599,9 +665,9 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 85. renovate
 1. Nombre: renovate (renovatebot/renovate)
 2. URL visible: https://github.com/renovatebot/renovate
-3. Micro resumen: Home of the Renovate CLI: Cross-platform Dependency Automation by Mend.io
-4. LOOP: ENTRADA → renovate → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/renovate — importado; excluido SOLO docs/usage/docker.md (GitHub push protection: credencial de ejemplo "Google Cloud Service Account" en la línea 409); 1 symlink omitido
+3. Micro resumen: Detecta y propone actualizaciones de dependencias.
+4. LOOP: DEPENDENCY SCAN → NEW VERSION → PROPOSAL → TEST → APPROVE/REJECT
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/renovate — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · excluido (no es LFS): docs/usage/docker.md — GitHub push protection (Google Cloud Service Account Credentials, línea 409); no es LFS · 1 symlink(s) omitidos (regla del engine)
 
 ## 86. watchfiles
 1. Nombre: watchfiles (samuelcolvin/watchfiles)
@@ -613,8 +679,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 87. semgrep
 1. Nombre: semgrep (semgrep/semgrep)
 2. URL visible: https://github.com/semgrep/semgrep
-3. Micro resumen: Lightweight static analysis for many languages. Find bug variants with patterns that look like source code.
-4. LOOP: ENTRADA → semgrep → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Análisis estático multi-lenguaje mediante reglas.
+4. LOOP: SOURCE → RULES → STATIC SCAN → MATCHES → FINDINGS
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/semgrep — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 88. continual-harness
@@ -627,15 +693,15 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 89. cosign
 1. Nombre: cosign (sigstore/cosign)
 2. URL visible: https://github.com/sigstore/cosign
-3. Micro resumen: Code signing and transparency for containers and binaries
-4. LOOP: ENTRADA → cosign → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Firma y verifica artefactos antes de activarlos.
+4. LOOP: ARTIFACT → SIGN → SIGNATURE → VERIFY → ALLOW/DENY
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/cosign — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 90. zoekt
 1. Nombre: zoekt (sourcegraph/zoekt)
 2. URL visible: https://github.com/sourcegraph/zoekt
-3. Micro resumen: Fast trigram based code search
-4. LOOP: ENTRADA → zoekt → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Buscador especializado de código fuente.
+4. LOOP: SOURCE CODE → INDEX → SYMBOL/TEXT QUERY → MATCHES
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/zoekt — ya en shark imput (enlazado, no descargado)
 
 ## 91. meta-harness
@@ -648,8 +714,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 92. harness-sdk
 1. Nombre: harness-sdk (strands-agents/harness-sdk)
 2. URL visible: https://github.com/strands-agents/harness-sdk
-3. Micro resumen: Build an agent harness and control it end-to-end. Open-source SDK for production AI agents in Python & TypeScript - any model, any cloud.
-4. LOOP: ENTRADA → harness-sdk → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Agent harness con control de tools, sesiones, hooks, budgets y guardrails.
+4. LOOP: HARNESS → MODEL → TOOL → HOOK/GUARDRAIL → RESULT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/harness-sdk — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 93. taskiq
@@ -662,8 +728,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 94. tauri
 1. Nombre: tauri (tauri-apps/tauri)
 2. URL visible: https://github.com/tauri-apps/tauri
-3. Micro resumen: Build smaller, faster, and more secure desktop and mobile applications with a web frontend.
-4. LOOP: ENTRADA → tauri → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Empaqueta frontend web como software desktop/móvil.
+4. LOOP: WEB UI → TAURI RUNTIME/IPC → NATIVE PACKAGE
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/tauri — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 95. sdk-python
@@ -676,9 +742,9 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 96. temporal
 1. Nombre: temporal (temporalio/temporal)
 2. URL visible: https://github.com/temporalio/temporal
-3. Micro resumen: Temporal service
-4. LOOP: ENTRADA → temporal → PROCESO → SALIDA VERIFICADA → CORE YAIWES
-- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/temporal — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
+3. Micro resumen: Workflows durables, timers, retries, task queues y recuperación después de caídas.
+4. LOOP: EVENTO → WORKFLOW STATE → ACTIVITY → CHECKPOINT → WAIT/RETRY → RESUME
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/temporal — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · reglas filter=lfs quitadas: .gitattributes (archivo eliminado: solo tenía reglas LFS) · 2 symlink(s) omitidos (regla del engine)
 
 ## 97. Life-Harness
 1. Nombre: Life-Harness (Tianshi-Xu/Life-Harness)
@@ -690,8 +756,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 98. tree-sitter
 1. Nombre: tree-sitter (tree-sitter/tree-sitter)
 2. URL visible: https://github.com/tree-sitter/tree-sitter
-3. Micro resumen: An incremental parsing system for programming tools
-4. LOOP: ENTRADA → tree-sitter → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Parser incremental multi-lenguaje. Base fuerte para Source Analyzer.
+4. LOOP: SOURCE → PARSER → SYNTAX TREE → QUERY → FUNCTIONS/CLASSES/CALLS
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/tree-sitter — ya en shark imput (enlazado, no descargado)
 
 ## 99. trigger.dev
@@ -711,8 +777,8 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 101. strix
 1. Nombre: strix (usestrix/strix)
 2. URL visible: https://github.com/usestrix/strix
-3. Micro resumen: Open-source AI penetration testing tool to find and fix your app’s vulnerabilities.
-4. LOOP: ENTRADA → strix → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Plataforma de análisis de seguridad. Interesa el patrón análisis→validación→reporte.
+4. LOOP: APP → ANALYZE → FINDING → VALIDATE → REPORT/FIX
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/strix — movido desde los 115
 
 ## 102. agent-browser
@@ -739,15 +805,15 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 105. difftastic
 1. Nombre: difftastic (Wilfred/difftastic)
 2. URL visible: https://github.com/Wilfred/difftastic
-3. Micro resumen: a structural diff that understands syntax 🟥🟩
-4. LOOP: ENTRADA → difftastic → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Diff estructural que entiende sintaxis.
+4. LOOP: OLD CODE + NEW CODE → PARSE → STRUCTURAL DIFF → CHANGESET
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/difftastic — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 106. AFlow_
 1. Nombre: AFlow_ (XiangJinyu/AFlow_)
 2. URL visible: https://github.com/XiangJinyu/AFlow_
-3. Micro resumen: 🔥🔥🔥 ICLR 2025 Oral. Automating Agentic Workflow Generation.
-4. LOOP: ENTRADA → AFlow_ → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Búsqueda y optimización automática de workflows agentic.
+4. LOOP: WORKFLOW CANDIDATE → EXECUTE/EVAL → SEARCH → NEW WORKFLOW → SCORE ↺
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/AFlow_ — movido desde los 115
 
 ## 107. zera-agent
@@ -760,15 +826,15 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 ## 108. z3
 1. Nombre: z3 (Z3Prover/z3)
 2. URL visible: https://github.com/Z3Prover/z3
-3. Micro resumen: The Z3 Theorem Prover
-4. LOOP: ENTRADA → z3 → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Solver SMT. Puede funcionar como Sheriff matemático de permisos, restricciones e incompatibilidades.
+4. LOOP: RESTRICCIONES → SOLVER → SAT / UNSAT → PERMITIR / BLOQUEAR
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/z3 — movido desde los 115 · completo (archivos faltantes recuperados desde _archives con motor_1)
 
 ## 109. CoEvoSkills
 1. Nombre: CoEvoSkills (Zhang-Henry/CoEvoSkills)
 2. URL visible: https://github.com/Zhang-Henry/CoEvoSkills
-3. Micro resumen: CoEvoSkills: Self-Evolving Agent Skills via Co-Evolutionary Verification — COLM 2026
-4. LOOP: ENTRADA → CoEvoSkills → PROCESO → SALIDA VERIFICADA → CORE YAIWES
+3. Micro resumen: Evolución/generación y comprobación de skills.
+4. LOOP: EXPERIENCE → SKILL CANDIDATE → VERIFY → EVOLVE → ACCEPT
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/CoEvoSkills — movido desde los 115
 
 ## 110. GPTCache
@@ -777,6 +843,1576 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 3. Micro resumen: Semantic cache for LLMs. Fully integrated with LangChain and llama_index.
 4. LOOP: ENTRADA → GPTCache → PROCESO → SALIDA VERIFICADA → CORE YAIWES
 - Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/GPTCache — descargado · completo (archivos faltantes recuperados desde _archives con motor_1)
+
+# Lista 2 (t130u) — percepción, agentes visuales y simulación
+
+## 111. browser-use
+1. Nombre: Browser Use (browser-use/browser-use)
+2. URL visible: https://github.com/browser-use/browser-use
+3. Micro resumen: Browser Use — componente de la lista 2 (t130u).
+4. LOOP: Pantalla/Web → Agente visual → Detectar estado/elementos → Razonar acción → Click/Escribir/Navegar → Observar nuevo estado → Repetir tarea
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/browser-use — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos); .gitattributes eliminado (solo tenía reglas LFS)
+
+## 112. screenshot-to-code
+1. Nombre: Screenshot-to-Code (abi/screenshot-to-code)
+2. URL visible: https://github.com/abi/screenshot-to-code
+3. Micro resumen: Screenshot-to-Code — componente de la lista 2 (t130u).
+4. LOOP: Imagen UI → Visión LLM → Descomponer componentes → Inferir layout → Generar código → Renderizar → Comparar visualmente → Corregir → Réplica
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/screenshot-to-code — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 113. OpenAdapt
+1. Nombre: OpenAdapt (OpenAdaptAI/OpenAdapt)
+2. URL visible: https://github.com/OpenAdaptAI/OpenAdapt
+3. Micro resumen: OpenAdapt — componente de la lista 2 (t130u).
+4. LOOP: Humano ejecuta tarea → Capturar pantalla+acciones → Extraer secuencia → Compilar workflow → Verificar estados → Guardar conocimiento → Ejecutar nuevamente
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/OpenAdapt — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 114. claude-skills
+1. Nombre: Screenshot-to-Code Skill (OneWave-AI/claude-skills)
+2. URL visible: https://github.com/OneWave-AI/claude-skills
+3. Micro resumen: Screenshot-to-Code Skill — componente de la lista 2 (t130u).
+4. LOOP: Screenshot → Claude Code → Screenshot-to-Code Skill → Detectar estructura visual → Generar componentes → HTML/CSS/React/Vue → Render → Comparación → Ajuste
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/claude-skills — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos); el engine no admite subcarpetas → repo completo; la skill está en `code/screenshot-to-code/`
+
+## 115. inner-coordinates
+1. Nombre: Inner Coordinates (XiaoChu-1208/inner-coordinates)
+2. URL visible: https://github.com/XiaoChu-1208/inner-coordinates
+3. Micro resumen: Inner Coordinates — componente de la lista 2 (t130u).
+4. LOOP: Humano/Agente demuestra tarea → Capturar frames+clicks → Identificar pantallas → Pantalla=NODE → Acción=EDGE → Crear mapa del workflow → Guardarlo → Ejecutarlo desde memoria → Verificar → Auto-corregir mapa
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/inner-coordinates — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 116. android_world
+1. Nombre: AndroidWorld (google-research/android_world)
+2. URL visible: https://github.com/google-research/android_world
+3. Micro resumen: AndroidWorld — componente de la lista 2 (t130u).
+4. LOOP: Objetivo → AndroidWorld → Ver Android → Interpretar pantalla → Touch/Texto → Aplicación responde → Verificar → Continuar
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/android_world — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 117. android_env
+1. Nombre: AndroidEnv (google-deepmind/android_env)
+2. URL visible: https://github.com/google-deepmind/android_env
+3. Micro resumen: AndroidEnv — componente de la lista 2 (t130u).
+4. LOOP: Android → Pixels → Agente AI → Acción Touch → Resultado → Reward → Aprendizaje → Nueva acción
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/android_env — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 118. genesis-world
+1. Nombre: Genesis World (Genesis-Embodied-AI/genesis-world)
+2. URL visible: https://github.com/Genesis-Embodied-AI/genesis-world
+3. Micro resumen: Genesis World — componente de la lista 2 (t130u).
+4. LOOP: Descripción/escenario → Genesis → Mundo físico → Objetos + física + sensores → Agente AI → Simulación → Resultado → Aprendizaje
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/genesis-world — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos); nombre real verificado: Genesis-Embodied-AI/Genesis → redirige a Genesis-Embodied-AI/genesis-world
+
+## 119. mujoco
+1. Nombre: MuJoCo (google-deepmind/mujoco)
+2. URL visible: https://github.com/google-deepmind/mujoco
+3. Micro resumen: MuJoCo — componente de la lista 2 (t130u).
+4. LOOP: Mundo físico → MuJoCo → Simulación → Agente AI → Acción → Física → Resultado → Reward → Aprendizaje → Repetición
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/mujoco — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 120. dm_control
+1. Nombre: dm_control (complemento MuJoCo) (google-deepmind/dm_control)
+2. URL visible: https://github.com/google-deepmind/dm_control
+3. Micro resumen: dm_control (complemento MuJoCo) — componente de la lista 2 (t130u).
+4. LOOP: Mundo físico → MuJoCo → Simulación → Agente AI → Acción → Física → Resultado → Reward → Aprendizaje → Repetición
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/dm_control — descargado con motor_2 + engine; completado con motor_1 + motor_3 (archivos ignorados por .gitignore incluidos)
+
+## 121. IsaacSim
+1. Nombre: Isaac Sim (isaac-sim/IsaacSim)
+2. URL visible: https://github.com/isaac-sim/IsaacSim
+3. Micro resumen: Isaac Sim — componente de la lista 2 (t130u).
+4. LOOP: Escenario → Isaac Sim → Física + sensores + robot → Agente AI → Acción → Simulación → Datos/Reward → Isaac Lab → Aprendizaje → Nueva política
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/IsaacSim — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · 1099 punteros LFS eliminados · reglas filter=lfs quitadas: .gitattributes (líneas filter=lfs quitadas)
+<details><summary>Rutas LFS eliminadas (1099)</summary>
+
+- `docs/readme/hero_shot_compressed.png`
+- `docs/readme/isim_6.0_base_tut_gui_vs2022_winsdk_verify.png`
+- `docs/readme/vs_modify.png`
+- `source/deprecated/isaacsim.core.api/data/icon.png`
+- `source/deprecated/isaacsim.core.api/data/preview.png`
+- `source/deprecated/isaacsim.core.api/python/tests/data/cm_asset.usd`
+- `source/deprecated/isaacsim.core.prims/data/icon.png`
+- `source/deprecated/isaacsim.core.prims/data/preview.png`
+- `source/deprecated/isaacsim.core.utils/data/icon.png`
+- `source/deprecated/isaacsim.core.utils/data/preview.png`
+- `source/deprecated/isaacsim.examples.extension/data/icon.png`
+- `source/deprecated/isaacsim.examples.extension/data/preview.png`
+- `source/deprecated/isaacsim.examples.extension/template_source_files/common/data/icon.png`
+- `source/deprecated/isaacsim.examples.extension/template_source_files/common/data/preview.png`
+- `source/deprecated/isaacsim.replicator.domain_randomization/data/icon.png`
+- `source/deprecated/isaacsim.replicator.domain_randomization/data/preview.png`
+- `source/deprecated/isaacsim.replicator.mobility_gen/data/icon.png`
+- `source/deprecated/isaacsim.replicator.mobility_gen/data/preview.png`
+- `source/deprecated/isaacsim.robot.experimental.manipulators.examples/data/icon.png`
+- `source/deprecated/isaacsim.robot.experimental.manipulators.examples/data/preview.png`
+- `source/deprecated/isaacsim.robot.manipulators/data/icon.png`
+- `source/deprecated/isaacsim.robot.manipulators/data/preview.png`
+- `source/deprecated/isaacsim.robot.manipulators.examples/data/icon.png`
+- `source/deprecated/isaacsim.robot.manipulators.examples/data/preview.png`
+- `source/deprecated/isaacsim.robot.manipulators.ui/data/icon.png`
+- `source/deprecated/isaacsim.robot.manipulators.ui/data/preview.png`
+- `source/deprecated/isaacsim.robot.wheeled_robots/data/icon.png`
+- `source/deprecated/isaacsim.robot.wheeled_robots/data/preview.png`
+- `source/deprecated/isaacsim.robot_motion.lula/data/icon.png`
+- `source/deprecated/isaacsim.robot_motion.lula/data/preview.png`
+- `source/deprecated/isaacsim.robot_motion.lula_test_widget/data/icon.png`
+- `source/deprecated/isaacsim.robot_motion.lula_test_widget/data/preview.png`
+- `source/deprecated/isaacsim.robot_motion.motion_generation/data/icon.png`
+- `source/deprecated/isaacsim.robot_motion.motion_generation/data/preview.png`
+- `source/deprecated/isaacsim.robot_motion.motion_generation.examples/data/icon.png`
+- `source/deprecated/isaacsim.robot_motion.motion_generation.examples/data/preview.png`
+- `source/deprecated/isaacsim.robot_setup.wizard/data/icon.png`
+- `source/deprecated/isaacsim.robot_setup.wizard/data/preview.png`
+- `source/deprecated/isaacsim.robot_setup.wizard/icons/add_robot.png`
+- `source/deprecated/isaacsim.robot_setup.wizard/icons/define_robot.png`
+- `source/deprecated/isaacsim.robot_setup.wizard/icons/drag_and_drop.png`
+- `source/deprecated/isaacsim.robot_setup.wizard/icons/import_robot.png`
+- `source/deprecated/isaacsim.sensors.camera/data/icon.png`
+- `source/deprecated/isaacsim.sensors.camera/data/preview.png`
+- `source/deprecated/isaacsim.sensors.camera/data/tests/nested_semantics.usd`
+- `source/deprecated/isaacsim.sensors.camera/data/tests/test_rename_node_type.usda`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_camera_frame_res_211_99_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_camera_frame_res_4_4_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_camera_frame_res_64_64_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_camera_frame_res_67_137_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_world_frame_res_211_99_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_world_frame_res_4_4_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_world_frame_res_64_64_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_pointcloud/debug_imgs/pointcloud_world_frame_res_67_137_rgb.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_depth/camera_view_depth_batched_0.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_depth/camera_view_depth_batched_1.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_depth/camera_view_depth_batched_2.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_depth/camera_view_depth_batched_3.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_rgb/camera_view_rgb_batched_0.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_rgb/camera_view_rgb_batched_1.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_rgb/camera_view_rgb_batched_2.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/batched_rgb/camera_view_rgb_batched_3.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/tiled_depth/camera_view_depth_tiled.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/camera_view/tiled_rgb/camera_view_rgb_tiled.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/single_view_depth_sensor/depth_sensor_distance_annotator.png`
+- `source/deprecated/isaacsim.sensors.camera/isaacsim/sensors/camera/tests/data/golden/single_view_depth_sensor/depth_sensor_distance_annotator_windows.png`
+- `source/deprecated/isaacsim.sensors.physics/data/icon.png`
+- `source/deprecated/isaacsim.sensors.physics/data/preview.png`
+- `source/deprecated/isaacsim.sensors.physx/data/icon.png`
+- `source/deprecated/isaacsim.sensors.physx/data/preview.png`
+- `source/deprecated/isaacsim.sensors.physx.examples/data/icon.png`
+- `source/deprecated/isaacsim.sensors.physx.examples/data/preview.png`
+- `source/deprecated/isaacsim.sensors.physx.ui/data/icon.png`
+- `source/deprecated/isaacsim.sensors.physx.ui/data/preview.png`
+- `source/deprecated/isaacsim.sensors.rtx/data/icon.png`
+- `source/deprecated/isaacsim.sensors.rtx/data/preview.png`
+- `source/deprecated/isaacsim.util.merge_mesh/data/icon.png`
+- `source/deprecated/isaacsim.util.merge_mesh/data/preview.png`
+- `source/deprecated/omni.isaac.ml_archive/data/icon.png`
+- `source/deprecated/omni.isaac.ml_archive/data/preview.png`
+- `source/extensions/isaacsim.app.about/data/icon.png`
+- `source/extensions/isaacsim.app.about/data/preview.png`
+- `source/extensions/isaacsim.app.about/data/tests/golden_img/test_about_ui.png`
+- `source/extensions/isaacsim.app.setup/data/icon.png`
+- `source/extensions/isaacsim.app.setup/data/nvidia-omniverse-isaacsim.ico`
+- `source/extensions/isaacsim.app.setup/data/omni.isaac.sim.png`
+- `source/extensions/isaacsim.app.setup/data/preview.png`
+- `source/extensions/isaacsim.asset.exporter.urdf/data/icon.png`
+- `source/extensions/isaacsim.asset.exporter.urdf/data/preview.png`
+- `source/extensions/isaacsim.asset.exporter.urdf.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.exporter.urdf.ui/data/preview.png`
+- `source/extensions/isaacsim.asset.gen.conveyor/data/icon.png`
+- `source/extensions/isaacsim.asset.gen.conveyor/data/preview.png`
+- `source/extensions/isaacsim.asset.gen.conveyor.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.gen.conveyor.ui/data/preview.png`
+- `source/extensions/isaacsim.asset.gen.omap/data/icon.png`
+- `source/extensions/isaacsim.asset.gen.omap/data/preview.png`
+- `source/extensions/isaacsim.asset.gen.omap.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.gen.omap.ui/data/preview.png`
+- `source/extensions/isaacsim.asset.importer.heightmap/data/icon.png`
+- `source/extensions/isaacsim.asset.importer.heightmap/data/preview.png`
+- `source/extensions/isaacsim.asset.importer.heightmap/data/test/test_image.png`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/icon.png`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/F1.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/F2.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/F3.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/TH1_z.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/TH2_z.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/TH3_z.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/forearm_electric.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/forearm_electric_cvx.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/knuckle.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/lfmetacarpal.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/palm.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/stls/hand/wrist.stl`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/textures/block.png`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/mjcf/open_ai_assets/textures/block_hidden.png`
+- `source/extensions/isaacsim.asset.importer.mjcf/data/preview.png`
+- `source/extensions/isaacsim.asset.importer.mjcf.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.importer.mjcf.ui/data/preview.png`
+- `source/extensions/isaacsim.asset.importer.mjcf.ui/icons/icoFileMJCF.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/icon.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/preview.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/carter/meshes/caster_wheel.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/carter/meshes/chassis.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/carter/meshes/pivot.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/carter/meshes/side_wheel.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/J1.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/J2.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/J3.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/J4.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/J5.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/J6.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/collision/base_link.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/J1.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/J2.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/J3.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/J4.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/J5.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/J6.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/cobotta_pro_900_visualization/meshes/visual/base_link.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/images/collision.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/images/visual.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/collision/base_link.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/collision/inner_finger.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/collision/inner_knuckle.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/collision/outer_knuckle.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/visual/base_link.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/visual/inner_finger.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/visual/inner_knuckle.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/cobotta_pro_900/onrobot_rg6_visualization/meshes/visual/outer_knuckle.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/finger.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/hand.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link0.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link1.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link2.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link3.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link4.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link5.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link6.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision/link7.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/finger.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/hand.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link0.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link1.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link2.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link3.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link4.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link5.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link6.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/visual/link7.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/assembly_battery.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/axle.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/base.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/base_collision.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/mx12w.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/nano_chassis_base.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/nano_chassis_bridge.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/nano_chassis_rs_mount.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/pusher.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/realsense.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/shock_mount.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/kaya/meshes/wheel_and_rollers.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_base.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_forearm.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_shoulder.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_upper_arm.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_wrist_1.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_wrist_2.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/meshes/ur10_wrist_3.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_mtl/test_mtl.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_mtl_stl/cube.stl`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/tex_cube.dae`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/tex_cube.obj`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/textures/base_color.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/textures/emission_map.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/textures/metallic_map.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/textures/normal_map.png`
+- `source/extensions/isaacsim.asset.importer.urdf/data/urdf/tests/test_textures_urdf/meshes/textures/roughness_map.png`
+- `source/extensions/isaacsim.asset.importer.urdf.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.importer.urdf.ui/data/preview.png`
+- `source/extensions/isaacsim.asset.importer.urdf.ui/icons/icoFileURDF.png`
+- `source/extensions/isaacsim.asset.importer.utils/data/icon.png`
+- `source/extensions/isaacsim.asset.importer.utils/data/preview.png`
+- `source/extensions/isaacsim.asset.transformer/data/icon.png`
+- `source/extensions/isaacsim.asset.transformer/data/preview.png`
+- `source/extensions/isaacsim.asset.transformer.rules/data/icon.png`
+- `source/extensions/isaacsim.asset.transformer.rules/data/preview.png`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/Materials/Materials.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/backpack/configuration/g1_29dof_NVBP_base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/backpack/configuration/g1_29dof_NVBP_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/backpack/configuration/g1_29dof_NVBP_robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/backpack/configuration/g1_29dof_NVBP_sensor.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/backpack/g1_29dof_NVBP.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_29dof_with_hand_rev_1_0_base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_29dof_with_hand_rev_1_0_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_29dof_with_hand_rev_1_0_physics_simplified.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_29dof_with_hand_rev_1_0_robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_29dof_with_hand_rev_1_0_sensor.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_Gripper_three_finger_hand_physics_right.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_left_hand_inspire_left_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_left_hand_three_finger_hand_physics_left.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_right_hand_inspire_right_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/g1_right_hand_three_finger_hand_physics_right.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/g1_29dof_rev_1_0_with_inspire_hand_retarget_inspire_white_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_left_base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_left_hand.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_left_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_left_robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_right_base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_right_hand.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_right_physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/inspire_hand/inspire_right_robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_finger_hand_base_left.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_finger_hand_base_right.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_finger_hand_physics_left.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_finger_hand_physics_right.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_fingers_left_hand.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_fingers_left_hand_robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_fingers_right_hand.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/configuration/three_finger_hand/three_fingers_right_hand_robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/G1/g1.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/inspire_hand/Plastics/Rubber_Smooth/Rubber_Smooth_BaseColor.png`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/inspire_hand/Plastics/Rubber_Smooth/Rubber_Smooth_Normal.png`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/inspire_hand/Plastics/Rubber_Smooth/Rubber_Smooth_ORM.png`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/inspire_hand/inspire_hand_materials.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/test_advanced/usdex/test_advanced.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/test_collision_from_visuals/test_collision_from_visuals.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/test_prims/base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/Robotiq_2F_140_base.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/Robotiq_2F_140_physics_edit.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/configuration/Robotiq_2F_140_robot.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/materials/materials.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/parts/Finger1_JFT.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/parts/Finger2_JFP.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/parts/Finger3_JFH.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/parts/Finger4_JFL.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/parts/Fingertip_JFD.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-140/parts/_F_Body_JFX.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/Robotiq_2F_85.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/Physics/None.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/Physics/Physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/Physics/Physx_Loop.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/Physics/Physx_Mimic.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/geometries.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/instances.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/materials.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/Robotiq/2F-85/payloads/robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/configuration/ur10e_Gripper_Robotiq_2F_140.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/configuration/ur10e_Gripper_Robotiq_2f_85.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/configuration/ur10e_base.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/configuration/ur10e_physics.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/configuration/ur10e_robot.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/configuration/ur10e_sensor.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e/ur10e.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Gripper/None.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Gripper/Robotiq_2F_140.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Gripper/Robotiq_2F_85.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Physics/None.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Physics/physics.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Physics/physx.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Sensor/None.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/Sensor/Sensors.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/base.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/geometries.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/instances.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/materials.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_interface/payloads/robot.usda`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_shoulder/configuration/ur10e_base_defeatured.usd`
+- `source/extensions/isaacsim.asset.transformer.rules/data/tests/ur10e_shoulder/ur10e.usda`
+- `source/extensions/isaacsim.asset.transformer.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.transformer.ui/data/preview.png`
+- `source/extensions/isaacsim.asset.validation/data/icon.png`
+- `source/extensions/isaacsim.asset.validation/data/preview.png`
+- `source/extensions/isaacsim.asset.validation.ui/data/icon.png`
+- `source/extensions/isaacsim.asset.validation.ui/data/preview.png`
+- `source/extensions/isaacsim.benchmark.services/data/icon.png`
+- `source/extensions/isaacsim.benchmark.services/data/preview.png`
+- `source/extensions/isaacsim.code_editor.jupyter/data/icon.png`
+- `source/extensions/isaacsim.code_editor.jupyter/data/kernels/embedded_omniverse_python3_socket/logo-32x32.png`
+- `source/extensions/isaacsim.code_editor.jupyter/data/kernels/embedded_omniverse_python3_socket/logo-64x64.png`
+- `source/extensions/isaacsim.code_editor.jupyter/data/preview.png`
+- `source/extensions/isaacsim.code_editor.python_server/data/icon.png`
+- `source/extensions/isaacsim.code_editor.python_server/data/preview.png`
+- `source/extensions/isaacsim.code_editor.python_server.ui/data/icon.png`
+- `source/extensions/isaacsim.code_editor.python_server.ui/data/preview.png`
+- `source/extensions/isaacsim.code_editor.vscode/data/icon.png`
+- `source/extensions/isaacsim.code_editor.vscode/data/preview.png`
+- `source/extensions/isaacsim.common/data/icon.png`
+- `source/extensions/isaacsim.common/data/preview.png`
+- `source/extensions/isaacsim.core.cloner/data/icon.png`
+- `source/extensions/isaacsim.core.cloner/data/preview.png`
+- `source/extensions/isaacsim.core.cloner/python/tests/data/quatf_d.usda`
+- `source/extensions/isaacsim.core.deprecation_manager/data/icon.png`
+- `source/extensions/isaacsim.core.deprecation_manager/data/preview.png`
+- `source/extensions/isaacsim.core.experimental.actuators/data/icon.png`
+- `source/extensions/isaacsim.core.experimental.actuators/data/preview.png`
+- `source/extensions/isaacsim.core.experimental.materials/data/icon.png`
+- `source/extensions/isaacsim.core.experimental.materials/data/preview.png`
+- `source/extensions/isaacsim.core.experimental.objects/data/icon.png`
+- `source/extensions/isaacsim.core.experimental.objects/data/preview.png`
+- `source/extensions/isaacsim.core.experimental.objects/data/templates/wireframe-blue.png`
+- `source/extensions/isaacsim.core.experimental.primdata/data/icon.png`
+- `source/extensions/isaacsim.core.experimental.primdata/data/preview.png`
+- `source/extensions/isaacsim.core.experimental.prims/data/icon.png`
+- `source/extensions/isaacsim.core.experimental.prims/data/preview.png`
+- `source/extensions/isaacsim.core.experimental.utils/data/icon.png`
+- `source/extensions/isaacsim.core.experimental.utils/data/preview.png`
+- `source/extensions/isaacsim.core.includes/data/icon.png`
+- `source/extensions/isaacsim.core.includes/data/preview.png`
+- `source/extensions/isaacsim.core.nodes/data/icon.png`
+- `source/extensions/isaacsim.core.nodes/data/preview.png`
+- `source/extensions/isaacsim.core.nodes/python/tests/data/golden/attach_hydra_texture/rgb/attach_hydra_texture_rgb.png`
+- `source/extensions/isaacsim.core.rendering_manager/data/icon.png`
+- `source/extensions/isaacsim.core.rendering_manager/data/preview.png`
+- `source/extensions/isaacsim.core.simulation_manager/data/icon.png`
+- `source/extensions/isaacsim.core.simulation_manager/data/preview.png`
+- `source/extensions/isaacsim.core.throttling/data/icon.png`
+- `source/extensions/isaacsim.core.throttling/data/preview.png`
+- `source/extensions/isaacsim.core.version/data/icon.png`
+- `source/extensions/isaacsim.core.version/data/preview.png`
+- `source/extensions/isaacsim.examples.base/data/icon.png`
+- `source/extensions/isaacsim.examples.base/data/preview.png`
+- `source/extensions/isaacsim.examples.browser/data/icon.png`
+- `source/extensions/isaacsim.examples.browser/data/preview.png`
+- `source/extensions/isaacsim.examples.interactive/data/SurfaceGripper_gantry.usda`
+- `source/extensions/isaacsim.examples.interactive/data/icon.png`
+- `source/extensions/isaacsim.examples.interactive/data/preview.png`
+- `source/extensions/isaacsim.examples.ipc/data/icon.png`
+- `source/extensions/isaacsim.examples.ipc/data/preview.png`
+- `source/extensions/isaacsim.examples.ui/data/icon.png`
+- `source/extensions/isaacsim.examples.ui/data/preview.png`
+- `source/extensions/isaacsim.gui.components/data/icon.png`
+- `source/extensions/isaacsim.gui.components/data/preview.png`
+- `source/extensions/isaacsim.gui.content_browser/data/icon.png`
+- `source/extensions/isaacsim.gui.content_browser/data/preview.png`
+- `source/extensions/isaacsim.gui.menu/data/icon.png`
+- `source/extensions/isaacsim.gui.menu/data/preview.png`
+- `source/extensions/isaacsim.gui.property/data/icon.png`
+- `source/extensions/isaacsim.gui.property/data/preview.png`
+- `source/extensions/isaacsim.gui.sensors.icon/data/icon.png`
+- `source/extensions/isaacsim.gui.sensors.icon/data/preview.png`
+- `source/extensions/isaacsim.gui.sensors.icon/data/tests/golden_img/legacy/prim_icon.png`
+- `source/extensions/isaacsim.gui.sensors.icon/data/tests/golden_img/prim_icon.png`
+- `source/extensions/isaacsim.gui.sensors.icon/data/tests/primicon.png`
+- `source/extensions/isaacsim.hsb.bridge/data/icon.png`
+- `source/extensions/isaacsim.hsb.bridge/data/preview.png`
+- `source/extensions/isaacsim.hsb.core/data/icon.png`
+- `source/extensions/isaacsim.hsb.core/data/preview.png`
+- `source/extensions/isaacsim.hsb.nodes/data/icon.png`
+- `source/extensions/isaacsim.hsb.nodes/data/preview.png`
+- `source/extensions/isaacsim.physics.newton/data/icon.png`
+- `source/extensions/isaacsim.physics.newton/data/preview.png`
+- `source/extensions/isaacsim.physics.newton.tensors/data/icon.png`
+- `source/extensions/isaacsim.physics.newton.tensors/data/usd/Ant.usda`
+- `source/extensions/isaacsim.physics.newton.tensors/data/usd/CartPole.usda`
+- `source/extensions/isaacsim.physics.newton.tensors/data/usd/Franka.usda`
+- `source/extensions/isaacsim.physics.newton.tensors/data/usd/Humanoid.usda`
+- `source/extensions/isaacsim.physics.newton.ui/data/icon.png`
+- `source/extensions/isaacsim.physics.newton.ui/data/preview.png`
+- `source/extensions/isaacsim.pip.newton/data/icon.png`
+- `source/extensions/isaacsim.pip.newton/data/preview.png`
+- `source/extensions/isaacsim.pip.nv/data/icon.png`
+- `source/extensions/isaacsim.pip.nv/data/preview.png`
+- `source/extensions/isaacsim.pip.onnx/data/icon.png`
+- `source/extensions/isaacsim.pip.onnx/data/preview.png`
+- `source/extensions/isaacsim.replicator.behavior/data/icon.png`
+- `source/extensions/isaacsim.replicator.behavior/data/preview.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/distance_to_image_plane_0000.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/distance_to_image_plane_0001.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/distance_to_image_plane_0002.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/distance_to_image_plane_0003.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.behavior/isaacsim/replicator/behavior/tests/data/golden/_out_behaviors_sdg/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.behavior.ui/data/icon.png`
+- `source/extensions/isaacsim.replicator.behavior.ui/data/preview.png`
+- `source/extensions/isaacsim.replicator.episode_recorder/data/icon.png`
+- `source/extensions/isaacsim.replicator.episode_recorder/data/preview.png`
+- `source/extensions/isaacsim.replicator.episode_recorder.ui/data/icon.png`
+- `source/extensions/isaacsim.replicator.episode_recorder.ui/data/preview.png`
+- `source/extensions/isaacsim.replicator.examples/data/icon.png`
+- `source/extensions/isaacsim.replicator.examples/data/preview.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_numpy/annot_depth_1_0.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_numpy/annot_depth_1_1.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_numpy/annot_depth_2_0.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_numpy/annot_depth_2_1.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_numpy/annot_rgb_0.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_numpy/annot_rgb_1.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_warp/annot_depth_1_0.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_warp/annot_depth_1_1.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_warp/annot_depth_2_0.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_warp/annot_depth_2_1.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_warp/annot_rgb_0.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_annot_warp/annot_rgb_1.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_numpy/distance_to_camera_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_numpy/distance_to_camera_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_numpy/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_numpy/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_warp/distance_to_camera_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_warp/distance_to_camera_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_warp/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_augm_writer_warp/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_box_stacking_env_none/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_box_stacking_env_warehouse/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/depth/depth_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/depth/depth_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/depth/depth_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/edges/edges_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/edges/edges_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/edges/edges_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/segmentation/segmentation_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/segmentation/segmentation_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/segmentation/segmentation_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/shaded_seg/shaded_seg_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/shaded_seg/shaded_seg_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_simple/clip_0000/shaded_seg/shaded_seg_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0000/depth/depth_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0000/depth/depth_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0000/depth/depth_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0000/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0000/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0000/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0001/depth/depth_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0001/depth/depth_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0001/depth/depth_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0001/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0001/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_cosmos_warehouse/clip_0001/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_deformable_drop/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_deformable_drop/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_deformable_drop/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_deformable_drop/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_0.0042_pt_subsamples_4_spp_32/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_0.0042_pt_subsamples_4_spp_32/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_0.0042_pt_subsamples_4_spp_32/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_0.0042_rt/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_0.0042_rt/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_0.0042_rt/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_None_pt_subsamples_4_spp_32/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_None_pt_subsamples_4_spp_32/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_None_pt_subsamples_4_spp_32/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_None_rt/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_None_rt/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_motion_blur/_out_motion_blur_func_dt_None_rt/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_nav_sdg_demo/left_sensor/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_nav_sdg_demo/left_sensor/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_nav_sdg_demo/right_sensor/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_nav_sdg_demo/right_sensor/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_0/000000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_0/000001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_0/000002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_0/000003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_1/000000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_1/000001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_1/000002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_obj_based_sdg_pose_writer/cam_1/000003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/distance_to_camera_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/distance_to_camera_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/distance_to_camera_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/distance_to_camera_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/semantic_segmentation_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/semantic_segmentation_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/semantic_segmentation_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_object_reconstruction_assets_drop/semantic_segmentation_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_lights/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_lights/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_lights/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_sphere_scan/PerspView/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_sphere_scan/PerspView/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_sphere_scan/PerspView/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_sphere_scan/SphereView/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_sphere_scan/SphereView/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_sphere_scan/SphereView/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_textures/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_textures/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_rand_textures/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/DriverView/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/DriverView/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/DriverView/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/DriverView/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/PalletView/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/PalletView/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/PalletView/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/PalletView/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/TopView/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/TopView/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/TopView/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_scene_based_sdg/TopView/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_simready_assets/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.examples/python/tests/data/golden/_out_simready_assets/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.experimental.domain_randomization/data/icon.png`
+- `source/extensions/isaacsim.replicator.experimental.domain_randomization/data/preview.png`
+- `source/extensions/isaacsim.replicator.experimental.mobility_gen/data/icon.png`
+- `source/extensions/isaacsim.replicator.experimental.mobility_gen/data/preview.png`
+- `source/extensions/isaacsim.replicator.grasping/data/icon.png`
+- `source/extensions/isaacsim.replicator.grasping/data/preview.png`
+- `source/extensions/isaacsim.replicator.grasping.ui/data/icon.png`
+- `source/extensions/isaacsim.replicator.grasping.ui/data/preview.png`
+- `source/extensions/isaacsim.replicator.mobility_gen.examples/data/icon.png`
+- `source/extensions/isaacsim.replicator.mobility_gen.examples/data/preview.png`
+- `source/extensions/isaacsim.replicator.mobility_gen.ui/data/docs_images/startup_preview.png`
+- `source/extensions/isaacsim.replicator.mobility_gen.ui/data/icon.png`
+- `source/extensions/isaacsim.replicator.mobility_gen.ui/data/preview.png`
+- `source/extensions/isaacsim.replicator.nurec_utils/data/icon.png`
+- `source/extensions/isaacsim.replicator.nurec_utils/data/preview.png`
+- `source/extensions/isaacsim.replicator.synthetic_recorder/data/icon.png`
+- `source/extensions/isaacsim.replicator.synthetic_recorder/data/preview.png`
+- `source/extensions/isaacsim.replicator.teleop/data/icon.png`
+- `source/extensions/isaacsim.replicator.teleop/data/preview.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm/rgb_0004.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0004.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_floating_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0004.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_dex3_view_cam/rgb/rgb_0004.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_dual_ur3_xarm_dex3/rp_xarm_view_cam/rgb/rgb_0004.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_solo_ur3_xarm/rgb_0000.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_solo_ur3_xarm/rgb_0001.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_solo_ur3_xarm/rgb_0002.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_solo_ur3_xarm/rgb_0003.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_ik_solo_ur3_xarm/rgb_0004.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraSide/rgb_after_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraSide/rgb_after_lift.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraSide/rgb_after_place.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraSide/rgb_before_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraTop/rgb_after_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraTop/rgb_after_lift.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraTop/rgb_after_place.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/Right_right_hand_palm_link_TCPCameraTop/rgb_before_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/scene_top/rgb_after_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/scene_top/rgb_after_lift.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/scene_top/rgb_after_place.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_dex3/scene_top/rgb_before_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraSide/rgb_after_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraSide/rgb_after_lift.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraSide/rgb_after_place.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraSide/rgb_before_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraTop/rgb_after_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraTop/rgb_after_lift.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraTop/rgb_after_place.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/Right_xarm_gripper_base_link_TCPCameraTop/rgb_before_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/scene_top/rgb_after_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/scene_top/rgb_after_lift.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/scene_top/rgb_after_place.png`
+- `source/extensions/isaacsim.replicator.teleop/isaacsim/replicator/teleop/tests/data/_out_teleop_script_editor_xarm/scene_top/rgb_before_grasp.png`
+- `source/extensions/isaacsim.replicator.teleop.ui/data/icon.png`
+- `source/extensions/isaacsim.replicator.teleop.ui/data/preview.png`
+- `source/extensions/isaacsim.replicator.writers/data/icon.png`
+- `source/extensions/isaacsim.replicator.writers/data/preview.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_fisheyePolynomial/rp1/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_fisheyePolynomial/rp1/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_fisheyePolynomial/rp2/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_fisheyePolynomial/rp2/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_generalizedProjection/rp1/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_generalizedProjection/rp1/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_generalizedProjection/rp2/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_generalizedProjection/rp2/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinhole/rp1/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinhole/rp1/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinhole/rp2/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinhole/rp2/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinholeOpenCV/rp1/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinholeOpenCV/rp1/000000_overlay.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinholeOpenCV/rp2/000000.png`
+- `source/extensions/isaacsim.replicator.writers/python/tests/data/golden/_out_test_pose_writer_pinholeOpenCV/rp2/000000_overlay.png`
+- `source/extensions/isaacsim.robot.experimental.wheeled_robots/data/icon.png`
+- `source/extensions/isaacsim.robot.experimental.wheeled_robots/data/preview.png`
+- `source/extensions/isaacsim.robot.policy.examples/data/icon.png`
+- `source/extensions/isaacsim.robot.policy.examples/data/preview.png`
+- `source/extensions/isaacsim.robot.poser/data/icon.png`
+- `source/extensions/isaacsim.robot.poser/data/preview.png`
+- `source/extensions/isaacsim.robot.poser.ui/data/icon.png`
+- `source/extensions/isaacsim.robot.poser.ui/data/preview.png`
+- `source/extensions/isaacsim.robot.schema/data/icon.png`
+- `source/extensions/isaacsim.robot.schema/data/preview.png`
+- `source/extensions/isaacsim.robot.schema.ui/data/icon.png`
+- `source/extensions/isaacsim.robot.schema.ui/data/preview.png`
+- `source/extensions/isaacsim.robot.surface_gripper/data/SurfaceGripper_gantry.usda`
+- `source/extensions/isaacsim.robot.surface_gripper/data/icon.png`
+- `source/extensions/isaacsim.robot.surface_gripper/data/preview.png`
+- `source/extensions/isaacsim.robot.surface_gripper.ui/data/icon.png`
+- `source/extensions/isaacsim.robot.surface_gripper.ui/data/preview.png`
+- `source/extensions/isaacsim.robot.wheeled_robots.nodes/data/icon.png`
+- `source/extensions/isaacsim.robot.wheeled_robots.nodes/data/preview.png`
+- `source/extensions/isaacsim.robot.wheeled_robots.ui/data/icon.png`
+- `source/extensions/isaacsim.robot.wheeled_robots.ui/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.controllers/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.controllers/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.cumotion/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.cumotion/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.cumotion.examples/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.cumotion.examples/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.examples/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.examples/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.experimental.motion_generation/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.experimental.motion_generation/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.pink/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.pink/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.pink.examples/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.pink.examples/data/preview.png`
+- `source/extensions/isaacsim.robot_motion.schema/data/icon.png`
+- `source/extensions/isaacsim.robot_motion.schema/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.assembler/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.assembler/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.collision_detector/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.collision_detector/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.gain_tuner/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.gain_tuner/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.gain_tuner.ui/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.gain_tuner.ui/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.grasp_editor/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.grasp_editor/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.sysid/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.sysid/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.sysid/data/scenes/benchtop_force.usda`
+- `source/extensions/isaacsim.robot_setup.sysid/data/scenes/contact_probing.usda`
+- `source/extensions/isaacsim.robot_setup.sysid/data/scenes/free_space.usda`
+- `source/extensions/isaacsim.robot_setup.sysid/data/scenes/gravity_comp.usda`
+- `source/extensions/isaacsim.robot_setup.sysid.ui/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.sysid.ui/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.virtual_gantry/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.virtual_gantry/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.virtual_gantry.ui/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.virtual_gantry.ui/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.virtual_gantry_schema/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.virtual_gantry_schema/data/preview.png`
+- `source/extensions/isaacsim.robot_setup.xrdf_editor/data/icon.png`
+- `source/extensions/isaacsim.robot_setup.xrdf_editor/data/preview.png`
+- `source/extensions/isaacsim.ros2.bridge/data/icon.png`
+- `source/extensions/isaacsim.ros2.bridge/data/preview.png`
+- `source/extensions/isaacsim.ros2.control/data/icon.png`
+- `source/extensions/isaacsim.ros2.control/data/preview.png`
+- `source/extensions/isaacsim.ros2.core/data/icon.png`
+- `source/extensions/isaacsim.ros2.core/data/preview.png`
+- `source/extensions/isaacsim.ros2.examples/data/icon.png`
+- `source/extensions/isaacsim.ros2.examples/data/preview.png`
+- `source/extensions/isaacsim.ros2.nodes/data/icon.png`
+- `source/extensions/isaacsim.ros2.nodes/data/preview.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/nova_carter_warehouse_front_stereo_left_rgb.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_0_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_0_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_120_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_120_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_150_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_150_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_180_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_180_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_210_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_210_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_240_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_240_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_270_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_270_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_300_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_300_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_30_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_30_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_330_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_330_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_60_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_60_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_90_camera_1.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/angle_90_camera_2.png`
+- `source/extensions/isaacsim.ros2.nodes/python/tests/data/golden/spinning_camera/spinning_camera_scene.usda`
+- `source/extensions/isaacsim.ros2.sim_control/data/icon.png`
+- `source/extensions/isaacsim.ros2.sim_control/data/preview.png`
+- `source/extensions/isaacsim.ros2.tf_viewer/data/icon.png`
+- `source/extensions/isaacsim.ros2.tf_viewer/data/preview.png`
+- `source/extensions/isaacsim.ros2.ui/data/icon.png`
+- `source/extensions/isaacsim.ros2.ui/data/preview.png`
+- `source/extensions/isaacsim.ros2.urdf/data/icon.png`
+- `source/extensions/isaacsim.ros2.urdf/data/preview.png`
+- `source/extensions/isaacsim.sensors.camera.ui/data/icon.png`
+- `source/extensions/isaacsim.sensors.camera.ui/data/preview.png`
+- `source/extensions/isaacsim.sensors.experimental.physics/data/icon.png`
+- `source/extensions/isaacsim.sensors.experimental.physics/data/preview.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/data/icon.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/data/preview.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/data/spg/golden/grayscale.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/data/spg/golden/grayscale_invert.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/data/spg/scene/cornell_box.usda`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output/oak_d_tof__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output/oak_d_tof__camera_pseudo_depth_tof_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/oak4_d__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/oak4_d_wide__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/oak_d_pro_poe__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/oak_d_pro_w_poe__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/oak_d_tof__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/oak_d_tof__camera_pseudo_depth_tof_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/orbbec_femtomega_v1_0__camera_tof_wfov_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/orbbec_gemini2_v1_0__stream_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/orbbec_gemini_335__stream_ir_left_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/orbbec_gemini_335l__camera_depth_left_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/rsd455__camera_pseudo_depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/rsd457__depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/rsd555__depth_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/sick_safevisionary2__depthcamera_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/sick_visionary_t_mini__depthcamera_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/golden/depth_sensor_output_zero_sigma/zed_x__cameraleft_rp.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_00.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_01.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_02.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_03.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_04.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_05.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_06.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_07.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_08.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_09.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_10.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_11.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_12.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_13.png`
+- `source/extensions/isaacsim.sensors.experimental.rtx/python/tests/data/structured_light_camera/patterns/image_14.png`
+- `source/extensions/isaacsim.sensors.physics.examples/data/icon.png`
+- `source/extensions/isaacsim.sensors.physics.examples/data/preview.png`
+- `source/extensions/isaacsim.sensors.physics.nodes/data/icon.png`
+- `source/extensions/isaacsim.sensors.physics.nodes/data/preview.png`
+- `source/extensions/isaacsim.sensors.physics.ui/data/icon.png`
+- `source/extensions/isaacsim.sensors.physics.ui/data/preview.png`
+- `source/extensions/isaacsim.sensors.rtx.nodes/data/icon.png`
+- `source/extensions/isaacsim.sensors.rtx.nodes/data/preview.png`
+- `source/extensions/isaacsim.sensors.rtx.ui/data/icon.png`
+- `source/extensions/isaacsim.sensors.rtx.ui/data/preview.png`
+- `source/extensions/isaacsim.simulation_app/data/icon.png`
+- `source/extensions/isaacsim.simulation_app/data/omni.isaac.sim.png`
+- `source/extensions/isaacsim.simulation_app/data/preview.png`
+- `source/extensions/isaacsim.storage.native/data/icon.png`
+- `source/extensions/isaacsim.storage.native/data/preview.png`
+- `source/extensions/isaacsim.streaming.rtsp/data/icon.png`
+- `source/extensions/isaacsim.streaming.rtsp/data/preview.png`
+- `source/extensions/isaacsim.test.action_event_sdg/data/icon.png`
+- `source/extensions/isaacsim.test.action_event_sdg/data/preview.png`
+- `source/extensions/isaacsim.test.collection/data/icon.png`
+- `source/extensions/isaacsim.test.collection/data/preview.png`
+- `source/extensions/isaacsim.test.collection/data/tests/articulation_drives_opposite.usd`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Black Grid.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Curved Grid.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Flat Grid.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Full Warehouse.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Hospital.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Jetracer Track.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Office.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Simple Room.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Small Warehouse Digital Twin.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Small Warehouse With Forklifts.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Small Warehouse With Multiple Shelves.png`
+- `source/extensions/isaacsim.test.collection/data/tests/golden_img/Small Warehouse.png`
+- `source/extensions/isaacsim.test.collection/data/tests/test_mtl/test_mtl.obj`
+- `source/extensions/isaacsim.test.docstring/data/icon.png`
+- `source/extensions/isaacsim.test.docstring/data/preview.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_capture/distance_to_camera_auto_scaled_8bit.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_capture/distance_to_camera_manual_scaled_8bit.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_capture/rgb_data.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/different_extension_rgb_2.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/different_resolution_rgb_1.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/different_resolution_rgb_2.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_depth_8bit_1.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_depth_8bit_2.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_forklift_rt1.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_forklift_rt16.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_forklift_rt2.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_forklift_rt4.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_forklift_rt64.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_forklift_rt8.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_rotated_drill_1.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_rotated_drill_2.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_semantic_segmentation_1.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_semantic_segmentation_2.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_shifted_warehouse_1.png`
+- `source/extensions/isaacsim.test.utils/data/golden/image_comparison/similar_rgb_shifted_warehouse_2.png`
+- `source/extensions/isaacsim.test.utils/data/icon.png`
+- `source/extensions/isaacsim.test.utils/data/preview.png`
+- `source/extensions/isaacsim.ucx.bridge/data/icon.png`
+- `source/extensions/isaacsim.ucx.bridge/data/preview.png`
+- `source/extensions/isaacsim.ucx.core/data/icon.png`
+- `source/extensions/isaacsim.ucx.core/data/preview.png`
+- `source/extensions/isaacsim.ucx.nodes/data/icon.png`
+- `source/extensions/isaacsim.ucx.nodes/data/preview.png`
+- `source/extensions/isaacsim.util.camera_inspector/data/icon.png`
+- `source/extensions/isaacsim.util.camera_inspector/data/preview.png`
+- `source/extensions/isaacsim.util.physics/data/icon.png`
+- `source/extensions/isaacsim.util.physics/data/preview.png`
+- `source/extensions/isaacsim.zmq.bridge/data/icon.png`
+- `source/extensions/isaacsim.zmq.bridge/data/preview.png`
+- `source/extensions/isaacsim.zmq.core/data/icon.png`
+- `source/extensions/isaacsim.zmq.core/data/preview.png`
+- `source/extensions/isaacsim.zmq.protos/data/icon.png`
+- `source/extensions/isaacsim.zmq.protos/data/preview.png`
+- `source/extensions/omni.isaac.core_archive/data/icon.png`
+- `source/extensions/omni.isaac.core_archive/data/preview.png`
+- `source/extensions/omni.kit.loop-isaac/data/icon.png`
+- `source/extensions/omni.kit.loop-isaac/data/preview.png`
+- `source/extensions/omni.pip.cloud/data/icon.png`
+- `source/extensions/omni.pip.cloud/data/preview.png`
+- `source/extensions/omni.pip.compute/data/icon.png`
+- `source/extensions/omni.pip.compute/data/preview.png`
+- `source/extensions/omni.usd.schema.mujoco/data/icon.png`
+- `source/extensions/omni.usd.schema.mujoco/data/preview.png`
+- `source/extensions/omni.usd.schema.newton/data/icon.png`
+- `source/extensions/omni.usd.schema.newton/data/preview.png`
+- `source/libraries/isaacsim/foundation/objects/resources/tests/isaacsim.foundation.objects/attributes.usda`
+- `source/libraries/isaacsim/foundation/objects/resources/tests/isaacsim.foundation.objects/scene.usda`
+- `source/libraries/isaacsim/foundation/objects/resources/tests/isaacsim.foundation.objects/variant.usda`
+- `source/libraries/isaacsim/foundation/ovsim/resources/tests/isaacsim.foundation.ovsim/variant.usda`
+- `source/libraries/isaacsim/foundation/prims/resources/tests/isaacsim.foundation.prims/ant.usda`
+- `source/libraries/isaacsim/foundation/usd/openusd/resources/tests/isaacsim.foundation.usd.openusd/attributes.usda`
+- `source/libraries/isaacsim/foundation/usd/openusd/resources/tests/isaacsim.foundation.usd.openusd/scene.usda`
+- `source/libraries/isaacsim/foundation/usd/openusd/resources/tests/isaacsim.foundation.usd.openusd/variant.usda`
+- `source/libraries/isaacsim/foundation/usd/ovstage/resources/tests/isaacsim.foundation.usd.ovstage/attributes.usda`
+- `source/libraries/isaacsim/foundation/usd/ovstage/resources/tests/isaacsim.foundation.usd.ovstage/scene.usda`
+- `source/libraries/isaacsim/foundation/usd/ovstage/resources/tests/isaacsim.foundation.usd.ovstage/variant.usda`
+- `source/libraries/isaacsim/ovsim/api/resources/tests/isaacsim.ovsim.api/variant.usda`
+- `source/libraries/isaacsim/ovsim/clients/local/resources/tests/isaacsim.ovsim.clients.local/variant.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/Ant.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/CartPole.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/CartPoleNoRail.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/CartRailNoPole.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/FixedTendonTest.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/Humanoid.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/MultipleSpatialTendonsTest.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/ShadowHand.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/SpatialTendonTest.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/SurfaceDeformable.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/VolumeDeformable.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/cabinet.usda`
+- `source/libraries/isaacsim/physics/manager/resources/tests/franka.usda`
+- `source/libraries/isaacsim/physics/ovsim/resources/tests/isaacsim.physics.ovsim/variant.usda`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/camera_link.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_hand.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_leftfinger.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link0.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link1.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link2.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link3.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link4.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link5.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link6.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_link7.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/franka/meshes/panda_rightfinger.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/base.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/forearm.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/shoulder.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/upperarm.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/wrist1.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/wrist2.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/collision/wrist3.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/base.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/forearm.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/shoulder.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/upperarm.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/wrist1.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/wrist2.stl`
+- `source/libraries/isaacsim/robot_motion/cumotion/python/robot_configurations/ur10/meshes/visual/wrist3.stl`
+- `source/scripts/python/linux-aarch64/icon/omni.isaac.sim.png`
+- `source/scripts/python/linux-x86_64/icon/omni.isaac.sim.png`
+- `source/standalone_examples/benchmarks/data/mobility_gen/warehouse_multiple_shelves/map.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/OmniverseKit_Persp/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/left/camera_left/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/back_hawk/right/camera_right/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/left/camera_left/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/front_hawk/right/camera_right/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/left/camera_left/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/left_hawk/right/camera_right/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/left/camera_left/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.066667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.083333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.100000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.116667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.133333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.150000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.166667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.183333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.200000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.216667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.233333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.250000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.266667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.283333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.300000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.316667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.333333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.350000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.366667.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_robots_nova_carter_ros2/Robots/Robot_0/chassis_link/sensors/right_hawk/right/camera_right/rgb/rgb_0.383333.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_sdg/OmniverseKit_Persp/rgb/rgb_0000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_sdg/Replicator/cam_0_Xform/cam_0/rgb/rgb_0000.png`
+- `source/standalone_examples/benchmarks/validation/golden_data/benchmark_sdg/Replicator/cam_1_Xform/cam_1/rgb/rgb_0000.png`
+- `source/standalone_examples/data/torus/torus.obj`
+- `source/standalone_examples/data/torus/torus.stl`
+- `source/standalone_examples/testing/isaacsim.core.api/data/orientation_bug.usd`
+- `templates/isaacsim-cpp-extension/data/icon.png`
+- `templates/isaacsim-cpp-extension/data/preview.png`
+- `templates/isaacsim-omnigraph-extension/data/icon.png`
+- `templates/isaacsim-omnigraph-extension/data/preview.png`
+- `templates/isaacsim-python-extension/data/icon.png`
+- `templates/isaacsim-python-extension/data/preview.png`
+- `templates/isaacsim-ui-extension/data/icon.png`
+- `templates/isaacsim-ui-extension/data/preview.png`
+
+</details>
+
+## 122. IsaacLab
+1. Nombre: Isaac Lab (isaac-sim/IsaacLab)
+2. URL visible: https://github.com/isaac-sim/IsaacLab
+3. Micro resumen: Isaac Lab — componente de la lista 2 (t130u).
+4. LOOP: Escenario → Isaac Sim → Física + sensores + robot → Agente AI → Acción → Simulación → Datos/Reward → Isaac Lab → Aprendizaje → Nueva política
+- Ubicación: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/IsaacLab — re-adquirido sin LFS por motores (ZIP local → motor_1 → motor_3) · 372 punteros LFS eliminados · reglas filter=lfs quitadas: .gitattributes (líneas filter=lfs quitadas); tools/template/templates/external/.gitattributes (líneas filter=lfs quitadas) · 25 symlink(s) omitidos (regla del engine)
+<details><summary>Rutas LFS eliminadas (372)</summary>
+
+- `docs/source/_static/actuators/delay-clip.webp`
+- `source/isaaclab_newton/test/assets/data/articulation_ordering_branching.usda`
+- `source/isaaclab_newton/test/assets/data/fixed_cartpole.usda`
+- `source/isaaclab_newton/test/assets/data/fixed_spatial_chain.usda`
+- `source/isaaclab_newton/test/assets/data/fixed_tendon_hand.usda`
+- `source/isaaclab_newton/test/assets/data/floating_two_leg.usda`
+- `source/isaaclab_newton/test/assets/data/floating_two_link.usda`
+- `source/isaaclab_newton/test/assets/data/revolute_pendulum.usda`
+- `source/isaaclab_newton/test/assets/data/rigid_body_with_articulation_root.usda`
+- `source/isaaclab_ov/test/assets/data/articulation_ordering_branching.usda`
+- `source/isaaclab_physx/test/assets/data/articulation_ordering_branching.usda`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-simple_shading_constant_diffuse.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-simple_shading_diffuse_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/ovphysx-ovrtx_renderer-simple_shading_full_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-simple_shading_constant_diffuse.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-simple_shading_diffuse_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-isaacsim_rtx_renderer-simple_shading_full_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/cartpole/physx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cable/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_cloth/physx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/franka_soft/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/kuka_visual_material_randomization/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/kuka_visual_material_randomization/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/kuka_visual_material_randomization/physx-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_hetero/physx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/ovphysx-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/lift_kuka_homo/physx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/mpm_particles/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Cartpole-Camera-Direct/default_physics-default_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Cartpole-Camera-Direct/default_physics-default_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Cartpole-Camera-Direct/default_physics-default_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Cartpole-Camera-Direct/default_physics-default_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Reorient-Cube-Shadow-Camera-Direct/default_physics-default_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Reorient-Cube-Shadow-Camera-Direct/default_physics-default_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Reorient-Cube-Shadow-Camera-Direct/default_physics-default_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/registered_tasks/Isaac-Reorient-Cube-Shadow-Camera-Direct/default_physics-default_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/newton-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-simple_shading_constant_diffuse.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-simple_shading_diffuse_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/ovphysx-ovrtx_renderer-simple_shading_full_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-albedo.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-instance_id_segmentation_fast.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-motion_vectors.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-simple_shading_constant_diffuse.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-simple_shading_diffuse_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-isaacsim_rtx_renderer-simple_shading_full_mdl.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-depth.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-distance_to_camera.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-distance_to_image_plane.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-instance_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-normals.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand/physx-newton_renderer-semantic_segmentation.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand_yellow_bg/newton-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand_yellow_bg/newton-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand_yellow_bg/physx-isaacsim_rtx_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand_yellow_bg/physx-isaacsim_rtx_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand_yellow_bg/physx-newton_renderer-rgb.png`
+- `source/isaaclab_tasks/test/golden_images/shadow_hand_yellow_bg/physx-newton_renderer-rgba.png`
+- `source/isaaclab_tasks/test/golden_stages/cartpole/newton-isaacsim_rtx_renderer-rgb.usda`
+- `source/isaaclab_tasks/test/golden_stages/cartpole/physx-isaacsim_rtx_renderer-rgb.usda`
+- `source/isaaclab_tasks/test/golden_stages/cartpole/physx-newton_renderer-rgb.usda`
+- `source/isaaclab_tasks/test/golden_stages/registered_tasks_Isaac-Cartpole-Camera-Direct/default_physics-default_renderer-stage.usda`
+- `source/isaaclab_tasks/test/golden_stages/registered_tasks_Isaac-Reorient-Cube-Shadow-Camera-Direct/default_physics-default_renderer-stage.usda`
+
+</details>
+
+## Notas (sin repo)
+- Gemini Computer Use (Gemini 3.x): servicio cerrado, sin repo open source → solo nota.
+- Pesos HF de TimesFM: NO descargados (regla sin HF).
+- Ya estaban en core (no se duplican): vercel-labs/agent-browser, google-research/timesfm.
 
 ## No-repo (solo referencia)
 - MOSS paper: https://arxiv.org/abs/2605.22794
@@ -790,7 +2426,9 @@ CLI-Anything: **no tocar** (se movió sin modificar contenido).
 - agente.md / constitución YAIWES (15 puntos).
 - Autoevolución: motor de descarga/extracción como schema-contrato + workflow (sin GitHub Actions).
 
+
 ## Estado final (2026-10-15, America/Bogota)
-- 110/110 componentes de la lista presentes: 103 en esta carpeta (46 descargados, 53 movidos, 4 importados sin LFS) + 7 enlazados en shark imput.
-- Forense: los 152 repos de ambas carpetas comparados blob a blob con el árbol upstream del commit fuente del manifiesto → idénticos, salvo: renovate (1 archivo excluido a propósito) y zhangxjohn/MoDr (el repo upstream hoy está vacío; se conserva la copia descargada, 95 archivos).
-- Sin `_archives`, sin duplicados, sin HF/LFS/Actions.
+- Esta carpeta: 122 entradas listadas; lista 1: 103 repos aquí + 7 enlazados en shark imput; lista 2: 12 repos nuevos.
+- Sin LFS en todo Yaiwes: 0 punteros LFS y 0 líneas filter=lfs (escaneo completo del repo).
+- Sin `_archives` en todo Yaiwes (también shark imput y memoria, tras extraer y verificar con motor_1).
+- Forense blob a blob contra upstream: idéntico salvo lo anotado por repo (punteros LFS y reglas filter=lfs eliminados, renovate docs/usage/docker.md, symlinks, MoDr con upstream vacío).
