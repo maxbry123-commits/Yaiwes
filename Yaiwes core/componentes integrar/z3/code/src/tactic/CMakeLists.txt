@@ -1,0 +1,28 @@
+z3_add_component(tactic
+  SOURCES
+    dependency_converter.cpp
+    goal.cpp
+    goal_num_occurs.cpp
+    goal_shared_occs.cpp
+    goal_util.cpp
+    probe.cpp
+    tactical.cpp
+    tactic.cpp
+  COMPONENT_DEPENDENCIES
+    ast
+    model
+    simplifiers
+    converters
+)
+
+add_subdirectory(aig)
+add_subdirectory(arith)
+add_subdirectory(bv)
+add_subdirectory(core)
+add_subdirectory(fd_solver)
+add_subdirectory(ff)
+add_subdirectory(fpa)
+add_subdirectory(portfolio)
+add_subdirectory(sls)
+add_subdirectory(smtlogics)
+add_subdirectory(ufbv)

@@ -1,0 +1,792 @@
+# Z3 native certificates and Lean verification
+
+## Goal and boundary
+
+The goal is unsat results from Z3 that an independent Lean checker accepts
+without trusting the solver. Z3's proof format is a means to that end, not
+something to preserve. The current low-level proof terms and clause logs are
+prone to regressions, because every simplifier and solver path has to thread
+proof evidence through by hand. The regression matrix below and the Lean checks
+exist to expose those regressions, and the format is free to change wherever a
+change makes the evidence more complete or easier to check. The exporter is a
+thin adapter over whatever evidence Z3 emits, so a format change is a change to
+the adapter, not to the Lean rules, which are tied to the meaning of each
+inference rather than to its encoding. Missing native proof evidence and
+checker correctness are separate obligations. Proof certification is opt-in,
+so users who do not request proofs see no change while the integration is
+developed.
+
+## Current integration status (2026-10-02)
+
+`examples/python/proof_certificate.py` saves a native Z3 proof as JSON.
+`examples/python/proof_to_lean.py` translates that proof into Lean source and
+checks it. `examples/python/proof_preprocessing.py` checks that simplification
+steps preserve proof evidence connecting the result to the original assertions.
+`scripts/check_lean.sh` invokes the Lean version specified in
+`lean/lean-toolchain`. These tools currently support selected proofs over
+Boolean variables and operators, not arbitrary SMT inputs.
+
+The Python script `scripts/proofs/proof_matrix.py` in
+[Z3Prover/z3test](https://github.com/Z3Prover/z3test/tree/master/scripts/proofs)
+runs input files through Z3 with different proof-generation and checking
+settings, then reports the results. Its automated tests and sample input files
+also live in that repository. With `--lean`, the script uses
+`examples/python/proof_certificate.py` to save a native Z3 proof and
+`examples/python/proof_to_lean.py` to check it with Lean.
+
+The `releaseClang` job in `.github/workflows/ci.yml` requires Lean to accept the
+proof for every Boolean example, reported as `lean-verified`. It saves the
+native JSON proof certificates and the checked Lean source files.
+These Lean checks and the other tests share the `z3test/` checkout from its
+default branch.
+`proof_certificate.py` and `proof_to_lean.py` can also be used directly,
+without `proof_matrix.py`.
+
+### Input files checked now
+
+The automated Lean checks use these six files in `z3test/regressions/proofs/lean/`:
+
+- `unit_resolution.smt2`
+- `boolean_branching.smt2`
+- `boolean_def_axiom.smt2`
+- `boolean_rewrite.smt2`
+- `boolean_structural.smt2`
+- `boolean_solve_eqs.smt2`
+
+### Additional input files: future plan
+
+**Planned only; these files are not included in the current automated Lean
+checks.** Add the seven `.smt2` examples from
+[jreeves3/SMT-Skeleton-Check/formulas](https://github.com/jreeves3/SMT-Skeleton-Check/tree/main/formulas):
+
+| Logic | Input file |
+| --- | --- |
+| QF_UF | `simple-cong.smt2` |
+| QF_UF | `QG-classification-qg5-gensys_icl634.smt2` |
+| QF_LIA | `cut_lemmas-20-vars-cut_lemma_01_003.smt2` |
+| QF_LRA | `LassoRanker-CooperatingT2-efegp.t2.c_Iteration1_Lasso_3-pieceTemplate.smt2` |
+| QF_UFLIA | `wisas-xs_10_20.smt2` |
+| UF | `20170428-Barrett-cdt-cade2015-nada-afp-abstract_completeness-x2015_09_10_16_59_39_090_1045351.smt_in.smt2` |
+| UFLIA | `boogie-AdditiveMethods_AdditiveMethods..ctor.smt2` |
+
+The LassoRanker QF_LRA example is now available as the optional, manual
+certification benchmark described below; the other six examples remain
+planned extensions. It is not run by PR CI or scheduled/nightly builds.
+
+These examples require support beyond Boolean variables: equality and
+uninterpreted functions, linear real or integer arithmetic, and, for UF and
+UFLIA, quantifiers. Before enabling each file, check that Z3 can read it,
+review cvc5-specific options such as `:simplification` without changing the
+assertions, and add the proof translation needed for Lean to check it.
+Keep these additional external test inputs in `Z3Prover/z3test`.
+
+### Larger collections of input files: future plan
+
+**Planned only; these collections are not included in the current automated
+Lean checks.** Obtain additional `.smt2` inputs using the benchmark names in
+the following CSV files in
+[jreeves3/SMT-Skeleton-Check/data/ijcar26](https://github.com/jreeves3/SMT-Skeleton-Check/tree/main/data/ijcar26):
+
+| Logic | CSV file containing benchmark names | Distinct names | Recorded as `unsat` |
+| --- | --- | ---: | ---: |
+| QF_UF | `QF_UF_cvc5-no-proof-rt.csv` | 7,503 | 4,356 |
+| QF_LIA | `QF_LIA_cvc5-no-proof-rt.csv` | 13,306 | 3,545 |
+| QF_LRA | `QF_LRA_cvc5-no-proof-rt.csv` | 1,753 | 696 |
+| QF_UFLIA | `QF_UFLIA_cvc5-no-proof-rt.csv` | 190 | 190 |
+| UF | `UF_cvc5-no-proof-rt.csv` | 2,857 | 702 |
+| UFLIA | `UFLIA_cvc5-no-proof-rt.csv` | 2,849 | 1,518 |
+
+The counts above describe the published CSV files inspected on 2026-10-02.
+Their `Name` columns identify benchmarks, not ready-to-use file paths. The
+repository provides only the seven example `.smt2` files listed above, not
+the complete collections. Obtain the remaining inputs separately.
+The recorded `unsat` results come from cvc5 runs; they are not Lean-checked
+results.
+
+Start with the entries recorded as `unsat`. Locate the original inputs,
+record their source and expected result, and store the selected test inputs
+and file lists in `Z3Prover/z3test`. Add them to automated Lean checking
+gradually as `proof_certificate.py` and `proof_to_lean.py` support their
+formulas and proof steps. Missing proof support must remain an explicit
+failure, not an accepted proof.
+
+The dated findings below describe earlier runs and retain their historical
+file paths. The Boolean-negation and arithmetic-coefficient fixes have since
+merged as Z3Prover/z3#10952, Z3Prover/z3#10954, and Z3Prover/z3#10955.
+
+## Regression methodology
+
+Proof checking in Z3 is currently disjointed, and the remaining work is larger
+than a handful of PRs. Before extending Lean coverage further, establish one
+regression methodology and suite that covers every proof-producing path:
+
+- The `sat.smt=true` core has a modular self-checker (`euf_proof_checker` with
+  theory plugins for arithmetic `farkas`/`bound`/`implied-eq`/`cut`,
+  bit-vectors, quantifiers, Tseitin, and `distinct`). It falls back to calling
+  the SMT solver for lemmas it does not handle; such a fallback is not a check.
+- The legacy core (`sat.smt=false`) produces proof objects with
+  `produce-proofs` and clause proofs with `smt.clause_proof` /
+  `solver.proof.log`, checked by `solver.proof.check` and
+  `solver.proof.check_rup`, optionally saved via `solver.proof.save` or
+  `solver.proof.trim`. The clause-proof logging is not yet rock solid.
+- `theory_lra` has ad hoc self-validation behind `smt.arith.validate`, and the
+  SMT context validates cores behind `smt.core.validate`.
+
+The suite is a matrix of benchmarks x parameters x checking method.
+
+**Benchmarks.** QF_UF, QF_LIA, QF_LRA, QF_NIA, QF_AUFLIA from the SMT-LIB
+release archives, plus the z3test regressions and the generated propositional
+families from the scaling survey. Curate per logic a small canary set (seconds,
+mixed sat/unsat) for PR CI and a larger set for nightly runs. Record the
+expected result of every instance from a proof-free run.
+
+**Parameters.**
+1. `sat.smt=true` with clause-proof checking enabled (`solver.proof.check`,
+   `solver.proof.check_rup`) and `solver.proof.log` written for external replay.
+2. `sat.smt=false` with `produce-proofs=true` (legacy proof objects).
+3. `sat.smt=false` with `smt.clause_proof=true` (legacy clause proofs).
+4. Self-validation oracles: `smt.arith.validate=true`, `smt.core.validate=true`.
+   These use the solver to check itself and only count as diagnostics.
+
+**Checking method.** Self checker (the built-in checkers above) and external
+checker (the C++ `proof_checker` for proof objects, DRAT tools for pure clause
+trails, and Lean reconstruction for the fragments it supports).
+
+**Recorded per cell.** Result agreement with the proof-free run, time, proof
+size, checker verdict, number of self-checker fallbacks, and a failure class:
+`verified`, `unverified-fallback`, `checker-rejected`, `no-proof`, `crash`,
+`timeout`. A cell that passes only through fallback is never reported as
+verified. Every `checker-rejected` and `crash` instance is minimized and added
+as a regression test with its parameter cell.
+
+**Coverage tracking.** For each logic and parameter cell, tabulate the proof
+rules and theory-lemma kinds that occur and which checkers accept each kind.
+This replaces guessing which rule to support next; the Boolean survey below is
+the first instance of this method.
+
+**Implemented infrastructure.** The runner is now
+`Z3Prover/z3test/scripts/proofs/proof_matrix.py`. It takes a benchmark
+list and emits one JSON record per cell, together with a summary table;
+canary lists live in `Z3Prover/z3test/regressions/proofs/canaries/`. The runner must
+exit nonzero on `checker-rejected` and `crash`, and must report fallbacks
+separately from verified results.
+
+### First matrix run (2026-09-25)
+
+`examples/python/proof_matrix.py` implements the runner. A canary of 86
+single-query benchmarks (z3test regressions plus small local SMT-LIB samples in
+QF_UF, QF_LIA, QF_LRA/QF_RDL, QF_NIA, QF_AUFLIA/QF_ALIA) produced these
+findings:
+
+- **Crash (fixed in PR).** `sat.smt=true` with `solver.proof.log` segfaulted on
+  13 array-logic instances that solve fine without logging (for example z3test
+  `t168.smt2`). The array solver justified its unconditional axiom merges with
+  a bare `sat::constraint_base` index, which `log_justifications` reinterpreted
+  as a `th_explain`. The fix (branch `array-proof-log`) uses a `th_explain`
+  with an `array` hint carrying the derived equality. A four-line reproducer
+  is in the PR description and should become the first canary regression.
+- **Checker rejection exposed by the fix.** With logging working on arrays,
+  z3test `t8.smt2` (array `default`, `map`, and `array-ext`) replays with
+  `tseitin` and `euf` steps whose derived units are not RUP-derivable
+  (`unit (not (default s1)) is not rup`). This is a logging or checker defect
+  in the array/euf interplay, not a solver result error.
+- **Preprocessing is outside the clause log.** Every QF_UF unsat instance and
+  some QF_LIA ones are closed by `solve-eqs` or value propagation before the
+  core runs, so the clause log is empty and the run is classed `no-proof`. The
+  `smt-clause-log-nopp` cell disables those simplifiers to measure the core
+  alone. Preprocessing proofs exist only in the legacy proof objects.
+- **Self-checker fallbacks in linear arithmetic.** On the QF_LIA canary the
+  checker fell back to the SMT solver for 262 `smt` hints, 41 failed `rup`
+  checks, and all 16 `bound` hints in one bignum instance; one `farkas` hint in
+  QF_RDL was also rejected and recovered by fallback. `bound` and `farkas`
+  misses are the coefficient defects described below; `smt` hints carry no
+  checkable justification at all; `rup` misses mean the logged clause is not
+  reverse-unit-propagation derivable from the logged state.
+- **Nonlinear lemmas always fall back.** `nla` and `cut` hints were never
+  accepted by the checker.
+- **Legacy proof objects have no external checker.** Every unsat legacy proof
+  is classed `no-checker` outside the propositional fragment. Their theory
+  lemma kinds on this canary are `arith`, `arith farkas`,
+  `arith assign-bounds`, and `arith triangle-eq`, which is the inventory for
+  milestone 3. The built-in `context::check_proof` runs `proof_checker` but
+  discards the verdict and is not exposed as an option.
+- **Legacy clause proofs** (`smt.clause_proof`) record only assumptions and the
+  final `proof-trail`, so there is nothing to check.
+
+### Canary lists and known failures (2026-09-25)
+
+The array proof-logging fix merged as Z3Prover/z3#10922 without a test, and the
+canary set of the first run existed only as session files. Both are now in the
+repository under `examples/python/proof_canaries/`:
+
+- `array_axiom_log.smt2` is the four-line reproducer from the PR. The
+  end-to-end test in `test_proof_matrix.py` asserts that both clause-log cells
+  classify it as `unverified-fallback` with `array` hints, so a return of the
+  crash fails the test, and so does a silent change to `verified` once an array
+  checker plugin exists. CI runs the matrix tests against the built binary in
+  the Lean-enabled job.
+- One list per logic (`QF_UF`, `QF_LIA`, `QF_LRA` with `QF_RDL`, `QF_NIA`,
+  `QF_AUFLIA` with `QF_ALIA` and the z3test array regressions, plus the
+  propositional Lean examples). Entries resolve next to the list first and then
+  against `--benchmark-root`, so the z3test checkout and the SMT-LIB samples
+  are expected under one root outside the repository. The two z3test array
+  files whose proof-free run itself reports an error are excluded.
+- List entries may carry `cell=status` annotations for known failures in the
+  `checker-rejected`, `disagree`, and `crash` classes. A known failure that
+  reproduces is reported but does not fail the run; one that stops reproducing
+  is reported as stale so the annotation is removed deliberately. `t8.smt2`
+  carries the first annotation, for both clause-log cells, until the
+  array/euf replay defect is fixed. This is how every future minimized
+  `checker-rejected` or `crash` instance is recorded: the instance goes into
+  the canary directory or its list, its expected class is annotated, and the
+  fix removes the annotation.
+
+**t8 diagnosed (2026-09-28).** The rejection is two checker defects, not a
+logging gap. The array `default` axiom for `(_ map not)` over a Bool array
+introduces the term `(not (default s))` as its own literal. The clause log
+prints the negation of that literal as `(not (not x))`, while the `tseitin`
+and `euf` hints, built through `literal2expr`, collapse it to `x`;
+`theory_checker::check` compared the two syntactically, saw a spurious extra
+hint literal, and demanded a unit that is not RUP-derivable. Separately, the
+`euf` plugin treated `(not x)` inside an equality as uninterpreted and found no
+conflict in `x = true, (not x) = y, y = true`. The fix (branch
+`proof-log-double-negation`) compares literals modulo double negation and makes
+the `euf` plugin reject a class where `x` and `(not x)` coincide or share a
+truth value. On t8 the replay goes from four rejected `tseitin` and two
+rejected `euf` steps to all accepted, leaving only the `array` fallbacks. The
+one-assertion reproducer `array_default_not.smt2` is in the canary directory
+with a known-failure annotation; the annotations for it and t8 go stale, and
+are removed, when the fix merges.
+
+Rerunning the 115-entry canary set on the merged fix exits zero: the 13 former
+crash cells now log and replay (`unverified-fallback` or `not-applicable`), the
+`t8.smt2` annotation reproduces, and the six propositional examples are
+Lean-verified through `legacy-proof-object`. New observation: proof logging
+slows the larger `QF_ALIA_SAT` instances (`qlock-bug-10`, `qlock-bug2-10`,
+`qlock.induction.10`) past the 30-second budget although they solve within it
+without logging, so the array log volume on sat instances is itself a cost to
+measure.
+
+## Milestones
+
+1. **Native Boolean proof exporter (implemented).** Use the existing proof API
+   with proof generation enabled before solving. Export one propositional
+   refutation together with its original source, assertion roots, typed native
+   declarations, shared proof/term DAG, and rule inventory. Reject unsupported
+   script semantics, nonpropositional assertions, missing proofs, and unsupported
+   native shapes. Never present the artifact as independently verified.
+2. **Kernel-checked Boolean vertical slice (basic, structural, scoped, and gate-clause rules implemented).**
+   Extend the initial reconstructor with more Boolean proof rules and formalize
+   the frontend encoding boundary. Account for preprocessing, fresh definitions,
+   hypothesis scope, and the
+   connection to the original assertions. Produce a theorem that the assertions
+   imply False, with no sorry or solver-oracle axioms. Reject malformed/tampered
+   certificates and unsupported inference rules.
+3. **Equality and linear arithmetic.** Add uninterpreted functions and equality
+   reasoning, then real/integer linear arithmetic with checked side conditions
+   and certificates. Extend native evidence only where replay needs it. Complete
+   each fragment end-to-end before adding another.
+4. **Broader theories and integration.** Treat bit-vectors, arrays, quantifiers,
+   strings, and nonlinear arithmetic as distinct extensions. Introduce a
+   proof-required frontend that publishes certified unsat only after successful
+   checking, preserves exact incremental/assumption contexts, and explicitly
+   rejects unsupported configurations. Keep the C++ checker for diagnostics.
+5. **External consumers as gradual milestones.** Each is one end-to-end test in
+   the regression matrix: the Rutgers project consuming Z3 certificates
+   end-to-end; a Z3-native path in Lean-smt, which currently only supports
+   CVC5; and a certifying mode for F*, whose infrastructure is not yet set up
+   here. Start with the consumer whose fragment the checkers already cover.
+
+The regression methodology above is the current top priority and gates the
+order in which milestones 3 to 5 proceed.
+
+## First milestone deliverables
+
+- `examples/python/proof_certificate.py`: opt-in CLI and Python exporter using
+  existing APIs; no solver algorithm or public API changes.
+- Versioned, topologically ordered JSON encoding of native ASTs, preserving
+  declaration identity and complete arguments.
+- Documentation in `examples/python/README` and CMake example integration.
+- `examples/python/test_proof_certificate.py`: focused coverage of exact native
+  DAG preservation, source/assertion binding,
+  sharing, Boolean operators, named assertions, lexer/query restrictions, CLI
+  behavior, and error paths. Run this in the existing Python-wheel CI job,
+  separately from the dependency-free build-script tests.
+
+## Acceptance boundary
+
+For a supported unsat snapshot, produce a complete native proof bundle with
+explicit unverified status. For sat, unknown, unsupported inputs, or missing
+proof evidence, fail explicitly without a success-shaped certificate.
+The exporter itself still makes no independent verification claim. The new
+reconstruction slice publishes a Lean artifact only after checking succeeds,
+and rejects unsupported proof rules rather than treating them as axioms.
+
+## Lean environment
+
+The `lean/` workspace pins Lean 4.34.0 and contains a small example proof library.
+Run `./scripts/check_lean.sh` to build/check it, or
+`./scripts/check_lean.sh /tmp/l.txt` to check a Lean source file. Both `.lean` and
+`.txt` inputs are accepted, and files may import `Z3Proofs`.
+
+The helper rechecks imported modules and enables warnings as errors. It checks
+Lean source, not JSON. The separate `examples/python/proof_to_lean.py` consumer
+validates JSON and invokes the helper before publishing generated Lean source.
+Installation and usage are documented in `lean/README.md`.
+
+## Current reconstruction slice
+
+- Require the original SMT-LIB input separately from the certificate. Match
+  source text and the exact parsed assertion structures; validate declaration
+  signatures, topological node references, sorts, and proof conclusions.
+- Reconstruct `asserted`, `unit-resolution`, `mp`, and Boolean `rewrite`,
+  including derived clauses, both complement orientations, factoring, shared
+  intermediate proofs, and ordered implication/equivalence elimination.
+- Reconstruct Boolean equivalence `refl`, `symm`, and `trans`, as well as
+  `monotonicity` for the supported Boolean connectives. Match application heads,
+  arities, and oriented argument equivalences, including omitted reflexive
+  premises and shared evidence. Use direct Lean proof terms, not truth tables.
+- Reconstruct condensed Boolean transitivity (`trans*`) by finding a path
+  through the supplied equivalences, reversing edges as needed. Support
+  reordered, repeated, cyclic, and redundant evidence, and reflexive empty
+  paths. Validate every premise, preserve the hypotheses of all supplied
+  premises, and reject disconnected endpoints. Balance the generated
+  `Iff.trans` terms so long paths do not require deeply nested compositions.
+- Reconstruct `and-elim` and `not-or-elim` for immediate operands, including
+  singleton/n-ary connectives and native double-negation cancellation.
+- Reconstruct `iff-true` and `iff-false` from their exact Boolean premises and
+  ordered endpoints, using axiom-free logical terms and preserving scope.
+- Reconstruct `hypothesis` and `lemma` with explicit open-hypothesis tracking.
+  Represent open proof DAG nodes as functions of their structural hypothesis
+  sets, preserving sharing without closing a shared node globally. A lemma must
+  consume a proof of false and discharge every open hypothesis into a
+  complementary conclusion literal. Support nested lemmas, both complement
+  orientations, compound literals, clause reordering, duplicates, and weakening.
+  Reject a root with any undischarged hypotheses.
+- Reconstruct Boolean `def-axiom` clauses as independent Lean theorems, never
+  as trusted axioms. Support the gate schemas for not, n-ary and/or, implication,
+  Boolean equivalence, xor, and Boolean ite, plus complementary literals and
+  constant tautologies. Handle negated/compound operands and reordered,
+  duplicated, or weakened clauses using direct proof terms over one gate's
+  immediate operands, not truth tables over nested atoms. Reject invalid or
+  unsupported clauses, including unused ones. Fresh definitions remain separate.
+- Check each rewrite independently of the assertions by exhaustive cases over
+  its own atoms and kernel reduction using `of_decide_eq_true rfl`. Rewrites and
+  double-negation cancellation, gate clauses, and classical lemma steps use
+  temporary decidability witnesses, which are eliminated constructively from
+  the refutation:
+  `k (isFalse (fun hp => k (isTrue hp))) : False` for
+  `k : Decidable p -> False`. The final theorem keeps arbitrary `Nat -> Prop`
+  valuations, the original hypotheses, and no axiom dependencies.
+- Generate shared Lean proposition definitions and explicit proof terms using
+  Lean core logical rules. Do not introduce axioms, sorry, or solver calls to
+  justify missing reasoning.
+- Check with the pinned Lean toolchain before atomically publishing a `.lean`
+  artifact. Fail explicitly for malformed certificates, changed assumptions,
+  unsupported rules, and Lean errors.
+- Exercise complete examples using `z3test/regressions/proofs/lean/unit_resolution.smt2`,
+  `z3test/regressions/proofs/lean/boolean_rewrite.smt2`, and
+  `z3test/regressions/proofs/lean/boolean_structural.smt2`, plus scoped learning in
+  `z3test/regressions/proofs/lean/boolean_branching.smt2` and gate clauses in
+  `z3test/regressions/proofs/lean/boolean_def_axiom.smt2`. Cover Boolean truth tables, chained
+  and shared proof steps, all Boolean congruence operators, both elimination
+  orientations, large congruences without truth tables, forged structural
+  premises/conclusions, false or unused rewrites, nested and shared hypothesis
+  scopes, malformed lemmas, leaked hypotheses, forged/unused gate clauses, and
+  large gate and learned clauses without truth tables. Cover condensed
+  transitivity with reversed/cyclic paths, structural sharing, scoped premises,
+  disconnected endpoints, and long equivalence chains.
+
+Z3's SMT-LIB parser and the Python statement encoder remain part of the trusted
+frontend. The source digest identifies the generated namespace; it is not the
+input-binding check or a formal proof of parsing/encoding correctness.
+
+Rewrite truth tables are exponential in the number of atoms in an individual
+rewrite; large valid rewrites may exceed Lean's normal resource limits. A
+checking failure never publishes an artifact.
+
+Definition introduction and other native rules remain unsupported. These and
+a formalized encoding connection must be addressed before claiming general
+Boolean proof support. Arithmetic and other theories remain later milestones.
+
+### Scaling survey (2026-09-25)
+
+A survey of export, reconstruction, and Lean checking over generated
+propositional families (pigeonhole, xor cycles, implication chains, wide de
+Morgan, nested equivalences, random 3-SAT) shows that rule coverage is no longer
+the bottleneck: every rule the default pipeline emits on propositional inputs is
+supported. Two resource cliffs remain, both on the Lean side:
+
+- The main theorem is one nested `let` chain. Lean's elaborator hits its
+  recursion limit at roughly 500 bindings (about 1000 proof nodes). Raising
+  `maxRecDepth` inside the theorem recovers chains and random 3-SAT, but the
+  chain is superlinear to elaborate; pigeonhole with five holes emits 5391
+  steps for 1939 nodes because shared lemma nodes are re-instantiated per
+  hypothesis scope. Emit steps as top-level lemmas parameterized by the
+  assertion hypotheses, or as a tactic `have` chain, and share instantiations.
+- Rewrites are checked by truth tables, exponential in the atom count: eight
+  atoms take seconds, twelve exceed the heartbeat limit. The large rewrites seen
+  are structural: identity, and/or flattening, de Morgan, and reordering.
+  Prove these schemas directly and keep truth tables only for small rewrites.
+  Z3 should also stop emitting identity rewrites from the simplify pass.
+
+The z3test corpus has almost no single-query propositional files, so generated
+families are the benchmark for this fragment.
+
+## Preprocessing evidence audit
+
+Before expanding the checker further, exercise native simplifiers explicitly.
+`examples/python/proof_preprocessing.py` compares the simplifier API
+(`solve-eqs` wrapping `SimpleSolver`) with the `solve-eqs`/`smt` tactic chain,
+each with proof generation off and on. It records elimination and search
+statistics separately from proof validity and checks every available native
+refutation against the original input using the existing Lean consumer.
+
+`z3test/regressions/proofs/lean/boolean_solve_eqs.smt2` requires its equality for unsatisfiability:
+elimination leaves four clauses and search still makes decisions and conflicts.
+Use `--require-search` for this case. The existing unit-resolution example
+covers contradictions closed by preprocessing alone; a search step is not
+required in that case.
+
+Both examples now run `solve-eqs` and reconstruct their refutations successfully
+through both interfaces with proof generation enabled. The native producer
+changes were merged upstream in Z3Prover/z3#10915. The native producer
+carries equality evidence through extraction and substitution normalization,
+composes substitution congruences with subsequent rewrites, and preserves proofs
+when flattening conjunctions or replaying eliminated definitions. Tracked
+assertions keep their original labels instead of introducing unbound proxy
+assumptions in the final proof.
+
+Proof support currently covers direct variable equalities and Boolean units.
+Theory-specific isolation, conditional and nested-equation extraction, and
+guarded array definitions remain disabled in proof mode until their own
+certificates are implemented. The actual goal's proof setting is respected;
+proof-disabled goals keep the existing extraction behavior.
+
+Native checks validate proof conclusions, original assertion leaves, and rewrite
+side conditions. Lean coverage checks complete Boolean refutations, axiom
+dependencies, incremental additions, push/pop, query assumptions, context
+translation, and tracked assertions against explicit original-input snapshots.
+The exporter retains its single-snapshot input restriction.
+
+Preprocessing-only proofs and preprocessing followed by search must both
+preserve the original assertion boundary; checking a SAT proof of an unrelated
+or unverified CNF is insufficient. The audit continues to report failure when
+required execution evidence or checked proofs are absent.
+
+## QF_LRA slice through the clause log (2026-10-06)
+
+Milestone 3 now has a working linear real arithmetic slice. It deliberately
+uses the `sat.smt` clause log rather than the smt core's proof objects, because
+`theory_lra` records its arithmetic conflicts there as `(_ th-lemma arith)`
+with no Farkas coefficients: `set_conflict_or_lemma` passes a parameter vector
+that is only ever reset. The clause log carries them, for example
+`(farkas 1 $11 2 $17 1 $21)`, and its hints are already validated by the C++
+checker in the matrix. `proof_clause_log.py` rebuilds the log into the
+existing certificate format, so the Boolean reconstruction is reused
+unchanged: theory hints become `th-lemma` nodes, Tseitin hints become
+`def-axiom` nodes, and reverse-unit-propagation steps become explicit
+hypothesis/unit-resolution/lemma chains. Lean proves each theory lemma and each
+arithmetic rewrite with `grind` over a `Rat` encoding of the Real variables,
+after the reconstructor has re-derived the recorded Farkas combination with
+exact rationals.
+
+Findings from building and running it:
+
+- **`bound_simplifier` defeats the no-preprocessing cell.** With `solve_eqs`,
+  `propagate_values`, and `elim_unconstrained` disabled, `bound_simplifier`
+  (on by default) still runs `solve_eqs` and `propagate_values` internally,
+  so assumed clauses can combine several assertions. The exporter disables it
+  too; the companion matrix update disables it in `smt-clause-log-nopp` as well.
+- **Equality coefficients in `farkas` hints are placeholders.** A hint
+  listing an equality with coefficient 1 may need multiplier 15 to cancel;
+  Z3's checker solves for equality multipliers rather than reading them, and
+  the exporter and reconstructor now do the same by Gaussian elimination.
+- **Hint conventions differ.** `farkas`, `bound`, `implied-eq`, and `euf` list
+  jointly contradictory literals; `tseitin` lists the gate clause itself;
+  `smt` carries no literals. A clause-log consumer must know which is which.
+  An `implied-eq` ends in a disequality: Python checks the shape and Lean
+  proves the implied equality, rather than summing the disequality as a
+  Farkas constraint. `alldiff` clauses must be tied to the original `distinct`
+  assertion, never trusted as unconditional theory lemmas.
+- **Z3's RUP check is Tseitin-aware.** `rup` steps may rely on the definitions
+  of compound Boolean atoms that are never logged as clauses; the replayer
+  adds those gate clauses as `def-axiom` nodes.
+- **Preprocessing splits assertions.** An `xor` or Boolean equality becomes
+  several clauses, and a contradiction found while asserting produces an
+  empty or truncated log. Such clauses are tied to the assertions by a `cnf`
+  theory lemma that Lean proves, which keeps the theorem's hypotheses equal to
+  the original assertions.
+- **`grind` and fractional equalities.** Lean 4.34's `grind` proves the lemmas
+  once denominators are cleared but not always with fractional constants in
+  equalities; stating each fractional atom's scaled form as a helper
+  implication restores completeness on every instance tried.
+- **Real as Rat.** Lean core has no `Real`; the encoding is sound for linear
+  constraints with rational coefficients and is stated at the trust boundary.
+  Lean core's own `Rat` lemmas depend on the three standard axioms, so the
+  arithmetic slice cannot be axiom-free regardless of the tactic used.
+- **Scaling.** Random QF_LRA instances up to 24 variables and 140 constraints
+  (about 2,400 DAG nodes, 525 proof steps) export in under a second and check
+  in about three seconds once `maxRecDepth` is raised; the earlier ~500-step
+  elaboration cliff was the default recursion limit, not the kernel.
+
+The companion matrix update is
+[Z3Prover/z3test#77](https://github.com/Z3Prover/z3test/pull/77): it adds the
+clause-log `--lean` cell and eight QF_LRA inputs, including implied equality,
+n-ary `distinct`, and fractional unary-negation regressions.
+
+Still open for this slice: real SMT-LIB QF_LRA benchmarks (the canary list has
+two unsat instances, both trivial), `smt` hints have not been observed on the
+inputs tried, and QF_LIA needs `cut` hints that the C++ checker never accepts.
+
+**Real `ite` terms and congruence claims (2026-10-11).** The exporter rejected
+every QF_LRA input with a Real-valued `ite`, although the clause log handles
+them cleanly: `theory_lra` treats the `ite` as an opaque variable and the
+`euf` core records `(not c) ∨ (ite c a b) = a` and `c ∨ (ite c a b) = b` as
+`tseitin` inferences. The replay now does the same, adds those gate clauses
+as `def-axiom` nodes, and Lean proves them from a decidability witness for
+`c` with `ite_eq_left`/`ite_eq_right`; the term is Lean's `ite` over `Rat`
+with the classical instance, so the term definitions containing one are
+`noncomputable`. Z3 normalizes `abs`/`max`-shaped `ite` terms by swapping
+branches, so the assumption is bridged by a `rewrite` that `grind` proves by
+splitting on the condition. The same inputs exposed `euf` hints that carry
+congruence claims `(cc (= a b))` and `(comm (= a b))` as `Proof`-sorted
+arguments; Z3's checker uses them as guidance and builds the clause from the
+Boolean arguments only, and the replay now drops them after a shape check.
+Review of this slice found that a comparison applied directly to an `ite`
+with a fractional branch, such as `(>= (ite p x (/ 1.0 2.0)) 1.0)`, exported
+a certificate that `grind` could not close: Z3's rewriter pushes the
+comparison through the `ite`, so no gate clause is recorded, and `grind`
+splits on the `ite` but, as with fractional atoms, does not combine the
+resulting equality `ite = 1/2` with its linear facts. Each `grind` lemma now
+states the two branch equalities of every reachable `ite` first, scaled to
+integer coefficients when a branch has fractions, proved by `ite_eq_left` and
+`ite_eq_right`. Random instances with `ite` terms verify end to end; integer
+`ite` and `ite` with nonlinear branches stay rejected.
+
+**QF_UF through the clause log (2026-10-11).** Inputs over one uninterpreted
+sort with constants, functions, and predicates are now certified end to end.
+The clause log needs nothing new: the sort and the functions it uses are
+declared in the log (and must be the input's own, with the input's arities),
+equality conflicts arrive as `euf` hints with `cc` claims, `distinct` as
+`alldiff` clauses, and the Boolean structure as `tseitin` and `rup` steps.
+In Lean the sort is a type variable `_U` and the symbols are indexed families
+`_elems : Nat -> _U`, `_funs : Nat -> List _U -> _U`, and
+`_preds : Nat -> List _U -> Prop`, so one theorem signature serves every
+arity; the theorem quantifies over all such interpretations, which include
+every model of the input, so it is sound for unsatisfiability. `grind`'s
+congruence closure proves every `euf` lemma and every rewrite over the sort
+tried, including through `List.cons` applications, in well under a second
+each, and reports the three standard axioms. Python checks only shapes for
+`euf` hints, so a false `euf` lemma is rejected by Lean alone (covered by a
+tampering test). Still rejected: a second uninterpreted sort, mixing the sort
+with arithmetic (QF_UFLRA), functions with Bool or Real arguments or results,
+and `ite` over the sort (the last accepted since 2026-10-12, see below).
+
+**Long refutations in every fragment (2026-10-12).** The lemma outlining
+added for LassoRanker applied only to arithmetic certificates with more than
+2,000 steps, and only at shared subproofs. A 7-level QF_UF equality diamond
+(1,606 steps) and the propositional pigeonhole principle for five holes
+(1,644 steps) both failed in `theorem unsat` with `maximum number of
+heartbeats (200000)`: one nested term of `let`-bound steps elaborates
+superlinearly, and the `maxHeartbeats` raise covers only the `grind` lemmas.
+Outlining now applies to every fragment above 500 steps, cuts a chain at
+every 500 nested steps even without sharing, and ignores steps the root never
+uses. The arithmetic and uninterpreted slices keep their classical witnesses
+inside the lemmas; propositional lemmas take their decidability witnesses as
+parameters, introduced constructively by the main theorem, so the
+propositional slice reports no axioms at any size. The 7-level diamond now
+checks in 3 s (the 8-level one, 3,827 nodes, in 5 s; previously a failure),
+the 6-level one drops from 15 s to 2 s, and pigeonhole-5 checks in 3 s;
+pigeonhole-6 (8,693 steps, 3,071 lemmas) checks in about 90 s. Covered by
+`test_proof_to_lean_uf.py` and `test_proof_to_lean_integration.py`.
+
+**`ite` over the uninterpreted sort (2026-10-12).** The QF_UF slice rejected
+every input with an `ite` whose branches have the uninterpreted sort, although
+the clause log treats it exactly like a Real `ite`: the `euf` core keeps the
+term opaque and records `(not c) ∨ (ite c a b) = a` and `c ∨ (ite c a b) = b`
+as `tseitin` inferences. The exporter now classifies such inputs as `qf_uf`,
+the replay adds the gate clauses as `def-axiom` nodes for `ite` terms found
+inside equalities, `distinct`, and predicate applications, and the
+reconstructor renders the term as Lean's `ite` over `_U` with the classical
+instance and proves the gates with `ite_eq_left`/`ite_eq_right` as before.
+`grind` splits on the `ite` inside `euf` lemmas and rewrites without help.
+Random instances with nested `ite` terms exposed two older gaps that the new
+inputs hit often: Z3 also records the two condition-free Boolean `ite` gate
+clauses (`(or (not (ite p q r)) q r)` and `(or (ite p q r) (not q) (not r))`),
+which the def-axiom checker rejected; and when `q` is asserted, Z3
+internalizes a later `distinct` with `(ite (not q) b a)` already replaced by
+`a`, so its `alldiff` clauses follow only from the `distinct` together with
+`q`. The replay's last-resort `cnf` lemma now negates an unsat core of the
+assertions instead of all of them, and keeps a clause literal that is already
+the negation of a source as a literal (resolving it away produced a
+unit-resolution the reconstructor rejected). 20 of 400 random stress
+instances failed before these fixes, none after. Still rejected: a second
+sort (accepted since 2026-10-12, see below), QF_UFLRA, and Bool or Real
+arguments or results of uninterpreted functions.
+
+**Several uninterpreted sorts (2026-10-12).** Inputs over more than one
+uninterpreted sort were rejected at the exporter, although Z3's clause log
+declares every sort and treats functions between sorts like any other. The
+exporter now classifies any number of sorts as `qf_uf` and the certificate
+keeps every sort name, so the reconstructor checks the proof graph is
+well-sorted (functions and predicates take uninterpreted-sort arguments
+only, equality and `distinct` compare one sort, every application matches
+its declaration) and `_bind_input` checks the sort set against the input.
+Lean renders all sorts as the one type `_U`: a many-sorted model is an
+instance of the theorem over the disjoint union of its carriers, every
+ground term keeps its value, and well-sorted inputs only compare terms of
+one sort, so the collapsed theorem implies unsatisfiability of the
+many-sorted input. The two documented two-sort inputs and 19 random
+three-sort instances with `ite` terms (unsat cores of 3 to 5 assertions)
+verify end to end under the standard axioms; three are pinned in
+`test_proof_to_lean_uf.py`. Review of this change found that the binder
+matched symbols by name alone while Z3 accepts one name declared with several
+signatures (`(declare-fun c () A) (declare-fun c () B)`, applied as
+`(as c A)`): the honest refutation of a one-sort input could be rebound to a
+satisfiable two-sort input whose assertions print identically, once an
+unused declaration padded the certificate's sort set. Overloaded names are
+now rejected by `classify_fragment` (so by the exporter and, since the
+reconstructor parses the input itself, by the binder), the binder requires
+every bound declaration to carry the input's full signature and interns
+terms with their sort, and a declaration over an uninterpreted sort that no
+node uses is rejected. Still rejected: QF_UFLRA and Bool or Real arguments
+or results of uninterpreted functions (Bool accepted since 2026-10-12, see
+below).
+
+**Bool arguments of uninterpreted functions (2026-10-12).** Functions and
+predicates with Bool arguments (`(declare-fun f (Bool) U)`, `(declare-fun r
+(Bool U) Bool)`, `(declare-fun p (Bool) Bool)`) were rejected at the
+exporter; they are common in hardware-derived QF_UF benchmarks. The clause
+log treats a Boolean argument like any other enode: once the SAT solver
+assigns it, the egraph merges it with `true` or `false`, and the `euf` hint
+lists the Boolean literal among its premises, so `(f q) = (f r)` follows from
+`q`, `r`, and congruence. Lean renders a Boolean argument `p` as `_bool p`
+for one more quantified map `_bool : Prop -> _U`: Bool is one more sort in
+the disjoint-union instance, and `grind` proves the lemmas through the
+congruence `p <-> q -> _bool p = _bool q` (via `propext`); nothing states
+that `_bool True` and `_bool False` differ, and no inference needs it. The
+egraph does know that every Boolean argument is `true` or `false` once the
+SAT solver assigns it, and `cnf` lemmas combining preprocessed assertions
+rest on that without naming the literal, so each `grind` lemma first states
+excluded middle for every Boolean argument it reaches (5 of 40 random
+instances failed in `grind` before this, none after). Two
+findings about Z3's sat.smt core shaped the slice: (1) a unit asserted at
+level 0 is substituted into the arguments before internalization (`(f q)`
+is logged as `(f true)`), which the replay's existing `cnf` fallback ties to
+the unit and the assertion; and (2) a Boolean unit makes goal2sat log its
+internal `true` variable, which has no expression, as a fresh constant
+`k!0` assumed as a unit clause. The second affected plain QF_UF inputs with
+a negated unit assertion as well (`(assert (not s))` with `s` elsewhere),
+which the exporter rejected as a fresh symbol; empirically the phantom
+appears for inputs without a `set-logic` line and not for the same
+assertions under `(set-logic QF_UF)`, so the inputs that test it carry no
+`set-logic` line and the live tests check the raw log for `k!0` before
+checking that the certificate has none. The replay now drops assumed
+or deleted clauses over such phantom constants (sound: dropping a clause
+only removes support for later propagation) and still rejects any inference
+or definition mentioning one. Functions whose arguments are all Bool are
+accepted only together with an uninterpreted sort: without one the sat.smt
+core Ackermannizes them with fresh symbols the log cannot be tied to the
+input, so the exporter rejects that case explicitly. Two documented inputs
+and five pinned random instances verify end to end under the standard
+axioms. Still rejected: QF_UFLRA and Real arguments or results.
+
+## Arithmetic proof infrastructure
+
+### Real QF_LRA hardening (2026-10-07)
+
+The planned LassoRanker example contains 1,463 Real variables and 105 original
+assertions. Its source is pinned in z3test under
+`regressions/proofs/lean/real/`, unchanged and with its upstream license.
+A proof-free run reports unsat in about one second, while the no-preprocessing
+clause log contains about 600,000 inferences and 39 MB of text. Replaying the
+whole log in Python exceeds the small-canary budget.
+
+The exporter now reduces large logs using native dependency annotations,
+validates the dependency graph, and reconstructs the selected refutation.
+Every retained step is still checked, and all original assertions remain in
+the certificate. Cached normalization and literal keys avoid repeated AST
+traversals. EUF cc/comm annotations are recognized without turning their
+conclusions into assumptions.
+
+This exercise exposed a native proof-trimmer defect: when adding a clause
+with one unassigned literal, it failed to check whether another literal was
+already true. It could therefore propagate from a satisfied clause and
+produce an invalid dependency core. The minimized case is `p`, `not q`,
+`p or q or r`, `not r`, `not p`; only the final `not p` contradicts the
+preceding assertions. The trimmer must not propagate `r` from the satisfied
+third clause. Native and external replay regressions cover this case.
+
+The reconstructed certificate has about 67,000 nodes and 41,000 proof steps,
+so a single deeply nested Lean term is unsuitable. Arithmetic proof DAGs are
+outlined at shared subproofs into independently checked lemmas with explicit
+input and hypothesis scopes (since 2026-10-12 every fragment above 500 steps
+is outlined, and chains are also cut every 500 nested steps; see "Long
+refutations in every fragment" above). Large arithmetic rewrites normalize each atom
+separately, then reconstruct and/or rearrangements over abstract propositions.
+This avoids sending large Boolean equivalences back through arithmetic search.
+
+The complete reconstructed LassoRanker refutation was accepted by the pinned
+Lean kernel with `--trust=0` and warnings treated as errors. The final matrix
+run reports `lean-verified`, with 109 seconds for certificate production and
+830 seconds for reconstruction and Lean checking. All 105 original assertions
+and the input, raw log, reduced log, certificate, and checked proof hashes were
+retained and verified. The generated source is approximately 89 MB, so
+this is a correctness milestone, not yet an efficient large-benchmark checker.
+Because this cost is unsuitable for routine CI, LassoRanker is manual-only:
+neither PR CI nor scheduled/nightly builds run it. An explicit invocation of
+the matrix runner selects the file and its production/checking budgets.
+Automatic CI retains the small examples and minimized regressions, with their
+existing budgets and strict rejection policy unchanged.
+
+The arithmetic proof infrastructure is slightly broken and must be repaired
+before milestone 3 can claim checked arithmetic. Known defects:
+
+- **Fixed (2026-09-28), two checker-side defects and one producer defect found
+  by the matrix.** The two `farkas` misses on QF_RDL `bignum_rdl2` were the
+  arithmetic checker not parsing printed numerals: a replayed log carries
+  non-integers as `(/ n d)`, and the checker accepted only plain numerals and
+  `(- n)`, so any hint with a fractional constant was rejected (branch
+  `proof-checker-numerals`). The 16 `bound` misses on QF_LIA `bignum_lia1`
+  were the producer: `lar_solver::explain_implied_bound` handed every premise
+  to the consumer with coefficient 1 behind a TODO, because the dependency
+  flattening had lost the row coefficients. A bound on column `j` from row
+  `sum_k a_k x_k = 0` uses each other column's bound with Farkas coefficient
+  `|a_k / a_j|`; the bound analyzer now supplies those weights through
+  `implied_bound` (branch `lp-bound-explanation-coefficients`). This is the
+  second of Nikolaj's two coefficient situations, bounds derived from a
+  tableau row over slack columns. After both fixes every `farkas` and `bound`
+  hint in the canary set is accepted.
+- `theory_lra` attaches Farkas coefficients to `th-lemma arith farkas`, but the
+  coefficients can be wrong in two situations: when a lemma is reused for unit
+  propagation rather than the conflict it was derived for, and when the LP
+  solver derives bounds internally that do not correspond to literals and
+  those bounds enter an LP explanation. The `sat.smt=true` arithmetic checker
+  already re-derives `farkas` and `bound` justifications, so the first step is
+  to run the matrix with that checker and with `smt.arith.validate` on the
+  linear logics and measure how often each defect occurs. The fix is to explain
+  only in terms of literal bounds, or to emit explicit derived-bound steps
+  that the checker can replay, and to regenerate coefficients for the
+  propagated orientation.
+- `nla` lemmas are built at more than fifty sites across the basics, order,
+  monotonicity, tangent, power, and Groebner modules, and the self-checker
+  falls back to the SMT solver for them. Proposal: inventory the lemma schemas,
+  certify each schema statically at build time as a parameterized theorem,
+  name the schema in the `lemma_builder` output, and emit each lemma with a
+  hint recording the schema and its instantiation (monomial, factors, sign, and
+  bounds). The proof checker then instantiates the certified schema from the
+  hint instead of calling a solver. Lemmas without a certified schema stay in
+  the `unverified-fallback` class of the matrix until they are covered.
+
+## Completed first-milestone evidence
+
+- CMake/Ninja Release build with local Python bindings; full native build
+  completed in 101.70 seconds. No legacy Python/make artifacts were present.
+- 22 exporter tests passed against the local build, including exact DAG
+  preservation, deep terms, escaped symbols, and command/fragment rejection.
+- All 18 existing build-script tests passed with Python site packages disabled.
+- Solver, Python bindings, help, and copied CMake examples were exercised.
+- `boolean-unsat.proof.json` in this session's files directory contains an
+  exported three-assertion refutation: 16 nodes, 12 declarations, and native
+  asserted/mp/rewrite/unit-resolution steps. Its status is explicitly unverified.

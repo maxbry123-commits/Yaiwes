@@ -1,0 +1,10 @@
+z3_add_component(normal_forms
+  SOURCES
+    defined_names.cpp
+    elim_term_ite.cpp
+    name_exprs.cpp
+    nnf.cpp
+    pull_quant.cpp
+  COMPONENT_DEPENDENCIES
+    rewriter
+)

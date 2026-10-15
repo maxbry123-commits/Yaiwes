@@ -1,0 +1,35 @@
+ /*++
+Copyright (c) 2016 Microsoft Corporation
+
+Module Name:
+
+   bv_bound_chk_tactic.h
+
+Author:
+
+  Mikolas Janota
+
+Tactic Documentation
+
+## Tactic bv_bound_chk
+
+### Short Description
+
+Attempts to detect inconsistencies of bounds on bv expressions.
+
+### Notes 
+
+* does not support proofs, does not support cores
+
+ --*/
+#pragma once
+
+#include "tactic/tactical.h"
+#include "util/params.h"
+#include "ast/ast.h"
+#include "tactic/tactic.h"
+
+tactic* mk_bv_bound_chk_tactic(ast_manager & m, params_ref const & p = params_ref());
+
+Z3_ADD_TACTIC(bv_bound_chk, "bv_bound_chk", "attempts to detect inconsistencies of bounds on bv expressions.", mk_bv_bound_chk_tactic(m, p));
+

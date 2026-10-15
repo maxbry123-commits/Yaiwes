@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 9204075,
+  "bundle_sha256": "b950d639e4060a85c9053dfa9b65ab49bb21ebe8ec305753698ec0072b356754",
+  "extracted_tree": {
+    "bytes": 36626268,
+    "files": 3092,
+    "sha256": "cfd2d1a32f3cedf2df0e6cde6944377f351d83c379202d91884d9d554ed0fca2"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 9204075,
+      "name": "z3.bundle.zip.part-0001",
+      "sha256": "b950d639e4060a85c9053dfa9b65ab49bb21ebe8ec305753698ec0072b356754"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "z3",
+  "source_bytes": 36626268,
+  "source_commit": "11306ced808398e9b03686f096c63771dee8ba82",
+  "source_files": 3092,
+  "source_ref": "master",
+  "source_repo": "Z3Prover/z3",
+  "source_tree": {
+    "bytes": 36626268,
+    "files": 3092,
+    "sha256": "cfd2d1a32f3cedf2df0e6cde6944377f351d83c379202d91884d9d554ed0fca2"
+  }
+}
