@@ -1,0 +1,47 @@
+{
+  "bundle_bytes": 31321580,
+  "bundle_sha256": "40099dca4d0075348ba76479a23df9eac6f3d8b9a529c8e2e8a9d0e621452261",
+  "extracted_tree": {
+    "bytes": 78632789,
+    "files": 7586,
+    "sha256": "14049cdc99d5d867a8fe1b0478c8d4f3e68903a6048242da6689bdd4e4260097"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "wasmtime.bundle.zip.part-0001",
+      "sha256": "10e4bc7f82afe15a6273d32a84452397744f1c03c2d95dcc441728b5ddc117f8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "wasmtime.bundle.zip.part-0002",
+      "sha256": "27f0748b7ff7fa42d2516154ab8e0b10e24bef1fc3bf35b2a017b6e16cca344b"
+    },
+    {
+      "bytes": 6155756,
+      "name": "wasmtime.bundle.zip.part-0003",
+      "sha256": "6147d27d1f0a0299f8ba4714c0c34329018b3461f8c7d3835aa198ca5912d187"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".claude/skills"
+  ],
+  "skipped_special_count": 1,
+  "slug": "wasmtime",
+  "source_bytes": 78632789,
+  "source_commit": "b140c545f5e5523fed8ee42a6166b1fa04d39b31",
+  "source_files": 7586,
+  "source_ref": "main",
+  "source_repo": "bytecodealliance/wasmtime",
+  "source_tree": {
+    "bytes": 78632789,
+    "files": 7586,
+    "sha256": "14049cdc99d5d867a8fe1b0478c8d4f3e68903a6048242da6689bdd4e4260097"
+  }
+}
