@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 191984,
+  "bundle_sha256": "7f0a5ac0cd2fad08d77e2d93c22995a3d7cd62713fd530783c92668a3c899841",
+  "extracted_tree": {
+    "bytes": 661112,
+    "files": 115,
+    "sha256": "9e02c42853f1a0d6b9086002ee158f0ba10d9aa02b86a207d608051e7ff20e33"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 191984,
+      "name": "watchdog.bundle.zip.part-0001",
+      "sha256": "7f0a5ac0cd2fad08d77e2d93c22995a3d7cd62713fd530783c92668a3c899841"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "watchdog",
+  "source_bytes": 661112,
+  "source_commit": "5255b429a96f20b271963db1f9497e257bdc8713",
+  "source_files": 115,
+  "source_ref": "master",
+  "source_repo": "gorakhargosh/watchdog",
+  "source_tree": {
+    "bytes": 661112,
+    "files": 115,
+    "sha256": "9e02c42853f1a0d6b9086002ee158f0ba10d9aa02b86a207d608051e7ff20e33"
+  }
+}
