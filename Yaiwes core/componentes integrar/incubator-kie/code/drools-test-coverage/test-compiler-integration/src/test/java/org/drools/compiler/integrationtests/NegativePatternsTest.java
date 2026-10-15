@@ -1,0 +1,319 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.drools.compiler.integrationtests;
+
+import java.io.Serializable;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
+
+import org.drools.core.event.TrackingAgendaEventListener;
+import org.drools.testcoverage.common.util.KieBaseTestConfiguration;
+import org.drools.testcoverage.common.util.KieBaseUtil;
+import org.drools.testcoverage.common.util.KieSessionTestConfiguration;
+import org.drools.testcoverage.common.util.TestParametersUtil2;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.kie.api.KieBase;
+import org.kie.api.runtime.KieSession;
+import org.kie.api.runtime.rule.EntryPoint;
+import org.kie.api.runtime.rule.FactHandle;
+import org.kie.api.time.SessionPseudoClock;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Tests negative patterns with or without additional constraints and events are
+ * inserted through one or more entry points.
+ * BZ-978979
+ */
+public class NegativePatternsTest {
+
+    private static final int LOOPS = 2;
+    private static final int SHORT_SLEEP_TIME = 20;
+    private static final int LONG_SLEEP_TIME = 30;
+
+
+    private KieSession ksession;
+    private TrackingAgendaEventListener firedRulesListener;
+
+
+    public static Stream<KieBaseTestConfiguration> parameters() {
+        return TestParametersUtil2.getKieBaseStreamConfigurations(true).stream();
+    }
+    
+    public void prepareKieSession(KieBaseTestConfiguration kieBaseTestConfiguration) {
+        final String drl = "package org.drools.compiler.integrationtests\n" +
+                     "\n" +
+                     "import " + NegativePatternsTest.TestEvent.class.getCanonicalName() + "\n" +
+                     "\n" +
+                     "declare TestEvent\n" +
+                     "    @role( event )\n" +
+                     "    @expires( 22ms )\n" +
+                     "end\n" +
+                     "\n" +
+                     "rule \"SingleAbsence\"\n" +
+                     "    duration( 18ms )\n" +
+                     "    when\n" +
+                     "        not ( TestEvent ( ) from entry-point EventStream )\n" +
+                     "    then\n" +
+                     "        // consequence\n" +
+                     "end\n" +
+                     "\n" +
+                     "rule \"SingleConstrained\"\n" +
+                     "    duration( 18ms )\n" +
+                     "    when\n" +
+                     "        not ( TestEvent ( name == \"EventA\" ) from entry-point EventStream )\n" +
+                     "    then\n" +
+                     "        // consequence\n" +
+                     "end\n" +
+                     "\n" +
+                     "rule \"MultipleEvents\"\n" +
+                     "    duration( 18ms )\n" +
+                     "    when\n" +
+                     "        TestEvent ( name == \"EventA\" ) over window:time( 22ms ) from entry-point EventStream\n" +
+                     "        not ( TestEvent ( name == \"EventB\" ) over window:time( 22ms )  from entry-point EventStream )\n" +
+                     "    then\n" +
+                     "        // consequence\n" +
+                     "end\n" +
+                     "\n" +
+                     "rule \"MultipleEntryPoints\"\n" +
+                     "    duration( 18ms )\n" +
+                     "    when\n" +
+                     "        not (\n" +
+                     "            TestEvent( name == \"EventA\" ) from entry-point EventStream\n" +
+                     "        )\n" +
+                     "        not (\n" +
+                     "            TestEvent( name == \"EventB\" ) from entry-point OtherStream\n" +
+                     "        )\n" +
+                     "    then\n" +
+                     "        // consequence\n" +
+                     "end\n";
+
+        final KieBase kbase = KieBaseUtil.getKieBaseFromKieModuleFromDrl("subnetwork-test", kieBaseTestConfiguration, drl);
+        ksession = kbase.newKieSession(KieSessionTestConfiguration.STATEFUL_PSEUDO.getKieSessionConfiguration(), null);
+        firedRulesListener = new TrackingAgendaEventListener();
+        ksession.addEventListener(firedRulesListener);
+    }
+
+    @AfterEach
+    public void cleanKieSession() {
+        if (ksession != null) {
+            ksession.dispose();
+        }
+    }
+
+    @ParameterizedTest(name = "KieBase type={0}")
+    @MethodSource("parameters")
+    public void testSingleEvent(KieBaseTestConfiguration kieBaseTestConfiguration) {
+        prepareKieSession(kieBaseTestConfiguration);
+        final EntryPoint entryPoint = ksession.getEntryPoint("EventStream");
+
+        int count = 0;
+
+        // no rules should be fired in the beginning
+        advanceTime(LONG_SLEEP_TIME);
+        assertRuleFiredCount("SingleAbsence", count);
+
+        // after firing the rule will wait for 18ms
+        ksession.fireAllRules();
+        assertRuleFiredCount("SingleAbsence", count);
+        count++;
+        advanceTime(LONG_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("SingleAbsence", count);
+
+        final FactHandle event = entryPoint.insert(new TestEvent(0, "EventA"));
+        ksession.fireAllRules();
+        advanceTime(LONG_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("SingleAbsence", count);
+
+        entryPoint.delete(event);
+        ksession.fireAllRules();
+        count++;
+        advanceTime(LONG_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("SingleAbsence", count);
+
+        // rule was already fired and no changes were made to working memory
+        ksession.fireAllRules();
+        advanceTime(LONG_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("SingleAbsence", count);
+    }
+
+    @ParameterizedTest(name = "KieBase type={0}")
+    @MethodSource("parameters")
+    public void testConstrainedAbsence(KieBaseTestConfiguration kieBaseTestConfiguration) {
+        prepareKieSession(kieBaseTestConfiguration);
+        final EntryPoint entryPoint = ksession.getEntryPoint("EventStream");
+
+        int count = 0;
+
+        count++;
+        for (int i = 0; i < LOOPS; i++) {
+            entryPoint.insert(new TestEvent(count, "EventB"));
+            ksession.fireAllRules();
+            advanceTime(LONG_SLEEP_TIME);
+        }
+
+        FactHandle handle;
+        for (int i = 0; i < LOOPS; i++) {
+            handle = entryPoint.insert(new TestEvent(i, "EventA"));
+            advanceTime(LONG_SLEEP_TIME);
+            ksession.fireAllRules();
+
+            entryPoint.delete(handle);
+            count++;
+            advanceTime(LONG_SLEEP_TIME);
+            ksession.fireAllRules();
+        }
+
+        ksession.fireAllRules();
+        assertRuleFiredCount("SingleConstrained", count);
+    }
+
+    @ParameterizedTest(name = "KieBase type={0}")
+    @MethodSource("parameters")
+    public void testMultipleEvents(KieBaseTestConfiguration kieBaseTestConfiguration) {
+        prepareKieSession(kieBaseTestConfiguration);
+        final EntryPoint entryPoint = ksession.getEntryPoint("EventStream");
+
+        int count = 0;
+
+        while (count < LOOPS / 2) {
+            entryPoint.insert(new TestEvent(count, "EventA"));
+            ksession.fireAllRules();
+            count++;
+            advanceTime(SHORT_SLEEP_TIME);
+            ksession.fireAllRules();
+        }
+        assertRuleFiredCount("MultipleEvents", count);
+
+        entryPoint.insert(new TestEvent(count, "EventA"));
+        final FactHandle handle = entryPoint.insert(new TestEvent(-1, "EventB"));
+        advanceTime(SHORT_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("MultipleEvents", count);
+
+        entryPoint.delete(handle);
+        ksession.fireAllRules();
+        assertRuleFiredCount("MultipleEvents", count);
+        // it shouldn't fire because of the duration
+        advanceTime(SHORT_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("MultipleEvents", count);
+        // it shouldn't fire because event A is gone out of window
+
+        while (count < LOOPS) {
+            entryPoint.insert(new TestEvent(count, "EventA"));
+            ksession.fireAllRules();
+            count++;
+            advanceTime(SHORT_SLEEP_TIME);
+            ksession.fireAllRules();
+        }
+
+        ksession.fireAllRules();
+        assertRuleFiredCount("MultipleEvents", count);
+    }
+
+    @ParameterizedTest(name = "KieBase type={0}")
+    @MethodSource("parameters")
+    public void testMultipleEntryPoints(KieBaseTestConfiguration kieBaseTestConfiguration) {
+        prepareKieSession(kieBaseTestConfiguration);
+        final EntryPoint entryPoint = ksession.getEntryPoint("EventStream");
+
+        final EntryPoint otherStream = ksession.getEntryPoint("OtherStream");
+        int count = 0;
+
+        count++;
+        ksession.fireAllRules();
+        advanceTime(LONG_SLEEP_TIME);
+        ksession.fireAllRules();
+        assertRuleFiredCount("MultipleEntryPoints", count);
+
+        FactHandle handle;
+        for (int i = 0; i < LOOPS; i++) {
+            handle = entryPoint.insert(new TestEvent(count, "EventA"));
+            ksession.fireAllRules();
+            advanceTime(LONG_SLEEP_TIME);
+
+            entryPoint.delete(handle);
+            ksession.fireAllRules();
+            count++;
+            advanceTime(LONG_SLEEP_TIME);
+            ksession.fireAllRules();
+        }
+
+        for (int i = 0; i < LOOPS; i++) {
+            handle = otherStream.insert(new TestEvent(count, "EventB"));
+            advanceTime(LONG_SLEEP_TIME);
+            ksession.fireAllRules();
+
+            otherStream.delete(handle);
+            count++;
+            advanceTime(SHORT_SLEEP_TIME);
+            ksession.fireAllRules();
+        }
+
+        ksession.fireAllRules();
+        assertRuleFiredCount("MultipleEntryPoints", count);
+    }
+
+    private void advanceTime(final long amount) {
+        final SessionPseudoClock clock = ksession.getSessionClock();
+        clock.advanceTime(amount, TimeUnit.MILLISECONDS);
+    }
+
+    private void assertRuleFiredCount(String ruleName, int expectedCount) {
+        assertThat(firedRulesListener.getAfterMatchFired()).filteredOn(s -> s.equals(ruleName)).hasSize(expectedCount);
+    }
+
+    /**
+     * Simple event used for tests.
+     */
+    public static class TestEvent implements Serializable {
+
+        private static final long serialVersionUID = -6985691286327371275L;
+        private final Integer id;
+        private final String name;
+
+        public TestEvent(final Integer id, final String name) {
+            this.id = id;
+            this.name = name;
+        }
+
+        public int getId() {
+            return id;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("TestEvent[id=%s, name=%s]", id, name);
+        }
+    }
+
+}

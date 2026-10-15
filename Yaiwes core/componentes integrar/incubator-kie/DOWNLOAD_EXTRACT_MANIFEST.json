@@ -1,0 +1,67 @@
+{
+  "bundle_bytes": 81531434,
+  "bundle_sha256": "8666cc3e9a9da5c2b01290194c5041b09b728645cdce3a9741e143275d15c369",
+  "extracted_tree": {
+    "bytes": 344460290,
+    "files": 25819,
+    "sha256": "c0485c962130dde962f23291ab2fac9c3f9ab29d3cdf8a445f2721183f1aa162"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "incubator-kie.bundle.zip.part-0001",
+      "sha256": "d7916e1a55f8c12c656bd919d9b95616511bf5111369638eea5fa1e320cb472a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "incubator-kie.bundle.zip.part-0002",
+      "sha256": "c48703ab3737e34ac643d23421539b255814cc2bf458fa792d078c148468fe45"
+    },
+    {
+      "bytes": 12582912,
+      "name": "incubator-kie.bundle.zip.part-0003",
+      "sha256": "c2623f7f26c6c41027355147b2841abaf1332012471e74ed416bbced1f41f0e7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "incubator-kie.bundle.zip.part-0004",
+      "sha256": "bfa1597ad40130b448e836d4f0f60ea60f138375774b5a5925a6ce0def54a317"
+    },
+    {
+      "bytes": 12582912,
+      "name": "incubator-kie.bundle.zip.part-0005",
+      "sha256": "b1fad17b8c68a006ce7f6a18b41914cee395fa7b0e86ace006584cc002ac827b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "incubator-kie.bundle.zip.part-0006",
+      "sha256": "517bb6fc21bd9c2cfdca365007a0717a0db0ebbd5b82a0a50676f22d971d3c39"
+    },
+    {
+      "bytes": 6033962,
+      "name": "incubator-kie.bundle.zip.part-0007",
+      "sha256": "4285187c23bcf5932f8820b22dca9209fda52edf199b9b178b5da0ad5a5a12c8"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "CLAUDE.md"
+  ],
+  "skipped_special_count": 1,
+  "slug": "incubator-kie",
+  "source_bytes": 344460290,
+  "source_commit": "c706a6993b22b1ea9a17e903a5c77321b0617ffc",
+  "source_files": 25819,
+  "source_ref": "main",
+  "source_repo": "apache/incubator-kie",
+  "source_tree": {
+    "bytes": 344460290,
+    "files": 25819,
+    "sha256": "c0485c962130dde962f23291ab2fac9c3f9ab29d3cdf8a445f2721183f1aa162"
+  }
+}
