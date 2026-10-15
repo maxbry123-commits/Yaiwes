@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1475145,
+  "bundle_sha256": "c48986105529f68fe75cd75f4f0100f227cf3e2a779025943b0244417e509c40",
+  "extracted_tree": {
+    "bytes": 4492250,
+    "files": 816,
+    "sha256": "4e598a870effafb2a72310d59e20b07edcbac08e837550c1e4eec977e7d26d40"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1475145,
+      "name": "Dexie.js.bundle.zip.part-0001",
+      "sha256": "c48986105529f68fe75cd75f4f0100f227cf3e2a779025943b0244417e509c40"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "Dexie.js",
+  "source_bytes": 4492250,
+  "source_commit": "ddb6cb94a156837deea8bcef646cce0d5c8327c7",
+  "source_files": 816,
+  "source_ref": "master",
+  "source_repo": "dexie/Dexie.js",
+  "source_tree": {
+    "bytes": 4492250,
+    "files": 816,
+    "sha256": "4e598a870effafb2a72310d59e20b07edcbac08e837550c1e4eec977e7d26d40"
+  }
+}
