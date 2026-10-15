@@ -1,0 +1,297 @@
+{
+  "bundle_bytes": 595560374,
+  "bundle_sha256": "d57187b404da9899b7ef46fd8376d01f0f88738c3cce340d9441fc56d23b5a2b",
+  "extracted_tree": {
+    "bytes": 804266671,
+    "files": 15008,
+    "sha256": "0aa66e472012cd177f25044593e6a7f71c2e1285349274ab6139ae37b93c1ef3"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0001",
+      "sha256": "881ebc8886c46d96116c5b11622b50126b5175e9a40c2c1f25ff392a280d7603"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0002",
+      "sha256": "68b5a33ee63763c83b7df1d58559c547e092ba2b62506d9b5a6bd20e622f8bcb"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0003",
+      "sha256": "ffc4b0bba0465d04abcd53c6da88719383b3ce862343c795f3263fce9ce0e244"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0004",
+      "sha256": "823e5b3b7c7b4a45d9a47e837e27655644ca180a23f16b5323e94ac19c66f401"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0005",
+      "sha256": "34306c280d7b12e170764b97ddd3d8cc1c623136dd14d99d3c14f877e1b0ea35"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0006",
+      "sha256": "415255f9667775d842b95b729614ea81e83f74ba1fe74db60e7f63314fddd352"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0007",
+      "sha256": "7ddf655dcf6599007099ffbe48ab1418fb72a691d58aa9258dee33549e6df71b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0008",
+      "sha256": "ed2f0e5b5e3808b58469bfb03742a9018af7ac4cb34ffed0c0243859cb040742"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0009",
+      "sha256": "8b9afe95132583fd46330dfac396d4d8406cdc99ddf5843fef574ceefd7a53a7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0010",
+      "sha256": "40e2080b2095266bda80883a2f0c6cfd94b0c36e574c6cd58807be765ce25257"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0011",
+      "sha256": "87f321076984993f855129e72882f6a45ae5f8002a682ea394e056e79e9c17a8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0012",
+      "sha256": "773d92db7e2e709923d70f7d647de9fd9c1e09b49bb17e0f418015563b5bc1a4"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0013",
+      "sha256": "d5c2f60ed66e99bd1876c79ffb1e16c4bbbfbfde4e36bf880aef731ba2444d3e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0014",
+      "sha256": "a17eb311d9efd544b2868f009b5d825674271b4ea366528f0473f96d3f71dcda"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0015",
+      "sha256": "e36169f73b3e18a84ed0d9125574cb02881cf006ccef68d10791ee146908054c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0016",
+      "sha256": "dcaa403c118e5a26b616c24861d7f46d93dc1a4a9ea442a35b20bcb7ee71704f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0017",
+      "sha256": "582aba9f5fa9ff0ab6f0cf7fecd7a4129003342d4d60339eafff9f3dd56f0479"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0018",
+      "sha256": "c4f648098bc3944fdd4c33ee42a6b293055918904de34d7218b3c71d9b4a565f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0019",
+      "sha256": "662178bb368fa27f6305f8187d49ca619fc863e0415963843311a0bdd9293e8e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0020",
+      "sha256": "5714d56eb47a6315036d5a26cd9a7160965d0f6c7fd347e61babe391aa3c9ba1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0021",
+      "sha256": "c6114ddfa9afbaf154921e964ffc6f30c9ed10a7abe6a956097da9a5b41405c6"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0022",
+      "sha256": "1181db25ad5ac83074d0163c88d1f170c8a9da05eab49ca272b5ee72e99c2132"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0023",
+      "sha256": "693f56dca1a8ac227b4a46630af911d2a2284566cc84bdd95324f36dc8deee88"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0024",
+      "sha256": "2adcf2b7b6a728269896dd1a20de1846c4580b559cce7494693bb51f6397e18d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0025",
+      "sha256": "8cf14088f34993a64fb33e518520e772a95b45fc7ccd8b6b7df9a08a87f95ccd"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0026",
+      "sha256": "4b5dc72d061eba350c2ce2c3e4636e52caad42c6dde20ab1d6c5988653a3c98b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0027",
+      "sha256": "9482ffe79f8c8414b68a00530ea6209ba7b76003577d5b9f62d2a4450d91202e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0028",
+      "sha256": "590c00985e51de0139bd9886344181d7a30e4156016eec3ef1976a5e616e6707"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0029",
+      "sha256": "787ea7a5db6250ed92b2a8f17c049457344bdc583d5ee52021f3550b04a17782"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0030",
+      "sha256": "9277095851c922f8703bf57a1d49f4b9c0f55d6b196b22832c3c7672e029404e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0031",
+      "sha256": "774824192388222dc4bb9204f8c8779032e471fae00da3c00cf86bfed04721da"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0032",
+      "sha256": "f598b58d44880664cbfa4165f4cf0476671feb201e4da266594c361427c2b514"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0033",
+      "sha256": "135c9726a537cbe1721dd1c1d1e4a31c6b4a33f9f47e871d035744a7b1a59f60"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0034",
+      "sha256": "b137c91faac5d1361ec3b54e641802dec1d931dd45453774aacd4a037f923052"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0035",
+      "sha256": "334e3dc911dcc913944293bea2d08e16d642dea70494008fd8fc0d57bd5246db"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0036",
+      "sha256": "230f1cfa901743b413a3d278b3abddfbf8574d6266e19d3f0a9364381e66d30f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0037",
+      "sha256": "76455cf0afc6b749be50299cced4510c80225bb4e1a2644676687ead4c641682"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0038",
+      "sha256": "e106e6057f1265394e91bb593091a34358fba620f514a142b188ccce7bb5d8b1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0039",
+      "sha256": "60a4a726a001467293810f9acfc0a3752649a313af9e2656509a5544848dd285"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0040",
+      "sha256": "c20bc25fe6d494fa0c0aae9ba8db6b295763c10c8c05c48347179ee92ac53723"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0041",
+      "sha256": "967cbeab305a88bbb82e3103bcfbcb25ebad96b83d400496c17fe9b77c1d5a41"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0042",
+      "sha256": "8b6912079ea1cad0aded37bcb17120a3d0d2053c4f01e5883d897b56f9e77277"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0043",
+      "sha256": "1d3885af4e2fd266993500e22e61c4e90bc527b914347d9570d92494b73f37db"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0044",
+      "sha256": "966708ce818960c906595c95b9ab6417457c7d096be72e16b57bb95b4227d21a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0045",
+      "sha256": "e07e8d02e42f8c80f4f27c3cbd98c6e5f3d78a06dcaacf03efe8b85cff95c2c7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0046",
+      "sha256": "779e53ab2333e23fb911de19abdbdc5da0931653c1e4585fd1709671e890fdd9"
+    },
+    {
+      "bytes": 12582912,
+      "name": "remotion.bundle.zip.part-0047",
+      "sha256": "5dd9fe34ce2cfa078f322180988ba570fac2cc62f3c89816a4c7eb23a7c1b74b"
+    },
+    {
+      "bytes": 4163510,
+      "name": "remotion.bundle.zip.part-0048",
+      "sha256": "e81563e05f00a43f183d9494cdb11889a3ddd758f82d842138f3e35b28aec0df"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".agents/skills/remotion-best-practices",
+    ".agents/skills/remotion-captions",
+    ".agents/skills/remotion-create",
+    ".agents/skills/remotion-docs",
+    ".agents/skills/remotion-interactivity",
+    ".agents/skills/remotion-maps",
+    ".agents/skills/remotion-markup",
+    ".agents/skills/remotion-multimedia",
+    ".agents/skills/remotion-render",
+    ".agents/skills/remotion-saas",
+    ".agents/skills/remotion-studio",
+    ".agents/skills/remotion-upgrade",
+    ".claude/skills",
+    "packages/example/.claude/skills/remotion-markup",
+    "packages/skills/skills/remotion-best-practices/remotion-captions",
+    "packages/skills/skills/remotion-best-practices/remotion-create",
+    "packages/skills/skills/remotion-best-practices/remotion-docs",
+    "packages/skills/skills/remotion-best-practices/remotion-interactivity",
+    "packages/skills/skills/remotion-best-practices/remotion-maps",
+    "packages/skills/skills/remotion-best-practices/remotion-markup",
+    "packages/skills/skills/remotion-best-practices/remotion-multimedia",
+    "packages/skills/skills/remotion-best-practices/remotion-render",
+    "packages/skills/skills/remotion-best-practices/remotion-saas",
+    "packages/skills/skills/remotion-best-practices/remotion-studio",
+    "packages/skills/skills/remotion-best-practices/remotion-upgrade",
+    "packages/skills/skills/remotion-markup/remotion-maps"
+  ],
+  "skipped_special_count": 26,
+  "slug": "remotion",
+  "source_bytes": 804266671,
+  "source_commit": "b48686180f4242081522f2302aec6fd3c4fd8f25",
+  "source_files": 15008,
+  "source_ref": "main",
+  "source_repo": "remotion-dev/remotion",
+  "source_tree": {
+    "bytes": 804266671,
+    "files": 15008,
+    "sha256": "0aa66e472012cd177f25044593e6a7f71c2e1285349274ab6139ae37b93c1ef3"
+  }
+}
