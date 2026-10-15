@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 828161,
+  "bundle_sha256": "0a30bd240ee94a421a0f31de4791412a7249dfeda326b1eaba9afbe6c9422099",
+  "extracted_tree": {
+    "bytes": 2259767,
+    "files": 262,
+    "sha256": "3e627ff069e98a7a9431fa2e16cb28be7fd85d7623f6a466ad79439eaa9f1d39"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 828161,
+      "name": "claude-code-plugin.bundle.zip.part-0001",
+      "sha256": "0a30bd240ee94a421a0f31de4791412a7249dfeda326b1eaba9afbe6c9422099"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "claude-code-plugin",
+  "source_bytes": 2259767,
+  "source_commit": "2d5b9c18f278ffe2a2d506c2d9b67c18568e4d24",
+  "source_files": 262,
+  "source_ref": "main",
+  "source_repo": "remotion-dev/claude-code-plugin",
+  "source_tree": {
+    "bytes": 2259767,
+    "files": 262,
+    "sha256": "3e627ff069e98a7a9431fa2e16cb28be7fd85d7623f6a466ad79439eaa9f1d39"
+  }
+}
