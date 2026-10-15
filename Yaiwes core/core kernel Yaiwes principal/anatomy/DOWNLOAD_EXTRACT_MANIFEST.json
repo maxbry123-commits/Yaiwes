@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 2965791,
+  "bundle_sha256": "91c0051b4fa1741f53857b4619a55254ff47964fabc836c34d64070216a57957",
+  "extracted_tree": {
+    "bytes": 12286381,
+    "files": 147,
+    "sha256": "54ffcc30c4a07dbbfee88924f5f66da24047df35c3899ef1068acf7c7ad91136"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2965791,
+      "name": "anatomy.bundle.zip.part-0001",
+      "sha256": "91c0051b4fa1741f53857b4619a55254ff47964fabc836c34d64070216a57957"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "anatomy",
+  "source_bytes": 12286381,
+  "source_commit": "bc943e40c59998be5da61f9d39c6a983b1116099",
+  "source_files": 147,
+  "source_ref": "main",
+  "source_repo": "wheresryan22/anatomy",
+  "source_tree": {
+    "bytes": 12286381,
+    "files": 147,
+    "sha256": "54ffcc30c4a07dbbfee88924f5f66da24047df35c3899ef1068acf7c7ad91136"
+  }
+}
