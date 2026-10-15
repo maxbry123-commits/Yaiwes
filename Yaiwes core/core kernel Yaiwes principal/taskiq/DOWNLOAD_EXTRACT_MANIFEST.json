@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 481492,
+  "bundle_sha256": "38dec21e02bd37671ef33ba6b8e0af8d2002cabf996312415a4bb1d4522cbe83",
+  "extracted_tree": {
+    "bytes": 1436393,
+    "files": 230,
+    "sha256": "ddb00168db95de4f75b41f57a0022f5629e48bb5dd06ce4f196fc943bd8656ee"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 481492,
+      "name": "taskiq.bundle.zip.part-0001",
+      "sha256": "38dec21e02bd37671ef33ba6b8e0af8d2002cabf996312415a4bb1d4522cbe83"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "taskiq",
+  "source_bytes": 1436393,
+  "source_commit": "f08a54ab3a8e4e16045c84379cf26eb4fa83d4b2",
+  "source_files": 230,
+  "source_ref": "master",
+  "source_repo": "taskiq-python/taskiq",
+  "source_tree": {
+    "bytes": 1436393,
+    "files": 230,
+    "sha256": "ddb00168db95de4f75b41f57a0022f5629e48bb5dd06ce4f196fc943bd8656ee"
+  }
+}
