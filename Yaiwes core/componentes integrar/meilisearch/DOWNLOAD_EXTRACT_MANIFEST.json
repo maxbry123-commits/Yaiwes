@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 21226676,
+  "bundle_sha256": "5442266e0700a75b62fb6f70b648e548445079754d05071380ab1da17119a4ce",
+  "extracted_tree": {
+    "bytes": 33484166,
+    "files": 1750,
+    "sha256": "1c338fda57aa36f87740f6356cbeeae58b7da36f5526f5534c73e192bdb223e6"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "meilisearch.bundle.zip.part-0001",
+      "sha256": "54a52eefbe1d2698f3f0c349aa838e917d4765593023681ab4b9f92a5ece7f4a"
+    },
+    {
+      "bytes": 8643764,
+      "name": "meilisearch.bundle.zip.part-0002",
+      "sha256": "35eb1aed4cb86c9bf3df38776a467617c0d76226a1d2c8853d74b2f1c57088d0"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "meilisearch",
+  "source_bytes": 33484166,
+  "source_commit": "dae34d0eae213ba1edaa46519f344f9beca5df23",
+  "source_files": 1750,
+  "source_ref": "main",
+  "source_repo": "meilisearch/meilisearch",
+  "source_tree": {
+    "bytes": 33484166,
+    "files": 1750,
+    "sha256": "1c338fda57aa36f87740f6356cbeeae58b7da36f5526f5534c73e192bdb223e6"
+  }
+}
