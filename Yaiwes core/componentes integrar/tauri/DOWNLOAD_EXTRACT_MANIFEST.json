@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 16222975,
+  "bundle_sha256": "59e9a91dbeb99f80d6d2d30380acb77550d1a33837cc9b9e4e784bb08895f58a",
+  "extracted_tree": {
+    "bytes": 22450362,
+    "files": 1098,
+    "sha256": "231956ca775ebcd0a5de219338f99b79b766a24e2a578d82312ae013f91f99ef"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "tauri.bundle.zip.part-0001",
+      "sha256": "e45d2220e10f49322f285cc34d90d635fac9a3beeab29f361c7346eab2638418"
+    },
+    {
+      "bytes": 3640063,
+      "name": "tauri.bundle.zip.part-0002",
+      "sha256": "f7c2022d6f10421f6dd01f0a0b7823b0f7518a61c229df8b0435dcf0f4c0acf1"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "tauri",
+  "source_bytes": 22450362,
+  "source_commit": "152d293ddf5680b968dc4853e52d87c12a2deaeb",
+  "source_files": 1098,
+  "source_ref": "dev",
+  "source_repo": "tauri-apps/tauri",
+  "source_tree": {
+    "bytes": 22450362,
+    "files": 1098,
+    "sha256": "231956ca775ebcd0a5de219338f99b79b766a24e2a578d82312ae013f91f99ef"
+  }
+}
