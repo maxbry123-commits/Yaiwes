@@ -1,0 +1,106 @@
+import { forwardRef } from "react";
+
+import useRenderProps from "../../lib/props/render/use-render-props";
+import { DropZoneProps } from "../DropZone/types";
+
+import {
+  ComponentData,
+  Config,
+  Content,
+  Metadata,
+  FieldTransforms,
+} from "../../types";
+import { getDropZoneProps } from "../../lib/props/shared/get-drop-zone-props";
+
+type SlotRenderProps = DropZoneProps & {
+  content: Content;
+  config: Config;
+  metadata: Metadata;
+  fieldTransforms?: FieldTransforms;
+};
+
+export const SlotRenderPure = (props: SlotRenderProps) => (
+  <SlotRender {...props} />
+);
+
+const Item = ({
+  config,
+  item,
+  metadata,
+  fieldTransforms,
+}: {
+  config: Config;
+  item: ComponentData;
+  metadata: Metadata;
+  fieldTransforms?: FieldTransforms;
+}) => {
+  const Component = config.components[item.type];
+
+  const props = useRenderProps(
+    config,
+    item,
+    (slotProps) => (
+      <SlotRenderPure
+        {...slotProps}
+        config={config}
+        metadata={metadata}
+        fieldTransforms={fieldTransforms}
+      />
+    ),
+    fieldTransforms
+  );
+
+  return (
+    <Component.render
+      {...props}
+      puck={{
+        ...props.puck,
+        metadata: metadata || {},
+      }}
+    />
+  );
+};
+
+/**
+ * Render a slot.
+ *
+ * Replacement for DropZoneRender
+ */
+export const SlotRender = forwardRef<HTMLDivElement, SlotRenderProps>(
+  function SlotRenderInternal(allProps, ref) {
+    const {
+      props: {
+        className,
+        style,
+        content,
+        config,
+        metadata,
+        as,
+        fieldTransforms,
+      },
+      forwardableProps,
+    } = getDropZoneProps(allProps);
+
+    const El = as ?? "div";
+
+    return (
+      <El {...forwardableProps} className={className} style={style} ref={ref}>
+        {content.map((item) => {
+          if (!config.components[item.type]) {
+            return null;
+          }
+
+          return (
+            <Item
+              key={item.props.id}
+              config={config}
+              item={item}
+              metadata={metadata}
+              fieldTransforms={fieldTransforms}
+            />
+          );
+        })}
+      </El>
+    );
+  }
+);
