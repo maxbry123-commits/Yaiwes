@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 10640046,
+  "bundle_sha256": "4d037e7bfc1bf2f6e83c51b9baa02aae04bd3c82db1047cd316dd010b4906bbf",
+  "extracted_tree": {
+    "bytes": 56278267,
+    "files": 4080,
+    "sha256": "037b055ea9c0da761f6c8552a594ba6b4a885e4965be622974b98a98d9669f2f"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 10640046,
+      "name": "souffle.bundle.zip.part-0001",
+      "sha256": "4d037e7bfc1bf2f6e83c51b9baa02aae04bd3c82db1047cd316dd010b4906bbf"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "souffle",
+  "source_bytes": 56278267,
+  "source_commit": "f53dab8bf4bbf2395a26d2771f6b75395825cc46",
+  "source_files": 4080,
+  "source_ref": "master",
+  "source_repo": "souffle-lang/souffle",
+  "source_tree": {
+    "bytes": 56278267,
+    "files": 4080,
+    "sha256": "037b055ea9c0da761f6c8552a594ba6b4a885e4965be622974b98a98d9669f2f"
+  }
+}
