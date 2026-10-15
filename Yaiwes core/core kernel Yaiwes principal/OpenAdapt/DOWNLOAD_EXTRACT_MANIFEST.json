@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 4840874,
+  "bundle_sha256": "5a1dbf0c40aed65d162109772257a8155b746741cb4bdec660589c09062c7fca",
+  "extracted_tree": {
+    "bytes": 8009861,
+    "files": 372,
+    "sha256": "74f1a2ee410bc20861fce942d806a7aa400196983c559b1cd97311afb998f2f8"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 4840874,
+      "name": "OpenAdapt.bundle.zip.part-0001",
+      "sha256": "5a1dbf0c40aed65d162109772257a8155b746741cb4bdec660589c09062c7fca"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "OpenAdapt",
+  "source_bytes": 8009861,
+  "source_commit": "8a432ec14d9294c3f35c8927da208ee85431de33",
+  "source_files": 372,
+  "source_ref": "main",
+  "source_repo": "OpenAdaptAI/OpenAdapt",
+  "source_tree": {
+    "bytes": 8009861,
+    "files": 372,
+    "sha256": "74f1a2ee410bc20861fce942d806a7aa400196983c559b1cd97311afb998f2f8"
+  }
+}
