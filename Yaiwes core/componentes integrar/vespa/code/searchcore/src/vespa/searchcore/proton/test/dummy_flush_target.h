@@ -1,0 +1,27 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+#pragma once
+
+#include <vespa/searchcorespi/flush/iflushtarget.h>
+
+namespace proton::test {
+
+struct DummyFlushTarget : public searchcorespi::LeafFlushTarget {
+    DummyFlushTarget(const std::string& name) noexcept;
+    DummyFlushTarget(const std::string& name, const Type& type, const Component& component) noexcept;
+    ~DummyFlushTarget() override;
+    MemoryGain getApproxMemoryGain() const override { return MemoryGain(0, 0); }
+    DiskGain getApproxDiskGain() const override { return DiskGain(0, 0); }
+    SerialNum getFlushedSerialNum() const override { return 0; }
+    Time getLastFlushTime() const override { return Time(); }
+    void init_flush(SerialNum, std::shared_ptr<search::IFlushToken>, TaskPromise task_promise) override {
+        task_promise.set_value({});
+    }
+    [[nodiscard]] bool can_flush(SerialNum current_serial) const noexcept override;
+    searchcorespi::FlushStats getLastFlushStats() const override { return searchcorespi::FlushStats(); }
+    [[nodiscard]] size_t reserved_memory_for_flush() const noexcept override;
+    [[nodiscard]] std::chrono::steady_clock::duration last_flush_duration() const noexcept override;
+    [[nodiscard]] std::chrono::steady_clock::duration estimated_flush_duration() const noexcept override;
+    uint64_t getApproxBytesToWriteToDisk() const override { return 0; }
+};
+
+} // namespace proton::test

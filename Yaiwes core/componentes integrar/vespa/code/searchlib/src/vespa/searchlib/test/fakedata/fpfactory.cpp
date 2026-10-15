@@ -1,0 +1,94 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "fpfactory.h"
+
+#include "fakeegcompr64filterocc.h"
+#include "fakefilterocc.h"
+#include "fakememtreeocc.h"
+#include "fakewordset.h"
+#include "fakezcbfilterocc.h"
+#include "fakezcfilterocc.h"
+
+#include <vespa/check_require.h>
+
+namespace search::fakedata {
+
+using index::Schema;
+
+FPFactory::~FPFactory() = default;
+
+void FPFactory::setup(const FakeWordSet& fws) {
+    std::vector<const FakeWord*> v;
+
+    for (const auto& words : fws.words()) {
+        for (const auto& word : words) {
+            v.push_back(word.get());
+        }
+    }
+    setup(v);
+}
+
+void FPFactory::setup(const std::vector<const FakeWord*>& fws) {
+    (void)fws;
+}
+
+using FPFactoryMap = std::map<const std::string, FPFactoryMaker* const>;
+
+static FPFactoryMap* fpFactoryMap = nullptr;
+
+/*
+ * Posting list factory glue.
+ */
+
+FPFactory* getFPFactory(const std::string& name, const Schema& schema) {
+    if (fpFactoryMap == nullptr) {
+        return nullptr;
+    }
+
+    auto i = fpFactoryMap->find(name);
+
+    if (i != fpFactoryMap->end()) {
+        return i->second(schema);
+    } else {
+        return nullptr;
+    }
+}
+
+std::vector<std::string> getPostingTypes() {
+    std::vector<std::string> res;
+
+    if (fpFactoryMap != nullptr) {
+        for (const auto& elem : *fpFactoryMap) {
+            res.push_back(elem.first);
+        }
+    }
+    return res;
+}
+
+FPFactoryInit::FPFactoryInit(const FPFactoryMapEntry& fpFactoryMapEntry) : _key(fpFactoryMapEntry.first) {
+    if (fpFactoryMap == nullptr) {
+        fpFactoryMap = new FPFactoryMap;
+    }
+    fpFactoryMap->insert(fpFactoryMapEntry);
+}
+
+FPFactoryInit::~FPFactoryInit() {
+    CHECK(fpFactoryMap != nullptr);
+    size_t eraseRes = fpFactoryMap->erase(_key);
+    CHECK(eraseRes == 1);
+    (void)eraseRes;
+    if (fpFactoryMap->empty()) {
+        delete fpFactoryMap;
+        fpFactoryMap = nullptr;
+    }
+}
+
+void FPFactoryInit::forceLink() {
+    FakeEGCompr64FilterOcc::forceLink();
+    FakeFilterOcc::forceLink();
+    FakeZcbFilterOcc::forceLink();
+    FakeZcFilterOcc::forceLink();
+    FakeMemTreeOcc::forceLink();
+}
+
+} // namespace search::fakedata

@@ -1,0 +1,249 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.config.model.api;
+
+import com.yahoo.component.Version;
+import com.yahoo.config.application.api.ApplicationPackage;
+import com.yahoo.config.application.api.DeployLogger;
+import com.yahoo.config.application.api.FileRegistry;
+import com.yahoo.config.provision.ApplicationId;
+import com.yahoo.config.provision.AthenzDomain;
+import com.yahoo.config.provision.CloudAccount;
+import com.yahoo.config.provision.CloudResourceTags;
+import com.yahoo.config.provision.ClusterSpec;
+import com.yahoo.config.provision.DataplaneToken;
+import com.yahoo.config.provision.DockerImage;
+import com.yahoo.config.provision.HostName;
+import com.yahoo.config.provision.NodeResources.Architecture;
+import com.yahoo.config.provision.OpenTelemetryConfiguration;
+import com.yahoo.config.provision.SharedHosts;
+
+import java.io.File;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.net.URI;
+import java.security.cert.X509Certificate;
+import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+
+/**
+ * Model context containing state provided to model factories.
+ *
+ * @author Ulf Lilleengen
+ */
+public interface ModelContext {
+
+    ApplicationPackage applicationPackage();
+    Optional<Model> previousModel();
+    HostProvisioner getHostProvisioner();
+    Provisioned provisioned();
+    DeployLogger deployLogger();
+    ConfigDefinitionRepo configDefinitionRepo();
+    FileRegistry getFileRegistry();
+    ExecutorService getExecutor();
+    default Optional<? extends Reindexing> reindexing() { return Optional.empty(); }
+    Properties properties();
+    default Optional<File> appDir() { return Optional.empty(); }
+    OnnxModelCost onnxModelCost();
+
+    /** The Docker image repo we want to use for images for this deployment (optional, will use default if empty) */
+    default Optional<DockerImage> wantedDockerImageRepo() { return Optional.empty(); }
+
+    /** The Vespa version this model is built for */
+    Version modelVespaVersion();
+
+    /** The Vespa version we want nodes to become */
+    Version wantedNodeVespaVersion();
+
+    /**
+     * How to remove a temporary feature flags:
+     * 1)
+     * - Roll out an override of the feature flag to the new value everywhere
+     *
+     * 2)
+     * - Update the default flag value to match the override, and roll that out everywhere
+     *
+     * 3)
+     * - Remove the flag overrides as they are covered by the new default value
+     * - Modify the implementation to assume the new default value.  This includes
+     *     * Remove references to the FeatureFlags method in the config model
+     *     * Remove FeatureFlags method overrides in ModelContextImpl and TestProperties
+     *     * Remove the flag definition
+     *   HOWEVER, keep and update the default method in FeatureFlags return the new default value.  Annotate the
+     *   default method with the `removeAfter` set beyond the Vespa version to be released.
+     *
+     * 3)
+     *  - Remove the default method in FeatureFlags once the oldest config model in use are beyond the `removeAfter`
+     */
+    interface FeatureFlags {
+        @ModelFeatureFlag(owners = {"hakonhall"}) default boolean useNonPublicEndpointForTest() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default String responseSequencerType() { return  "ADAPTIVE"; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default double queryDispatchWarmup() { return 5.0; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int defaultNumResponseThreads() { return 2; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int mbusNetworkThreads() { return 1; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int mbusJavaRpcNumTargets() { return 2; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int mbusJavaEventsBeforeWakeup() { return 1; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int mbusCppRpcNumTargets() { return 2; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int mbusCppEventsBeforeWakeup() { return 1; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int rpcNumTargets() { return 2; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int rpcEventsBeforeWakeup() { return 1; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default boolean useAsyncMessageHandlingOnSchedule() { return true; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default double feedConcurrency() { return 0.5; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default double feedNiceness() { return 0.0; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int maxUnCommittedMemory() { return 130000; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default boolean containerDumpHeapOnShutdownTimeout() { return false; }
+        @ModelFeatureFlag(owners = {"onur"}) default OpenTelemetryConfiguration opentelemetrySdk() { return OpenTelemetryConfiguration.disabled(); }
+        @ModelFeatureFlag(owners = {"hmusum"}) default int heapSizePercentage(Optional<String> clusterId) { return  0;}
+        @ModelFeatureFlag(owners = {"hmusum"}) default List<String> allowedAthenzProxyIdentities() { return List.of(); }
+        @ModelFeatureFlag(owners = {"vekterli"}) default int maxActivationInhibitedOutOfSyncGroups() { return 0; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default double resourceLimitDisk() { return 0.75; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default double resourceLimitMemory() { return 0.8; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default double resourceLimitAddressSpace() { return 0.80; }
+        @ModelFeatureFlag(owners = {"arnej"}) default boolean forwardIssuesAsErrors() { return true; }
+        @ModelFeatureFlag(owners = {"arnej", "andreer"}) default List<String> ignoredHttpUserAgents() { return List.of(); }
+        @ModelFeatureFlag(owners = {"hmusum"}) default String unknownConfigDefinition() { return "warn"; }
+        @ModelFeatureFlag(owners = {"havardpe"}) default boolean sortBlueprintsByCost() { return false; }
+        @ModelFeatureFlag(owners = {"olaa"}, removeAfter = "8.768") default boolean logserverOtelCol() { return false; }
+        @ModelFeatureFlag(owners = {"bratseth"}) default SharedHosts sharedHosts() { return SharedHosts.empty(); }
+        @ModelFeatureFlag(owners = {"bragehk"}) default boolean tokenAuthForDeploy() { return false; }
+        @ModelFeatureFlag(owners = {"bratseth"}) default Architecture adminClusterArchitecture() { return Architecture.x86_64; }
+        @ModelFeatureFlag(owners = {"arnej"}) default double logserverNodeMemory() { return 0.0; }
+        @ModelFeatureFlag(owners = {"arnej"}) default double clusterControllerNodeMemory() { return 0.0; }
+        @ModelFeatureFlag(owners = {"arnej"}) default boolean useLegacyWandQueryParsing() { return true; }
+        @ModelFeatureFlag(owners = {"arnej"}) default boolean sendOldQueryStack() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default boolean forwardAllLogLevels() { return true; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default long zookeeperPreAllocSize() { return 65536L; }
+        @ModelFeatureFlag(owners = {"vekterli"}) default int maxContentNodeMaintenanceOpConcurrency() { return -1; }
+        @ModelFeatureFlag(owners = {"glebashnik"}) default FeatureFlag<Boolean> useTritonFlag() { return () -> false; }
+        @ModelFeatureFlag(owners = {"glebashnik"}) default FeatureFlag<Boolean> tritonShareOnnxSessionFlag() { return () -> false; }
+        @ModelFeatureFlag(owners = {"arnej"}) default boolean ignoreConnectivityChecksAtStartup() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default boolean requireExplicitDocprocCluster() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default FeatureFlag<Integer> metricsProxyHeapSizeInMibFlag() { return () -> 0; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default OptionalInt metricsProxyAdminNodeHeapSizeInMib() { return OptionalInt.empty(); }
+        @ModelFeatureFlag(owners = {"toregge"}) default double searchNodeReservedMemoryFactor() { return 0.0; }
+        @ModelFeatureFlag(owners = {"arnej"}) default boolean forceDisableOnnxModelOptimization() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default boolean failWhenConfiguringIndexedMapOfArray() { return true; }
+        // Retained for Kubernetes upgrades within the supported 30 minor version window.
+        // Keep until the oldest version supported by that window is at least 8.740.40.
+        @ModelFeatureFlag(owners = {"johsol"}, removeAfter = "8.740") default boolean protonLogWarningOnDiskCapacityChange() { return true; }
+        @ModelFeatureFlag(owners = {"johsol"}, removeAfter = "8.740") default boolean protonResampleDiskCapacity() { return true; }
+        @ModelFeatureFlag(owners = {"johsol", "boeker", "arnej"}) default boolean fastMapSearch() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}, removeAfter = "8.755") default boolean relaxStrictlyIncreasingClusterStateVersions() { return true; }
+        // TODO (@sebasabe): Remove when no loaded config model version reads it; productDiscovery() replaces it
+        @ModelFeatureFlag(owners = {"sebasabe"}) default boolean commerceDiscovery() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum", "vekterli"}) default boolean enableLandlock() { return false; }
+        @ModelFeatureFlag(owners = {"hmusum"}) default boolean enableLegacyFeedHandler() { return true; }
+        @ModelFeatureFlag(owners = {"sebasabe"}) default boolean productDiscovery() { return false; }
+    }
+
+    /** Warning: As elsewhere in this package, do not make backwards incompatible changes that will break old config models! */
+    interface Properties {
+
+        FeatureFlags featureFlags();
+        boolean multitenant();
+        ApplicationId applicationId();
+        List<ConfigServerSpec> configServerSpecs();
+        HostName loadBalancerName();
+        URI ztsUrl();
+        AthenzDomain tenantSecretDomain();
+        String athenzDnsSuffix();
+        boolean hostedVespa();
+        Set<ContainerEndpoint> endpoints();
+        boolean isBootstrap();
+        boolean isFirstTimeDeployment();
+
+        default Optional<EndpointCertificateSecrets> endpointCertificateSecrets() { return Optional.empty(); }
+
+        default Optional<AthenzDomain> athenzDomain() { return Optional.empty(); }
+
+        /** The parent of tenant Athenz domains, which hold the tenant identities of applications: {@code <parent>.<tenant>} */
+        default AthenzDomain tenantParentDomain() { return AthenzDomain.from("vespa.tenant"); }
+
+        default Quota quota() { return Quota.unlimited(); }
+
+        default List<TenantVault> tenantVaults() { return List.of(); }
+
+        default List<TenantSecretStore> tenantSecretStores() { return List.of(); }
+
+        @Deprecated(forRemoval = true, since = "8.659") // Remove after '8.659' is gone
+        default String jvmGCOptions() { return jvmGCOptions(Optional.empty()); }
+
+        // Default setting for the gc-options attribute if not specified explicitly by application
+        default String jvmGCOptions(Optional<ClusterSpec.Type> clusterType) {
+            return jvmGCOptions(clusterType, Optional.empty());
+        }
+
+        // Default setting for the gc-options attribute if not specified explicitly by application
+        @Deprecated(forRemoval = true)
+        String jvmGCOptions(Optional<ClusterSpec.Type> clusterType, Optional<ClusterSpec.Id> clusterId);
+
+        /** Returns a flag for resolving JVM GC options with per-hostname granularity. */
+        default FeatureFlag<String> jvmGCOptionsFlag() {
+            return new FeatureFlag.Static<>(jvmGCOptions(Optional.empty(), Optional.empty()));
+        }
+
+        default String mallocImpl(Optional<ClusterSpec.Type> clusterType) { return ""; }
+
+        default int searchNodeInitializerThreads(String clusterId) { return 0; }
+
+        default int heapSizePercentage(String clusterId) { return 0;}
+
+        // Note: Used in unit tests (set to false in TestProperties) to avoid needing to deal with implicitly created node for logserver
+        default boolean useDedicatedNodeForLogserver() { return true; }
+
+        // Allow disabling mTLS for now, harden later
+        default boolean allowDisableMtls() { return true; }
+
+        default List<X509Certificate> operatorCertificates() { return List.of(); }
+
+        default List<String> tlsCiphersOverride() { return List.of(); }
+
+        List<String> environmentVariables();
+
+        /** TODO: Remove after September 2026 */
+        @Deprecated
+        default Optional<CloudAccount> cloudAccount() { return Optional.of(getCloudAccount()); }
+
+        @SuppressWarnings("deprecated")
+        default CloudAccount getCloudAccount() { return cloudAccount().orElse(CloudAccount.unspecified()); }
+
+        default CloudResourceTags cloudResourceTags() { return CloudResourceTags.empty(); }
+
+        default boolean allowUserFilters() { return true; }
+
+        default Duration endpointConnectionTtl() { return Duration.ZERO; }
+
+        default List<DataplaneToken> dataplaneTokens() { return List.of(); }
+
+        default List<String> requestPrefixForLoggingContent() { return List.of(); }
+
+        default List<String> jdiscHttpComplianceViolations() { return List.of(); }
+    }
+
+    /** A flag value that can be refined with additional dimensions before resolving. */
+    @FunctionalInterface
+    interface FeatureFlag<T> {
+        default FeatureFlag<T> withClusterType(ClusterSpec.Type clusterType) { return this; }
+        default FeatureFlag<T> withClusterId(ClusterSpec.Id clusterId) { return this; }
+        default FeatureFlag<T> withHostname(String hostname) { return this; }
+        T value();
+
+        /** A flag with a fixed value, ignoring all dimensions. */
+        record Static<T>(T value) implements FeatureFlag<T> {}
+    }
+
+    /** Annotation for manual bookkeeping for life-cycle of config-model flags */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    @interface ModelFeatureFlag {
+        String[] owners();
+        String removeAfter() default ""; // On the form "8.100.10"
+        String comment() default "";
+    }
+
+}

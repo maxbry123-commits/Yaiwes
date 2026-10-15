@@ -1,0 +1,162 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "summarymanager.h"
+
+#include "documentstoreadapter.h"
+#include "shrink_summary_lid_space_flush_target.h"
+#include "summarycompacttarget.h"
+#include "summaryflushtarget.h"
+
+#include <vespa/config-summary.h>
+#include <vespa/config/print/ostreamconfigwriter.h>
+#include <vespa/document/repo/documenttyperepo.h>
+#include <vespa/fastlib/text/normwordfolder.h>
+#include <vespa/juniper/rpinterface.h>
+#include <vespa/searchsummary/docsummary/docsum_field_writer_factory.h>
+#include <vespa/searchsummary/docsummary/i_query_term_filter.h>
+#include <vespa/searchsummary/docsummary/query_term_filter_factory.h>
+#include <vespa/searchsummary/docsummary/struct_fields_mapper.h>
+#include <vespa/vespalib/util/exceptions.h>
+#include <vespa/vespalib/util/lambdatask.h>
+
+#include <sstream>
+
+#include <vespa/log/log.h>
+LOG_SETUP(".proton.docsummary.summarymanager");
+
+using namespace config;
+using namespace document;
+using namespace search::docsummary;
+
+using vespalib::IllegalArgumentException;
+using vespalib::make_string;
+using vespalib::compression::CompressionConfig;
+
+using search::DocumentStore;
+using search::IDocumentStore;
+using search::LogDocumentStore;
+using search::WriteableFileChunk;
+
+using search::TuneFileSummary;
+using search::common::FileHeaderContext;
+using search::docsummary::StructFieldsMapper;
+using searchcorespi::IFlushTarget;
+
+namespace proton {
+
+namespace {
+
+std::unique_ptr<StructFieldsMapper> make_struct_fields_mapper(const search::attribute::IAttributeContext& ctx) {
+    auto mapper = std::make_unique<StructFieldsMapper>();
+    mapper->setup(ctx);
+    return mapper;
+}
+
+} // namespace
+
+SummaryManager::SummarySetup::SummarySetup(const std::string& baseDir, const SummaryConfig& summaryCfg,
+                                           const JuniperrcConfig&                             juniperCfg,
+                                           search::IAttributeManager::SP                      attributeMgr,
+                                           search::IDocumentStore::SP                         docStore,
+                                           std::shared_ptr<const search::IDocumentIdProvider> document_id_provider,
+                                           std::shared_ptr<const DocumentTypeRepo>            repo,
+                                           const search::index::Schema&                       schema)
+    : _docsumWriter(),
+      _wordFolder(std::make_unique<Fast_NormalizeWordFolder>()),
+      _juniperProps(juniperCfg),
+      _juniperConfig(),
+      _attributeMgr(std::move(attributeMgr)),
+      _docStore(std::move(docStore)),
+      _document_id_provider(std::move(document_id_provider)),
+      _repo(std::move(repo)) {
+    _juniperConfig = std::make_unique<juniper::Juniper>(&_juniperProps, _wordFolder.get());
+    auto                                     resultConfig = std::make_unique<ResultConfig>();
+    std::unique_ptr<IQueryTermFilterFactory> query_term_filter_factory =
+        std::make_unique<QueryTermFilterFactory>(schema);
+    auto docsum_field_writer_factory = std::make_unique<DocsumFieldWriterFactory>(*this, *query_term_filter_factory);
+    auto struct_fields_mapper = make_struct_fields_mapper(*_attributeMgr->createContext());
+    if (!resultConfig->readConfig(summaryCfg, make_string("SummaryManager(%s)", baseDir.c_str()),
+                                  *docsum_field_writer_factory, *struct_fields_mapper))
+    {
+        std::ostringstream            oss;
+        ::config::OstreamConfigWriter writer(oss);
+        writer.write(summaryCfg);
+        throw IllegalArgumentException(
+            make_string("Could not initialize summary result config for directory '%s' based on summary config '%s'",
+                        baseDir.c_str(), oss.str().c_str()));
+    }
+    docsum_field_writer_factory.reset();
+
+    _docsumWriter = std::make_unique<DynamicDocsumWriter>(std::move(resultConfig));
+}
+
+IDocsumStore::UP SummaryManager::SummarySetup::createDocsumStore() {
+    return std::make_unique<DocumentStoreAdapter>(*_docStore, *_repo);
+}
+
+std::shared_ptr<const search::IDocumentIdProvider>
+SummaryManager::SummarySetup::get_document_id_provider() const noexcept {
+    return _document_id_provider;
+}
+
+ISummaryManager::ISummarySetup::SP
+SummaryManager::createSummarySetup(const SummaryConfig& summaryCfg, const JuniperrcConfig& juniperCfg,
+                                   const std::shared_ptr<const DocumentTypeRepo>& repo,
+                                   const search::IAttributeManager::SP&           attributeMgr,
+                                   const search::index::Schema&                   schema) {
+    return std::make_shared<SummarySetup>(_baseDir, summaryCfg, juniperCfg, attributeMgr, _docStore,
+                                          _document_id_provider, repo, schema);
+}
+
+SummaryManager::SummaryManager(vespalib::Executor& shared_executor, const LogDocumentStore::Config& storeConfig,
+                               const search::GrowStrategy& growStrategy, const std::string& baseDir,
+                               const TuneFileSummary& tuneFileSummary, const FileHeaderContext& fileHeaderContext,
+                               search::transactionlog::SyncProxy& tlSyncer, search::IBucketizer::SP bucketizer,
+                               std::shared_ptr<const search::IDocumentIdProvider> document_id_provider)
+    : _baseDir(baseDir), _docStore(), _document_id_provider(std::move(document_id_provider)) {
+    _docStore =
+        std::make_shared<LogDocumentStore>(shared_executor, baseDir, storeConfig, growStrategy, tuneFileSummary,
+                                           fileHeaderContext, tlSyncer, std::move(bucketizer));
+}
+
+SummaryManager::~SummaryManager() = default;
+
+void SummaryManager::putDocument(uint64_t syncToken, search::DocumentIdT lid, const Document& doc) {
+    _docStore->write(syncToken, lid, doc);
+}
+
+void SummaryManager::putDocument(uint64_t syncToken, search::DocumentIdT lid, const vespalib::nbostream& doc) {
+    _docStore->write(syncToken, lid, doc);
+}
+
+void SummaryManager::removeDocument(uint64_t syncToken, search::DocumentIdT lid) {
+    _docStore->remove(syncToken, lid);
+}
+
+namespace {
+
+IFlushTarget::SP createShrinkLidSpaceFlushTarget(vespalib::Executor& summaryService, IDocumentStore::SP docStore) {
+    return std::make_shared<ShrinkSummaryLidSpaceFlushTarget>(
+        "summary.shrink", IFlushTarget::Type::GC, IFlushTarget::Component::DOCUMENT_STORE,
+        docStore->tentativeLastSyncToken(), summaryService, std::move(docStore));
+}
+
+} // namespace
+
+IFlushTarget::List SummaryManager::getFlushTargets(vespalib::Executor& summaryService) {
+    IFlushTarget::List ret;
+    ret.push_back(std::make_shared<SummaryFlushTarget>(getBackingStore(), summaryService));
+    if (dynamic_cast<LogDocumentStore*>(_docStore.get()) != nullptr) {
+        ret.push_back(std::make_shared<SummaryCompactBloatTarget>(summaryService, getBackingStore()));
+        ret.push_back(std::make_shared<SummaryCompactSpreadTarget>(summaryService, getBackingStore()));
+    }
+    ret.push_back(createShrinkLidSpaceFlushTarget(summaryService, _docStore));
+    return ret;
+}
+
+void SummaryManager::reconfigure(const LogDocumentStore::Config& config) {
+    auto& docStore = dynamic_cast<LogDocumentStore&>(*_docStore);
+    docStore.reconfigure(config);
+}
+
+} // namespace proton

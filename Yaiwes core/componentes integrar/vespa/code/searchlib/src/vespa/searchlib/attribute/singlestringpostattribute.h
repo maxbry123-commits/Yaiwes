@@ -1,0 +1,101 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include "i_docid_posting_store.h"
+#include "postinglistattribute.h"
+#include "singlestringattribute.h"
+#include "string_direct_posting_store_adapter.h"
+
+namespace search {
+
+/**
+ * Implementation of single value string attribute that in addition to enum store
+ * uses an underlying posting list to provide faster search.
+ *
+ * B: EnumAttribute<StringAttribute>
+ */
+template <typename B>
+class SingleValueStringPostingAttributeT
+    : public SingleValueStringAttributeT<B>,
+      protected PostingListAttributeSubBase<AttributePosting, typename B::LoadedVector, typename B::LoadedValueType,
+                                            typename B::EnumStore> {
+public:
+    using EnumStore = typename SingleValueStringAttributeT<B>::EnumStore;
+    using EnumStoreBatchUpdater = typename EnumStore::BatchUpdater;
+
+private:
+    using LoadedVector = typename B::LoadedVector;
+    using PostingParent = PostingListAttributeSubBase<AttributePosting, LoadedVector, typename B::LoadedValueType,
+                                                      typename B::EnumStore>;
+
+    using Change = StringAttribute::Change;
+    using ChangeVector = StringAttribute::ChangeVector;
+    using ComparatorType = typename EnumStore::ComparatorType;
+    using DocId = typename SingleValueStringAttributeT<B>::DocId;
+    using EnumIndex = typename SingleValueStringAttributeT<B>::EnumIndex;
+    using PostingMap = typename PostingParent::PostingMap;
+    using QueryTermSimpleUP = AttributeVector::QueryTermSimpleUP;
+    using SelfType = SingleValueStringPostingAttributeT<B>;
+    using ValueModifier = typename SingleValueStringAttributeT<B>::ValueModifier;
+
+    using PostingParent::_posting_store;
+    using PostingParent::clearAllPostings;
+    using PostingParent::forwardedOnAddDoc;
+    using PostingParent::handle_load_posting_lists;
+    using PostingParent::handle_load_posting_lists_and_update_enum_store;
+
+public:
+    using PostingStore = typename PostingParent::PostingStore;
+    using Dictionary = EnumPostingTree;
+    using PostingParent::get_posting_store;
+
+private:
+    using DirectPostingStoreAdapterType =
+        attribute::StringDirectPostingStoreAdapter<IDocidPostingStore, PostingStore, EnumStore>;
+    DirectPostingStoreAdapterType _posting_store_adapter;
+
+    void freezeEnumDictionary() override;
+    void mergeMemoryStats(vespalib::MemoryUsage& total) override;
+    void applyUpdateValueChange(const Change& c, EnumStore& enumStore, std::map<DocId, EnumIndex>& currEnumIndices);
+
+    void makePostingChange(const vespalib::datastore::EntryComparator& cmp, IEnumStoreDictionary& dictionary,
+                           const std::map<DocId, EnumIndex>& currEnumIndices, PostingMap& changePost);
+
+    void applyValueChanges(EnumStoreBatchUpdater& updater) override;
+
+public:
+    SingleValueStringPostingAttributeT(const std::string& name, const AttributeVector::Config& c);
+    SingleValueStringPostingAttributeT(const std::string& name);
+    ~SingleValueStringPostingAttributeT();
+
+    void reclaim_memory(vespalib::Generation oldest_used_gen) override;
+    void before_inc_generation(vespalib::Generation current_gen) override;
+
+    std::unique_ptr<attribute::SearchContext> getSearch(QueryTermSimpleUP                     term,
+                                                        const attribute::SearchContextParams& params) const override;
+
+    const IDocidPostingStore* as_docid_posting_store() const override { return &_posting_store_adapter; }
+
+    bool onAddDoc(DocId doc) override {
+        return forwardedOnAddDoc(doc, this->_enumIndices.size(), this->_enumIndices.capacity());
+    }
+
+    void onAddDocs(DocId lidLimit) override {
+        forwardedOnAddDoc(lidLimit, this->_enumIndices.size(), this->_enumIndices.capacity());
+    }
+
+    void load_posting_lists(LoadedVector& loaded) override { handle_load_posting_lists(loaded); }
+
+    attribute::IPostingListAttributeBase* getIPostingListAttributeBase() override { return this; }
+
+    const attribute::IPostingListAttributeBase* getIPostingListAttributeBase() const override { return this; }
+
+    void load_posting_lists_and_update_enum_store(enumstore::EnumeratedPostingsLoader& loader) override {
+        handle_load_posting_lists_and_update_enum_store(loader);
+    }
+};
+
+using SingleValueStringPostingAttribute = SingleValueStringPostingAttributeT<EnumAttribute<StringAttribute>>;
+
+} // namespace search

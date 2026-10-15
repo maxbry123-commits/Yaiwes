@@ -1,0 +1,52 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+schema test {
+  document test {
+    struct elem {
+      field name type string {}
+      field weight type int {}
+    }
+    field elem_array type array<elem> {
+      indexing: summary
+      struct-field name {
+        indexing: attribute
+        attribute: fast-search
+      }
+      struct-field weight {
+        indexing: attribute
+      }
+    }
+    # A struct whose sub-fields are named like a map entry's, which is what makes the shape ambiguous
+    # when it has to be deduced from the struct field attribute names alone.
+    struct keyval {
+      field key type string {}
+      field value type string {}
+    }
+    field keyval_array type array<keyval> {
+      indexing: summary
+      struct-field key {
+        indexing: attribute
+      }
+      struct-field value {
+        indexing: attribute
+      }
+    }
+    struct mykv {
+      field mykey type string {}
+      field myval type string {}
+    }
+    field kv_array type array<mykv> {
+      struct-field mykey {
+          indexing: attribute
+          match: cased
+          attribute: fast-search
+      }
+      struct-field myval {
+          indexing: attribute
+          match: cased
+      }
+    }
+  }
+  document-summary rename {
+    summary new_elem_array { source: elem_array }
+  }
+}

@@ -1,0 +1,1063 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.clustercontroller.core;
+
+import com.yahoo.text.Text;
+import com.yahoo.vdslib.distribution.ConfiguredNode;
+import com.yahoo.vdslib.distribution.Distribution;
+import com.yahoo.vdslib.state.ClusterState;
+import com.yahoo.vdslib.state.Node;
+import com.yahoo.vdslib.state.NodeState;
+import com.yahoo.vdslib.state.State;
+import com.yahoo.vespa.clustercontroller.core.hostinfo.HostInfo;
+import com.yahoo.vespa.clustercontroller.utils.staterestapi.requests.SetUnitStateRequest;
+import com.yahoo.vespa.config.content.StorDistributionConfig;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static com.yahoo.vdslib.state.NodeType.DISTRIBUTOR;
+import static com.yahoo.vdslib.state.NodeType.STORAGE;
+import static com.yahoo.vdslib.state.State.DOWN;
+import static com.yahoo.vdslib.state.State.INITIALIZING;
+import static com.yahoo.vdslib.state.State.MAINTENANCE;
+import static com.yahoo.vdslib.state.State.UP;
+import static com.yahoo.vespa.clustercontroller.core.NodeStateChangeChecker.Result;
+import static com.yahoo.vespa.clustercontroller.utils.staterestapi.requests.SetUnitStateRequest.Condition.FORCE;
+import static com.yahoo.vespa.clustercontroller.utils.staterestapi.requests.SetUnitStateRequest.Condition.SAFE;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+public class NodeStateChangeCheckerTest {
+
+    private static final int requiredRedundancy = 4;
+    private static final int currentClusterStateVersion = 2;
+
+    private static final Node distributor = new Node(DISTRIBUTOR, 1);
+    private static final Node storageNode = new Node(STORAGE, 1);
+
+    private static final NodeState UP_NODE_STATE = new NodeState(STORAGE, UP);
+    private static final NodeState MAINTENANCE_NODE_STATE = createNodeState(MAINTENANCE, "Orchestrator");
+    private static final NodeState DOWN_NODE_STATE = createNodeState(DOWN, "RetireEarlyExpirer");
+
+    private static NodeState createNodeState(State state, String description) {
+        return new NodeState(STORAGE, state).setDescription(description);
+    }
+
+    private static ClusterState clusterState(String state) { return ClusterState.stateFromString(state); }
+
+    private static ClusterState defaultAllUpClusterState() {
+        return defaultAllUpClusterState(4);
+    }
+
+    private static ClusterState defaultAllUpClusterState(int nodeCount) {
+        return clusterState(Text.format("version:%d distributor:%d storage:%d",
+                                          currentClusterStateVersion,
+                                          nodeCount,
+                                          nodeCount));
+    }
+
+    private NodeStateChangeChecker createChangeChecker(ContentCluster cluster) {
+        return new NodeStateChangeChecker(cluster, false);
+    }
+
+    private NodeStateChangeChecker createChangeChecker(ContentCluster cluster, boolean inMoratorium) {
+        return new NodeStateChangeChecker(cluster, inMoratorium);
+    }
+
+    private ContentCluster createCluster(int nodeCount, int maxNumberOfGroupsAllowedToBeDown) {
+        return createCluster(nodeCount, 1, maxNumberOfGroupsAllowedToBeDown);
+    }
+
+    private ContentCluster createCluster(int nodeCount, int groupCount, int maxNumberOfGroupsAllowedToBeDown) {
+        List<ConfiguredNode> nodes = createNodes(nodeCount);
+        Distribution distribution = new Distribution(createDistributionConfig(nodeCount, groupCount));
+        return new ContentCluster("clustername", nodes, distribution, maxNumberOfGroupsAllowedToBeDown);
+    }
+
+    private String createDistributorHostInfo(int replicationFactor1, int replicationFactor2, int replicationFactor3) {
+        return "{\n" +
+                "    \"cluster-state-version\": 2,\n" +
+                "    \"distributor\": {\n" +
+                "        \"storage-nodes\": [\n" +
+                "            {\n" +
+                "                \"node-index\": 0,\n" +
+                "                \"min-current-replication-factor\": " + replicationFactor1 + "\n" +
+                "            },\n" +
+                "            {\n" +
+                "                \"node-index\": 1,\n" +
+                "                \"min-current-replication-factor\": " + replicationFactor2 + "\n" +
+                "            },\n" +
+                "            {\n" +
+                "                \"node-index\": 2,\n" +
+                "                \"min-current-replication-factor\": " + replicationFactor3 + "\n" +
+                "            },\n" +
+                "            {\n" +
+                "                \"node-index\": 3\n" +
+                "            }\n" +
+                "        ]\n" +
+                "    }\n" +
+                "}\n";
+    }
+
+    private void markAllNodesAsReportingStateUp(ContentCluster cluster) {
+        final ClusterInfo clusterInfo = cluster.clusterInfo();
+        final int configuredNodeCount = cluster.clusterInfo().getConfiguredNodes().size();
+        for (int i = 0; i < configuredNodeCount; i++) {
+            clusterInfo.getDistributorNodeInfo(i).setReportedState(new NodeState(DISTRIBUTOR, UP), 0);
+            clusterInfo.getDistributorNodeInfo(i).setHostInfo(HostInfo.createHostInfo(createDistributorHostInfo(4, 5, 6)));
+            clusterInfo.getStorageNodeInfo(i).setReportedState(new NodeState(STORAGE, UP), 0);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeWithForce(int maxNumberOfGroupsAllowedToBeDown) {
+        NodeState newState = new NodeState(STORAGE, INITIALIZING);
+        boolean inMoratorium = false;
+        Result result = evaluateTransition(createCluster(1, maxNumberOfGroupsAllowedToBeDown), inMoratorium, distributor,
+                                           defaultAllUpClusterState(), FORCE, UP_NODE_STATE, newState);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testDeniedInMoratorium(int maxNumberOfGroupsAllowedToBeDown) {
+        boolean inMoratorium = true;
+        Result result = evaluateTransition(createCluster(4, maxNumberOfGroupsAllowedToBeDown), inMoratorium, new Node(STORAGE, 10),
+                                           defaultAllUpClusterState(), UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Master cluster controller is bootstrapping and in moratorium", result.reason());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testUnknownStorageNode(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateTransition(createCluster(4, maxNumberOfGroupsAllowedToBeDown), new Node(STORAGE, 10),
+                                           defaultAllUpClusterState(), UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Unknown node storage.10", result.reason());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSafeMaintenanceDisallowedWhenOtherStorageNodeInFlatClusterIsSuspended(int maxNumberOfGroupsAllowedToBeDown) {
+        // Nodes 0-3, storage node 0 being in maintenance with "Orchestrator" description.
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        setStorageNodeWantedStateToOrchestratorMaintenance(cluster, 0);
+        ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                "version:%d distributor:4 storage:4 .0.s:m",
+                currentClusterStateVersion));
+
+        Result result = evaluateTransition(cluster, new Node(STORAGE, 1),
+                                           clusterStateWith0InMaintenance, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("At most one node can have a wanted state: Other storage node 0 has wanted state Maintenance",
+                     result.reason());
+    }
+
+    @Test
+    void testMaintenanceAllowedFor2Of4Groups() {
+        int maxNumberOfGroupsAllowedToBeDown = 2;
+        // 4 groups with 1 node in each group
+        var cluster = createCluster(4, 4, maxNumberOfGroupsAllowedToBeDown);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 5, 6)));
+
+        // All nodes up, set a storage node in group 0 to maintenance
+        {
+            int nodeIndex = 0;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, defaultAllUpClusterState());
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // Node in group 0 in maintenance, set storage node in group 1 to maintenance
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:4 .0.s:d storage:4 .0.s:m", currentClusterStateVersion));
+            int nodeIndex = 1;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, clusterState);
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // Nodes in group 0 and 1 in maintenance, try to set storage node in group 2 to maintenance while storage node 2 is down, should fail
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:4 storage:4 .0.s:m .1.s:m .2.s:d", currentClusterStateVersion));
+            int nodeIndex = 2;
+            cluster.clusterInfo().getStorageNodeInfo(nodeIndex).setReportedState(new NodeState(STORAGE, DOWN), 0);
+            Node node = new Node(STORAGE, nodeIndex);
+            Result result = evaluateTransition(cluster, node, clusterState, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+            assertFalse(result.allowed(), result.toString());
+            assertFalse(result.isAlreadySet());
+            assertEquals("At most 2 groups can have wanted state: [0, 1, 2]", result.reason());
+        }
+
+        // Nodes in group 0 and 1 in maintenance, try to set storage node in group 2 to maintenance, should fail
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:4 storage:4 .0.s:m .1.s:m", currentClusterStateVersion));
+            int nodeIndex = 2;
+            Node node = new Node(STORAGE, nodeIndex);
+            Result result = evaluateTransition(cluster, node, clusterState, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+            assertFalse(result.allowed(), result.toString());
+            assertFalse(result.isAlreadySet());
+            assertEquals("At most 2 groups can have wanted state: [0, 1]", result.reason());
+        }
+
+    }
+
+    @Test
+    void testMaintenanceAllowedFor2Of4GroupsOneNodeAtATime() {
+        int maxNumberOfGroupsAllowedToBeDown = 0;
+        // 2 groups with 2 nodes in each group
+        var cluster = createCluster(4, 2, maxNumberOfGroupsAllowedToBeDown);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 5, 6)));
+
+        // All nodes up, set a storage node in group 0 to maintenance
+        {
+            int nodeIndex = 0;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, defaultAllUpClusterState());
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // One node in group 0 in maintenance, try to set another storage node in group 0 to maintenance, should fail
+        {
+            ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                    "version:%d distributor:4 storage:4 .0.s:m",
+                    currentClusterStateVersion));
+            int nodeIndex = 1;
+            settingToMaintenanceIsNotAllowed(nodeIndex, cluster, clusterStateWith0InMaintenance,
+                                             "At most one node can have a wanted state: Other storage node 0 has wanted state Maintenance");
+        }
+
+        // One node in group 0 in maintenance, try to set a storage node in group 1 to maintenance, should also fail
+        {
+            ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                    "version:%d distributor:4 storage:4 .0.s:m",
+                    currentClusterStateVersion));
+            int nodeIndex = 2;
+            settingToMaintenanceIsNotAllowed(nodeIndex, cluster, clusterStateWith0InMaintenance,
+                                             "At most one node can have a wanted state: Other storage node 0 has wanted state Maintenance");
+        }
+
+    }
+
+    @Test
+    void testMaintenanceAllowedFor2Of4Groups8Nodes() {
+        int maxNumberOfGroupsAllowedToBeDown = 2;
+        // 4 groups with 2 nodes in each group
+        var cluster = createCluster(8, 4, maxNumberOfGroupsAllowedToBeDown);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 5, 6)));
+
+        // All nodes up, set a storage node in group 0 to maintenance
+        {
+            ClusterState clusterState = defaultAllUpClusterState(8);
+            int nodeIndex = 0;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, clusterState);
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // 1 Node in group 0 in maintenance, try to set node 1 in group 0 to maintenance
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 .0.s:d storage:8 .0.s:m", currentClusterStateVersion));
+            int nodeIndex = 1;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, clusterState);
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // 2 nodes in group 0 in maintenance, try to set storage node 2 in group 1 to maintenance
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 storage:8 .0.s:m .1.s:m", currentClusterStateVersion));
+            int nodeIndex = 2;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, clusterState);
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // 2 nodes in group 0 and 1 in group 1 in maintenance, try to set storage node 4 in group 2 to maintenance, should fail (different group)
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 storage:8 .0.s:m .1.s:m .2.s:m", currentClusterStateVersion));
+            int nodeIndex = 4;
+            settingToMaintenanceIsNotAllowed(nodeIndex, cluster, clusterState, "At most 2 groups can have wanted state: [0, 1]");
+        }
+
+        // 2 nodes in group 0 and 1 in group 1 in maintenance, try to set storage node 3 in group 1 to maintenance
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 storage:8 .0.s:m .1.s:m .2.s:m", currentClusterStateVersion));
+            int nodeIndex = 3;
+            settingToMaintenanceIsAllowed(nodeIndex, cluster, clusterState);
+            setStorageNodeWantedStateToOrchestratorMaintenance(cluster, nodeIndex);
+        }
+
+        // 2 nodes in group 0 and 2 nodes in group 1 in maintenance, try to set storage node 4 in group 2 to maintenance, should fail
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 storage:8 .0.s:m .1.s:m .2.s:m .3.s:m", currentClusterStateVersion));
+            int nodeIndex = 4;
+            settingToMaintenanceIsNotAllowed(nodeIndex, cluster, clusterState, "At most 2 groups can have wanted state: [0, 1]");
+        }
+
+        // 2 nodes in group 0 in maintenance, storage node 3 in group 1 is in maintenance with another description
+        // (set in maintenance by operator), try to set storage node 2 in group 1 to maintenance, should be allowed
+        {
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 storage:8 .0.s:m .1.s:m .3.s:m", currentClusterStateVersion));
+            setStorageNodeWantedState(cluster, 3, MAINTENANCE, "Maintenance, set by operator");  // Set to another description
+            setStorageNodeWantedState(cluster, 2, UP, ""); // Set back to UP, want to set this to maintenance again
+            int nodeIndex = 2;
+            Node node = new Node(STORAGE, nodeIndex);
+            Result result = evaluateTransition(cluster, node, clusterState, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+            assertTrue(result.allowed(), result.toString());
+            assertFalse(result.isAlreadySet());
+        }
+
+        // 2 nodes in group 0 up again but buckets not in sync and 2 nodes in group 1 in maintenance,
+        // try to set storage node 4 in group 2 to maintenance
+        {
+            setStorageNodeWantedState(cluster, 0, MAINTENANCE, "Orchestrator");
+            setStorageNodeWantedState(cluster, 1, MAINTENANCE, "Orchestrator");
+            setStorageNodeWantedState(cluster, 2, UP, ""); // Set up again
+            setStorageNodeWantedState(cluster, 3, UP, ""); // Set up again
+            ClusterState clusterState = clusterState(Text.format("version:%d distributor:8 storage:8 .0.s:m .1.s:m", currentClusterStateVersion));
+
+            // Set bucket in sync to 1 for node 2 in group 1
+            var distributorHostInfo = createDistributorHostInfo(1, 2, 1);
+            cluster.clusterInfo().getDistributorNodeInfo(0).setHostInfo(HostInfo.createHostInfo(distributorHostInfo));
+            cluster.clusterInfo().getDistributorNodeInfo(1).setHostInfo(HostInfo.createHostInfo(distributorHostInfo));
+            cluster.clusterInfo().getDistributorNodeInfo(2).setHostInfo(HostInfo.createHostInfo(distributorHostInfo));
+
+            int nodeIndex = 2;
+            settingToMaintenanceIsNotAllowed(nodeIndex, cluster, clusterState,
+                                             "Distributor 0 says storage node 0 has buckets with redundancy as low as 1, but we require at least 4");
+        }
+
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSafeMaintenanceDisallowedWhenOtherDistributorInFlatClusterIsSuspended(int maxNumberOfGroupsAllowedToBeDown) {
+        // Nodes 0-3, distributor 0 being down with "Orchestrator" description.
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        setDistributorNodeWantedState(cluster, 0, DOWN, "Orchestrator");
+        ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                "version:%d distributor:4 .0.s:d storage:4",
+                currentClusterStateVersion));
+
+        settingToMaintenanceIsNotAllowed(1, cluster, clusterStateWith0InMaintenance,
+                                         "At most one node can have a wanted state: Other distributor 0 has wanted state Down");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSafeMaintenanceDisallowedWhenDistributorInGroupIsDown(int maxNumberOfGroupsAllowedToBeDown) {
+        // Nodes 0-3, distributor 0 being in maintenance with "Orchestrator" description.
+        // 2 groups: nodes 0-1 is group 0, 2-3 is group 1.
+        ContentCluster cluster = createCluster(4, 2, maxNumberOfGroupsAllowedToBeDown);
+        setDistributorNodeWantedState(cluster, 0, DOWN, "Orchestrator");
+        ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                "version:%d distributor:4 .0.s:d storage:4",
+                currentClusterStateVersion));
+
+        {
+            // Denied for node 2 in group 1, since distributor 0 in group 0 is down
+            var message = maxNumberOfGroupsAllowedToBeDown >= 1
+                    ? "Wanted state already set for another node in groups: [0]"
+                    : "At most one group can have wanted state: Other distributor 0 in group 0 has wanted state Down";
+            settingToMaintenanceIsNotAllowed(2, cluster, clusterStateWith0InMaintenance, message);
+        }
+
+        {
+            // Even node 1 of group 0 is not permitted, as node 0 is not considered
+            // suspended since only the distributor has been set down.
+            var message = maxNumberOfGroupsAllowedToBeDown >= 1
+                    ? "Wanted state already set for another node in groups: [0]"
+                    : "Another distributor wants state DOWN: 0";
+            settingToMaintenanceIsNotAllowed(1, cluster, clusterStateWith0InMaintenance, message);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSafeMaintenanceWhenOtherStorageNodeInGroupIsSuspended(int maxNumberOfGroupsAllowedToBeDown) {
+        // Nodes 0-3, storage node 0 being in maintenance with "Orchestrator" description.
+        // 2 groups: nodes 0-1 is group 0, 2-3 is group 1.
+        ContentCluster cluster = createCluster(4, 2, maxNumberOfGroupsAllowedToBeDown);
+        setStorageNodeWantedState(cluster, 0, MAINTENANCE, "Orchestrator");
+        ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                "version:%d distributor:4 storage:4 .0.s:m",
+                currentClusterStateVersion));
+
+        {
+            // Denied for node 2 in group 1, since node 0 in group 0 is in maintenance
+            var message = maxNumberOfGroupsAllowedToBeDown >= 1
+                    ? "At most 1 groups can have wanted state: [0]"
+                    : "At most one group can have wanted state: Other storage node 0 in group 0 has wanted state Maintenance";
+            settingToMaintenanceIsNotAllowed(2, cluster, clusterStateWith0InMaintenance, message);
+        }
+
+        {
+            // Permitted for node 1 in group 0, since node 0 is already in maintenance with
+            // description Orchestrator, and it is in the same group
+            settingToMaintenanceIsAllowed(1, cluster, clusterStateWith0InMaintenance);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void safe_maintenance_disallowed_when_existing_node_state_set_in_outdated_context(int maxNumberOfGroupsAllowedToBeDown) {
+        // Nodes 0-3, storage node 0 being in maintenance with "Orchestrator" description.
+        // 2 groups: nodes 0-1 is group 0, 2-3 is group 1.
+        ContentCluster cluster = createCluster(4, 2, maxNumberOfGroupsAllowedToBeDown);
+        setStorageNodeWantedStateToOrchestratorMaintenance(cluster, 0);
+        ClusterState clusterStateWith0InMaintenance = clusterState(Text.format(
+                "version:%d distributor:4 storage:4 .0.s:m",
+                currentClusterStateVersion));
+        // Pretend we got a reconfig or leadership change, causing our knowledge of the old world
+        // to be too spotty to trust.
+        cluster.bumpOrchestrationGeneration();
+        // Denied for node1 in group 0, since node 0 in group 0 is in maintenance with an outdated context
+        settingToMaintenanceIsNotAllowed(1, cluster, clusterStateWith0InMaintenance,
+                NodeStateChangeChecker.STALE_ORCHESTRATOR_CONTEXT_MSG);
+        // Renew the state context generation for node 0; should now be allowed
+        setStorageNodeWantedStateToOrchestratorMaintenance(cluster, 0);
+        settingToMaintenanceIsAllowed(1, cluster, clusterStateWith0InMaintenance);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSafeSetStateDistributors(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(1, 1, maxNumberOfGroupsAllowedToBeDown);
+        settingToMaintenanceIsNotAllowed(new Node(DISTRIBUTOR, 1), cluster, defaultAllUpClusterState(),
+                                         "Safe-set of node state is only supported for storage nodes! Requested node type: distributor");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeSafeMissingStorage(int maxNumberOfGroupsAllowedToBeDown) {
+        // Create a content cluster with 4 nodes, and storage node with index 3 down.
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 5, 6)));
+        cluster.clusterInfo()
+               .getStorageNodeInfo(3)
+               .setReportedState(new NodeState(STORAGE, DOWN), 0);
+        ClusterState clusterStateWith3Down = clusterState(Text.format(
+                "version:%d distributor:4 storage:4 .3.s:d",
+                currentClusterStateVersion));
+
+        // We should then be denied setting storage node 1 safely to maintenance.
+        settingToMaintenanceIsNotAllowed(storageNode, cluster, clusterStateWith3Down,
+                                         "Another storage node has state DOWN: 3");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeStorageSafeYes(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = transitionToMaintenanceWithNoStorageNodesDown(createCluster(4, 1, maxNumberOfGroupsAllowedToBeDown), defaultAllUpClusterState());
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSetUpFailsIfReportedIsDown(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+        // Not setting nodes up -> all are down
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                storageNode, defaultAllUpClusterState(), SAFE,
+                MAINTENANCE_NODE_STATE, UP_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    // A node may be reported as Up but have a generated state of Down if it's part of
+    // nodes taken down implicitly due to a group having too low node availability.
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSetUpSucceedsIfReportedIsUpButGeneratedIsDown(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+
+        markAllNodesAsReportingStateUp(cluster);
+
+        ClusterState stateWithNodeDown = clusterState(Text.format(
+                "version:%d distributor:4 storage:4 .%d.s:d",
+                currentClusterStateVersion, storageNode.getIndex()));
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                storageNode, stateWithNodeDown, SAFE,
+                MAINTENANCE_NODE_STATE, UP_NODE_STATE);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanSetUpEvenIfOldWantedStateIsDown(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 3, 6)));
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                storageNode, defaultAllUpClusterState(), SAFE,
+                new NodeState(STORAGE, DOWN), UP_NODE_STATE);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeStorageSafeNo(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 3, 6)));
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                storageNode, defaultAllUpClusterState(), SAFE,
+                UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Distributor 0 says storage node 1 has buckets with redundancy as low as 3, but we require at least 4",
+                     result.reason());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeIfMissingMinReplicationFactor(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+        setAllNodesUp(cluster, HostInfo.createHostInfo(createDistributorHostInfo(4, 3, 6)));
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                new Node(STORAGE, 3), defaultAllUpClusterState(), SAFE,
+                UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeIfStorageNodeMissingFromNodeInfo(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+        String hostInfo = "{\n" +
+                "    \"cluster-state-version\": 2,\n" +
+                "    \"distributor\": {\n" +
+                "        \"storage-nodes\": [\n" +
+                "            {\n" +
+                "                \"node-index\": 0,\n" +
+                "                \"min-current-replication-factor\": " + requiredRedundancy + "\n" +
+                "            }\n" +
+                "        ]\n" +
+                "    }\n" +
+                "}\n";
+        setAllNodesUp(cluster, HostInfo.createHostInfo(hostInfo));
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                new Node(STORAGE, 1), defaultAllUpClusterState(), SAFE,
+                UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testMissingDistributorState(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+        cluster.clusterInfo()
+               .getStorageNodeInfo(1)
+               .setReportedState(new NodeState(STORAGE, UP), 0);
+
+        Result result = nodeStateChangeChecker.evaluateTransition(
+                storageNode, defaultAllUpClusterState(), SAFE, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Distributor node 0 has not reported any cluster state version yet.", result.reason());
+    }
+
+    private Result transitionToSameState(State state, String oldDescription, String newDescription, int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+
+        NodeState currentNodeState = createNodeState(state, oldDescription);
+        NodeState newNodeState = createNodeState(state, newDescription);
+        return nodeStateChangeChecker.evaluateTransition(
+                storageNode, defaultAllUpClusterState(), SAFE,
+                currentNodeState, newNodeState);
+    }
+
+    private Result transitionToSameState(String oldDescription, String newDescription, int maxNumberOfGroupsAllowedToBeDown) {
+        return transitionToSameState(MAINTENANCE, oldDescription, newDescription, maxNumberOfGroupsAllowedToBeDown);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSettingUpWhenUpCausesAlreadySet(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = transitionToSameState(UP, "foo", "bar", maxNumberOfGroupsAllowedToBeDown);
+        assertTrue(result.notAllowed());
+        assertTrue(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testSettingAlreadySetState(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = transitionToSameState("foo", "foo", maxNumberOfGroupsAllowedToBeDown);
+        assertFalse(result.allowed());
+        assertTrue(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testDifferentDescriptionImpliesDenied(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = transitionToSameState("foo", "bar", maxNumberOfGroupsAllowedToBeDown);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    private Result transitionToMaintenanceWithOneStorageNodeDown(ContentCluster cluster, ClusterState clusterState) {
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+
+        for (int x = 0; x < cluster.clusterInfo().getConfiguredNodes().size(); x++) {
+            cluster.clusterInfo().getDistributorNodeInfo(x).setReportedState(new NodeState(DISTRIBUTOR, UP), 0);
+            cluster.clusterInfo().getDistributorNodeInfo(x).setHostInfo(HostInfo.createHostInfo(createDistributorHostInfo(4, 5, 6)));
+            cluster.clusterInfo().getStorageNodeInfo(x).setReportedState(new NodeState(STORAGE, UP), 0);
+        }
+
+        return nodeStateChangeChecker.evaluateTransition(
+                storageNode, clusterState, SAFE, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+    }
+
+    private void setAllNodesUp(ContentCluster cluster, HostInfo distributorHostInfo) {
+        for (int x = 0; x < cluster.clusterInfo()
+                                   .getConfiguredNodes()
+                                   .size(); x++) {
+            State state = UP;
+            cluster.clusterInfo()
+                   .getDistributorNodeInfo(x)
+                   .setReportedState(new NodeState(DISTRIBUTOR, state), 0);
+            cluster.clusterInfo()
+                   .getDistributorNodeInfo(x)
+                   .setHostInfo(distributorHostInfo);
+            cluster.clusterInfo()
+                   .getStorageNodeInfo(x)
+                   .setReportedState(new NodeState(STORAGE, state), 0);
+        }
+    }
+
+    private Result transitionToMaintenanceWithNoStorageNodesDown(ContentCluster cluster, ClusterState clusterState) {
+        return transitionToMaintenanceWithOneStorageNodeDown(cluster, clusterState);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeWhenAllUp(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = transitionToMaintenanceWithNoStorageNodesDown(createCluster(4, maxNumberOfGroupsAllowedToBeDown), defaultAllUpClusterState());
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeWhenAllUpOrRetired(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = transitionToMaintenanceWithNoStorageNodesDown(createCluster(4, maxNumberOfGroupsAllowedToBeDown), defaultAllUpClusterState());
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCanUpgradeWhenStorageIsDown(int maxNumberOfGroupsAllowedToBeDown) {
+        ClusterState clusterState = defaultAllUpClusterState();
+        var storageNodeIndex = storageNode.getIndex();
+
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeState downNodeState = new NodeState(STORAGE, DOWN);
+        cluster.clusterInfo()
+               .getStorageNodeInfo(storageNodeIndex)
+               .setReportedState(downNodeState, 4 /* time */);
+        clusterState.setNodeState(new Node(STORAGE, storageNodeIndex), downNodeState);
+
+        Result result = transitionToMaintenanceWithOneStorageNodeDown(cluster, clusterState);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testCannotUpgradeWhenOtherStorageIsDown(int maxNumberOfGroupsAllowedToBeDown) {
+        int otherIndex = 2;
+        // If this fails, just set otherIndex to some other valid index.
+        assertNotEquals(storageNode.getIndex(), otherIndex);
+
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        ClusterState clusterState = defaultAllUpClusterState();
+        NodeState downNodeState = new NodeState(STORAGE, DOWN);
+        cluster.clusterInfo().getStorageNodeInfo(otherIndex).setReportedState(downNodeState, 4 /* time */);
+        clusterState.setNodeState(new Node(STORAGE, otherIndex), downNodeState);
+
+        Result result = transitionToMaintenanceWithOneStorageNodeDown(cluster, clusterState);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertTrue(result.reason().contains("Another storage node has state DOWN: 2"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testNodeRatioRequirementConsidersGeneratedNodeStates(int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+
+        markAllNodesAsReportingStateUp(cluster);
+
+        // Both minRatioOfStorageNodesUp and minStorageNodesUp imply that a single node being
+        // in state Down should halt the upgrade. This must also take into account the generated
+        // state, not just the reported state. In this case, all nodes are reported as being Up
+        // but one node has a generated state of Down.
+        ClusterState stateWithNodeDown = clusterState(Text.format(
+                "version:%d distributor:4 storage:4 .3.s:d",
+                currentClusterStateVersion));
+
+        Result result = evaluateTransition(cluster, storageNode, stateWithNodeDown,
+                                           UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+
+        settingToMaintenanceIsNotAllowed(storageNode.getIndex(), cluster, stateWithNodeDown,
+                                         "Another storage node has state DOWN: 3");
+    }
+
+    private record HostInfoMetrics(int bucketCount, Integer entryCountOrNull, Integer docCountOrNull) {
+        static HostInfoMetrics zero() { return new HostInfoMetrics(0, 0, 0); }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testDownDisallowedByNonRetiredState(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateDownTransition(defaultAllUpClusterState(),
+                                               UP,
+                                               currentClusterStateVersion,
+                                               HostInfoMetrics.zero(),
+                                               maxNumberOfGroupsAllowedToBeDown);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Only retired nodes are allowed to be set to DOWN in safe mode - is Up", result.reason());
+    }
+
+    private record MetricsAndMessage(HostInfoMetrics hostInfoMetrics, String expectedMessage) {}
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void down_disallowed_by_host_info_metrics_implying_node_still_stores_data(int maxNumberOfGroupsAllowedToBeDown) {
+        var disallowCases = List.of(
+                // Non-zero bucket count, and no entry/doc count metrics
+                new MetricsAndMessage(new HostInfoMetrics(1, null, null), "The storage node manages 1 buckets"),
+                // Non-zero bucket count and non-zero entries (note that we prefer reporting the entry count over the bucket count)
+                new MetricsAndMessage(new HostInfoMetrics(1, 2, 1), "The storage node stores 1 documents and 1 tombstones across 1 buckets"),
+
+                // These are cases that should not normally happen, but we test them nevertheless:
+                // Bucket count should never be zero if the entry count is > 0
+                new MetricsAndMessage(new HostInfoMetrics(0, 2, 1), "The storage node stores 1 documents and 1 tombstones across 0 buckets"),
+                // Entry count should never be zero if the document count is > 0
+                new MetricsAndMessage(new HostInfoMetrics(0, 0, 2), "The storage node reports 0 entries, but 2 documents"),
+                // Document count should always be present alongside entry count
+                new MetricsAndMessage(new HostInfoMetrics(0, 0, null), "The storage node host info reports stored entry count, but not document count")
+        );
+        for (var dc : disallowCases) {
+            Result result = evaluateDownTransition(
+                    retiredClusterStateSuffix(),
+                    UP,
+                    currentClusterStateVersion,
+                    dc.hostInfoMetrics,
+                    maxNumberOfGroupsAllowedToBeDown);
+            assertFalse(result.allowed());
+            assertFalse(result.isAlreadySet());
+            assertEquals(dc.expectedMessage, result.reason());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testDownDisallowedByReportedState(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateDownTransition(
+                retiredClusterStateSuffix(),
+                INITIALIZING,
+                currentClusterStateVersion,
+                HostInfoMetrics.zero(),
+                maxNumberOfGroupsAllowedToBeDown);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Reported state (Initializing) is not UP, so no bucket data is available", result.reason());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void testDownDisallowedByVersionMismatch(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateDownTransition(
+                retiredClusterStateSuffix(),
+                UP,
+                currentClusterStateVersion - 1,
+                HostInfoMetrics.zero(),
+                maxNumberOfGroupsAllowedToBeDown);
+        assertFalse(result.allowed());
+        assertFalse(result.isAlreadySet());
+        assertEquals("Cluster controller at version 2 got info for storage node 1 at a different version 1",
+                     result.reason());
+    }
+
+    // Legacy fallback when the content node does not report stored entry count (docs + tombstones)
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void allowed_to_set_down_when_no_buckets_without_entry_metrics(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateDownTransition(
+                retiredClusterStateSuffix(),
+                UP,
+                currentClusterStateVersion,
+                new HostInfoMetrics(0, null, null),
+                maxNumberOfGroupsAllowedToBeDown);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void allowed_to_set_down_when_no_stored_entries_or_buckets(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateDownTransition(
+                retiredClusterStateSuffix(),
+                UP,
+                currentClusterStateVersion,
+                HostInfoMetrics.zero(),
+                maxNumberOfGroupsAllowedToBeDown);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1})
+    void allowed_to_set_down_when_no_stored_entries_but_empty_buckets_are_present(int maxNumberOfGroupsAllowedToBeDown) {
+        Result result = evaluateDownTransition(
+                retiredClusterStateSuffix(),
+                UP,
+                currentClusterStateVersion,
+                // The node has (orphaned) buckets, but nothing is stored in them
+                new HostInfoMetrics(100, 0, 0),
+                maxNumberOfGroupsAllowedToBeDown);
+        assertTrue(result.allowed());
+        assertFalse(result.isAlreadySet());
+    }
+
+    private Result evaluateDownTransition(ClusterState clusterState,
+                                          State reportedState,
+                                          int hostInfoClusterStateVersion,
+                                          HostInfoMetrics hostInfoMetrics,
+                                          int maxNumberOfGroupsAllowedToBeDown) {
+        ContentCluster cluster = createCluster(4, maxNumberOfGroupsAllowedToBeDown);
+        NodeStateChangeChecker nodeStateChangeChecker = createChangeChecker(cluster);
+
+        StorageNodeInfo nodeInfo = cluster.clusterInfo().getStorageNodeInfo(storageNode.getIndex());
+        nodeInfo.setReportedState(new NodeState(STORAGE, reportedState), 0);
+        nodeInfo.setHostInfo(createHostInfoWithMetrics(hostInfoClusterStateVersion, hostInfoMetrics));
+
+        return nodeStateChangeChecker.evaluateTransition(
+                storageNode, clusterState, SAFE,
+                UP_NODE_STATE, DOWN_NODE_STATE);
+    }
+
+    private ClusterState retiredClusterStateSuffix() {
+        return clusterState(Text.format("version:%d distributor:4 storage:4 .%d.s:r",
+                                          currentClusterStateVersion,
+                                          storageNode.getIndex()));
+    }
+
+    private static String bucketSpacesMetricJsonIfNonNull(String metric, Integer lastValueOrNull) {
+        if (lastValueOrNull != null) {
+            // We fake the value for the global space; its actual value does not matter, as global
+            // document [entry] count is not taken into consideration for node removals (they are never
+            // moved away during retirement). We just want a unique value to test that we don't
+            // accidentally use the wrong dimension.
+            return Stream.of("default", "global")
+                    .map(bucketSpace ->
+                        Text.format("""
+                        {
+                            "name":"vds.datastored.bucket_space.%s",
+                            "values":{"last":%d},
+                            "dimensions":{"bucketSpace":"%s"}
+                        },""", metric, (lastValueOrNull + (bucketSpace.equals("default") ? 0 : 123)), bucketSpace))
+                    .collect(Collectors.joining("\n"));
+        }
+        return "";
+    }
+
+    private static HostInfo createHostInfoWithMetrics(int clusterStateVersion, HostInfoMetrics hostInfoMetrics) {
+        return HostInfo.createHostInfo(Text.format("""
+                        {
+                          "metrics":
+                          {
+                            "snapshot":
+                            {
+                              "from":1494940706,
+                              "to":1494940766
+                            },
+                            "values":
+                            [
+                              %s
+                              %s
+                              %s
+                              {
+                                "name":"vds.datastored.alldisks.buckets",
+                                "values":
+                                {
+                                  "last":%d
+                                },
+                                "dimensions":
+                                {
+                                }
+                              },
+                              {
+                                "name":"vds.datastored.alldisks.docs",
+                                "values":
+                                {
+                                  "last":154689587
+                                },
+                                "dimensions":
+                                {
+                                }
+                              }
+                            ]
+                          },
+                          "cluster-state-version":%d
+                        }""",
+                bucketSpacesMetricJsonIfNonNull("buckets_total", hostInfoMetrics.bucketCount),
+                bucketSpacesMetricJsonIfNonNull("entries",       hostInfoMetrics.entryCountOrNull),
+                bucketSpacesMetricJsonIfNonNull("docs",          hostInfoMetrics.docCountOrNull),
+                hostInfoMetrics.bucketCount, clusterStateVersion));
+    }
+
+    private List<ConfiguredNode> createNodes(int count) {
+        List<ConfiguredNode> nodes = new ArrayList<>();
+        for (int i = 0; i < count; i++)
+            nodes.add(new ConfiguredNode(i, false));
+        return nodes;
+    }
+
+    private StorDistributionConfig createDistributionConfig(int nodes) {
+        var configBuilder = new StorDistributionConfig.Builder()
+                .ready_copies(requiredRedundancy)
+                .redundancy(requiredRedundancy)
+                .initial_redundancy(requiredRedundancy);
+
+        var groupBuilder = new StorDistributionConfig.Group.Builder()
+                                    .index("invalid")
+                                    .name("invalid")
+                                    .capacity(nodes);
+        int nodeIndex = 0;
+        for (int j = 0; j < nodes; ++j, ++nodeIndex) {
+            groupBuilder.nodes(new StorDistributionConfig.Group.Nodes.Builder()
+                                       .index(nodeIndex));
+        }
+        configBuilder.group(groupBuilder);
+
+        return configBuilder.build();
+    }
+
+    // When more than 1 group
+    private StorDistributionConfig createDistributionConfig(int nodes, int groups) {
+        if (groups == 1) return createDistributionConfig(nodes);
+
+        if (nodes % groups != 0)
+            throw new IllegalArgumentException("Cannot have " + groups + " groups with an odd number of nodes: " + nodes);
+
+        int nodesPerGroup = nodes / groups;
+
+        var configBuilder = new StorDistributionConfig.Builder()
+                .active_per_leaf_group(true)
+                .ready_copies(groups)
+                .redundancy(groups)
+                .initial_redundancy(groups);
+
+        configBuilder.group(new StorDistributionConfig.Group.Builder()
+                                    .index("invalid")
+                                    .name("invalid")
+                                    .capacity(nodes)
+                                    .partitions("1|*"));
+
+        int nodeIndex = 0;
+        for (int i = 0; i < groups; ++i) {
+            var groupBuilder = new StorDistributionConfig.Group.Builder()
+                    .index(String.valueOf(i))
+                    .name(String.valueOf(i))
+                    .capacity(nodesPerGroup)
+                    .partitions("");
+            for (int j = 0; j < nodesPerGroup; ++j, ++nodeIndex) {
+                groupBuilder.nodes(new StorDistributionConfig.Group.Nodes.Builder()
+                                           .index(nodeIndex));
+            }
+            configBuilder.group(groupBuilder);
+        }
+        return configBuilder.build();
+    }
+
+    private Result settingToMaintenanceIsAllowed(int nodeIndex, ContentCluster cluster, ClusterState clusterState) {
+        return settingToMaintenanceIsAllowed(nodeIndex, cluster, clusterState, false);
+    }
+
+    private Result settingToMaintenanceIsAllowed(int nodeIndex, ContentCluster cluster, ClusterState clusterState, boolean isAlreadySet) {
+        Node node = new Node(STORAGE, nodeIndex);
+        Result result = evaluateTransition(cluster, node, clusterState, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertTrue(result.allowed(), result.toString());
+        assertEquals(isAlreadySet, result.isAlreadySet());
+        assertEquals("Preconditions fulfilled and new state different", result.reason());
+        return result;
+    }
+
+    private Result settingToMaintenanceIsNotAllowed(int nodeIndex, ContentCluster cluster, ClusterState clusterState, String reason) {
+        return settingToMaintenanceIsNotAllowed(new Node(STORAGE, nodeIndex), cluster, clusterState, reason);
+    }
+
+    private Result settingToMaintenanceIsNotAllowed(Node node, ContentCluster cluster, ClusterState clusterState, String reason) {
+        Result result = evaluateTransition(cluster, node, clusterState, UP_NODE_STATE, MAINTENANCE_NODE_STATE);
+        assertFalse(result.allowed(), result.toString());
+        assertFalse(result.isAlreadySet());
+        assertEquals(reason, result.reason());
+        return result;
+    }
+
+    private void setStorageNodeWantedStateToOrchestratorMaintenance(ContentCluster cluster, int nodeIndex) {
+        setStorageNodeWantedState(cluster, nodeIndex, MAINTENANCE, "Orchestrator");
+    }
+
+    private void setStorageNodeWantedState(ContentCluster cluster, int nodeIndex, State state, String description) {
+        NodeState nodeState = new NodeState(STORAGE, state);
+        var nodeInfo = cluster.clusterInfo().getStorageNodeInfo(nodeIndex);
+        nodeInfo.setWantedState(nodeState.setDescription(description));
+        nodeInfo.setWantedStateOrchestrationGeneration(cluster.orchestrationGeneration());
+    }
+
+    private void setDistributorNodeWantedState(ContentCluster cluster, int nodeIndex, State state, String description) {
+        NodeState nodeState = new NodeState(DISTRIBUTOR, state);
+        var nodeInfo = cluster.clusterInfo().getDistributorNodeInfo(nodeIndex);
+        nodeInfo.setWantedState(nodeState.setDescription(description));
+        nodeInfo.setWantedStateOrchestrationGeneration(cluster.orchestrationGeneration());
+    }
+
+    private Result evaluateTransition(ContentCluster cluster, Node node, ClusterState clusterState,
+                                      NodeState oldState, NodeState newState) {
+        return evaluateTransition(cluster, false, node, clusterState, oldState, newState);
+    }
+
+    private Result evaluateTransition(ContentCluster cluster, boolean inMoratorium, Node node, ClusterState clusterState,
+                                      NodeState oldState, NodeState newState) {
+        return evaluateTransition(cluster, inMoratorium, node, clusterState, SAFE, oldState, newState);
+    }
+
+    private Result evaluateTransition(ContentCluster cluster, boolean inMoratorium, Node node,
+                                      ClusterState clusterState, SetUnitStateRequest.Condition condition,
+                                      NodeState oldState, NodeState newState) {
+        return createChangeChecker(cluster, inMoratorium).evaluateTransition(node, clusterState, condition, oldState, newState);
+    }
+
+}

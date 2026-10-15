@@ -1,0 +1,444 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.flags;
+
+import com.yahoo.component.Vtag;
+import com.yahoo.vespa.defaults.Defaults;
+import com.yahoo.vespa.flags.custom.OpenTelemetrySettings;
+import com.yahoo.vespa.flags.custom.Sidecars;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.function.Predicate;
+
+import static com.yahoo.vespa.flags.Dimension.APPLICATION;
+import static com.yahoo.vespa.flags.Dimension.CLUSTER_ID;
+import static com.yahoo.vespa.flags.Dimension.CLUSTER_TYPE;
+import static com.yahoo.vespa.flags.Dimension.HOSTNAME;
+import static com.yahoo.vespa.flags.Dimension.INSTANCE_ID;
+import static com.yahoo.vespa.flags.Dimension.TENANT_ID;
+import static com.yahoo.vespa.flags.Dimension.VESPA_VERSION;
+
+/**
+ * Definitions of feature flags.
+ *
+ * <p>To use feature flags, define the flag in this class as an "unbound" flag, e.g. {@link UnboundBooleanFlag}
+ * or {@link UnboundStringFlag}. At the location you want to get the value of the flag, you need the following:</p>
+ *
+ * <ol>
+ *     <li>The unbound flag</li>
+ *     <li>A {@link FlagSource}. The flag source is typically available as an injectable component. Binding
+ *     an unbound flag to a flag source produces a (bound) flag, e.g. {@link BooleanFlag} and {@link StringFlag}.</li>
+ *     <li>If you would like your flag value to be dependent on e.g. the application ID, then 1. you should
+ *     declare this in the unbound flag definition in this file (referring to
+ *     {@link Dimension#INSTANCE_ID}), and 2. specify the application ID when retrieving the value, e.g.
+ *     {@link BooleanFlag#with(Dimension, String)}. See {@link FetchVector} for more info.</li>
+ * </ol>
+ *
+ * <p>Once the code is in place, you can override the flag value. This depends on the flag source, but typically
+ * there is a REST API for updating the flags in the config server, which is the root of all flag sources in the zone.</p>
+ *
+ * @author hakonhall
+ */
+public class Flags {
+
+    private static volatile TreeMap<FlagId, FlagDefinition> flags = new TreeMap<>();
+
+    public static final UnboundBooleanFlag USE_NON_PUBLIC_ENDPOINT_FOR_TEST = defineFeatureFlag(
+            "use-non-public-endpoint-for-test", false,
+            List.of("hakonhall"), "2025-03-19", "2026-11-27",
+            "Whether to use non-public endpoint in test and staging environments (except Azure since it's not supported yet)",
+            "Takes effect on next deployment of the application",
+            INSTANCE_ID, VESPA_VERSION);
+
+    public static final UnboundStringFlag RESPONSE_SEQUENCER_TYPE = defineStringFlag(
+            "response-sequencer-type", "ADAPTIVE",
+            List.of("hmusum"), "2020-12-02", "2026-12-01",
+            "Selects type of sequenced executor used for mbus responses, valid values are LATENCY, ADAPTIVE, THROUGHPUT",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+
+    public static final UnboundIntFlag RESPONSE_NUM_THREADS = defineIntFlag(
+            "response-num-threads", 2,
+            List.of("hmusum"), "2020-12-02", "2026-12-01",
+            "Number of threads used for mbus responses, default is 2, negative number = numcores/4",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+
+    public static final UnboundBooleanFlag USE_ASYNC_MESSAGE_HANDLING_ON_SCHEDULE = defineFeatureFlag(
+            "async-message-handling-on-schedule", true,
+            List.of("hmusum"), "2020-12-02", "2026-12-01",
+            "Optionally deliver async messages in own thread",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+
+    public static final UnboundIntFlag MBUS_JAVA_NUM_TARGETS = defineIntFlag(
+            "mbus-java-num-targets", 2,
+            List.of("hmusum"), "2022-07-05", "2026-12-01",
+            "Number of rpc targets per service",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+    public static final UnboundIntFlag MBUS_CPP_NUM_TARGETS = defineIntFlag(
+            "mbus-cpp-num-targets", 2,
+            List.of("hmusum"), "2022-07-05", "2026-12-01",
+            "Number of rpc targets per service",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+    public static final UnboundIntFlag RPC_NUM_TARGETS = defineIntFlag(
+            "rpc-num-targets", 2,
+            List.of("hmusum"), "2022-07-05", "2026-12-01",
+            "Number of rpc targets per content node",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+    public static final UnboundIntFlag MBUS_JAVA_EVENTS_BEFORE_WAKEUP = defineIntFlag(
+            "mbus-java-events-before-wakeup", 1,
+            List.of("hmusum"), "2022-07-05", "2026-12-01",
+            "Number of write events before waking up transport thread",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+    public static final UnboundIntFlag MBUS_CPP_EVENTS_BEFORE_WAKEUP = defineIntFlag(
+            "mbus-cpp-events-before-wakeup", 1,
+            List.of("hmusum"), "2022-07-05", "2026-12-01",
+            "Number of write events before waking up transport thread",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+    public static final UnboundIntFlag RPC_EVENTS_BEFORE_WAKEUP = defineIntFlag(
+            "rpc-events-before-wakeup", 1,
+            List.of("hmusum"), "2022-07-05", "2026-12-01",
+            "Number of write events before waking up transport thread",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+
+    public static final UnboundIntFlag MBUS_NUM_NETWORK_THREADS = defineIntFlag(
+            "mbus-num-network-threads", 1,
+            List.of("hmusum"), "2022-07-01", "2026-12-01",
+            "Number of threads used for mbus network",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+
+    public static final UnboundBooleanFlag WRITE_CONFIG_SERVER_SESSION_DATA_AS_ONE_BLOB = defineFeatureFlag(
+            "write-config-server-session-data-as-blob", false,
+            List.of("hmusum"), "2023-07-19", "2026-12-01",
+            "Whether to write config server session data in one blob or as individual paths",
+            "Takes effect immediately");
+
+    public static final UnboundBooleanFlag READ_CONFIG_SERVER_SESSION_DATA_AS_ONE_BLOB = defineFeatureFlag(
+            "read-config-server-session-data-as-blob", false,
+            List.of("hmusum"), "2023-07-19", "2026-12-01",
+            "Whether to read config server session data from session data blob or from individual paths",
+            "Takes effect immediately");
+
+    public static final UnboundBooleanFlag REQUIRE_EXPLICIT_DOCPROC_CLUSTER = defineFeatureFlag(
+            "require-explicit-docproc-cluster", true,
+            List.of("hmusum"), "2026-05-26", "2026-12-01",
+            "Whether to require an explicit document-processing cluster to be configured in content clusters when there is more than one container cluster",
+            "Takes effect at redeployment",
+            APPLICATION, INSTANCE_ID, TENANT_ID);
+
+    public static final UnboundJacksonFlag<OpenTelemetrySettings> OPENTELEMETRY_SDK = defineJacksonFlag(
+            "opentelemetry-sdk", OpenTelemetrySettings.createDisabled(), OpenTelemetrySettings.class,
+            List.of("onur"), "2026-06-16", "2026-12-31",
+            "Configuration for Vespa's OpenTelemetry SDK (tracing) in the container: enabled, samplingRatio. When disabled the provider hands out a no-op OpenTelemetry that produces nothing",
+            "Takes effect at redeployment",
+            __ -> true,
+            APPLICATION, INSTANCE_ID);
+
+    public static final UnboundBooleanFlag USE_LEGACY_WAND_QUERY_PARSING = defineFeatureFlag(
+            "use-legacy-wand-query-parsing", true,
+            List.of("arnej"), "2023-07-26", "2027-01-01",
+            "If true, force legacy mode for weakAnd query parsing",
+            "Takes effect at redeployment",
+            INSTANCE_ID);
+
+    public static final UnboundJacksonFlag<Sidecars> SIDECARS_FOR_TEST = defineJacksonFlag(
+            "sidecars-for-test", Sidecars.DEFAULT, Sidecars.class,
+            List.of("glebashnik"), "2025-04-25", "2026-12-01",
+            "Specifies configuration for sidecars to testing provisioning",
+            "Takes effect at redeployment",
+            __ -> true,
+            APPLICATION
+    );
+
+    public static final UnboundBooleanFlag USE_TRITON = defineFeatureFlag(
+            "use-triton", false,
+            List.of("glebashnik"), "2025-04-30", "2026-12-01",
+            "Whether to use Triton as ONNX runtime",
+            "Takes effect at redeployment (requires restart)",
+            TENANT_ID, APPLICATION, INSTANCE_ID, CLUSTER_TYPE, CLUSTER_ID, VESPA_VERSION
+    );
+
+    public static final UnboundBooleanFlag TRITON_SHARE_ONNX_SESSION = defineFeatureFlag(
+            "triton-share-onnx-session", false,
+            List.of("glebashnik"), "2026-09-04", "2026-12-01",
+            "Whether model instances in Triton share one ONNX Runtime session per device instead of each loading " +
+            "the model. To be effective, it requires a Triton sidecar image with the share_session_between_instances patch.",
+            "Takes effect at redeployment (requires restart)",
+            TENANT_ID, APPLICATION, INSTANCE_ID, CLUSTER_TYPE, CLUSTER_ID, VESPA_VERSION
+    );
+
+    public static final UnboundIntFlag METRICS_PROXY_HEAP_SIZE_IN_MIB = defineIntFlag(
+            "metrics-proxy-heap-size-in-mib", 0,
+            List.of("hmusum"), "2026-04-29", "2026-12-01",
+            "Amount of memory (in MiB) to use for metrics proxy JVM heap on non-admin nodes. 0 means use the default.",
+            "Takes effect at redeployment",
+            TENANT_ID, APPLICATION, INSTANCE_ID, CLUSTER_TYPE, CLUSTER_ID, VESPA_VERSION);
+
+    public static final UnboundIntFlag METRICS_PROXY_ADMIN_HEAP_SIZE_IN_MIB = defineIntFlag(
+            "metrics-proxy-admin-heap-size-in-mib", 0,
+            List.of("hmusum"), "2026-04-29", "2026-12-01",
+            "Amount of memory (in MiB) to use for metrics proxy JVM heap on admin nodes. 0 means use the default.",
+            "Takes effect at redeployment",
+            TENANT_ID, APPLICATION, INSTANCE_ID);
+
+    public static final UnboundDoubleFlag SEARCHNODE_RESERVED_MEMORY_FACTOR = defineDoubleFlag(
+        "searchnode-reserved-memory-factor", 0.0,
+        List.of("toregge"), "2026-06-09", "2027-02-10",
+        "How much of the calculated reserved memory should be added to the used memory when " +
+            "reporting memory usage. " +
+            "0.0 means none at all, 1.0 means the all of the reserved memory.",
+        "Takes effect at redeployment.",
+        INSTANCE_ID
+    );
+
+    public static final UnboundBooleanFlag FAIL_WHEN_CONFIGURING_INDEXED_MAP_OF_ARRAY = defineFeatureFlag(
+            "fail-when-configuring-indexed-map-of-array", true,
+            List.of("hmusum"), "2026-07-01", "2026-11-13",
+            "Whether to fail a deployment when an indexed map of array is used in a schema",
+            "Takes effect at redeployment",
+            INSTANCE_ID
+    );
+
+    public static final UnboundBooleanFlag FAST_MAP_SEARCH = defineFeatureFlag(
+            "fast-map-search", true,
+            List.of("johsol", "boeker", "arnej"), "2026-08-13", "2027-02-13",
+            "Whether to enable fast map search for map fields in a schema.",
+            "Takes effect at redeployment",
+            INSTANCE_ID
+    );
+
+    // TODO (@sebasabe): Remove when no loaded config model version reads it (models older than the release adding PRODUCT_DISCOVERY), together with its flag data
+    public static final UnboundBooleanFlag COMMERCE_DISCOVERY = defineFeatureFlag(
+            "commerce-discovery", false,
+            List.of("sebasabe"), "2026-08-31", "2027-08-31",
+            "Whether the commerce-discovery element in services.xml is enabled",
+            "Takes effect at redeployment",
+            TENANT_ID
+    );
+
+    public static final UnboundIntFlag APPLICATION_UPDATE_ROLLOUT_PERCENT = defineIntFlag(
+            "application-update-rollout-percent", 0,
+            List.of("gjoranv"), "2026-09-09", "2027-03-08",
+            "Temporary percentage of applications selected for rollout, from 0 to 100",
+            "Takes effect on the next prepare. Lowering the percentage can restore previous behavior.",
+            TENANT_ID, APPLICATION, INSTANCE_ID);
+
+    public static final UnboundBooleanFlag ENABLE_LANDLOCK = defineFeatureFlag(
+            "enable-landlock", false,
+            List.of("hmusum", "vekterli"), "2026-09-25", "2027-03-08",
+            "Whether to set env variables enabling Landlock for sandboxing.",
+            "Takes effect on the next deployment.",
+            TENANT_ID, APPLICATION, INSTANCE_ID);
+
+    public static final UnboundBooleanFlag ENABLE_LEGACY_FEED_HANDLER = defineFeatureFlag(
+            "enable-legacy-feed-handler", true,
+            List.of("hmusum"), "2026-10-09", "2027-04-01",
+            "Whether to add the legacy feed handler (/reserved-for-internal-use/feedapi) to container clusters with document-api.",
+            "Takes effect on the next deployment.",
+            TENANT_ID, APPLICATION, INSTANCE_ID);
+
+    public static final UnboundBooleanFlag PRODUCT_DISCOVERY = defineFeatureFlag(
+            "product-discovery", false,
+            List.of("sebasabe"), "2026-10-09", "2027-10-09",
+            "Whether the product-discovery element in services.xml is enabled",
+            "Takes effect at redeployment",
+            TENANT_ID
+    );
+
+    public static UnboundBooleanFlag defineFeatureFlag(String flagId, boolean defaultValue, List<String> owners,
+                                                       String createdAt, String expiresAt, String description,
+                                                       String modificationEffect, Dimension... dimensions) {
+        return define(UnboundBooleanFlag::new, flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static UnboundStringFlag defineStringFlag(String flagId, String defaultValue, List<String> owners,
+                                                     String createdAt, String expiresAt, String description,
+                                                     String modificationEffect, Dimension... dimensions) {
+        return defineStringFlag(flagId, defaultValue, owners,
+                                createdAt, expiresAt, description,
+                                modificationEffect, value -> true,
+                                dimensions);
+    }
+
+    public static UnboundStringFlag defineStringFlag(String flagId, String defaultValue, List<String> owners,
+                                                     String createdAt, String expiresAt, String description,
+                                                     String modificationEffect, Predicate<String> validator,
+                                                     Dimension... dimensions) {
+        return define((i, d, v) -> new UnboundStringFlag(i, d, v, validator),
+                      flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static UnboundIntFlag defineIntFlag(String flagId, int defaultValue, List<String> owners,
+                                               String createdAt, String expiresAt, String description,
+                                               String modificationEffect, Dimension... dimensions) {
+        return define(UnboundIntFlag::new, flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static UnboundLongFlag defineLongFlag(String flagId, long defaultValue, List<String> owners,
+                                                 String createdAt, String expiresAt, String description,
+                                                 String modificationEffect, Dimension... dimensions) {
+        return define(UnboundLongFlag::new, flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static UnboundDoubleFlag defineDoubleFlag(String flagId, double defaultValue, List<String> owners,
+                                                     String createdAt, String expiresAt, String description,
+                                                     String modificationEffect, Dimension... dimensions) {
+        return define(UnboundDoubleFlag::new, flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static <T> UnboundCodecFlag<T> defineCodecFlag(String flagId, T defaultValue, List<String> owners,
+                                                          String createdAt, String expiresAt, String description,
+                                                          String modificationEffect, Codec<T> codec,
+                                                          Predicate<T> validator, Dimension... dimensions) {
+        TypedUnboundFlagFactory<T, UnboundCodecFlag<T>> factory = (FlagId flagId_, T defaultValue_, FetchVector defaultFetchVector_) ->
+                new UnboundCodecFlag<T>(flagId_, defaultValue_, defaultFetchVector_, codec, validator);
+        return define(factory, flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static <T> UnboundJacksonFlag<T> defineJacksonFlag(String flagId, T defaultValue, Class<T> jacksonClass, List<String> owners,
+                                                              String createdAt, String expiresAt, String description,
+                                                              String modificationEffect, Predicate<T> validator, Dimension... dimensions) {
+        return define((id2, defaultValue2, vector2) -> new UnboundJacksonFlag<>(id2, defaultValue2, vector2, jacksonClass, validator),
+                      flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static <T> UnboundListFlag<T> defineListFlag(String flagId, List<T> defaultValue, Class<T> elementClass,
+                                                        List<String> owners, String createdAt, String expiresAt,
+                                                        String description, String modificationEffect, Dimension... dimensions) {
+        return define((fid, dval, fvec) -> new UnboundListFlag<>(fid, dval, elementClass, fvec),
+                flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    public static <T> UnboundListFlag<T> defineListFlag(String flagId, List<T> defaultValue, Class<T> elementClass,
+                                                        List<String> owners, String createdAt, String expiresAt,
+                                                        String description, String modificationEffect,
+                                                        Predicate<List<T>> validator, Dimension... dimensions) {
+        return define((fid, dval, fvec) -> new UnboundListFlag<>(fid, dval, elementClass, fvec, validator),
+                flagId, defaultValue, owners, createdAt, expiresAt, description, modificationEffect, dimensions);
+    }
+
+    @FunctionalInterface
+    private interface TypedUnboundFlagFactory<T, U extends UnboundFlag<?, ?, ?>> {
+        U create(FlagId id, T defaultValue, FetchVector defaultFetchVector);
+    }
+
+    /**
+     * Defines a Flag.
+     *
+     * @param factory            Factory for creating unbound flag of type U
+     * @param flagId             The globally unique FlagId.
+     * @param defaultValue       The default value if none is present after resolution.
+     * @param description        Description of how the flag is used.
+     * @param modificationEffect What is required for the flag to take effect? A restart of process? immediately? etc.
+     * @param dimensions         What dimensions will be set in the {@link FetchVector} when fetching
+     *                           the flag value in
+     *                           {@link FlagSource#fetch(FlagId, FetchVector) FlagSource::fetch}.
+     *                           For instance, if APPLICATION is one of the dimensions here, you should make sure
+     *                           APPLICATION is set to the ApplicationId in the fetch vector when fetching the RawFlag
+     *                           from the FlagSource.
+     *                           SYSTEM, CLOUD, ENVIRONMENT, and ZONE_ID are special:  These dimensions are resolved just
+     *                           before the flag data is published to a zone.  This means there is never any need to set
+     *                           these dimensions when resolving a flag, and setting these dimensions just before resolving
+     *                           the flag will have no effect.
+     *                           There is one exception.  If any of these dimensions are declared when defining a flag,
+     *                           then those dimensions are NOT resolved when published to the controllers.  This allows
+     *                           the controller to resolve the flag to different values based on which cloud or zone
+     *                           it is operating on.  Flags should NOT declare these dimensions unless they intend to
+     *                           use them in the controller in this way.
+     * @param <T>                The boxed type of the flag value, e.g. Boolean for flags guarding features.
+     * @param <U>                The type of the unbound flag, e.g. UnboundBooleanFlag.
+     * @return An unbound flag with {@link Dimension#HOSTNAME HOSTNAME} and
+     *         {@link Dimension#VESPA_VERSION VESPA_VERSION} already set. The ZONE environment
+     *         is typically implicit.
+     */
+    private static <T, U extends UnboundFlag<?, ?, ?>> U define(TypedUnboundFlagFactory<T, U> factory,
+                                                                String flagId,
+                                                                T defaultValue,
+                                                                List<String> owners,
+                                                                String createdAt,
+                                                                String expiresAt,
+                                                                String description,
+                                                                String modificationEffect,
+                                                                Dimension[] dimensions) {
+        FlagId id = new FlagId(flagId);
+        FetchVector vector = new FetchVector()
+                .with(HOSTNAME, Defaults.getDefaults().vespaHostname())
+                // Warning: In unit tests and outside official Vespa releases, the currentVersion is e.g. 7.0.0
+                // (determined by the current major version). Consider not setting VESPA_VERSION if minor = micro = 0.
+                .with(VESPA_VERSION, Vtag.currentVersion.toFullString());
+        U unboundFlag = factory.create(id, defaultValue, vector);
+        FlagDefinition definition = new FlagDefinition(
+                unboundFlag, owners, parseDate(createdAt), parseDate(expiresAt), description, modificationEffect, dimensions);
+        if (flags.put(id, definition) != null)
+            throw new IllegalStateException("There are multiple definitions of the " + id + " flag");
+        return unboundFlag;
+    }
+
+    private static Instant parseDate(String rawDate) {
+        return DateTimeFormatter.ISO_DATE.parse(rawDate, LocalDate::from).atStartOfDay().toInstant(ZoneOffset.UTC);
+    }
+
+    public static List<FlagDefinition> getAllFlags() {
+        return List.copyOf(flags.values());
+    }
+
+    public static Optional<FlagDefinition> getFlag(FlagId flagId) {
+        return Optional.ofNullable(flags.get(flagId));
+    }
+
+    /**
+     * Allows the statically defined flags to be controlled in a test.
+     *
+     * <p>Returns a Replacer instance to be used with e.g. a try-with-resources block. Within the block,
+     * the flags starts out as cleared. Flags can be defined, etc. When leaving the block, the flags from
+     * before the block is reinserted.
+     *
+     * <p>NOT thread-safe. Tests using this cannot run in parallel.
+     */
+    public static Replacer clearFlagsForTesting(FlagId... flagsToKeep) {
+        return new Replacer(flagsToKeep);
+    }
+
+    public static class Replacer implements AutoCloseable {
+        private static volatile boolean flagsCleared = false;
+
+        private final TreeMap<FlagId, FlagDefinition> savedFlags;
+
+        private Replacer(FlagId... flagsToKeep) {
+            verifyAndSetFlagsCleared(true);
+            this.savedFlags = Flags.flags;
+            Flags.flags = new TreeMap<>();
+            List.of(flagsToKeep).forEach(id -> Flags.flags.put(id, savedFlags.get(id)));
+        }
+
+        @Override
+        public void close() {
+            verifyAndSetFlagsCleared(false);
+            Flags.flags = savedFlags;
+        }
+
+        /**
+         * Used to implement a simple verification that Replacer is not used by multiple threads.
+         * For instance two different tests running in parallel cannot both use Replacer.
+         */
+        private static void verifyAndSetFlagsCleared(boolean newValue) {
+            if (flagsCleared == newValue) {
+                throw new IllegalStateException("clearFlagsForTesting called while already cleared - running tests in parallell!?");
+            }
+            flagsCleared = newValue;
+        }
+    }
+}

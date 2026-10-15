@@ -1,0 +1,94 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "summaryflushtarget.h"
+
+#include <vespa/vespalib/util/lambdatask.h>
+
+using search::IDocumentStore;
+using search::SerialNum;
+using searchcorespi::FlushStats;
+using searchcorespi::IFlushTarget;
+
+namespace proton {
+
+namespace {
+
+class Flusher : public searchcorespi::FlushTask {
+private:
+    IDocumentStore& _docStore;
+    FlushStats&     _stats;
+    SerialNum       _currSerial;
+
+public:
+    Flusher(IDocumentStore& docStore, FlushStats& stats, SerialNum currSerial)
+        : _docStore(docStore), _stats(stats), _currSerial(currSerial) {
+        _currSerial = _docStore.initFlush(currSerial);
+    }
+    void run() override {
+        _docStore.flush(_currSerial);
+        updateStats();
+    }
+    void updateStats() {
+        // the target must live until this task is done (handled by flush engine).
+        _stats.setPath(_docStore.getBaseDir());
+    }
+
+    SerialNum getFlushSerial() const override { return _currSerial; }
+};
+
+} // namespace
+
+SummaryFlushTarget::SummaryFlushTarget(IDocumentStore& docStore, vespalib::Executor& summaryService)
+    : LeafFlushTarget("summary.flush", Type::SYNC, Component::DOCUMENT_STORE),
+      _docStore(docStore),
+      _summaryService(summaryService),
+      _lastStats() {
+    _lastStats.setPathElementsToLog(6);
+}
+
+IFlushTarget::MemoryGain SummaryFlushTarget::getApproxMemoryGain() const {
+    return MemoryGain(_docStore.memoryUsed(), _docStore.memoryMeta());
+}
+
+IFlushTarget::Time SummaryFlushTarget::getLastFlushTime() const {
+    return _docStore.getLastFlushTime();
+}
+
+SerialNum SummaryFlushTarget::getFlushedSerialNum() const {
+    return _docStore.lastSyncToken();
+}
+
+void SummaryFlushTarget::internal_init_flush(SerialNum currentSerial, TaskPromise task_promise) {
+    // called by summary executor
+    task_promise.set_value(std::make_unique<Flusher>(_docStore, _lastStats, currentSerial));
+}
+
+void SummaryFlushTarget::init_flush(SerialNum   currentSerial, std::shared_ptr<search::IFlushToken>,
+                                    TaskPromise task_promise) {
+    // Called by document db executor
+    TaskPromise proxied_task_promise;
+    auto        future_task = proxied_task_promise.get_future();
+    _summaryService.execute(
+        vespalib::makeLambdaTask([&, proxied_task_promise(std::move(proxied_task_promise))]() mutable {
+            internal_init_flush(currentSerial, std::move(proxied_task_promise));
+        }));
+    task_promise.set_value(future_task.get());
+}
+
+bool SummaryFlushTarget::can_flush(SerialNum current_serial) const noexcept {
+    return current_serial > _docStore.lastSyncToken();
+}
+
+size_t SummaryFlushTarget::reserved_memory_for_flush() const noexcept {
+    return 0;
+}
+
+std::chrono::steady_clock::duration SummaryFlushTarget::last_flush_duration() const noexcept {
+    return 2s; // placeholder value.
+}
+
+std::chrono::steady_clock::duration SummaryFlushTarget::estimated_flush_duration() const noexcept {
+    return 2s; // placeholder value.
+}
+
+} // namespace proton

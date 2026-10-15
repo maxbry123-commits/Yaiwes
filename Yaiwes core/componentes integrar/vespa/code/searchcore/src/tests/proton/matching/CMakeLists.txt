@@ -1,0 +1,100 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+vespa_add_executable(searchcore_ann_deadline_configuration_test_app TEST
+    SOURCES
+    ann_deadline_configuration_test.cpp
+    DEPENDS
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_ann_deadline_configuration_test_app COMMAND searchcore_ann_deadline_configuration_test_app)
+vespa_add_executable(searchcore_matching_test_app TEST
+    SOURCES
+    matching_test.cpp
+    DEPENDS
+    searchcore_test
+    searchcore_server
+    searchcore_matching
+    searchcore_feedoperation
+    searchcore_documentmetastore
+    searchcore_bucketdb
+    searchcore_pcommon
+    searchcore_grouping
+    searchlib_test
+)
+vespa_add_test(NAME searchcore_matching_test_app COMMAND searchcore_matching_test_app COST 100)
+vespa_add_executable(searchcore_sessionmanager_test_app TEST
+    SOURCES
+    sessionmanager_test.cpp
+    DEPENDS
+    searchcore_matching
+    searchcore_grouping
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_sessionmanager_test_app COMMAND searchcore_sessionmanager_test_app)
+vespa_add_executable(searchcore_sort_feature_store_test_app TEST
+    SOURCES
+    sort_feature_store_test.cpp
+    DEPENDS
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_sort_feature_store_test_app COMMAND searchcore_sort_feature_store_test_app)
+vespa_add_executable(searchcore_matching_stats_test_app TEST
+    SOURCES
+    matching_stats_test.cpp
+    DEPENDS
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_matching_stats_test_app COMMAND searchcore_matching_stats_test_app)
+vespa_add_executable(searchcore_query_test_app TEST
+    SOURCES
+    query_test.cpp
+    DEPENDS
+    searchcore_server
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_query_test_app COMMAND searchcore_query_test_app)
+vespa_add_executable(searchcore_termdataextractor_test_app TEST
+    SOURCES
+    termdataextractor_test.cpp
+    DEPENDS
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_termdataextractor_test_app COMMAND searchcore_termdataextractor_test_app)
+vespa_add_executable(searchcore_resolveviewvisitor_test_app TEST
+    SOURCES
+    resolveviewvisitor_test.cpp
+    DEPENDS
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_resolveviewvisitor_test_app COMMAND searchcore_resolveviewvisitor_test_app)
+vespa_add_executable(searchcore_querynodes_test_app TEST
+    SOURCES
+    querynodes_test.cpp
+    DEPENDS
+    searchlib_queryeval_test
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_querynodes_test_app COMMAND searchcore_querynodes_test_app)
+vespa_add_executable(searchcore_queryenvironment_test_app TEST
+    SOURCES
+    queryenvironment_test.cpp
+    DEPENDS
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_queryenvironment_test_app COMMAND searchcore_queryenvironment_test_app)
+vespa_add_executable(searchcore_tag_needed_handles_test_app TEST
+    SOURCES
+    tag_needed_handles_test.cpp
+    DEPENDS
+    searchcore_server
+    searchcore_matching
+    GTest::gtest
+)
+vespa_add_test(NAME searchcore_tag_needed_handles_test_app COMMAND searchcore_tag_needed_handles_test_app)

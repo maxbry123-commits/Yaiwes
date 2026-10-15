@@ -1,0 +1,540 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.schema.parser;
+
+import com.yahoo.config.model.api.ModelContext;
+import com.yahoo.document.DataType;
+import com.yahoo.document.MapDataType;
+import com.yahoo.schema.document.GeoPos;
+import com.yahoo.schema.document.QuantizationParams;
+import com.yahoo.schema.parser.ConvertParsedTypes.TypeResolver;
+import com.yahoo.schema.Index;
+import com.yahoo.schema.Schema;
+import com.yahoo.schema.document.Attribute;
+import com.yahoo.schema.document.BooleanIndexDefinition;
+import com.yahoo.schema.document.Case;
+import com.yahoo.schema.document.Dictionary;
+import com.yahoo.schema.document.FastMapSearchFields;
+import com.yahoo.schema.document.NormalizeLevel;
+import com.yahoo.schema.document.RankType;
+import com.yahoo.schema.document.SDDocumentType;
+import com.yahoo.schema.document.SDField;
+import com.yahoo.schema.document.Sorting;
+import com.yahoo.schema.document.annotation.SDAnnotationType;
+import com.yahoo.vespa.documentmodel.SummaryElementsSelector;
+import com.yahoo.vespa.documentmodel.SummaryField;
+import com.yahoo.vespa.documentmodel.SummaryTransform;
+
+import java.util.Locale;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.regex.Pattern;
+
+/**
+ * Helper for converting ParsedField etc. to SDField with settings
+ *
+ * @author arnej27959
+ */
+public class ConvertParsedFields {
+
+    private final TypeResolver context;
+    private final Map<String, SDDocumentType> structProxies;
+    private final ModelContext.Properties properties;
+
+    ConvertParsedFields(TypeResolver context, Map<String, SDDocumentType> structProxies,
+                        ModelContext.Properties properties) {
+        this.context = context;
+        this.structProxies = structProxies;
+        this.properties = properties;
+    }
+
+    static void caseHandling(SDField field, Case casing) {
+        field.setMatchingCase(casing);
+        if (casing == Case.CASED) {
+            var dictionary = field.getOrSetDictionary();
+            dictionary.updateMatch(casing);
+        }
+    }
+
+    static void convertMatchSettings(SDField field, ParsedMatchSettings parsed) {
+        parsed.getMatchType().ifPresent(matchingType -> field.setMatchingType(matchingType));
+        parsed.getMatchCase().ifPresent(casing -> caseHandling(field, casing));
+        parsed.getGramSize().ifPresent(gramSize -> field.getMatching().setGramSize(gramSize));
+        parsed.getMaxLength().ifPresent(maxLength -> field.getMatching().maxLength(maxLength));
+        parsed.getMaxTermOccurrences().ifPresent(maxTermOccurrences -> field.getMatching().maxTermOccurrences(maxTermOccurrences));
+        parsed.getMaxTokenLength().ifPresent(maxTokenLength -> field.getMatching().maxTokenLength(maxTokenLength));
+        parsed.getMatchAlgorithm().ifPresent
+                (matchingAlgorithm -> field.setMatchingAlgorithm(matchingAlgorithm));
+        parsed.getExactTerminator().ifPresent
+                (exactMatchTerminator -> field.getMatching().setExactMatchTerminator(exactMatchTerminator));
+    }
+
+    void convertSorting(Schema schema, SDField field, ParsedSorting parsed, String name) {
+        Attribute attribute = field.getAttributes().get(name);
+        if (attribute == null) {
+            attribute = new Attribute(schema.getName(), field.getName(), name, field.getDataType());
+            field.addAttribute(attribute);
+        }
+        Sorting sorting = attribute.getSorting();
+        if (parsed.getAscending()) {
+            sorting.setAscending();
+        } else {
+            sorting.setDescending();
+        }
+        parsed.getFunction().ifPresent(function -> sorting.setFunction(function));
+        parsed.getStrength().ifPresent(strength -> sorting.setStrength(strength));
+        parsed.getLocale().ifPresent(locale -> sorting.setLocale(locale));
+    }
+
+    void convertAttribute(Schema schema, SDField field, ParsedAttribute parsed) {
+        if (GeoPos.isAnyPos(field.getDataType())) {
+            convertPositionAttribute(schema, field, parsed);
+            return;
+        }
+        String name = parsed.name();
+        String fieldName = field.getName();
+        Attribute attribute = null;
+        if (fieldName.endsWith("." + name)) {
+            attribute = field.getAttributes().get(field.getName());
+        }
+        if (attribute == null) {
+            attribute = field.getAttributes().get(name);
+            if (attribute == null) {
+                attribute = new Attribute(schema.getName(), field.getName(), name, field.getDataType());
+                field.addAttribute(attribute);
+            }
+        }
+        attribute.setPaged(parsed.getPaged());
+        attribute.setFastSearch(parsed.getFastSearch());
+        if (parsed.getFastRank()) {
+            attribute.setFastRank(parsed.getFastRank());
+        }
+        attribute.setFastAccess(parsed.getFastAccess());
+        attribute.setMutable(parsed.getMutable());
+        attribute.setEnableOnlyBitVector(parsed.getEnableOnlyBitVector());
+        if (parsed.hasQuantization()) {
+            attribute.setQuantizationParams(QuantizationParams.ofBits(parsed.quantization().bits()));
+        }
+
+        // attribute.setTensorType(?)
+
+        for (String alias : parsed.getAliases()) {
+            field.getAliasToName().put(alias, parsed.lookupAliasedFrom(alias));
+        }
+        var distanceMetric = parsed.getDistanceMetric();
+        if (distanceMetric.isPresent()) {
+            String upper = distanceMetric.get().toUpperCase(Locale.ENGLISH);
+            upper = upper.replace('-', '_');
+            attribute.setDistanceMetric(Attribute.DistanceMetric.valueOf(upper));
+        }
+        var sorting = parsed.getSorting();
+        if (sorting.isPresent()) {
+            convertSorting(schema, field, sorting.get(), name);
+        }
+    }
+
+    private void convertPositionAttribute(Schema schema, SDField field, ParsedAttribute parsed) {
+        String fieldName = field.getName();
+
+        // Attribute settings on a position field only make sense if the field actually does attributing
+        if (!field.doesAttributing()) {
+            throw new IllegalArgumentException("For schema '" + schema.getName() +
+                "', field '" + fieldName + "': attribute properties require 'attribute' in the indexing statement");
+        }
+
+        // Reject renamed attributes — position fields only support the default attribute block
+        if (!parsed.name().equals(fieldName)) {
+            throw new IllegalArgumentException("For schema '" + schema.getName() +
+                "', field '" + fieldName + "': position fields do not support named attribute '" + parsed.name() + "'");
+        }
+
+        // Reject settings that are nonsensical or unsupported for position fields
+        if (parsed.getFastRank() || parsed.getMutable() || parsed.getEnableOnlyBitVector()
+                || parsed.getDistanceMetric().isPresent() || parsed.getSorting().isPresent()
+                || !parsed.getAliases().isEmpty()) {
+            throw new IllegalArgumentException("For schema '" + schema.getName() +
+                "', field '" + fieldName + "': position fields only support 'fast-search', 'fast-access', and 'paged' attribute settings");
+        }
+
+        // If only fast-search or empty: no-op. CreatePositionZCurve already sets fast-search on the zcurve attribute.
+        // Avoid creating an Attribute here so AttributesImplicitWord (which runs before CreatePositionZCurve) does not
+        // see a non-empty attributes map and flip this field to WORD matching.
+        if (!parsed.getFastAccess() && !parsed.getPaged()) {
+            return;
+        }
+
+        // Create a temporary Attribute to carry fast-access/paged to CreatePositionZCurve
+        boolean isArray = GeoPos.isPosArray(field.getDataType());
+        Attribute attribute = new Attribute(fieldName, Attribute.Type.LONG,
+            isArray ? Attribute.CollectionType.ARRAY : Attribute.CollectionType.SINGLE);
+        attribute.setFastAccess(parsed.getFastAccess());
+        attribute.setPaged(parsed.getPaged());
+        field.addAttribute(attribute);
+    }
+
+    private void convertRankType(SDField field, String indexName, String rankType) {
+        RankType type = RankType.fromString(rankType);
+        if (indexName == null || indexName.equals("")) {
+            field.setRankType(type); // Set default if the index is not specified.
+        } else {
+            Index index = field.getIndex(indexName);
+            if (index == null) {
+                index = new Index(indexName);
+                field.addIndex(index);
+            }
+            index.setRankType(type);
+        }
+    }
+
+    private void convertNormalizing(SDField field, String setting) {
+        NormalizeLevel.Level level;
+        if ("none".equals(setting)) {
+            level = NormalizeLevel.Level.NONE;
+        } else if ("codepoint".equals(setting)) {
+            level = NormalizeLevel.Level.CODEPOINT;
+        } else if ("lowercase".equals(setting)) {
+            level = NormalizeLevel.Level.LOWERCASE;
+        } else if ("accent".equals(setting)) {
+            level = NormalizeLevel.Level.ACCENT;
+        } else if ("all".equals(setting)) {
+            level = NormalizeLevel.Level.ACCENT;
+        } else {
+            throw new IllegalArgumentException("invalid normalizing setting: " + setting);
+        }
+        field.setNormalizing(new NormalizeLevel(level, true));
+    }
+
+    // from grammar, things that can be inside struct-field block
+    private void convertCommonFieldSettings(Schema schema, SDField field, ParsedField parsed) {
+        try {
+            convertMatchSettings(field, parsed.matchSettings());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("For schema '" + schema.getName() + "', field '" + field.getName() + "': " + e.getMessage());
+        }
+        var indexing = parsed.getIndexing();
+        if (indexing.isPresent()) {
+            field.setIndexingScript(schema.getName(), indexing.get().script());
+        }
+        if (field.doesAttributing() && !GeoPos.isAnyPos(field.getDataType())) {
+            Attribute.validateDataType(schema.getName(), field.getName(), field.getDataType());
+        }
+        parsed.getWeight().ifPresent(value -> field.setWeight(value));
+        parsed.getStemming().ifPresent(value -> field.setStemming(value));
+        parsed.getNormalizing().ifPresent(value -> convertNormalizing(field, value));
+        parsed.getIndexLinguisticsProfile().ifPresent(value -> field.setIndexLinguisticsProfile(value));
+        parsed.getSearchLinguisticsProfile().ifPresent(value -> field.setSearchLinguisticsProfile(value));
+        parsed.getIndexLinguisticsTokens().ifPresent(value -> field.setIndexLinguisticsTokens(value));
+        parsed.getSearchLinguisticsTokens().ifPresent(value -> field.setSearchLinguisticsTokens(value));
+        for (var attribute : parsed.getAttributes()) {
+            convertAttribute(schema, field, attribute);
+        }
+        for (var summaryField : parsed.getSummaryFields()) {
+            var dataType = field.getDataType();
+            var otherType = summaryField.getType();
+            if (otherType != null && summaryField.getHasExplicitType()) {
+                schema.getDeployLogger().log(Level.WARNING, () -> "For schema '" + schema.getName() +
+                        "', field '" + field.getName() +
+                        "', summary '" + summaryField.name() +
+                        "': Specifying the type is deprecated, ignored and will be an error in Vespa 9." +
+                        " Remove the type specification to silence this warning.");
+                dataType = context.resolveType(otherType);
+            }
+            convertSummaryField(schema, field, summaryField, dataType);
+        }
+        for (String command : parsed.getQueryCommands()) {
+            field.addQueryCommand(command);
+        }
+        for (var structField : parsed.getStructFields()) {
+            convertStructField(schema, field, structField);
+        }
+        if (parsed.hasLiteral()) {
+            field.getRanking().setLiteral(true);
+        }
+        if (parsed.hasFilter()) {
+            field.getRanking().setFilter(true);
+        }
+        if (parsed.hasNormal()) {
+            field.getRanking().setNormal(true);
+        }
+        for (var parsedFastMapSearch : parsed.getFastMapSearches()) {
+            convertFastMapSearch(schema, field, parsedFastMapSearch);
+        }
+    }
+
+    /** A lookup name is queried as field.lookupName and is part of the fieldName$lookupName attribute name. */
+    private static final Pattern validLookupName = Pattern.compile("[a-zA-Z_][a-zA-Z0-9_]*");
+
+    private void convertFastMapSearch(Schema schema, SDField field, ParsedField.ParsedFastMapSearch parsed) {
+        String lookupName = parsed.lookupName();
+        FastMapSearchFields fastMapFields;
+        if (field.getDataType() instanceof MapDataType) {
+            validateMapFieldName(schema, field, parsed.keyField(), FastMapSearchFields.MAP_KEY);
+            validateMapFieldName(schema, field, parsed.valueField(), FastMapSearchFields.MAP_VALUE);
+            fastMapFields = FastMapSearchFields.forMap(field.getDataType(), lookupName);
+        } else if (FastMapSearchFields.isArrayOfStruct(field.getDataType())) {
+            if (parsed.keyField() == null || parsed.valueField() == null) {
+                throw fastMapSearchError(schema, field, "'fast-search-map-field' on an array of struct requires " +
+                                                        "'key' and 'value' in its block to name the struct fields to use.");
+            }
+            if (parsed.keyField().equals(parsed.valueField())) {
+                throw fastMapSearchError(schema, field, "'fast-search-map-field' requires 'key' and 'value' to be different struct fields.");
+            }
+            fastMapFields = FastMapSearchFields.forArrayOfStruct(field.getDataType(), lookupName, parsed.keyField(), parsed.valueField());
+        } else {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' requires a map or an array of struct field, " +
+                                                    "but the type is " + field.getDataType().getName() + ".");
+        }
+        if ( ! validLookupName.matcher(lookupName).matches()) {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' must be a letter or underscore followed by " +
+                                                    "letters, digits or underscores, but got '" + lookupName + "'.");
+        }
+        if (lookupName.equals(FastMapSearchFields.MAP_KEY) || lookupName.equals(FastMapSearchFields.MAP_VALUE)) {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' can not be named '" + lookupName +
+                                                    "', as 'key' and 'value' name the key and value in a lookup.");
+        }
+        if (fastMapFields.hasSubField(lookupName)) {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' can not be named '" + lookupName +
+                                                    "', which is the name of a field in the " +
+                                                    (fastMapFields.isMap() ? "map" : "struct") + ".");
+        }
+        validateFastMapSubtype(schema, field, fastMapFields.keyType(), fastMapFields.keyField(), "key");
+        validateFastMapSubtype(schema, field, fastMapFields.valueType(), fastMapFields.valueField(), "value");
+        for (FastMapSearchFields other : field.getFastMapSearches()) {
+            if (other.keyField().equals(fastMapFields.keyField()) && other.valueField().equals(fastMapFields.valueField())) {
+                throw fastMapSearchError(schema, field, "'fast-search-map-field " + lookupName + "' has the same key and value as " +
+                                                        "'fast-search-map-field " + other.lookupName() + "'.");
+            }
+        }
+        // error on duplicates
+        if (!properties.featureFlags().fastMapSearch()) {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' is an unfinished feature that " +
+                                                    "will not be enabled yet. Please remove this property from the field.");
+        }
+        field.addFastMapSearch(fastMapFields);
+    }
+
+    /** Validates the type of the key or value. */
+    private void validateFastMapSubtype(Schema schema, SDField field, DataType type, String subField, String keyOrValue) {
+        if (type == null) {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' requires " + keyOrValue + " '" + subField +
+                                                    "' to be a field in the struct.");
+        }
+        boolean isKey = keyOrValue.equals("key");
+        if (isKey ? ! isSupportedFastMapKeyType(type) : ! isSupportedFastMapValueType(type)) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "For schema '%s', field '%s': 'fast-search-map-field' requires %s to be of type %s, but the type is %s.",
+                            schema.getName(),
+                            field.getName(),
+                            subField,
+                            isKey ? "string, int or long" : "string, int, long, float or double",
+                            type.getName()));
+        }
+    }
+
+    private boolean isSupportedFastMapKeyType(DataType dataType) {
+        return dataType.equals(DataType.STRING)
+                || dataType.equals(DataType.INT)
+                || dataType.equals(DataType.LONG);
+    }
+
+    private boolean isSupportedFastMapValueType(DataType dataType) {
+        return dataType.equals(DataType.STRING)
+                || dataType.equals(DataType.INT)
+                || dataType.equals(DataType.LONG)
+                || dataType.equals(DataType.FLOAT)
+                || dataType.equals(DataType.DOUBLE);
+    }
+
+    /** A map always has struct fields named key and value, so naming them is allowed but can not change them. */
+    private void validateMapFieldName(Schema schema, SDField field, String given, String required) {
+        if (given != null && ! given.equals(required)) {
+            throw fastMapSearchError(schema, field, "'fast-search-map-field' on a map requires " + required + " to be '" +
+                                                    required + "', but got '" + given + "'.");
+        }
+    }
+
+    private static IllegalArgumentException fastMapSearchError(Schema schema, SDField field, String message) {
+        return new IllegalArgumentException(String.format("For schema '%s', field '%s': %s",
+                                                          schema.getName(), field.getName(), message));
+    }
+
+    private void convertStructField(Schema schema, SDField field, ParsedField parsed) {
+        SDField structField = field.getStructField(parsed.name());
+        if (structField == null ) {
+            throw new IllegalArgumentException("Struct field '" + parsed.name() + "' has not been defined in struct " +
+                                               "for field '" + field.getName() + "'.");
+        }
+        convertCommonFieldSettings(schema, structField, parsed);
+    }
+
+    private void convertExtraFieldSettings(Schema schema, SDField field, ParsedField parsed) {
+        String name = parsed.name();
+        for (var dictOp : parsed.getDictionaryOptions()) {
+            var dictionary = field.getOrSetDictionary();
+            try {
+                switch (dictOp) {
+                    case HASH -> dictionary.updateType(Dictionary.Type.HASH);
+                    case BTREE -> dictionary.updateType(Dictionary.Type.BTREE);
+                    case CASED -> dictionary.updateMatch(Case.CASED);
+                    case UNCASED -> dictionary.updateMatch(Case.UNCASED);
+                }
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("For schema '" + schema.getName() + "', field '" + name + "': " + e.getMessage());
+            }
+        }
+        for (var index : parsed.getIndexes()) {
+            convertIndex(field, index);
+        }
+        for (var alias : parsed.getAliases()) {
+            field.getAliasToName().put(alias, parsed.lookupAliasedFrom(alias));
+        }
+        parsed.getRankTypes().forEach((indexName, rankType) -> convertRankType(field, indexName, rankType));
+        parsed.getSorting().ifPresent(sortInfo -> convertSorting(schema, field, sortInfo, name));
+        if (parsed.hasBolding()) {
+            // TODO must it be so ugly:
+            SummaryField summaryField = field.getSummaryField(name, true);
+            summaryField.addSource(name);
+            summaryField.addDestination("default");
+            summaryField.setTransform(summaryField.getTransform().bold());
+        }
+    }
+
+    static void convertSummaryFieldSettings(Schema schema, SummaryField summary, ParsedSummaryField parsed,
+                                            String documentSummaryName) {
+        var transform = SummaryTransform.NONE;
+        var selectElementsBySummaryFeature = parsed.getSelectElementsBySummaryFeature();
+        if (selectElementsBySummaryFeature.isPresent()) {
+            if (parsed.getMatchedElementsOnly()) {
+                throw new IllegalArgumentException("For schema '" + schema.getName() + "' document-summary '" +
+                    documentSummaryName + "' summary field '" + summary.getName() + "': " +
+                    "Both matched-elements-only and select-elements-by specified, this is not supported");
+            }
+            summary.setElementsSelector(SummaryElementsSelector.selectBySummaryFeature(selectElementsBySummaryFeature.get()));
+        } else if (parsed.getMatchedElementsOnly()) {
+            summary.setElementsSelector(SummaryElementsSelector.selectByMatch());
+        }
+        if (parsed.getDynamic()) {
+            transform = SummaryTransform.DYNAMICTEASER;
+        } else if (parsed.getTokens()) {
+            transform = SummaryTransform.TOKENS;
+        }
+        if (parsed.getBolded()) {
+            transform = transform.bold();
+        }
+        summary.setTransform(transform);
+        for (String source : parsed.getSources()) {
+            summary.addSource(source);
+        }
+        for (String destination : parsed.getDestinations()) {
+            summary.addDestination(destination);
+        }
+        for (String structField : parsed.getStructFieldSelect()) {
+            summary.addStructField(structField);
+        }
+        summary.setImplicit(false);
+    }
+
+    private void convertSummaryField(Schema schema, SDField field, ParsedSummaryField parsed, DataType type) {
+        var summary = new SummaryField(parsed.name(), type, field);
+        convertSummaryFieldSettings(schema, summary, parsed, "default");
+        summary.addDestination("default");
+        if (parsed.getSources().isEmpty()) {
+            summary.addSource(field.getName());
+        }
+        field.addSummaryField(summary);
+    }
+
+    private void convertIndex(SDField field, ParsedIndex parsed) {
+        String indexName = parsed.name();
+        Index index = field.getIndex(indexName);
+        if (index == null) {
+            index = new Index(indexName);
+            field.addIndex(index);
+        }
+        convertIndexSettings(index, parsed);
+    }
+
+    private void convertIndexSettings(Index index, ParsedIndex parsed) {
+        parsed.getPrefix().ifPresent(prefix -> index.setPrefix(prefix));
+        for (String alias : parsed.getAliases()) {
+            index.addAlias(alias);
+        }
+        parsed.getStemming().ifPresent(stemming -> index.setStemming(stemming));
+        var arity = parsed.getArity();
+        var lowerBound = parsed.getLowerBound();
+        var upperBound = parsed.getUpperBound();
+        var densePostingListThreshold = parsed.getDensePostingListThreshold();
+        if (arity.isPresent() ||
+            lowerBound.isPresent() ||
+            upperBound.isPresent() ||
+            densePostingListThreshold.isPresent())
+        {
+            var bid = new BooleanIndexDefinition(arity, lowerBound, upperBound, densePostingListThreshold);
+            index.setBooleanIndexDefiniton(bid);
+        }
+        parsed.getEnableBm25().ifPresent(enableBm25 -> index.setInterleavedFeatures(enableBm25));
+        parsed.getHnswIndexParams().ifPresent
+                (hnswIndexParams -> index.setHnswIndexParams(hnswIndexParams));
+    }
+
+    SDField convertDocumentField(Schema schema, SDDocumentType document, ParsedField parsed) {
+        String name = parsed.name();
+        DataType dataType = context.resolveType(parsed.getType());
+        var field = new SDField(document, name, dataType);
+        convertCommonFieldSettings(schema, field, parsed);
+        convertExtraFieldSettings(schema, field, parsed);
+        document.addField(field);
+        return field;
+    }
+
+    void convertExtraField(Schema schema, ParsedField parsed) {
+        String name = parsed.name();
+        DataType dataType = context.resolveType(parsed.getType());
+        var field = new SDField(schema.getDocument(), name, dataType);
+        convertCommonFieldSettings(schema, field, parsed);
+        convertExtraFieldSettings(schema, field, parsed);
+        schema.addExtraField(field);
+    }
+
+    void convertExtraIndex(Schema schema, ParsedIndex parsed) {
+        Index index = new Index(parsed.name());
+        convertIndexSettings(index, parsed);
+        schema.addIndex(index);
+    }
+
+    SDDocumentType convertStructDeclaration(Schema schema, SDDocumentType document, ParsedStruct parsed) {
+        // TODO - can we cleanup this mess
+        var structProxy = new SDDocumentType(parsed.name(), schema);
+        for (var parsedField : parsed.getFields()) {
+            var fieldType = context.resolveType(parsedField.getType());
+            var field = new SDField(document, parsedField.name(), fieldType);
+            convertCommonFieldSettings(schema, field, parsedField);
+            structProxy.addField(field);
+            if (parsedField.hasIdOverride()) {
+                structProxy.setFieldId(field, parsedField.idOverride());
+            }
+        }
+        for (var inherit: parsed.getResolvedInherits()) {
+            structProxy.inherit(structProxies.get(inherit.getFullName()));
+        }
+        structProxy.setStruct(context.resolveStruct(parsed));
+        structProxies.put(parsed.getFullName(), structProxy);
+        return structProxy;
+    }
+
+    void convertAnnotation(Schema schema, SDDocumentType document, ParsedAnnotation parsed) {
+        SDAnnotationType annType = context.resolveAnnotation(parsed.name());
+        var withStruct = parsed.getStruct();
+        if (withStruct.isPresent()) {
+            ParsedStruct parsedStruct = withStruct.get();
+            SDDocumentType structProxy = convertStructDeclaration(schema, document, parsedStruct);
+            structProxy.setStruct(context.resolveStruct(parsedStruct));
+            annType.setSdDocType(structProxy);
+        }
+        document.addAnnotation(annType);
+        schema.getDeployLogger()
+                .log(Level.WARNING, "For schema '" + parsed.getOwnerName() +
+                     "', annotation '" + parsed.name() +
+                     "': Creating new annotations is deprecated and will be removed in the near future");
+    }
+}

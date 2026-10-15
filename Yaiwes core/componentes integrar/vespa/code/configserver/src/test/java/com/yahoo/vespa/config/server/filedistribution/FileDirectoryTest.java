@@ -1,0 +1,184 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+package com.yahoo.vespa.config.server.filedistribution;
+
+import com.yahoo.config.FileReference;
+import com.yahoo.io.IOUtils;
+import com.yahoo.vespa.config.server.filedistribution.FileDirectory.HashScheme;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.util.List;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
+
+@RunWith(Parameterized.class)
+public class FileDirectoryTest {
+
+    @Parameterized.Parameters(name = "{0}")
+    public static List<Object[]> schemes() {
+        return List.of(
+                new Object[] { HashScheme.LEGACY, List.of("ea315b7acac56246", "2b8e97f15c854e1d", "bebc5a1aee74223d", "e5d4b3fe5ee3ede3", "894bced3fc9d199b") },
+                new Object[] { HashScheme.SHA256, List.of("6bc0de8175d0cf33c2d4cca86c64b0d954b41b44096954b90fd149ce5ce9179f",
+                                                        "b48994fa5fa5700bc19ed8bc52537fe4942faeaa21d4802264730a5c21ed7d49",
+                                                        "da94598bef60a61bea45583e6c8b40e8c65c6d79877a9619c005463330305201",
+                                                        "8a1174fbf2f578cad93afcb748413667175b5f926fe2434e49cfbf875253b555",
+                                                        "a52c4c81e16d8a3006ea728777fdc11a57b5d04fa8835958bca9113c8d83cbd3") });
+    }
+
+    private final HashScheme scheme;
+    private final List<String> references;
+
+    public FileDirectoryTest(HashScheme scheme, List<String> references) {
+        this.scheme = scheme;
+        this.references = references;
+    }
+
+    private FileDirectory fileDirectory;
+
+    @Rule
+    public TemporaryFolder temporaryFolder = new TemporaryFolder();
+
+    @Before
+    public void setup() {
+        fileDirectory = new FileDirectory(temporaryFolder.getRoot());
+    }
+
+    @Test
+    public void requireThatFileReferenceWithFilesWorks() throws IOException {
+        FileReference foo = createFile("foo");
+        FileReference bar = createFile("bar");
+
+        assertTrue(fileDirectory.getFile(foo).get().exists());
+        assertEquals(references.get(0), foo.value());
+        assertTrue(fileDirectory.getFile(bar).get().exists());
+        assertEquals(references.get(1), bar.value());
+    }
+
+    @Test
+    public void requireThatFileReferenceResolvingToRootIsRejected() throws IOException {
+        createFile("foo");
+        createFile("bar");
+
+        // A reference resolving to the root directory itself must never be served:
+        assertTrue(fileDirectory.getFile(new FileReference(".")).isEmpty());
+        assertTrue(fileDirectory.getFile(new FileReference("./")).isEmpty());
+        assertTrue(fileDirectory.getFile(new FileReference("")).isEmpty());
+    }
+
+    @Test
+    public void requireThatFileReferenceWithSubDirectoriesWorks() throws IOException {
+        String subdirName = "subdir";
+        File subDirectory = new File(temporaryFolder.getRoot(), subdirName);
+        createFileInSubDir(subDirectory, "foo", "some content");
+        FileReference fileReference = fileDirectory.addFile(subDirectory, scheme);
+        File dir = fileDirectory.getFile(fileReference).get();
+        assertTrue(dir.exists());
+        assertTrue(new File(dir, "foo").exists());
+        assertFalse(new File(dir, "doesnotexist").exists());
+        assertEquals(references.get(2), fileReference.value());
+
+        // Change contents of a file, file reference value should change
+        createFileInSubDir(subDirectory, "foo", "new content");
+        FileReference fileReference2 = fileDirectory.addFile(subDirectory, scheme);
+        dir = fileDirectory.getFile(fileReference2).get();
+        assertTrue(new File(dir, "foo").exists());
+        assertNotEquals(fileReference + " should not be equal to " + fileReference2, fileReference, fileReference2);
+        assertEquals(references.get(3), fileReference2.value());
+
+        // Add a file, should be available and file reference should have another value
+        createFileInSubDir(subDirectory, "bar", "some other content");
+        FileReference fileReference3 = fileDirectory.addFile(subDirectory, scheme);
+        dir = fileDirectory.getFile(fileReference3).get();
+        assertTrue(new File(dir, "foo").exists());
+        assertTrue(new File(dir, "bar").exists());
+        assertEquals(references.get(4), fileReference3.value());
+    }
+
+    @Test
+    public void requireThatExistingDirWithInvalidContentIsDeleted() throws IOException {
+        String subdirName = "subdir";
+        File subDirectory = new File(temporaryFolder.getRoot(), subdirName);
+        createFileInSubDir(subDirectory, "foo", "some content");
+        FileReference fileReference = fileDirectory.addFile(subDirectory, scheme);
+        File dir = fileDirectory.getFile(fileReference).get();
+        assertTrue(dir.exists());
+        File foo = new File(dir, "foo");
+        assertTrue(foo.exists());
+        FileTime fooCreatedTimestamp = Files.readAttributes(foo.toPath(), BasicFileAttributes.class).creationTime();
+        assertFalse(new File(dir, "doesnotexist").exists());
+        assertEquals(references.get(2), fileReference.value());
+
+        // Remove a file, directory should be deleted before adding a new file
+        try { Thread.sleep(1000);} catch (InterruptedException e) {/*ignore */} // Needed since we have timestamp resolution of 1 second
+        Files.delete(Paths.get(fileDirectory.getPath(fileReference)).resolve("subdir").resolve("foo"));
+        fileReference = fileDirectory.addFile(subDirectory, scheme);
+        dir = fileDirectory.getFile(fileReference).get();
+        File foo2 = new File(dir, "foo");
+        assertTrue(dir.exists());
+        assertTrue(foo2.exists());
+        FileTime foo2CreatedTimestamp = Files.readAttributes(foo2.toPath(), BasicFileAttributes.class).creationTime();
+        // Check that creation timestamp is newer than the old one to be sure that a new file was written
+        assertTrue(foo2CreatedTimestamp.compareTo(fooCreatedTimestamp) > 0);
+        assertFalse(new File(dir, "doesnotexist").exists());
+        assertEquals(references.get(2), fileReference.value());
+    }
+
+    @Test
+    public void requireThatNothingIsDoneIfFileReferenceExists() throws IOException {
+        String subdirName = "subdir";
+        File subDirectory = new File(temporaryFolder.getRoot(), subdirName);
+        createFileInSubDir(subDirectory, "foo", "some content");
+        FileReference fileReference = fileDirectory.addFile(subDirectory, scheme);
+        File dir = fileDirectory.getFile(fileReference).get();
+        assertTrue(dir.exists());
+        File foo = new File(dir, "foo");
+        assertTrue(foo.exists());
+        FileTime fooCreatedTimestamp = Files.readAttributes(foo.toPath(), BasicFileAttributes.class).creationTime();
+        assertFalse(new File(dir, "doesnotexist").exists());
+        assertEquals(references.get(2), fileReference.value());
+
+        try { Thread.sleep(1000);} catch (InterruptedException e) { /*ignore */ } // Needed since we have timestamp resolution of 1 second
+        // Add a file that already exists, nothing should happen
+        createFileInSubDir(subDirectory, "foo", "some content"); // same as before, nothing should happen
+        FileReference fileReference3 = fileDirectory.addFile(subDirectory, scheme);
+        dir = fileDirectory.getFile(fileReference3).get();
+        assertTrue(new File(dir, "foo").exists());
+        assertEquals(references.get(2), fileReference3.value()); // same hash
+
+        File foo2 = new File(dir, "foo");
+        assertTrue(dir.exists());
+        assertTrue(foo2.exists());
+        FileTime barCreatedTimestamp = Files.readAttributes(foo2.toPath(), BasicFileAttributes.class).creationTime();
+        // Check that creation timestamp is newer than the old one to be sure that a new file was written
+        assertEquals(barCreatedTimestamp, fooCreatedTimestamp);
+    }
+
+    // Content in created file is equal to the filename string
+    private FileReference createFile(String filename) throws IOException {
+        File file = temporaryFolder.newFile(filename);
+        IOUtils.writeFile(file, filename, false);
+        return fileDirectory.addFile(file, scheme);
+    }
+
+    private void createFileInSubDir(File subDirectory, String filename, String fileContent) throws IOException {
+        if (!subDirectory.exists())
+            subDirectory.mkdirs();
+        File file = new File(subDirectory, filename);
+        IOUtils.writeFile(file, fileContent, false);
+    }
+
+}

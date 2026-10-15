@@ -1,0 +1,1848 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.search.query;
+
+import com.google.common.base.Preconditions;
+import com.yahoo.prelude.query.FalseItem;
+import com.yahoo.prelude.query.NumericInItem;
+import com.yahoo.prelude.query.StringInItem;
+import com.yahoo.prelude.query.TrueItem;
+import com.yahoo.processing.IllegalInputException;
+import com.yahoo.collections.LazyMap;
+import com.yahoo.collections.LazySet;
+import com.yahoo.geo.DistanceParser;
+import com.yahoo.geo.ParsedDegree;
+import com.yahoo.javacc.UnicodeUtilities;
+import com.yahoo.language.Language;
+import com.yahoo.language.detect.Detector;
+import com.yahoo.language.process.LinguisticsParameters;
+import com.yahoo.language.process.Normalizer;
+import com.yahoo.language.process.Segmenter;
+import com.yahoo.language.process.StemMode;
+import com.yahoo.prelude.Index;
+import com.yahoo.prelude.IndexFacts;
+import com.yahoo.prelude.Location;
+import com.yahoo.prelude.query.AndItem;
+import com.yahoo.prelude.query.BlockItem;
+import com.yahoo.prelude.query.BoolItem;
+import com.yahoo.prelude.query.CompositeItem;
+import com.yahoo.prelude.query.DotProductItem;
+import com.yahoo.prelude.query.EquivItem;
+import com.yahoo.prelude.query.ExactStringItem;
+import com.yahoo.prelude.query.FuzzyItem;
+import com.yahoo.prelude.query.IntItem;
+import com.yahoo.prelude.query.Item;
+import com.yahoo.prelude.query.Limit;
+import com.yahoo.prelude.query.GeoLocationItem;
+import com.yahoo.prelude.query.NearItem;
+import com.yahoo.prelude.query.NearestNeighborItem;
+import com.yahoo.prelude.query.NullItem;
+import com.yahoo.prelude.query.NotItem;
+import com.yahoo.prelude.query.ONearItem;
+import com.yahoo.prelude.query.OrItem;
+import com.yahoo.prelude.query.PhraseItem;
+import com.yahoo.prelude.query.PhraseSegmentItem;
+import com.yahoo.prelude.query.PredicateQueryItem;
+import com.yahoo.prelude.query.PrefixItem;
+import com.yahoo.prelude.query.RangeItem;
+import com.yahoo.prelude.query.RankItem;
+import com.yahoo.prelude.query.RegExpItem;
+import com.yahoo.prelude.query.SameElementItem;
+import com.yahoo.prelude.query.SegmentingRule;
+import com.yahoo.prelude.query.StringRangeItem;
+import com.yahoo.prelude.query.Substring;
+import com.yahoo.prelude.query.SubstringItem;
+import com.yahoo.prelude.query.SuffixItem;
+import com.yahoo.prelude.query.TaggableItem;
+import com.yahoo.prelude.query.ToolBox;
+import com.yahoo.prelude.query.WandItem;
+import com.yahoo.prelude.query.WeakAndItem;
+import com.yahoo.prelude.query.WeightedSetItem;
+import com.yahoo.prelude.query.WordAlternativesItem;
+import com.yahoo.prelude.query.WordItem;
+import com.yahoo.search.Query;
+import com.yahoo.search.grouping.request.GroupingOperation;
+import com.yahoo.search.query.parser.Parsable;
+import com.yahoo.search.query.parser.Parser;
+import com.yahoo.search.query.parser.ParserEnvironment;
+import com.yahoo.search.query.parser.ParserFactory;
+import com.yahoo.search.yql.VespaGroupingStep;
+import com.yahoo.search.yql.YqlParser;
+import com.yahoo.slime.ArrayTraverser;
+import com.yahoo.slime.Inspector;
+import com.yahoo.slime.ObjectTraverser;
+import com.yahoo.slime.SlimeUtils;
+import com.yahoo.slime.Type;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+
+import static com.yahoo.search.yql.YqlParser.MAX_EDIT_DISTANCE;
+import static com.yahoo.search.yql.YqlParser.PREFIX_LENGTH;
+import static com.yahoo.slime.Type.ARRAY;
+import static com.yahoo.slime.Type.BOOL;
+import static com.yahoo.slime.Type.DOUBLE;
+import static com.yahoo.slime.Type.LONG;
+import static com.yahoo.slime.Type.OBJECT;
+import static com.yahoo.slime.Type.STRING;
+
+import static com.yahoo.search.yql.YqlParser.ACCENT_DROP;
+import static com.yahoo.search.yql.YqlParser.ALTERNATIVES;
+import static com.yahoo.search.yql.YqlParser.AND_SEGMENTING;
+import static com.yahoo.search.yql.YqlParser.ANNOTATIONS;
+import static com.yahoo.search.yql.YqlParser.APPROXIMATE;
+import static com.yahoo.search.yql.YqlParser.ASCENDING_HITS_ORDER;
+import static com.yahoo.search.yql.YqlParser.CONNECTION_ID;
+import static com.yahoo.search.yql.YqlParser.CONNECTION_WEIGHT;
+import static com.yahoo.search.yql.YqlParser.CONNECTIVITY;
+import static com.yahoo.search.yql.YqlParser.DESCENDING_HITS_ORDER;
+import static com.yahoo.search.yql.YqlParser.DISTANCE;
+import static com.yahoo.search.yql.YqlParser.DISTANCE_THRESHOLD;
+import static com.yahoo.search.yql.YqlParser.DOT_PRODUCT;
+import static com.yahoo.search.yql.YqlParser.EQUIV;
+import static com.yahoo.search.yql.YqlParser.FILTER;
+import static com.yahoo.search.yql.YqlParser.FUZZY;
+import static com.yahoo.search.yql.YqlParser.GEO_BOUNDING_BOX;
+import static com.yahoo.search.yql.YqlParser.GEO_LOCATION;
+import static com.yahoo.search.yql.YqlParser.HIT_LIMIT;
+import static com.yahoo.search.yql.YqlParser.HNSW_EXPLORE_ADDITIONAL_HITS;
+import static com.yahoo.search.yql.YqlParser.IMPLICIT_TRANSFORMS;
+import static com.yahoo.search.yql.YqlParser.LABEL;
+import static com.yahoo.search.yql.YqlParser.NEAR;
+import static com.yahoo.search.yql.YqlParser.NEAREST_NEIGHBOR;
+import static com.yahoo.search.yql.YqlParser.NFKC;
+import static com.yahoo.search.yql.YqlParser.NORMALIZE_CASE;
+import static com.yahoo.search.yql.YqlParser.ONEAR;
+import static com.yahoo.search.yql.YqlParser.ORIGIN;
+import static com.yahoo.search.yql.YqlParser.ORIGIN_LENGTH;
+import static com.yahoo.search.yql.YqlParser.ORIGIN_OFFSET;
+import static com.yahoo.search.yql.YqlParser.ORIGIN_ORIGINAL;
+import static com.yahoo.search.yql.YqlParser.PHRASE;
+import static com.yahoo.search.yql.YqlParser.PREDICATE;
+import static com.yahoo.search.yql.YqlParser.PREFIX;
+import static com.yahoo.search.yql.YqlParser.RANGE;
+import static com.yahoo.search.yql.YqlParser.RANK;
+import static com.yahoo.search.yql.YqlParser.RANKED;
+import static com.yahoo.search.yql.YqlParser.SAME_ELEMENT;
+import static com.yahoo.search.yql.YqlParser.SCORE_THRESHOLD;
+import static com.yahoo.search.yql.YqlParser.SIGNIFICANCE;
+import static com.yahoo.search.yql.YqlParser.STEM;
+import static com.yahoo.search.yql.YqlParser.SUBSTRING;
+import static com.yahoo.search.yql.YqlParser.SUFFIX;
+import static com.yahoo.search.yql.YqlParser.TARGET_HITS;
+import static com.yahoo.search.yql.YqlParser.TARGET_NUM_HITS;
+import static com.yahoo.search.yql.YqlParser.TOTAL_TARGET_HITS;
+import static com.yahoo.search.yql.YqlParser.MIN_TARGET_HITS;
+import static com.yahoo.search.yql.YqlParser.THRESHOLD_BOOST_FACTOR;
+import static com.yahoo.search.yql.YqlParser.UNIQUE_ID;
+import static com.yahoo.search.yql.YqlParser.USE_POSITION_DATA;
+import static com.yahoo.search.yql.YqlParser.USER_INPUT_LANGUAGE;
+import static com.yahoo.search.yql.YqlParser.WAND;
+import static com.yahoo.search.yql.YqlParser.WEAK_AND;
+import static com.yahoo.search.yql.YqlParser.WEIGHT;
+import static com.yahoo.search.yql.YqlParser.WEIGHTED_SET;
+
+/**
+ * The Select query language.
+ *
+ * This class will be parsing the Select parameters, and will be used when the query has the SELECT-type.
+ *
+ * @author henrhoi
+ */
+public class SelectParser implements Parser {
+
+    private static final String AND = "and";
+    private static final String AND_NOT = "and_not";
+    private static final String CALL = "call";
+    private static final String CONTAINS = "contains";
+    private static final String EQ = "equals";
+    private static final String IN = "in";
+    private static final String MATCHES = "matches";
+    private static final String NOT = "not";
+    private static final String OR = "or";
+
+    // text() function constants
+    private static final String TEXT = "text";
+    private static final String TEXT_QUERY = "query";
+    private static final String GRAMMAR = "grammar";
+    private static final String GRAMMAR_RAW = "raw";
+    private static final String GRAMMAR_SEGMENT = "segment";
+    private static final String GRAMMAR_COMPOSITE = "grammar." + QueryType.COMPOSITE;
+    private static final String GRAMMAR_TOKENIZATION = "grammar." + QueryType.TOKENIZATION;
+    private static final String GRAMMAR_SYNTAX = "grammar." + QueryType.SYNTAX;
+    private static final String GRAMMAR_PROFILE = "grammar." + QueryType.PROFILE;
+    private static final String ALLOW_EMPTY = "allowEmpty";
+
+    Parsable query;
+    private final ParserEnvironment environment;
+    private final IndexFacts indexFacts;
+    private final Map<Integer, TaggableItem> identifiedItems = LazyMap.newHashMap();
+    private final List<ConnectedItem> connectedItems = new ArrayList<>();
+    private final Set<String> selectSummaryFields = LazySet.newHashSet();
+    private final Normalizer normalizer;
+    private final Segmenter segmenter;
+    private final Detector detector;
+    private IndexFacts.Session indexFactsSession;
+    private IndexNameExpander indexNameExpander = new IndexNameExpander();
+    private boolean insideSameElement = false;
+
+    private static final List<String> FUNCTION_CALLS = List.of(WAND, WEIGHTED_SET, DOT_PRODUCT, GEO_BOUNDING_BOX, GEO_LOCATION, NEAREST_NEIGHBOR, PREDICATE, RANK, WEAK_AND);
+    private static final Set<String> OPERATOR_KEYS = Set.of(AND, AND_NOT, CONTAINS, EQ, IN, MATCHES, NOT, OR, RANGE);
+    private static final Set<String> COMPOSITE_LEAF_KEYS = Set.of(PHRASE, NEAR, ONEAR, EQUIV, FUZZY, ALTERNATIVES);
+
+    /**
+     * Used by {@link #getIndex} to expand field names.
+     */
+    private static class IndexNameExpander {
+        public String expand(String leaf) { return leaf; }
+    }
+
+    /**
+     * Transforms `leaf` to `prefix.leaf` for a given `prefix`.
+     */
+    private static class PrefixExpander extends IndexNameExpander {
+        private final String prefix;
+
+        public PrefixExpander(String prefix) {
+            this.prefix = prefix + ".";
+        }
+
+        @Override
+        public String expand(String leaf) {
+            return prefix + leaf;
+        }
+    }
+
+    /**
+     * Swaps the current index expander strategy.
+     */
+    private IndexNameExpander swapIndexCreator(IndexNameExpander newExpander) {
+        IndexNameExpander old = indexNameExpander;
+        indexNameExpander = newExpander;
+        return old;
+    }
+
+    public SelectParser(ParserEnvironment environment) {
+        this.environment = environment;
+        indexFacts = environment.getIndexFacts();
+        normalizer = environment.getLinguistics().getNormalizer();
+        segmenter = environment.getLinguistics().getSegmenter();
+        detector = environment.getLinguistics().getDetector();
+    }
+
+    @Override
+    public QueryTree parse(Parsable query) {
+        indexFactsSession = indexFacts.newSession(query.getSources(), query.getRestrict());
+        connectedItems.clear();
+        identifiedItems.clear();
+        selectSummaryFields.clear();
+        this.query = query;
+
+        populateSelectSummaryFields(query.getSelect().getFieldsString());
+        return buildTree();
+    }
+
+    private void populateSelectSummaryFields(String fieldsJson) {
+        if (fieldsJson == null || fieldsJson.isEmpty()) {
+            return;
+        }
+        Inspector inspector = SlimeUtils.jsonToSlime(fieldsJson).get();
+        if (inspector.field("error_message").valid()) {
+            throw new IllegalInputException("Illegal 'select.fields': " + inspector.field("error_message").asString() +
+                                            " at: '" + new String(inspector.field("offending_input").asData(), StandardCharsets.UTF_8) + "'");
+        }
+        if (inspector.type() != ARRAY) {
+            throw new IllegalInputException("'select.fields' must be a JSON array of field names");
+        }
+        inspector.traverse((ArrayTraverser) (idx, element) -> {
+            if (element.type() != STRING) {
+                throw new IllegalInputException("'select.fields' element at index " + idx + " is not a string");
+            }
+            selectSummaryFields.add(element.asString());
+        });
+    }
+
+    /** The summary fields parsed from the most recent {@code select.fields} JSON array. */
+    public Set<String> getSelectSummaryFields() {
+        return selectSummaryFields;
+    }
+
+    private QueryTree buildTree() {
+        Inspector inspector = SlimeUtils.jsonToSlime(this.query.getSelect().getWhereString()).get();
+        if (inspector.field("error_message").valid()) {
+            throw new IllegalInputException("Illegal query: " + inspector.field("error_message").asString() +
+                                            " at: '" + new String(inspector.field("offending_input").asData(), StandardCharsets.UTF_8) + "'");
+        }
+
+        try {
+            Item root = walkJson(inspector);
+            connectItems();
+            return new QueryTree(root);
+        }
+        catch (IllegalArgumentException e) {
+            throw new IllegalInputException("Illegal JSON query", e);
+        }
+    }
+
+    private Item walkJson(Inspector inspector) {
+        if (inspector.type() == BOOL)
+            return inspector.asBool() ? new TrueItem() : new FalseItem();
+
+        if (inspector.type() == STRING && insideSameElement) {
+            // Inside sameElement: bare string is a word item with empty field (field comes from sameElement parent)
+            return instantiateWordItem("", inspector.asString(), inspector, false);
+        }
+
+        Item[] item = {null};
+        inspector.traverse((ObjectTraverser) (key, value) -> {
+            if (insideSameElement && !isOperator(key) && !COMPOSITE_LEAF_KEYS.contains(key)) {
+                // Inside an operator within a sameElement.
+                // e.g. {"sameElement": [{"and": [{"f1": "a"}, {"f2": "b"}]}]} where key="f1" and value="a".
+                // This is the same as in instantiateSameElement.
+                item[0] = instantiateWordItem(getIndex(key), value.asString(), value, false);
+            } else {
+                item[0] = buildOperator(key, value);
+            }
+        });
+        return item[0];
+    }
+
+    /** Builds a query item from a single operator key and its value. */
+    private Item buildOperator(String key, Inspector value) {
+        String type = (FUNCTION_CALLS.contains(key)) ? CALL : key;
+        return switch (type) {
+            case AND -> buildAnd(key, value);
+            case AND_NOT -> buildNotAnd(key, value);
+            case CALL -> buildFunctionCall(key, value);
+            case CONTAINS -> buildTermSearch(key, value);
+            case EQ -> buildEquals(key, value);
+            case IN -> buildIn(key, value);
+            case MATCHES -> buildRegExpSearch(key, value);
+            case NOT -> buildNot(key, value);
+            case OR -> buildOr(key, value);
+            case RANGE -> buildRange(key, value);
+            default -> throw newUnexpectedArgumentException(key, AND, AND_NOT, CALL, CONTAINS, EQ, IN, MATCHES, NOT, OR, RANGE);
+        };
+    }
+
+    public List<VespaGroupingStep> getGroupingSteps(String grouping) {
+        return getGroupingSteps(grouping, null);
+    }
+
+    /**
+     * Returns the grouping steps of the given JSON grouping, resolving parameter references on the form @name
+     * using the given function, see {@link GroupingOperation#fromStringAsList(String, Function)}.
+     */
+    public List<VespaGroupingStep> getGroupingSteps(String grouping, Function<String, String> parameters) {
+        List<VespaGroupingStep> groupingSteps = new ArrayList<>();
+        List<String> groupingOperations = toGroupingRequests(grouping);
+        for (String groupingString : groupingOperations) {
+            GroupingOperation groupingOperation = GroupingOperation.fromString(groupingString, parameters);
+            VespaGroupingStep groupingStep = new VespaGroupingStep(groupingOperation);
+            groupingSteps.add(groupingStep);
+        }
+        return groupingSteps;
+    }
+
+    /** Translates a list of grouping requests on JSON form to a list in the grouping language form */
+    private List<String> toGroupingRequests(String groupingJson) {
+        Inspector inspector = SlimeUtils.jsonToSlime(groupingJson).get();
+        if (inspector.field("error_message").valid()) {
+            throw new IllegalInputException("Illegal query: " + inspector.field("error_message").asString() +
+                                            " at: '" + new String(inspector.field("offending_input").asData(), StandardCharsets.UTF_8) + "'");
+        }
+
+        List<String> operations = new ArrayList<>();
+        inspector.traverse((ArrayTraverser) (__, item) -> operations.add(toGroupingRequest(item)));
+        return operations;
+    }
+
+    private String toGroupingRequest(Inspector groupingJson) {
+        StringBuilder b = new StringBuilder();
+        toGroupingRequest(groupingJson, b);
+        return b.toString();
+    }
+
+    private void toGroupingRequest(Inspector groupingJson, StringBuilder b) {
+        // entry point: the top level is neither an operation body nor under any key
+        toGroupingRequest(groupingJson, null, false, b);
+    }
+
+    private void toGroupingRequest(Inspector groupingJson, String parentKey, boolean isOperationBody, StringBuilder b) {
+        switch (groupingJson.type()) {
+            case ARRAY:
+                // crossing into an array: elements are NOT a direct operation body, even when
+                // parentKey is "all"/"each" (e.g. "all": [ {...} ]). parentKey is propagated for
+                // emission, but isOperationBody is reset so a stray label inside is rejected.
+                groupingJson.traverse((ArrayTraverser) (index, item) -> {
+                    toGroupingRequest(item, parentKey, false, b);
+                    if (index + 1 < groupingJson.entries())
+                        b.append(",");
+                });
+                break;
+            case OBJECT:
+                String label = isOperationBody ? readLabel(groupingJson) : null;
+                boolean[] directEachSeen = {false};
+                groupingJson.traverse((ObjectTraverser) (name, object) -> {
+                    if ("label".equals(name)) {
+                        if (!isOperationBody) {
+                            throw new IllegalInputException(
+                                    "'label' must be a direct field of an 'all' grouping operation, found in "
+                                    + describeContext(parentKey));
+                        }
+                        return; // consumed by the enclosing operation emission below
+                    }
+                    b.append(name);
+                    b.append("(");
+                    // Only an all body may carry a JSON label.
+                    boolean childIsBody = "all".equals(name) && object.type() == OBJECT;
+                    toGroupingRequest(object, name, childIsBody, b);
+                    b.append(")");
+                    if (isOperationBody && "each".equals(name)) {
+                        directEachSeen[0] = true;
+                        if (label != null) {
+                            b.append(" as(").append(asLabelImage(label)).append(")");
+                        }
+                    }
+                    b.append(" ");
+                });
+                if (label != null && !directEachSeen[0]) {
+                    throw new IllegalInputException(
+                            "A grouping label requires an 'each' operation; label output expressions directly, "
+                            + "for example output(count() as(foo)).");
+                }
+                break;
+            case STRING:
+                b.append(groupingJson.asString());
+                break;
+            default:
+                b.append(groupingJson.toString());
+                break;
+        }
+    }
+
+    /**
+     * Returns a JSON label as it must be written in the grouping language: a parameter reference (@name) as is,
+     * so it is resolved like a parameter anywhere else in the grouping, and any other label as a quoted string.
+     */
+    private static String asLabelImage(String label) {
+        if (label.matches("@[A-Za-z_][A-Za-z0-9_-]*")) {
+            return label;
+        }
+        return UnicodeUtilities.quote(label, '"');
+    }
+
+    /** Describes where a misplaced "label" was found (only reached when isOperationBody is false). */
+    private static String describeContext(String parentKey) {
+        if (parentKey == null) return "the top-level grouping object";
+        if ("all".equals(parentKey)) return "an array under '" + parentKey + "'";
+        return "'" + parentKey + "'";
+    }
+
+    private static String readLabel(Inspector operationBody) {
+        Inspector field = operationBody.field("label");
+        if (!field.valid()) return null;
+        if (field.type() != STRING) {
+            throw new IllegalInputException("'label' in grouping must be a string, got " + field.type());
+        }
+        String s = field.asString();
+        if (s.isBlank()) {
+            throw new IllegalInputException("'label' in grouping must not be empty or whitespace");
+        }
+        return s;
+    }
+
+    private Item buildFunctionCall(String key, Inspector value) {
+        return switch (key) {
+            case WAND -> buildWand(key, value);
+            case WEIGHTED_SET -> buildWeightedSet(key, value);
+            case DOT_PRODUCT -> buildDotProduct(key, value);
+            case GEO_BOUNDING_BOX -> buildGeoBoundingBox(key, value);
+            case GEO_LOCATION -> buildGeoLocation(key, value);
+            case NEAREST_NEIGHBOR -> buildNearestNeighbor(key, value);
+            case PREDICATE -> buildPredicate(key, value);
+            case RANK -> buildRank(key, value);
+            case WEAK_AND -> buildWeakAnd(key, value);
+            default ->
+                    throw newUnexpectedArgumentException(key, DOT_PRODUCT, NEAREST_NEIGHBOR, RANK, WAND, WEAK_AND, WEIGHTED_SET, PREDICATE);
+        };
+    }
+
+    private void addItemsFromInspector(CompositeItem item, Inspector inspector){
+        if (inspector.type() == ARRAY){
+            inspector.traverse((ArrayTraverser) (index, new_value) -> {
+                item.addItem(walkJson(new_value));
+            });
+
+        } else if (inspector.type() == OBJECT){
+            if (inspector.field("children").valid()) {
+                inspector.field("children").traverse((ArrayTraverser) (index, new_value) -> {
+                    item.addItem(walkJson(new_value));
+                });
+            }
+
+        }
+    }
+
+    private Inspector getChildren(Inspector inspector) {
+        if (inspector.type() == ARRAY){
+            return inspector;
+
+        } else if (inspector.type() == OBJECT){
+            if (inspector.field("children").valid()) {
+                return inspector.field("children");
+            }
+            if (inspector.field(1).valid()) {
+                return inspector.field(1);
+            }
+        }
+        return null;
+    }
+
+    private HashMap<Integer, Inspector> childMap(Inspector inspector) {
+        HashMap<Integer, Inspector> children = new HashMap<>();
+        if (inspector.type() == ARRAY){
+            inspector.traverse((ArrayTraverser) children::put);
+
+        } else if (inspector.type() == OBJECT){
+            if (inspector.field("children").valid()){
+                inspector.field("children").traverse((ArrayTraverser) children::put);
+            }
+        }
+        return children;
+    }
+
+    private Inspector getAnnotations(Inspector inspector) {
+        if (inspector.type() == OBJECT && inspector.field("attributes").valid()){
+            return inspector.field("attributes");
+        }
+        return null;
+    }
+
+    private HashMap<String, Inspector> getAnnotationMapFromAnnotationInspector(Inspector annotation) {
+        HashMap<String, Inspector> attributes = new HashMap<>();
+        if (annotation.type() == OBJECT){
+            annotation.traverse((ObjectTraverser) attributes::put);
+        }
+        return attributes;
+    }
+
+    private HashMap<String, Inspector> getAnnotationMap(Inspector inspector) {
+        HashMap<String, Inspector> attributes = new HashMap<>();
+        if (inspector.type() == OBJECT && inspector.field("attributes").valid()){
+            inspector.field("attributes").traverse((ObjectTraverser) attributes::put);
+        }
+        return attributes;
+    }
+
+    private <T> T getAnnotation(String annotationName, HashMap<String, Inspector> annotations, Class<T> expectedClass, T defaultValue) {
+        return (annotations.get(annotationName) == null) ? defaultValue : expectedClass.cast(annotations.get(annotationName).asString());
+    }
+
+    private Boolean getBoolAnnotation(String annotationName, HashMap<String, Inspector> annotations, Boolean defaultValue) {
+        if (annotations != null){
+            Inspector annotation = annotations.getOrDefault(annotationName, null);
+            if (annotation != null){
+                return annotation.asBool();
+            }
+        }
+        return defaultValue;
+    }
+
+    private Integer getIntegerAnnotation(String annotationName, HashMap<String, Inspector> annotations, Integer defaultValue) {
+        if (annotations != null){
+            Inspector annotation = annotations.getOrDefault(annotationName, null);
+            if (annotation != null){
+                return (int)annotation.asLong();
+            }
+        }
+        return defaultValue;
+    }
+
+    private Double getDoubleAnnotation(String annotationName, HashMap<String, Inspector> annotations, Double defaultValue) {
+        if (annotations != null){
+            Inspector annotation = annotations.getOrDefault(annotationName, null);
+            if (annotation != null){
+                return annotation.asDouble();
+            }
+        }
+        return defaultValue;
+    }
+
+    private Inspector getAnnotationAsInspectorOrNull(String annotationName, HashMap<String, Inspector> annotations) {
+        return annotations.get(annotationName);
+    }
+
+    private CompositeItem buildAnd(String key, Inspector value) {
+        AndItem andItem = new AndItem();
+        addItemsFromInspector(andItem, value);
+
+        return andItem;
+    }
+
+    private CompositeItem buildNotAnd(String key, Inspector value) {
+        NotItem notItem = new NotItem();
+        addItemsFromInspector(notItem, value);
+
+        return notItem;
+    }
+
+    private CompositeItem buildOr(String key, Inspector value) {
+        OrItem orItem = new OrItem();
+        addItemsFromInspector(orItem, value);
+        return orItem;
+    }
+
+    private CompositeItem buildNot(String key, Inspector value) {
+        NotItem notItem = new NotItem();
+        Item negativeItem = walkJson(value);
+        notItem.addNegativeItem(negativeItem);
+        return notItem;
+    }
+
+    private Item buildGeoBoundingBox(String key, Inspector value) {
+        String field = value.entry(0).asString();
+        var coord_1 = value.entry(1).asDouble();
+        var coord_2 = value.entry(2).asDouble();
+        var coord_3 = value.entry(3).asDouble();
+        var coord_4 = value.entry(4).asDouble();
+        var swCorner = new Location.Point(coord_1, coord_2);
+        var neCorner = new Location.Point(coord_3, coord_4);
+        var loc = Location.fromBoundingBox(swCorner, neCorner);
+        var item = new GeoLocationItem(loc, field);
+        return item;
+    }
+
+    private Item buildGeoLocation(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        Preconditions.checkArgument(children.size() == 4, "Expected 4 arguments, got %s.", children.size());
+        String field = children.get(0).asString();
+        var arg1 = children.get(1);
+        var arg2 = children.get(2);
+        var arg3 = children.get(3);
+        if (arg3.type() != Type.STRING) {
+           throw new IllegalArgumentException("Invalid geoLocation radius type "+arg3.type()+" for "+arg3);
+        }
+        double radius = DistanceParser.parse(arg3.asString());
+        Location.Point center;
+        if (arg1.type() == Type.STRING && arg2.type() == Type.STRING) {
+            var c1input = children.get(1).asString();
+            var c2input = children.get(2).asString();
+            var coord_1 = ParsedDegree.fromString(c1input, true, false);
+            var coord_2 = ParsedDegree.fromString(c2input, false, true);
+            if (coord_1.isLatitude && coord_2.isLongitude) {
+                center = new Location.Point(coord_1.degrees, coord_2.degrees);
+            } else if (coord_2.isLatitude && coord_1.isLongitude) {
+                center = new Location.Point(coord_2.degrees, coord_1.degrees);
+            } else {
+                throw new IllegalArgumentException("Invalid geoLocation coordinates '"+c1input+"' and '"+c2input+"'");
+            }
+        } else if (arg1.type() == Type.DOUBLE && arg2.type() == Type.DOUBLE) {
+            center = new Location.Point(arg1.asDouble(), arg2.asDouble());
+        } else {
+            throw new IllegalArgumentException("Invalid geoLocation coordinate types "+arg1.type()+" and "+arg2.type());
+        }
+        var loc = Location.fromGeoCircle(center, radius);
+        var item = new GeoLocationItem(loc, field);
+        Inspector annotations = getAnnotations(value);
+        if (annotations != null){
+            annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+                if (LABEL.equals(annotation_name)) {
+                    item.setLabel(annotation_value.asString());
+                }
+            });
+        }
+        return item;
+    }
+
+    @SuppressWarnings("deprecation")
+    private Item buildNearestNeighbor(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        Preconditions.checkArgument(children.size() == 2, "Expected 2 arguments, got %s.", children.size());
+        String field = children.get(0).asString();
+        String property = children.get(1).asString();
+        NearestNeighborItem item = new NearestNeighborItem(indexFactsSession.getCanonicName(field), property);
+        Inspector annotations = getAnnotations(value);
+        if (annotations != null){
+            annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+                if (TARGET_HITS.equals(annotation_name)){
+                    item.setTargetHits((int)(annotation_value.asDouble()));
+                }
+                if (TARGET_NUM_HITS.equals(annotation_name)){
+                    item.setTargetHits((int)(annotation_value.asDouble()));
+                }
+                if (TOTAL_TARGET_HITS.equals(annotation_name)){
+                    item.setTotalTargetHits((int)(annotation_value.asDouble()));
+                }
+                if (MIN_TARGET_HITS.equals(annotation_name)){
+                    item.setMinTargetHits((int)(annotation_value.asDouble()));
+                }
+                if (DISTANCE_THRESHOLD.equals(annotation_name)) {
+                    double distanceThreshold = annotation_value.asDouble();
+                    item.setDistanceThreshold(distanceThreshold);
+                }
+                if (HNSW_EXPLORE_ADDITIONAL_HITS.equals(annotation_name)) {
+                    int hnswExploreAdditionalHits = (int)(annotation_value.asDouble());
+                    item.setHnswExploreAdditionalHits(hnswExploreAdditionalHits);
+                }
+                if (APPROXIMATE.equals(annotation_name)) {
+                    boolean allowApproximate = annotation_value.asBool();
+                    item.setAllowApproximate(allowApproximate);
+                }
+                if (LABEL.equals(annotation_name)) {
+                    item.setLabel(annotation_value.asString());
+                }
+            });
+        }
+        return item;
+    }
+
+    private CompositeItem buildWeakAnd(String key, Inspector value) {
+        WeakAndItem weakAnd = new WeakAndItem();
+        addItemsFromInspector(weakAnd, value);
+        Inspector annotations = getAnnotations(value);
+
+        if (annotations != null) {
+            annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+                if (TARGET_HITS.equals(annotation_name) || TARGET_NUM_HITS.equals(annotation_name)) {
+                    weakAnd.setTargetHits((int)(annotation_value.asDouble()));
+                }
+                if (TOTAL_TARGET_HITS.equals(annotation_name)) {
+                    weakAnd.setTotalTargetHits((int)(annotation_value.asDouble()));
+                }
+            });
+        }
+
+        return weakAnd;
+    }
+
+    private <T extends TaggableItem> T leafStyleSettings(Inspector annotations, T out) {
+        {
+            if (annotations != null) {
+                Inspector  itemConnectivity= getAnnotationAsInspectorOrNull(CONNECTIVITY, getAnnotationMapFromAnnotationInspector(annotations));
+                if (itemConnectivity != null) {
+                    Integer[] id = {null};
+                    Double[] weight = {null};
+                    itemConnectivity.traverse((ObjectTraverser) (key, value) -> {
+                        switch (key){
+                            case CONNECTION_ID:
+                                id[0] = (int) value.asLong();
+                                break;
+                            case CONNECTION_WEIGHT:
+                                weight[0] = value.asDouble();
+                                break;
+                        }
+                    });
+                    connectedItems.add(new ConnectedItem(out, id[0], weight[0]));
+                }
+
+                annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+
+                    if (SIGNIFICANCE.equals(annotation_name)) {
+                        if (annotation_value != null) {
+                            out.setSignificance(annotation_value.asDouble());
+                        }
+                    }
+                    if (UNIQUE_ID.equals(annotation_name)) {
+                        if (annotation_value != null) {
+                            out.setUniqueID((int)annotation_value.asLong());
+                            identifiedItems.put((int)annotation_value.asLong(), out);
+                        }
+                    }
+                });
+            }
+        }
+        {
+            Item leaf = (Item) out;
+            if (annotations != null) {
+                Inspector itemAnnotations = getAnnotationAsInspectorOrNull(ANNOTATIONS, getAnnotationMapFromAnnotationInspector(annotations));
+                if (itemAnnotations != null) {
+                    itemAnnotations.traverse((ObjectTraverser) (key, value) -> {
+                        leaf.addAnnotation(key, value.asString());
+                    });
+                }
+
+                annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+                    if (FILTER.equals(annotation_name)) {
+                        if (annotation_value != null) {
+                            leaf.setFilter(annotation_value.asBool());
+                        }
+                    }
+                    if (RANKED.equals(annotation_name)) {
+                        if (annotation_value != null) {
+                            leaf.setRanked(annotation_value.asBool());
+                        }
+                    }
+                    if (LABEL.equals(annotation_name)) {
+                        if (annotation_value != null) {
+                            leaf.setLabel(annotation_value.asString());
+                        }
+                    }
+                    if (WEIGHT.equals(annotation_name)) {
+                        if (annotation_value != null) {
+                            leaf.setWeight((int)annotation_value.asDouble());
+                        }
+                    }
+                });
+            }
+            if (out instanceof IntItem number && annotations != null) {
+                Integer hitLimit = getCappedRangeSearchParameter(annotations);
+                if (hitLimit != null) {
+                    number.setHitLimit(hitLimit);
+                }
+            } else if (out instanceof StringRangeItem stringRange && annotations != null) {
+                Integer hitLimit = getCappedRangeSearchParameter(annotations);
+                if (hitLimit != null) {
+                    stringRange.setHitLimit(hitLimit);
+                }
+            }
+        }
+
+        return out;
+    }
+
+    private Integer getCappedRangeSearchParameter(Inspector annotations) {
+        Integer[] hitLimit = {null};
+        annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+            if (HIT_LIMIT.equals(annotation_name)) {
+                if (annotation_value != null) {
+                    hitLimit[0] = (int)(annotation_value.asDouble());
+                }
+            }
+        });
+        Boolean[] ascending = {null};
+        Boolean[] descending = {null};
+
+        if (hitLimit[0] != null) {
+            annotations.traverse((ObjectTraverser) (annotation_name, annotation_value) -> {
+                if (ASCENDING_HITS_ORDER.equals(annotation_name)) {
+                    ascending[0] = annotation_value.asBool();
+                }
+                if (DESCENDING_HITS_ORDER.equals(annotation_name)) {
+                    descending[0] = annotation_value.asBool();
+                }
+
+            });
+            Preconditions.checkArgument(ascending[0] == null || descending[0] == null,
+                    "Settings for both ascending and descending ordering set, only one of these expected.");
+
+            if (Boolean.TRUE.equals(descending[0]) || Boolean.FALSE.equals(ascending[0])) {
+                hitLimit[0] = hitLimit[0] * -1;
+            }
+        }
+        return hitLimit[0];
+    }
+
+    /**
+     * Equals operator.
+     * <p>
+     * Short form: { "equals": [field, value] }
+     * Long form:  { "equals": { "field": field, "value": value } }
+     * <p>
+     * Optional argument: "index". Then it is turned into sameElement with array access.
+     */
+    private Item buildEquals(String key, Inspector value) {
+        var params = extractEqualsParams(value);
+        params.validateTypes();
+        if (params.index.valid()) {
+            return buildSameElementWithElementFilter(params);
+        }
+
+        String field = params.field.asString();
+        return switch (params.value.type()) {
+            case BOOL -> new BoolItem(params.value.asBool(), field);
+            case LONG -> new IntItem(params.value.asLong(), field);
+            default -> throw new IllegalArgumentException("'value' in 'equals' should be a boolean or integer, but " +
+                    "was " + params.value.type());
+        };
+    }
+
+    /** Holds and validates equals operator parameters. */
+    record EqualsParams(Inspector field, Inspector value, Inspector index) {
+        void validateTypes() {
+            if (!field.valid()) {
+                throw new IllegalArgumentException("Expected 'field' in 'equals' but is missing.");
+            }
+
+            if (!value.valid()) {
+                throw new IllegalArgumentException("Expected 'value' in 'equals' but is missing.");
+            }
+
+            if (field.type() != STRING) {
+                throw new IllegalArgumentException("'field' in 'equals' should be a string but was " + field.type());
+            }
+
+            if (index.valid() && (index.type() != LONG)) {
+                throw new IllegalArgumentException("'index' in 'equals' should be an integer but was " + index.type());
+            }
+        }
+    }
+
+    /** Extracts equals operator parameters from object and array form. */
+    private EqualsParams extractEqualsParams(Inspector value) {
+        if (value.type() == OBJECT) {
+            return new EqualsParams(value.field("field"), value.field("value"), value.field("index"));
+        } else {
+            if (value.entries() != 2) {
+                throw new IllegalArgumentException("The value of 'equals' should be an array containing a field name" +
+                        " and a value, but was " + value);
+            }
+            return new EqualsParams(value.entry(0), value.entry(1), value.entry(2));
+        }
+    }
+
+    /** Builds sameElement accessing a specific index in an array. */
+    private Item buildSameElementWithElementFilter(EqualsParams params) {
+        int elementIndex = YqlParser.convertToElementId(params.index.asLong());
+        var value = params.value;
+        // Numbers become numeric equality terms, other values word terms (consistent with YqlParser).
+        Item valueItem = switch (value.type()) {
+            case LONG -> new IntItem(String.valueOf(value.asLong()), "", true);
+            case DOUBLE -> new IntItem(String.valueOf(value.asDouble()), "", true);
+            case BOOL -> new WordItem(String.valueOf(value.asBool()), "", true);
+            case STRING -> new WordItem(value.asString(), "", true);
+            default -> throw new IllegalArgumentException("'value' in 'equals' should be a boolean, integer, double, " +
+                                                          "or string but was " + value.type());
+        };
+
+        SameElementItem sameElement = new SameElementItem(params.field.asString());
+        sameElement.setElementFilter(List.of(elementIndex));
+        sameElement.addItem(valueItem);
+        return sameElement;
+    }
+
+    private Item buildIn(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        String field = children.get(0).asString();
+        children.remove(0);
+
+        Preconditions.checkArgument(indexFactsSession.isIndex(field), "Field '%s' does not exist.", field);
+        field = indexFactsSession.getCanonicName(field);
+        var index = indexFactsSession.getIndex(field);
+
+        if (!index.isInteger() && !index.isString()) {
+            throw new IllegalArgumentException("The in operator is only supported for integer and string fields. The field '" +
+                    field + "' is not of these types");
+        }
+        if (index.isInteger() && index.isString()) {
+            throw new IllegalArgumentException("The in operator is not supported for fieldsets with a mix of integer and string fields. The fieldset '" +
+                    field + "' has both");
+        }
+
+        Item item = null;
+        if (index.isString()) {
+           StringInItem stringInItem = new StringInItem(field);
+
+            for (Inspector child:  children.values()){
+                if (child.type() != STRING) {
+                    throw new IllegalArgumentException("The field '" + field + "' is a string field, but the argument "
+                            + child + " is of type " + child.type());
+                }
+
+                stringInItem.addToken(child.asString());
+            }
+            item = stringInItem;
+
+        } else { // Integer index
+            NumericInItem numericInItem = new NumericInItem(field);
+
+            for (Inspector child:  children.values()){
+                if (child.type() != LONG) {
+                    throw new IllegalArgumentException("The field '" + field + "' is an integer field, but the argument "
+                    + child + " is of type " + child.type());
+                }
+                numericInItem.addToken(child.asLong());
+            }
+
+            item = numericInItem;
+        }
+
+        return item;
+    }
+
+    private Item buildRange(String key, Inspector value) {
+        Map<Integer, Inspector> children = childMap(value);
+        Inspector annotations = getAnnotations(value);
+
+        String field;
+        Inspector boundInspector;
+        if (children.get(0).type() == STRING){
+            field = getIndex(children.get(0).asString());
+            boundInspector = children.get(1);
+        } else {
+            field = getIndex(children.get(1).asString());
+            boundInspector = children.get(0);
+        }
+
+        var index = indexOf(field);
+        if (index.isString() && !index.isInteger() && !index.isNumerical())
+            return leafStyleSettings(annotations, buildStringRange(field, boundInspector, annotations));
+        else
+            return leafStyleSettings(annotations, buildIntRange(field, boundInspector));
+    }
+
+    /**
+     * Builds a lexical range over a string field, e.g. {"range": ["title", {">=": "aaa", "<": "zzz"}]}.
+     * Omitting a bound makes the interval unbounded in that direction, as -Infinity and Infinity do in YQL,
+     * such that an empty bound object matches everything.
+     */
+    private StringRangeItem buildStringRange(String field, Inspector boundInspector, Inspector annotations) {
+        String[] bounds = {null, null};
+        boolean[] inclusive = {false, false};
+        boundInspector.traverse((ObjectTraverser) (operator, bound) -> {
+            if (bound.type() != STRING) {
+                throw new IllegalArgumentException("The field '" + field + "' is a string field, but the argument "
+                                                   + bound + " to range is of type " + bound.type());
+            }
+            switch (operator) {
+                case "=" -> {
+                    bounds[0] = bounds[1] = bound.asString();
+                    inclusive[0] = inclusive[1] = true;
+                }
+                case ">=", ">" -> {
+                    bounds[0] = bound.asString();
+                    inclusive[0] = operator.equals(">=");
+                }
+                case "<=", "<" -> {
+                    bounds[1] = bound.asString();
+                    inclusive[1] = operator.equals("<=");
+                }
+                default -> throw newUnexpectedArgumentException(operator, "=", "<", "<=", ">", ">=");
+            }
+        });
+        return new StringRangeItem(bounds[0], inclusive[0], bounds[1], inclusive[1], field, true, getOrigin(annotations));
+    }
+
+    private IntItem buildIntRange(String field, Inspector boundInspector) {
+        boolean[] equals = {false};
+        Number[] bounds = {null, null};
+        String[] operators = {null, null};
+        boundInspector.traverse((ObjectTraverser) (operator, bound) -> {
+            if (bound.type() == STRING) {
+                throw new IllegalArgumentException("Expected a numeric argument to range, but got the string '" + bound.asString() + "'");
+            }
+            if (operator.equals("=")) {
+                bounds[0] = (bound.type() == DOUBLE) ? (Number) bound.asDouble() : (Number) bound.asLong();
+                operators[0] = operator;
+                equals[0] = true;
+            }
+            if (operator.equals(">=") || operator.equals(">")){
+                bounds[0] = (bound.type() == DOUBLE) ? (Number) bound.asDouble() : (Number) bound.asLong();
+                operators[0] = operator;
+            } else if (operator.equals("<=") || operator.equals("<")){
+                bounds[1] = (bound.type() == DOUBLE) ? (Number) bound.asDouble() : (Number) bound.asLong();
+                operators[1] = operator;
+            }
+
+        });
+        IntItem range = null;
+        if (equals[0]) {
+            range = new IntItem(bounds[0].toString(), field);
+        }
+        else if (operators[0] == null || operators[1] == null) {
+            int index = (operators[0] == null) ? 1 : 0;
+            range = switch (operators[index]) {
+                case ">=" -> buildGreaterThanOrEquals(field, bounds[index].toString());
+                case ">" -> buildGreaterThan(field, bounds[index].toString());
+                case "<" -> buildLessThan(field, bounds[index].toString());
+                case "<=" -> buildLessThanOrEquals(field, bounds[index].toString());
+                default -> range;
+            };
+        }
+        else {
+            range = instantiateRangeItem(bounds[0], bounds[1], field, operators[0].equals(">"), operators[1].equals("<"));
+        }
+
+        return range;
+    }
+
+    private IntItem buildGreaterThanOrEquals(String field, String bound) {
+        return new IntItem("[" + bound + ";]", field);
+
+    }
+
+    private IntItem buildLessThanOrEquals(String field, String bound) {
+        return new IntItem("[;" + bound + "]", field);
+    }
+
+    private IntItem buildGreaterThan(String field, String bound) {
+        return new IntItem(">" + bound, field);
+    }
+
+    private IntItem buildLessThan(String field, String bound) {
+        return new IntItem("<" + bound, field);
+    }
+
+    private IntItem instantiateRangeItem(Number lowerBound, Number upperBound, String field, boolean bounds_left_open, boolean bounds_right_open) {
+        Preconditions.checkArgument(lowerBound != null && upperBound != null && field != null,
+                "Expected 3 NonNull-arguments");
+
+        if (!bounds_left_open && !bounds_right_open) {
+            return new RangeItem(lowerBound, upperBound, field);
+        } else {
+            Limit from;
+            Limit to;
+            if (bounds_left_open && bounds_right_open) {
+                from = new Limit(lowerBound, false);
+                to = new Limit(upperBound, false);
+            } else if (bounds_left_open) {
+                from = new Limit(lowerBound, false);
+                to = new Limit(upperBound, true);
+            } else {
+                from = new Limit(lowerBound, true);
+                to = new Limit(upperBound, false);
+            }
+            return new IntItem(from, to, field);
+        }
+    }
+
+    private Item buildWand(String key, Inspector value) {
+        HashMap<String, Inspector> annotations = getAnnotationMap(value);
+        HashMap<Integer, Inspector> children = childMap(value);
+
+        Preconditions.checkArgument(children.size() == 2, "Expected 2 arguments, got %s.", children.size());
+        Integer targetHits = getIntegerAnnotation(TARGET_HITS, annotations, null);
+        if (targetHits == null)
+            targetHits = getIntegerAnnotation(TARGET_NUM_HITS, annotations, null);
+
+        WandItem out = new WandItem(children.get(0).asString());
+        out.setTargetHits(targetHits);
+        out.setTotalTargetHits(getIntegerAnnotation(TOTAL_TARGET_HITS, annotations, null));
+
+        Double scoreThreshold = getDoubleAnnotation(SCORE_THRESHOLD, annotations, null);
+
+        if (scoreThreshold != null) {
+            out.setScoreThreshold(scoreThreshold);
+        }
+
+        Double thresholdBoostFactor = getDoubleAnnotation(THRESHOLD_BOOST_FACTOR, annotations, null);
+        if (thresholdBoostFactor != null) {
+            out.setThresholdBoostFactor(thresholdBoostFactor);
+        }
+        return fillWeightedSet(value, children, out);
+    }
+
+    private WeightedSetItem fillWeightedSet(Inspector value, HashMap<Integer, Inspector> children, WeightedSetItem out) {
+        addItems(children, out);
+
+        return leafStyleSettings(getAnnotations(value), out);
+    }
+
+
+    private static void addItems(HashMap<Integer, Inspector> children, WeightedSetItem out) {
+        switch (children.get(1).type()) {
+            case OBJECT:
+                addStringItems(children, out);
+                break;
+            case ARRAY:
+                addLongItems(children, out);
+                break;
+            default:
+                throw newUnexpectedArgumentException(children.get(1).type(), ARRAY, OBJECT);
+        }
+    }
+
+    private static void addStringItems(HashMap<Integer, Inspector> children, WeightedSetItem out) {
+        //{"a":1, "b":2}
+        children.get(1).traverse((ObjectTraverser) (key, value) -> {
+            if (value.type() == STRING){
+                throw new IllegalArgumentException("Expected an integer argument, but got the string '" +
+                                                   value.asString() + "'");
+            }
+            out.addToken(key, (int)value.asLong());
+        });
+    }
+
+    private static void addLongItems(HashMap<Integer, Inspector> children, WeightedSetItem out) {
+        children.get(1).traverse((ArrayTraverser) (index, pair) -> {
+            List<Integer> pairValues = new ArrayList<>();
+            pair.traverse((ArrayTraverser) (pairIndex, pairValue) -> {
+                pairValues.add((int)pairValue.asLong());
+            });
+            Preconditions.checkArgument(pairValues.size() == 2,
+                    "Expected item and weight, got %s.", pairValues);
+            out.addToken(pairValues.get(0).longValue(), pairValues.get(1));
+        });
+    }
+
+    private Item buildRegExpSearch(String key, Inspector value) {
+        assertHasOperator(key, MATCHES);
+        HashMap<Integer, Inspector> children = childMap(value);
+        String field = getIndex(children.get(0).asString());
+        String wordData = children.get(1).asString();
+        RegExpItem regExp = new RegExpItem(field, true, wordData);
+        return leafStyleSettings(getAnnotations(value), regExp);
+    }
+
+    private Item buildWeightedSet(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        String field = children.get(0).asString();
+        Preconditions.checkArgument(children.size() == 2, "Expected 2 arguments, got %s.", children.size());
+        return fillWeightedSet(value, children, new WeightedSetItem(field));
+    }
+
+    private Item buildDotProduct(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        String field = children.get(0).asString();
+        Preconditions.checkArgument(children.size() == 2, "Expected 2 arguments, got %s.", children.size());
+        return fillWeightedSet(value, children, new DotProductItem(field));
+    }
+
+    private Item buildPredicate(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        String field = children.get(0).asString();
+        Inspector args = children.get(1);
+
+        Preconditions.checkArgument(children.size() == 3, "Expected 3 arguments, got %s.", children.size());
+
+        PredicateQueryItem item = new PredicateQueryItem();
+        item.setIndexName(field);
+
+        List<Inspector> argumentList = valueListFromInspector(getChildren(value));
+
+        // Adding attributes
+        argumentList.get(1).traverse((ObjectTraverser) (attrKey, attrValue) -> {
+            if (attrValue.type() == ARRAY){
+                List<Inspector> attributes = valueListFromInspector(attrValue);
+                attributes.forEach( (attribute) -> item.addFeature(attrKey, attribute.asString()));
+            } else {
+                item.addFeature(attrKey, attrValue.asString());
+            }
+        });
+
+        // Adding range attributes
+        argumentList.get(2).traverse((ObjectTraverser) (attrKey, attrValue) -> item.addRangeFeature(attrKey, (int)attrValue.asDouble()));
+
+        return leafStyleSettings(getAnnotations(value), item);
+    }
+
+    private CompositeItem buildRank(String key, Inspector value) {
+        RankItem rankItem = new RankItem();
+        addItemsFromInspector(rankItem, value);
+        return rankItem;
+    }
+
+    private Item buildTermSearch(String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        String field = getIndex(children.get(0).asString());
+
+        return instantiateLeafItem(field, key, value);
+    }
+
+    private String getInspectorKey(Inspector inspector){
+        String[] actualKey = {""};
+        if (inspector.type() == OBJECT){
+            inspector.traverse((ObjectTraverser) (key, value) -> {
+                actualKey[0] = key;
+
+            });
+        }
+        return actualKey[0];
+    }
+
+    private Item instantiateLeafItem(String field, String key, Inspector value) {
+        List<Inspector> possibleLeafFunction = valueListFromInspector(value);
+        String possibleLeafFunctionName = (possibleLeafFunction.size() > 1) ? getInspectorKey(possibleLeafFunction.get(1)) : "";
+        if (FUNCTION_CALLS.contains(key)) {
+            return instantiateCompositeLeaf(field, key, value);
+        } else if (!possibleLeafFunctionName.isEmpty()){
+           return instantiateCompositeLeaf(field, possibleLeafFunctionName, valueListFromInspector(value).get(1).field(possibleLeafFunctionName));
+        } else {
+            return instantiateWordItem(field, key, value);
+        }
+    }
+
+    private Item instantiateCompositeLeaf(String field, String key, Inspector value) {
+        return switch (key) {
+            case SAME_ELEMENT -> instantiateSameElementItem(field, key, value);
+            case PHRASE -> instantiatePhraseItem(field, key, value);
+            case NEAR -> instantiateNearItem(field, key, value);
+            case ONEAR -> instantiateONearItem(field, key, value);
+            case EQUIV -> instantiateEquivItem(field, key, value);
+            case FUZZY -> instantiateFuzzyItem(field, key, value);
+            case ALTERNATIVES -> instantiateWordAlternativesItem(field, key, value);
+            case TEXT -> buildText(field, key, value);
+            default -> throw newUnexpectedArgumentException(key, EQUIV, NEAR, ONEAR, PHRASE, SAME_ELEMENT, TEXT);
+        };
+    }
+
+    /**
+     * Builds a text() query item. The value inspector is the inner value of the "text" key and can be:
+     * <ul>
+     *   <li>A string: {@code {"text": "hello world"}} -> value is STRING</li>
+     *   <li>An object with query/attributes: {@code {"text": {"query": "hello world", "attributes": {...}}}}
+     *       -> value is OBJECT</li>
+     * </ul>
+     */
+    private Item buildText(String field, String key, Inspector value) {
+        // 1. Extract text string from supported JSON shapes
+        String wordData = extractTextString(value);
+
+        // 2. Read annotations (empty map for STRING form, populated for OBJECT form)
+        HashMap<String, Inspector> annotations = getAnnotationMap(value);
+
+        // 3. Check allowEmpty
+        boolean allowEmpty = getBoolAnnotation(ALLOW_EMPTY, annotations, Boolean.FALSE);
+        if (allowEmpty && (wordData == null || wordData.isEmpty()))
+            return new NullItem();
+        if (wordData == null || wordData.isEmpty())
+            throw new IllegalArgumentException("text() requires a non-empty input string. " +
+                                               "Use allowEmpty annotation to allow empty input.");
+
+        // 4. Resolve language
+        Language language = decideParsingLanguage(value, wordData);
+        boolean explicitLanguage = hasExplicitLanguageAnnotation(value);
+
+        // 5. Resolve grammar and query type
+        String grammar = getAnnotation(GRAMMAR, annotations, String.class, "linguistics");
+
+        QueryType queryType = buildQueryType(grammar, annotations);
+
+        // 6. Handle grammar:raw specially
+        if (GRAMMAR_RAW.equals(grammar)) {
+            ExactStringItem item = new ExactStringItem(wordData, true);
+            item.setIndexName(field);
+            if (explicitLanguage || language != Language.ENGLISH)
+                item.setLanguage(language);
+            return assignQueryType(item, queryType);
+        }
+
+        // 6b. Handle grammar:segment specially
+        if (GRAMMAR_SEGMENT.equals(grammar)) {
+            return assignQueryType(buildSegmentItem(field, wordData, language, explicitLanguage, annotations), queryType);
+        }
+
+        // 7. Parse via sub-parser (same pattern as YqlParser.parseUserInput)
+        Parser subParser = ParserFactory.newInstance(queryType, environment);
+        Item item = subParser.parse(new Parsable().setQuery(wordData)
+                                                  .addSources(query.getSources())
+                                                  .addRestricts(query.getRestrict())
+                                                  .setLanguage(language)
+                                                  .setDefaultIndexName(field)).getRoot();
+        if (item == null || item instanceof NullItem) {
+            if (allowEmpty) return new NullItem();
+            throw new IllegalArgumentException("Parsing '" + wordData + "' produced no result.");
+        }
+
+        // 8. Mark language if explicitly set or non-default
+        if (explicitLanguage || language != Language.ENGLISH)
+            setLanguageRecursively(item, language);
+
+        // 9. Propagate item-level annotations
+        propagateTextAnnotations(annotations, item);
+
+        // 10. Set composite-specific annotations
+        if (queryType.getComposite() == QueryType.Composite.weakAnd && item instanceof WeakAndItem weakAndItem) {
+            Integer targetHits = getIntegerAnnotation(TARGET_HITS, annotations, null);
+            if (targetHits != null)
+                weakAndItem.setTargetHits(targetHits);
+            Integer totalTargetHits = getIntegerAnnotation(TOTAL_TARGET_HITS, annotations, null);
+            if (totalTargetHits != null)
+                weakAndItem.setTotalTargetHits(totalTargetHits);
+        }
+        if ((queryType.getComposite() == QueryType.Composite.near || queryType.getComposite() == QueryType.Composite.oNear)
+            && item instanceof NearItem nearItem) {
+            Integer distance = getIntegerAnnotation(DISTANCE, annotations, null);
+            if (distance != null)
+                nearItem.setDistance(distance);
+        }
+
+        return item;
+    }
+
+    /** Builds a QueryType from a grammar string and annotation overrides, defaulting to LINGUISTICS. */
+    private QueryType buildQueryType(String grammar, HashMap<String, Inspector> annotations) {
+        var queryType = QueryType.from(Query.Type.LINGUISTICS);
+        String resolvedGrammar = grammar;
+        if (GRAMMAR_RAW.equals(resolvedGrammar) || GRAMMAR_SEGMENT.equals(resolvedGrammar))
+            resolvedGrammar = "linguistics"; // raw and segment are not separate types since they don't cause parsing - use linguistics to annotate the term
+        if (resolvedGrammar != null)
+            queryType = QueryType.from(resolvedGrammar);
+
+        String composite = getAnnotation(GRAMMAR_COMPOSITE, annotations, String.class, null);
+        String tokenization = getAnnotation(GRAMMAR_TOKENIZATION, annotations, String.class, null);
+        String syntax = getAnnotation(GRAMMAR_SYNTAX, annotations, String.class, null);
+        String profile = getAnnotation(GRAMMAR_PROFILE, annotations, String.class, null);
+        if (profile == null)
+            profile = queryType.getProfile();
+        return queryType.setComposite(composite)
+                        .setTokenization(tokenization)
+                        .setSyntax(syntax)
+                        .setProfile(profile);
+    }
+
+    /** Assigns the query type to the item if it is a BlockItem, for downstream consumers like StemmingSearcher. */
+    private Item assignQueryType(Item item, QueryType queryType) {
+        if (item instanceof BlockItem blockItem)
+            blockItem.setQueryType(queryType);
+        return item;
+    }
+
+    /** Returns the linguistics profile for the given field, checking query-assigned profile first. */
+    private String linguisticsProfileFor(String field) {
+        String queryAssignedProfile = environment.getType().getProfile();
+        if (queryAssignedProfile != null) return queryAssignedProfile;
+        Index index = indexFactsSession.getIndex(field);
+        if (index == null) return null;
+        return index.getLinguisticsProfile();
+    }
+
+    /**
+     * Builds a segment item from text input, forcing segmentation of the entire input string.
+     * Mirrors YqlParser's grammar:segment path through instantiateWordItem with SegmentWhen.ALWAYS.
+     */
+    private Item buildSegmentItem(String field, String wordData, Language language,
+                                  boolean explicitLanguage, HashMap<String, Inspector> annotations) {
+        // Read transform annotations (mirrors YqlParser.instantiateWordItem 7-arg, lines 1735-1742)
+        if (getBoolAnnotation(NFKC, annotations, Boolean.FALSE))
+            wordData = normalizer.normalize(wordData);
+        boolean fromQuery = getBoolAnnotation(IMPLICIT_TRANSFORMS, annotations, Boolean.TRUE);
+
+        // Segment using linguistics
+        String profile = linguisticsProfileFor(field);
+        List<String> segments = segmenter.segment(wordData, new LinguisticsParameters(profile, language, StemMode.NONE, false, false));
+
+        Item item;
+        if (segments.isEmpty() || segments.size() == 1) {
+            String word = segments.isEmpty() ? wordData : segments.get(0);
+            WordItem wordItem = new WordItem(word, fromQuery);
+            wordItem.setIndexName(field);
+            item = wordItem;
+        } else {
+            PhraseSegmentItem phrase = new PhraseSegmentItem(wordData, fromQuery, false);
+            phrase.setIndexName(field);
+            for (String s : segments) {
+                WordItem segment = new WordItem(s, fromQuery);
+                segment.setIndexName(field);
+                phrase.addItem(segment);
+            }
+            phrase.lock();
+            item = phrase;
+        }
+
+        // Mark language recursively if explicitly set or non-default
+        if (explicitLanguage || language != Language.ENGLISH)
+            setLanguageRecursively(item, language);
+
+        // Propagate item-level annotations (stem, ranked, filter, etc.)
+        propagateTextAnnotations(annotations, item);
+
+        return item;
+    }
+
+    /** Extracts the text string from the various JSON shapes passed to text(). */
+    private String extractTextString(Inspector value) {
+        if (value.type() == STRING) {
+            return value.asString();
+        } else if (value.type() == OBJECT) {
+            if (value.field(TEXT_QUERY).valid()) {
+                return requireStringField(value.field(TEXT_QUERY), TEXT_QUERY);
+            }
+            if (value.field("children").valid()) {
+                throw new IllegalArgumentException("text() does not support 'children'; use a 'query' string field instead.");
+            }
+            throw new IllegalArgumentException("text() object form requires a 'query' string field.");
+        } else if (value.type() == ARRAY) {
+            throw new IllegalArgumentException("text() does not support array arguments; use a string or an object with a 'query' field.");
+        }
+        throw new IllegalArgumentException("Unexpected JSON type for text(): " + value.type());
+    }
+
+    private static String requireStringField(Inspector value, String fieldName) {
+        if (value.type() != STRING)
+            throw new IllegalArgumentException("text()." + fieldName + " must be a string, got " + value.type());
+        return value.asString();
+    }
+
+    /** Propagates item-level annotations (stem, ranked, filter, etc.) recursively onto query items. */
+    private void propagateTextAnnotations(HashMap<String, Inspector> annotations, Item item) {
+        Boolean isRanked = getBoolAnnotation(RANKED, annotations, null);
+        Boolean filter = getBoolAnnotation(FILTER, annotations, null);
+        Boolean stem = getBoolAnnotation(STEM, annotations, null);
+        Boolean normalizeCase = getBoolAnnotation(NORMALIZE_CASE, annotations, null);
+        Boolean accentDrop = getBoolAnnotation(ACCENT_DROP, annotations, null);
+        Boolean usePositionData = getBoolAnnotation(USE_POSITION_DATA, annotations, null);
+
+        ToolBox.visit(new ToolBox.QueryVisitor() {
+            @Override
+            public boolean visit(Item visitItem) {
+                if (visitItem instanceof WordItem w) {
+                    if (usePositionData != null) w.setPositionData(usePositionData);
+                    if (stem != null) w.setStemmed(!stem);
+                    if (normalizeCase != null) w.setLowercased(!normalizeCase);
+                    if (accentDrop != null) w.setNormalizable(accentDrop);
+                }
+                if (visitItem instanceof TaggableItem) {
+                    if (isRanked != null) visitItem.setRanked(isRanked);
+                    if (filter != null) visitItem.setFilter(filter);
+                }
+                return true;
+            }
+        }, item);
+    }
+
+    /** Sets language recursively on all items in the tree. */
+    private void setLanguageRecursively(Item item, Language language) {
+        if (item instanceof CompositeItem composite) {
+            for (int i = 0; i < composite.getItemCount(); i++)
+                setLanguageRecursively(composite.getItem(i), language);
+        }
+        item.setLanguage(language);
+    }
+
+    private Item instantiateWordItem(String field, String key, Inspector node) {
+        var children = childMap(node);
+        if (children.size() < 2)
+            throw new IllegalArgumentException("Expected at least 2 children of '" + key + "', but got " + children.size());
+
+        String wordData = children.get(1).asString();
+        return instantiateWordItem(field, wordData, node, false);
+    }
+
+    private Item instantiateWordItem(String field, String rawWord, Inspector node, boolean exactMatch) {
+        String wordData = rawWord;
+        Language language = decideParsingLanguage(node, wordData);
+        HashMap<String, Inspector> annotations = getAnnotationMap(node);
+
+        if (getBoolAnnotation(NFKC, annotations, Boolean.FALSE)) {
+            // NOTE: If this is set to FALSE (default), we will still NFKC normalize text data
+            // during tokenization/segmentation, as that is always turned on also on the indexing side.
+            wordData = normalizer.normalize(wordData);
+        }
+        boolean fromQuery = getBoolAnnotation(IMPLICIT_TRANSFORMS, annotations,  Boolean.TRUE);
+        boolean prefixMatch = getBoolAnnotation(PREFIX, annotations, Boolean.FALSE);
+        boolean suffixMatch = getBoolAnnotation(SUFFIX, annotations,  Boolean.FALSE);
+        boolean substrMatch = getBoolAnnotation(SUBSTRING,annotations, Boolean.FALSE);
+
+        Preconditions.checkArgument((prefixMatch ? 1 : 0)
+                        + (substrMatch ? 1 : 0) + (suffixMatch ? 1 : 0) < 2,
+                "Only one of prefix, substring and suffix can be set.");
+
+        WordItem wordItem;
+        if (exactMatch) {
+            wordItem = new ExactStringItem(wordData, fromQuery);
+        } else if (prefixMatch) {
+            wordItem = new PrefixItem(wordData, fromQuery);
+        } else if (suffixMatch) {
+            wordItem = new SuffixItem(wordData, fromQuery);
+        } else if (substrMatch) {
+            wordItem = new SubstringItem(wordData, fromQuery);
+        } else {
+            wordItem = new WordItem(wordData, fromQuery);
+        }
+
+        prepareWord(field, node, wordItem);
+        // Mark the language used if it was explicitly set or is not the default
+        if (hasExplicitLanguageAnnotation(node) || language != Language.ENGLISH)
+            wordItem.setLanguage(language);
+
+        return leafStyleSettings(getAnnotations(node), wordItem);
+    }
+
+    /** Returns whether the language annotation is explicitly set on the given node. */
+    private boolean hasExplicitLanguageAnnotation(Inspector value) {
+        return getAnnotation(USER_INPUT_LANGUAGE, getAnnotationMap(value), String.class, null) != null;
+    }
+
+    private Language decideParsingLanguage(Inspector value, String wordData) {
+        String languageTag = getAnnotation(USER_INPUT_LANGUAGE, getAnnotationMap(value), String.class, null);
+
+        Language language = Language.fromLanguageTag(languageTag);
+        if (language != Language.UNKNOWN) return language;
+
+        Optional<Language> explicitLanguage = query.getExplicitLanguage();
+        if (explicitLanguage.isPresent()) return explicitLanguage.get();
+
+        language = detector.detect(wordData, null).getLanguage();
+        if (language != Language.UNKNOWN) return language;
+
+        return Language.ENGLISH;
+    }
+
+    private void prepareWord(String field, Inspector value, WordItem wordItem) {
+        wordItem.setIndexName(field);
+        wordStyleSettings(value, wordItem);
+    }
+
+    private void wordStyleSettings(Inspector value, WordItem out) {
+        HashMap<String, Inspector> annotations = getAnnotationMap(value);
+
+        Substring origin = getOrigin(getAnnotations(value));
+        if (origin != null) {
+            out.setOrigin(origin);
+        }
+        if (annotations !=  null) {
+            Boolean usePositionData = getBoolAnnotation(USE_POSITION_DATA, annotations, null);
+            if (usePositionData != null) {
+                out.setPositionData(usePositionData);
+            }
+            Boolean stem = getBoolAnnotation(STEM, annotations, null);
+            if (stem != null) {
+                out.setStemmed(!stem);
+            }
+
+            Boolean normalizeCase = getBoolAnnotation(NORMALIZE_CASE, annotations, null);
+            if (normalizeCase != null) {
+                out.setLowercased(!normalizeCase);
+            }
+            Boolean accentDrop = getBoolAnnotation(ACCENT_DROP, annotations, null);
+            if (accentDrop != null) {
+                out.setNormalizable(accentDrop);
+            }
+            Boolean andSegmenting = getBoolAnnotation(AND_SEGMENTING, annotations,  null);
+            if (andSegmenting != null) {
+                if (andSegmenting) {
+                    out.setSegmentingRule(SegmentingRule.BOOLEAN_AND);
+                } else {
+                    out.setSegmentingRule(SegmentingRule.PHRASE);
+                }
+            }
+        }
+    }
+
+    private Substring getOrigin(Inspector annotations) {
+        if (annotations != null) {
+            Inspector origin = getAnnotationAsInspectorOrNull(ORIGIN, getAnnotationMapFromAnnotationInspector(annotations));
+            if (origin == null) {
+                return null;
+            }
+            String[] original = {null};
+            Integer[] offset = {null};
+            Integer[] length = {null};
+
+            origin.traverse((ObjectTraverser) (key, value) -> {
+                switch (key) {
+                    case (ORIGIN_ORIGINAL):
+                        original[0] = value.asString();
+                        break;
+                    case (ORIGIN_OFFSET):
+                        offset[0] = (int) value.asDouble();
+                        break;
+                    case (ORIGIN_LENGTH):
+                        length[0] = (int) value.asDouble();
+                        break;
+                }
+
+
+            });
+            return new Substring(offset[0], length[0] + offset[0], original[0]);
+        }
+        return null;
+    }
+
+    /** Builds same element item. */
+    private Item instantiateSameElementItem(String field, String key, Inspector value) {
+        assertHasOperator(key, SAME_ELEMENT);
+
+        SameElementItem sameElement = new SameElementItem(field);
+        IndexNameExpander prev = swapIndexCreator(new PrefixExpander(field));
+        boolean prevInsideSameElement = insideSameElement;
+        insideSameElement = true;
+        getChildren(value).traverse((ArrayTraverser) (index, term) -> {
+            if (term.type() == OBJECT) {
+                term.traverse((ObjectTraverser) (childKey, childValue) -> {
+                    if (isOperator(childKey)) {
+                        sameElement.addItem(buildOperator(childKey, childValue));
+                    } else if (COMPOSITE_LEAF_KEYS.contains(childKey)) {
+                        // Composite leaf directly in sameElement, e.g. {"phrase": ["a", "b"]}
+                        // Uses empty field name since the sameElement parent provides the field context.
+                        sameElement.addItem(instantiateCompositeLeaf("", childKey, childValue));
+                    } else {
+                        // Any JSON object that is not operator or composite leaf, treated as shorthand.
+                        // e.g. {"sameElement": [{"f1": "a"}]} means sameElement(f1 contains a)
+                        sameElement.addItem(instantiateWordItem(getIndex(childKey), childValue.asString(), childValue, false));
+                    }
+                });
+            } else {
+                sameElement.addItem(walkJson(term));
+            }
+        });
+        insideSameElement = prevInsideSameElement;
+        swapIndexCreator(prev);
+
+        return sameElement;
+    }
+
+    /** Checks if key is operator keyword or function call keyword. */
+    private boolean isOperator(String key) {
+        return OPERATOR_KEYS.contains(key) || FUNCTION_CALLS.contains(key);
+    }
+
+    private Item instantiatePhraseItem(String field, String key, Inspector value) {
+        assertHasOperator(key, PHRASE);
+
+        PhraseItem phrase = new PhraseItem();
+        phrase.setIndexName(field);
+        phrase.setExplicit(true);
+        HashMap<Integer, Inspector> children = childMap(value);
+
+        for (Inspector word :  children.values()) {
+            if (word.type() == STRING)
+                phrase.addItem(instantiateWordItem(field, word.asString(), word, false));
+            else if (word.type() == OBJECT && word.field(PHRASE).valid())
+                phrase.addItem(instantiatePhraseItem(field, key, getChildren(word)));
+        }
+        return leafStyleSettings(getAnnotations(value), phrase);
+    }
+
+    private Item instantiateNearItem(String field, String key, Inspector value) {
+        assertHasOperator(key, NEAR);
+
+        NearItem near = new NearItem();
+        near.setIndexName(field);
+
+        HashMap<Integer, Inspector> children = childMap(value);
+
+        for (Inspector word :  children.values()){
+            near.addItem(new WordItem(word.asString(), field));
+        }
+
+        Integer distance = getIntegerAnnotation(DISTANCE, getAnnotationMap(value), null);
+
+        if (distance != null) {
+            near.setDistance(distance);
+        }
+        return near;
+    }
+
+    private Item instantiateONearItem(String field, String key, Inspector value) {
+        assertHasOperator(key, ONEAR);
+
+        NearItem onear = new ONearItem();
+        onear.setIndexName(field);
+        HashMap<Integer, Inspector> children = childMap(value);
+
+        for (Inspector word :  children.values()){
+            onear.addItem(new WordItem(word.asString(), field));
+        }
+
+        Integer distance = getIntegerAnnotation(DISTANCE, getAnnotationMap(value), null);
+        if (distance != null) {
+            onear.setDistance(distance);
+        }
+        return onear;
+    }
+
+    private Item instantiateEquivItem(String field, String key, Inspector value) {
+
+        HashMap<Integer, Inspector> children = childMap(value);
+        Preconditions.checkArgument(children.size() >= 2,
+                                    "Expected 2 or more arguments, got %s.", children.size());
+
+        EquivItem equiv = new EquivItem();
+        equiv.setIndexName(field);
+
+        for (Inspector word :  children.values()){
+            if (word.type() == STRING || word.type() == LONG || word.type() == DOUBLE){
+                equiv.addItem(new WordItem(word.asString(), field));
+            }
+            if (word.type() == OBJECT){
+                word.traverse((ObjectTraverser) (key2, value2) -> {
+                    assertHasOperator(key2, PHRASE);
+                    equiv.addItem(instantiatePhraseItem(field, key2, value2));
+                });
+            }
+        }
+
+        return leafStyleSettings(getAnnotations(value), equiv);
+    }
+
+    private Item instantiateFuzzyItem(String field, String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        HashMap<String, Inspector> annotations = getAnnotationMap(value);
+
+        Preconditions.checkArgument(children.size() == 1, "Expected 1 argument, got %s.", children.size());
+
+        String wordData = children.get(0).asString();
+
+        Integer maxEditDistance = getIntegerAnnotation(MAX_EDIT_DISTANCE, annotations, FuzzyItem.DEFAULT_MAX_EDIT_DISTANCE);
+        Integer prefixLength = getIntegerAnnotation(PREFIX_LENGTH, annotations, FuzzyItem.DEFAULT_PREFIX_LENGTH);
+        boolean prefixMatch = getBoolAnnotation(PREFIX, annotations, Boolean.FALSE);
+
+        FuzzyItem fuzzy = new FuzzyItem(field, true, wordData, maxEditDistance, prefixLength, prefixMatch);
+
+        return leafStyleSettings(getAnnotations(value), fuzzy);
+    }
+
+    private Item instantiateWordAlternativesItem(String field, String key, Inspector value) {
+        HashMap<Integer, Inspector> children = childMap(value);
+        Preconditions.checkArgument(!children.isEmpty(), "Expected 1 or more arguments, got none");
+        Preconditions.checkArgument(children.get(0).type() == OBJECT,
+                                    "Expected OBJECT, got %s.", children.get(0).type());
+
+        List<WordAlternativesItem.Alternative> terms = new ArrayList<>();
+
+        children.get(0).traverse((ObjectTraverser) (keys, values) -> {
+            terms.add(new WordAlternativesItem.Alternative(keys, values.asDouble()));
+        });
+        return leafStyleSettings(getAnnotations(value), new WordAlternativesItem(field, Boolean.TRUE, null, terms));
+    }
+
+    /**
+     * Expands the field and checks if it exists.
+     */
+    private String getIndex(String field) {
+        String expanded = indexNameExpander.expand(field);
+        Preconditions.checkArgument(indexFactsSession.isIndex(expanded), "Field '%s' does not exist.", expanded);
+        return indexFactsSession.getCanonicName(field);
+    }
+
+    /** Returns the index of a field name as returned by {@link #getIndex}. */
+    private Index indexOf(String field) {
+        return indexFactsSession.getIndex(indexNameExpander.expand(field));
+    }
+
+    private static void assertHasOperator(String key, String expectedKey) {
+        Preconditions.checkArgument(key.equals(expectedKey), "Expected operator %s, got %s.", expectedKey, key);
+    }
+
+    private static IllegalArgumentException newUnexpectedArgumentException(Object actual, Object... expected) {
+        StringBuilder out = new StringBuilder("Expected ");
+        for (int i = 0, len = expected.length; i < len; ++i) {
+            out.append(expected[i]);
+            if (i < len - 2) {
+                out.append(", ");
+            } else if (i < len - 1) {
+                out.append(" or ");
+            }
+        }
+        out.append(", got ").append(actual).append(".");
+        return new IllegalArgumentException(out.toString());
+    }
+
+    private List<Inspector> valueListFromInspector(Inspector inspector){
+        List<Inspector> inspectorList = new ArrayList<>();
+        inspector.traverse((ArrayTraverser) (key, value) -> inspectorList.add(value));
+        return inspectorList;
+    }
+
+    private void connectItems() {
+        for (ConnectedItem entry : connectedItems) {
+            TaggableItem to = identifiedItems.get(entry.toId);
+            if (to == null)
+                throw new IllegalArgumentException("Item '" + entry.fromItem +
+                                                   "' was specified to connect to item with ID " + entry.toId +
+                                                   ", which does not exist in the query.");
+            entry.fromItem.setConnectivity((Item) to, entry.weight);
+        }
+    }
+
+    private static final class ConnectedItem {
+
+        final double weight;
+        final int toId;
+        final TaggableItem fromItem;
+
+        ConnectedItem(TaggableItem fromItem, int toId, double weight) {
+            this.weight = weight;
+            this.toId = toId;
+            this.fromItem = fromItem;
+        }
+    }
+
+}

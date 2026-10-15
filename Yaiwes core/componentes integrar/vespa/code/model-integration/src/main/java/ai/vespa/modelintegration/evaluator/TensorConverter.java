@@ -1,0 +1,250 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+package ai.vespa.modelintegration.evaluator;
+
+import ai.onnxruntime.NodeInfo;
+import ai.onnxruntime.OnnxJavaType;
+import ai.onnxruntime.OnnxTensor;
+import ai.onnxruntime.OnnxValue;
+import ai.onnxruntime.OrtEnvironment;
+import ai.onnxruntime.OrtException;
+import ai.onnxruntime.TensorInfo;
+import ai.onnxruntime.ValueInfo;
+import ai.onnxruntime.platform.Fp16Conversions;
+import ai.vespa.rankingexpression.importer.onnx.OnnxImporter;
+import com.yahoo.tensor.DimensionSizes;
+import com.yahoo.tensor.IndexedTensor;
+import com.yahoo.tensor.Tensor;
+import com.yahoo.tensor.TensorType;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.DoubleBuffer;
+import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
+import java.nio.LongBuffer;
+import java.nio.ShortBuffer;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+
+/**
+ * @author lesters
+ */
+class TensorConverter {
+
+    /**
+     * The inputs of an ONNX model. Each input has an ONNX name, which is its name in the model, and a
+     * Vespa identifier derived from it (see {@link #asValidName}). Holds the tensor info of each input
+     * and a lookup from either name to the ONNX name.
+     */
+    record ModelInputs(Map<String, String> nameMapping, Map<String, TensorInfo> tensorInfos) {
+
+        static ModelInputs of(Map<String, NodeInfo> inputInfo) {
+            Map<String, String> nameMapping = new HashMap<>();
+            Map<String, TensorInfo> tensorInfos = new HashMap<>();
+
+            for (var entry : inputInfo.entrySet()) {
+                String onnxName = entry.getKey();
+                nameMapping.put(onnxName, onnxName);
+                nameMapping.put(asValidName(onnxName), onnxName);
+                tensorInfos.put(onnxName, toTensorInfo(entry.getValue().getInfo()));
+            }
+
+            return new ModelInputs(Map.copyOf(nameMapping), Map.copyOf(tensorInfos));
+        }
+
+        /** Returns the ONNX name of the input with the given ONNX name or Vespa identifier. */
+        String toOnnxName(String name) {
+            String onnxName = nameMapping.get(name);
+            
+            if (onnxName == null)
+                throw new IllegalArgumentException("ONNX model has no input with name " + name);
+            
+            return onnxName;
+        }
+
+        TensorInfo tensorInfo(String onnxName) {
+            return tensorInfos.get(onnxName);
+        }
+
+    }
+
+    /**
+     * Converts Vespa tensors to ONNX tensors.
+     * The caller owns the returned tensors and must close them. If conversion of any input fails,
+     * the tensors already created are closed before the exception is propagated.
+     */
+    static Map<String, OnnxTensor> toOnnxTensors(Map<String, Tensor> tensorMap, ModelInputs inputs, OrtEnvironment env)
+        throws OrtException
+    {
+        Map<String, OnnxTensor> result = new HashMap<>();
+        try {
+            for (var entry : tensorMap.entrySet()) {
+                String onnxName = inputs.toOnnxName(entry.getKey());
+                OnnxTensor onnxTensor = toOnnxTensor(entry.getValue(), inputs.tensorInfo(onnxName), env);
+                result.put(onnxName, onnxTensor);
+            }
+            return result;
+        } catch (Throwable t) {
+            result.values().forEach(OnnxTensor::close);
+            throw t;
+        }
+    }
+
+    static OnnxTensor toOnnxTensor(Tensor vespaTensor, TensorInfo onnxTensorInfo, OrtEnvironment environment)
+        throws OrtException
+    {
+        if ( ! (vespaTensor instanceof IndexedTensor tensor)) {
+            throw new IllegalArgumentException("OnnxEvaluator currently only supports tensors with indexed dimensions");
+        }
+        ByteBuffer buffer = ByteBuffer.allocateDirect((int)tensor.size() * onnxTensorInfo.type.size).order(ByteOrder.nativeOrder());
+        if (onnxTensorInfo.type == OnnxJavaType.FLOAT) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.putFloat(tensor.getFloat(i));
+            return OnnxTensor.createTensor(environment, buffer.rewind().asFloatBuffer(), tensor.shape());
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.DOUBLE) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.putDouble(tensor.get(i));
+            return OnnxTensor.createTensor(environment, buffer.rewind().asDoubleBuffer(), tensor.shape());
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.INT8) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.put((byte) tensor.get(i));
+            return OnnxTensor.createTensor(environment, buffer.rewind(), tensor.shape());
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.INT16) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.putShort((short) tensor.get(i));
+            return OnnxTensor.createTensor(environment, buffer.rewind().asShortBuffer(), tensor.shape());
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.INT32) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.putInt((int) tensor.get(i));
+            return OnnxTensor.createTensor(environment, buffer.rewind().asIntBuffer(), tensor.shape());
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.INT64) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.putLong((long) tensor.get(i));
+            return OnnxTensor.createTensor(environment, buffer.rewind().asLongBuffer(), tensor.shape());
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.FLOAT16) {
+            for (int i = 0; i < tensor.size(); i++) {
+                buffer.putShort(Fp16Conversions.floatToFp16((float)tensor.get(i)));
+            }
+            return OnnxTensor.createTensor(environment, buffer.rewind(), tensor.shape(), OnnxJavaType.FLOAT16);
+        }
+        if (onnxTensorInfo.type == OnnxJavaType.BFLOAT16) {
+            for (int i = 0; i < tensor.size(); i++)
+                buffer.putShort(Fp16Conversions.floatToBf16((float)tensor.get(i)));
+            return OnnxTensor.createTensor(environment, buffer.rewind(), tensor.shape(), OnnxJavaType.BFLOAT16);
+        }
+        throw new IllegalArgumentException("OnnxEvaluator does not currently support value type " + onnxTensorInfo.type);
+    }
+
+    interface Short2Float {
+        float convert(short value);
+    }
+    
+    private static void extractTensor(FloatBuffer buffer, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, buffer.get(i));
+    }
+    private static void extractTensor(DoubleBuffer buffer, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, buffer.get(i));
+    }
+    private static void extractTensor(ByteBuffer buffer, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, buffer.get(i));
+    }
+    private static void extractTensor(ShortBuffer buffer, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, buffer.get(i));
+    }
+    private static void extractTensor(ShortBuffer buffer, Short2Float converter, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, converter.convert(buffer.get(i)));
+    }
+    private static void extractTensor(IntBuffer buffer, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, buffer.get(i));
+    }
+    private static void extractTensor(LongBuffer buffer, IndexedTensor.BoundBuilder builder, int totalSize) {
+        for (int i = 0; i < totalSize; i++)
+            builder.cellByDirectIndex(i, buffer.get(i));
+    }
+
+    static Tensor toVespaTensor(OnnxValue onnxValue) {
+        if ( ! (onnxValue instanceof OnnxTensor onnxTensor)) {
+            throw new IllegalArgumentException("ONNX value is not a tensor: maps and sequences are not yet supported");
+        }
+        TensorInfo tensorInfo = onnxTensor.getInfo();
+        TensorType type = toVespaType(onnxTensor.getInfo());
+        DimensionSizes sizes = DimensionSizes.of(type);
+        IndexedTensor.BoundBuilder builder = (IndexedTensor.BoundBuilder) Tensor.Builder.of(type, sizes);
+        long totalSizeAsLong = sizes.totalSize();
+        if (totalSizeAsLong > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("TotalSize=" + totalSizeAsLong + " currently limited at INTEGER.MAX_VALUE");
+        }
+
+        int totalSize = (int) totalSizeAsLong;
+        switch (tensorInfo.type) {
+            case FLOAT -> extractTensor(onnxTensor.getFloatBuffer(), builder, totalSize);
+            case DOUBLE -> extractTensor(onnxTensor.getDoubleBuffer(), builder, totalSize);
+            case INT8 -> extractTensor(onnxTensor.getByteBuffer(), builder, totalSize);
+            case INT16 -> extractTensor(onnxTensor.getShortBuffer(), builder, totalSize);
+            case INT32 -> extractTensor(onnxTensor.getIntBuffer(), builder, totalSize);
+            case INT64 -> extractTensor(onnxTensor.getLongBuffer(), builder, totalSize);
+            case FLOAT16 -> extractTensor(onnxTensor.getShortBuffer(), Fp16Conversions::fp16ToFloat, builder, totalSize);
+            case BFLOAT16 -> extractTensor(onnxTensor.getShortBuffer(), Fp16Conversions::bf16ToFloat, builder, totalSize);
+            default -> throw new IllegalArgumentException("OnnxEvaluator does not currently support value type " + onnxTensor.getInfo().type);
+        }
+        return builder.build();
+    }
+
+    static Map<String, TensorType> toVespaTypes(Map<String, NodeInfo> infoMap) {
+        return infoMap.entrySet().stream().collect(Collectors.toMap(e -> asValidName(e.getKey()),
+                                                                    e -> toVespaType(e.getValue().getInfo())));
+    }
+
+    static String asValidName(String name) {
+        return OnnxImporter.asValidIdentifier(name);
+    }
+
+    static TensorType toVespaType(ValueInfo valueInfo) {
+        TensorInfo tensorInfo = toTensorInfo(valueInfo);
+        TensorType.Builder builder = new TensorType.Builder(toVespaValueType(tensorInfo.onnxType));
+        long[] shape = tensorInfo.getShape();
+        for (int i = 0; i < shape.length; ++i) {
+            long dimSize = shape[i];
+            String dimName = "d" + i;  // standard naming convention
+            if (dimSize > 0)
+                builder.indexed(dimName, dimSize);
+            else
+                builder.indexed(dimName);  // unbound dimension for dim size -1
+        }
+        return builder.build();
+    }
+
+    static private TensorType.Value toVespaValueType(TensorInfo.OnnxTensorType onnxType) {
+        return switch (onnxType) {
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 -> TensorType.Value.INT8;
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 -> TensorType.Value.BFLOAT16;
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 -> TensorType.Value.FLOAT;
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT -> TensorType.Value.FLOAT;
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE -> TensorType.Value.DOUBLE;
+            default -> TensorType.Value.DOUBLE;
+        };
+    }
+
+    static private TensorInfo toTensorInfo(ValueInfo valueInfo) {
+        if ( ! (valueInfo instanceof TensorInfo)) {
+            throw new IllegalArgumentException("ONNX value is not a tensor: maps and sequences are not yet supported");
+        }
+        return (TensorInfo) valueInfo;
+    }
+
+}

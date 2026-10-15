@@ -1,0 +1,316 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.model.content;
+
+import com.yahoo.config.model.api.ModelContext;
+import com.yahoo.config.model.deploy.DeployState;
+import com.yahoo.config.model.producer.AnyConfigProducer;
+import com.yahoo.config.model.producer.TreeConfigProducer;
+import com.yahoo.config.provision.ClusterSpec;
+import com.yahoo.documentmodel.NewDocumentType;
+import com.yahoo.schema.derived.SchemaInfo;
+import com.yahoo.vespa.config.search.DispatchConfig;
+import com.yahoo.vespa.config.search.DispatchNodesConfig;
+import com.yahoo.vespa.config.search.core.ProtonConfig;
+import com.yahoo.vespa.model.builder.xml.dom.ModelElement;
+import com.yahoo.vespa.model.search.IndexedSearchCluster;
+import com.yahoo.vespa.model.search.IndexingCluster;
+import com.yahoo.vespa.model.search.NodeSpec;
+import com.yahoo.vespa.model.search.SearchNode;
+import com.yahoo.vespa.model.search.Tuning;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.LinkedHashMap;
+import java.util.function.Predicate;
+
+/**
+ * Encapsulates the various options for search in a content model.
+ * Wraps a search cluster from com.yahoo.vespa.model.search.
+ */
+public class ContentSearchCluster extends TreeConfigProducer<AnyConfigProducer> implements
+        ProtonConfig.Producer,
+        Redundancy.Provider
+{
+
+    private static final int DEFAULT_DOC_STORE_COMPRESSION_LEVEL = 3;
+    private static final double DEFAULT_DISK_BLOAT = 0.25;
+
+    private final boolean flushOnShutdown;
+    private final Boolean syncTransactionLog;
+
+    /** The single, indexed search cluster this sets up (supporting multiple document types), or null if none */
+    private IndexedSearchCluster searchCluster;
+    private final IndexingCluster indexingCluster;
+    private Redundancy redundancy;
+
+    private final String clusterName;
+    private final Map<String, NewDocumentType> documentDefinitions;
+    private final Set<NewDocumentType> globallyDistributedDocuments;
+    private Double visibilityDelay = 0.0;
+
+    /** The search nodes of this if it does not have an indexed cluster */
+    private final List<SearchNode> nonIndexed = new ArrayList<>();
+
+    private final Map<StorageGroup, NodeSpec> groupToSpecMap = new LinkedHashMap<>();
+    private ResourceLimits resourceLimits;
+    private final double defaultFeedConcurrency;
+    private final double defaultFeedNiceness;
+    private final boolean forwardIssuesToQrs;
+    private final int searchNodeInitializerThreads;
+    private final double searchNodeReservedMemoryFactor;
+
+    public ContentSearchCluster(TreeConfigProducer<?> parent,
+                                String clusterName,
+                                ModelContext.FeatureFlags featureFlags,
+                                Map<String, NewDocumentType> documentDefinitions,
+                                Set<NewDocumentType> globallyDistributedDocuments,
+                                boolean flushOnShutdown,
+                                Boolean syncTransactionLog,
+                                int searchNodeInitializeThreads) {
+        super(parent, "search");
+        this.indexingCluster = new IndexingCluster();
+        this.clusterName = clusterName;
+        this.documentDefinitions = documentDefinitions;
+        this.globallyDistributedDocuments = globallyDistributedDocuments;
+        this.flushOnShutdown = flushOnShutdown;
+        this.syncTransactionLog = syncTransactionLog;
+
+        this.defaultFeedConcurrency = featureFlags.feedConcurrency();
+        this.defaultFeedNiceness = featureFlags.feedNiceness();
+        this.forwardIssuesToQrs = featureFlags.forwardIssuesAsErrors();
+        this.searchNodeInitializerThreads = searchNodeInitializeThreads;
+        this.searchNodeReservedMemoryFactor = featureFlags.searchNodeReservedMemoryFactor();
+    }
+
+    public void setVisibilityDelay(double delay) {
+        this.visibilityDelay = delay;
+        if (searchCluster != null) {
+            searchCluster.setVisibilityDelay(delay);
+        }
+    }
+
+    public void addCluster(IndexedSearchCluster sc) {
+        if (searchCluster != null) {
+            throw new IllegalArgumentException("Duplicate indexed cluster '" + searchCluster.getClusterName() + "'");
+        }
+        searchCluster = sc;
+    }
+
+    /**
+     * Returns whether the schemas in this cluster use streaming mode.
+     *
+     * @return True if this cluster only has schemas with streaming mode, False if it only has schemas
+     *         with indexing, null if it has both or none.
+     */
+    public Boolean isStreaming() {
+        if (searchCluster == null) return false;
+        boolean hasStreaming = searchCluster.hasStreaming();
+        if (searchCluster.hasIndexed() == hasStreaming) return null;
+        return hasStreaming;
+    }
+
+    public boolean hasStreaming() {
+        return (searchCluster != null) && searchCluster.hasStreaming();
+    }
+
+    public boolean hasIndexed() {
+        return (searchCluster != null) && searchCluster.hasIndexed();
+    }
+
+    public List<SearchNode> getSearchNodes() {
+        return (searchCluster != null) ? searchCluster.getSearchNodes() : nonIndexed;
+    }
+
+    public void addSearchNode(DeployState deployState, ContentNode node, StorageGroup parentGroup) {
+        NodeSpec spec = getNextSearchNodeSpec(parentGroup);
+        SearchNode searchNode = SearchNode.create(parent(), "" + node.getDistributionKey(), node.getDistributionKey(),
+                                                  spec, clusterName, node, flushOnShutdown, tuning,
+                                                  deployState.isHosted(), syncTransactionLog,
+                                                  deployState.getProperties().mallocImpl(Optional.of(ClusterSpec.Type.content)));
+        searchNode.setHostResource(node.getHostResource());
+        searchNode.initService(deployState);
+        addSearchNode(searchNode);
+    }
+
+    public void addSearchNode(DeployState deployState, ContentNode node, StorageGroup parentGroup, ModelElement element) {
+        NodeSpec spec = getNextSearchNodeSpec(parentGroup);
+        SearchNode searchNode = new SearchNode.Builder("" + node.getDistributionKey(), spec, clusterName, node, flushOnShutdown,
+                                                       tuning, syncTransactionLog)
+                .build(deployState, parent(), element.getXml());
+        addSearchNode(searchNode);
+    }
+
+    private void addSearchNode(SearchNode searchNode) {
+        if (searchCluster != null) {
+            searchCluster.addSearchNode(searchNode);
+        } else {
+            nonIndexed.add(searchNode);
+        }
+    }
+
+    private TreeConfigProducer<AnyConfigProducer> parent() {
+        return searchCluster != null ? searchCluster : this;
+    }
+
+    /** Translates group ids to continuous 0-base "row" id integers */
+    private NodeSpec getNextSearchNodeSpec(StorageGroup parentGroup) {
+        NodeSpec spec = groupToSpecMap.get(parentGroup);
+        if (spec == null) {
+            spec = new NodeSpec(groupToSpecMap.size(), 0);
+        } else {
+            spec = new NodeSpec(spec.groupIndex(), spec.partitionId() + 1);
+        }
+        groupToSpecMap.put(parentGroup, spec);
+        return spec;
+    }
+
+    private Tuning tuning;
+
+    public void setTuning(Tuning tuning) { this.tuning = tuning; }
+
+    public void setResourceLimits(ResourceLimits resourceLimits) {
+        this.resourceLimits = resourceLimits;
+    }
+
+    public boolean usesHierarchicDistribution() {
+        return searchCluster != null && groupToSpecMap.size() > 1;
+    }
+
+    public void handleRedundancy(Redundancy redundancy) {
+        this.redundancy = redundancy;
+    }
+
+    public List<NewDocumentType> getDocumentTypesWithStreamingCluster() { return documentTypes(this::hasIndexingModeStreaming); }
+    public List<NewDocumentType> getDocumentTypesWithIndexedCluster() { return documentTypes(this::hasIndexingModeIndexed); }
+    public List<NewDocumentType> getDocumentTypesWithStoreOnly() { return documentTypes(this::hasIndexingModeStoreOnly); }
+
+    private List<NewDocumentType> documentTypes(Predicate<NewDocumentType> filter) {
+        return documentDefinitions.values().stream()
+                .filter(filter)
+                .toList();
+    }
+
+    private boolean hasIndexingModeStreaming(NewDocumentType type) {
+        if (searchCluster == null) return false;
+        var schemaInfo = searchCluster.schemas().get(type.getName());
+        return (schemaInfo != null) && (schemaInfo.getIndexMode() == SchemaInfo.IndexMode.STREAMING);
+    }
+
+    private boolean hasIndexingModeIndexed(NewDocumentType type) {
+        if (searchCluster == null) return false;
+        var schemaInfo = searchCluster.schemas().get(type.getName());
+        return (schemaInfo != null) && (schemaInfo.getIndexMode() == SchemaInfo.IndexMode.INDEX);
+    }
+
+    private boolean hasIndexingModeStoreOnly(NewDocumentType type) {
+        return !hasIndexingModeStreaming(type) && !hasIndexingModeIndexed(type);
+    }
+
+    private boolean hasDocumentIdAttributeEnabled(NewDocumentType type) {
+        if (searchCluster == null) return false;
+        var schemaInfo = searchCluster.schemas().get(type.getName());
+        if (schemaInfo == null) return false;
+        var schema = schemaInfo.fullSchema();
+        return (schema != null) && (schema.documentIdAttributeEnabled());
+    }
+
+    @Override
+    public void getConfig(ProtonConfig.Builder builder) {
+        boolean hasAnyNonIndexedSchema = false;
+        for (NewDocumentType type : TopologicalDocumentTypeSorter.sort(documentDefinitions.values())) {
+            ProtonConfig.Documentdb.Builder ddbB = new ProtonConfig.Documentdb.Builder();
+            String docTypeName = type.getFullName().getName();
+            boolean globalDocType = isGloballyDistributed(type);
+            ddbB.inputdoctypename(docTypeName)
+                .configid(getConfigId())
+                .visibilitydelay(visibilityDelay)
+                .global(globalDocType)
+                .document_id_attribute(hasDocumentIdAttributeEnabled(type));
+
+            if (hasIndexingModeStreaming(type)) {
+                hasAnyNonIndexedSchema = true;
+                ddbB.configid(searchCluster.getDocumentDBConfigId(type.getFullName().getName()));
+                ddbB.mode(ProtonConfig.Documentdb.Mode.Enum.STREAMING);
+            } else if (hasIndexingModeIndexed(type)) {
+                ddbB.configid(searchCluster.getDocumentDBConfigId(type.getFullName().getName()));
+                ddbB.mode(ProtonConfig.Documentdb.Mode.Enum.INDEX);
+            } else {
+                hasAnyNonIndexedSchema = true;
+                ddbB.mode(ProtonConfig.Documentdb.Mode.Enum.STORE_ONLY);
+            }
+            if (globalDocType) {
+                ddbB.visibilitydelay(0.0);
+            }
+            builder.documentdb(ddbB);
+        }
+
+        if (hasAnyNonIndexedSchema) {
+            builder.feeding.concurrency(Math.min(1.0, defaultFeedConcurrency*2));
+        } else {
+            builder.feeding.concurrency(defaultFeedConcurrency);
+        }
+        builder.feeding.niceness(defaultFeedNiceness);
+        builder.flush.memory.diskbloatfactor(DEFAULT_DISK_BLOAT);
+        builder.flush.memory.each.diskbloatfactor(DEFAULT_DISK_BLOAT);
+        builder.summary.log.chunk.compression.level(DEFAULT_DOC_STORE_COMPRESSION_LEVEL);
+        builder.summary.log.compact.compression.level(DEFAULT_DOC_STORE_COMPRESSION_LEVEL);
+        builder.forward_issues(forwardIssuesToQrs);
+        builder.writefilter.reserved_memory_factor(searchNodeReservedMemoryFactor);
+
+        int numDocumentDbs = builder.documentdb.size();
+        builder.initialize(
+                new ProtonConfig.Initialize.Builder()
+                        .threads(searchNodeInitializerThreads == 0
+                                         ? numDocumentDbs + 1
+                                         : searchNodeInitializerThreads));
+
+        if (resourceLimits != null) resourceLimits.getConfig(builder);
+
+        if (tuning != null) {
+            tuning.getConfig(builder);
+        }
+        if (redundancy != null) {
+            redundancy.getConfig(builder);
+        }
+
+        setMaxFlushed(builder);
+    }
+
+    private void setMaxFlushed(ProtonConfig.Builder builder) {
+        // maxflushed should be moved down to proton
+        double concurrency = builder.feeding.build().concurrency();
+        if (concurrency > defaultFeedConcurrency) {
+            int maxFlushes = (int)Math.ceil(4 * concurrency);
+            builder.index.maxflushed(maxFlushes);
+        }
+    }
+
+    private boolean isGloballyDistributed(NewDocumentType docType) {
+        return globallyDistributedDocuments.contains(docType);
+    }
+
+    public void getConfig(DispatchNodesConfig.Builder builder) {
+        if (searchCluster != null) {
+            searchCluster.getConfig(builder);
+        }
+    }
+
+    public void getConfig(DispatchConfig.Builder builder) {
+        if (searchCluster != null) {
+            searchCluster.getConfig(builder);
+        }
+    }
+    public IndexedSearchCluster getSearchCluster() { return searchCluster; }
+    public boolean hasSearchCluster() { return searchCluster != null; }
+    public IndexingCluster getIndexingDocproc() { return indexingCluster; }
+    public String getClusterName() { return clusterName; }
+
+    @Override
+    public String toString() { return "content cluster '" + clusterName + "'"; }
+
+    public Redundancy redundancy() { return redundancy; }
+
+}

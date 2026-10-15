@@ -1,0 +1,413 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.indexinglanguage.linguistics;
+
+import com.yahoo.document.DocumentId;
+import com.yahoo.document.annotation.Annotation;
+import com.yahoo.document.annotation.AnnotationTypes;
+import com.yahoo.document.annotation.SpanTree;
+import com.yahoo.document.annotation.SpanTrees;
+import com.yahoo.document.datatypes.StringFieldValue;
+import com.yahoo.language.Linguistics;
+import com.yahoo.language.process.LinguisticsParameters;
+import com.yahoo.language.process.Token;
+import com.yahoo.language.process.TokenType;
+import com.yahoo.language.process.Tokenizer;
+import com.yahoo.language.simple.SimpleLinguistics;
+import com.yahoo.language.simple.SimpleToken;
+import com.yahoo.vespa.indexinglanguage.expressions.InvalidInputException;
+import org.junit.Test;
+import org.mockito.Mockito;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Predicate;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * @author Simon Thoresen Hult
+ */
+@SuppressWarnings({"deprecation", "removal"})
+public class LinguisticsAnnotatorTestCase {
+
+    @Test
+    public void requireThatAnnotateFailsWithZeroTokens() {
+        assertAnnotations(null, "foo");
+    }
+
+    @Test
+    public void requireThatAnnotateFailsWithoutIndexableTokenString() {
+        for (TokenType type : TokenType.values()) {
+            if (type.isIndexable()) {
+                continue;
+            }
+            assertAnnotations(null, "foo", token("foo", "bar", type));
+        }
+    }
+
+    @Test
+    public void requireThatIndexableTokenStringsAreAnnotated() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("bar")));
+        for (TokenType type : TokenType.values()) {
+            if (!type.isIndexable()) continue;
+            assertAnnotations(expected, "foo", token("foo", "bar", type));
+        }
+    }
+
+    @Test
+    public void requireThatTokenizationCanPreserveCase() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 5).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("mIX")));
+        for (TokenType type : TokenType.values()) {
+            if (!type.isIndexable()) continue;
+            assertAnnotations(expected, "mIXEd", token("mIXEd", "mIX", type));
+        }
+    }
+
+    @Test
+    public void requireThatIndexableTokenStringsAreAnnotatedWithStemmingALL() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        var span1 = expected.spanList().span(0, 6);
+        span1.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("tesla")));
+        span1.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("teslas")));
+        var span2 = expected.spanList().span(0, 4);
+        span2.annotate(new Annotation(AnnotationTypes.TERM));
+        span2.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("car")));
+        var span3 = expected.spanList().span(0, 8);
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("modelxes")));
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("modelx")));
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("mex")));
+        for (TokenType type : TokenType.values()) {
+            if (!type.isIndexable()) continue;
+            assertAnnotations(expected, "Tesla cars", new AnnotatorConfig().setStemMode("ALL"),
+                              token("Teslas", "tesla", type),
+                              token("cars", "car", type),
+                              SimpleToken.fromStems("ModelXes", List.of("modelxes", "modelx", "mex")));
+        }
+    }
+
+    @Test
+    public void requireThatIndexableTokenStringsAreAnnotatedWithStemmingALL_STEMS() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        var span1 = expected.spanList().span(0, 6);
+        span1.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("tesla")));
+        var span2 = expected.spanList().span(0, 4);
+        span2.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("car")));
+        var span3 = expected.spanList().span(0, 8);
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("mdlx")));
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("modelx")));
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("mex")));
+        for (TokenType type : TokenType.values()) {
+            if (!type.isIndexable()) continue;
+            assertAnnotations(expected, "Tesla cars", new AnnotatorConfig().setStemMode("ALL_STEMS"),
+                              token("Teslas", "tesla", type),
+                              token("cars", "car", type),
+                              SimpleToken.fromStems("ModelXes", List.of("mdlx", "modelx", "mex")));
+        }
+    }
+
+    @Test
+    public void requireThatTokenizationCanPreserveCaseWithStemmingALL() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        var span1 = expected.spanList().span(0, 6);
+        span1.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("Tesla")));
+        span1.annotate(new Annotation(AnnotationTypes.TERM));
+        var span2 = expected.spanList().span(0, 4);
+        span2.annotate(new Annotation(AnnotationTypes.TERM));
+        span2.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("car")));
+        var span3 = expected.spanList().span(0, 8);
+        span3.annotate(new Annotation(AnnotationTypes.TERM));
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("ModelX")));
+        span3.annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("mex")));
+        for (TokenType type : TokenType.values()) {
+            if (!type.isIndexable()) continue;
+            assertAnnotations(expected, "Tesla cars", new AnnotatorConfig().setStemMode("ALL").setLowercase(false),
+                              token("Teslas", "Tesla", type),
+                              token("cars", "car", type),
+                              SimpleToken.fromStems("ModelXes", List.of("ModelX", "mex")));
+        }
+    }
+
+    @Test
+    public void requireThatSpecialTokenStringsAreAnnotatedRegardlessOfType() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("bar")));
+        for (TokenType type : TokenType.values()) {
+            assertAnnotations(expected, "foo", token("foo", "bar", type, true));
+        }
+    }
+
+    @Test
+    public void requireThatTermAnnotationsAreEmptyIfOrigIsLowerCase() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 3).annotate(new Annotation(AnnotationTypes.TERM));
+        for (boolean specialToken : List.of(true, false)) {
+            for (TokenType type : TokenType.values()) {
+                if (!specialToken && !type.isIndexable()) {
+                    continue;
+                }
+                assertAnnotations(expected, "foo", token("foo", "foo", type, specialToken));
+            }
+        }
+    }
+
+    @Test
+    public void requireThatTermAnnotationsPreserveCasing() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("BaR")));
+        for (boolean specialToken : List.of(true, false)) {
+            for (TokenType type : TokenType.values()) {
+                if (!specialToken && !type.isIndexable()) {
+                    continue;
+                }
+                assertAnnotations(expected, "foo", token("foo", "BaR", type, specialToken));
+            }
+        }
+    }
+
+    @Test
+    public void requireThatCompositeTokensAreFlattened() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("foo")));
+        expected.spanList().span(3, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("bar")));
+        expected.spanList().span(6, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("baz")));
+
+        SimpleToken token = token("FOOBARBAZ", "foobarbaz", TokenType.ALPHABETIC)
+                .addComponent(token("FOO", "foo", TokenType.ALPHABETIC).setOffset(0))
+                .addComponent(token("BARBAZ", "barbaz", TokenType.ALPHABETIC).setOffset(3)
+                                                                             .addComponent(token("BAR", "bar", TokenType.ALPHABETIC).setOffset(3))
+                                                                             .addComponent(token("BAZ", "baz", TokenType.ALPHABETIC).setOffset(6)));
+        assertAnnotations(expected, "foobarbaz", token);
+    }
+
+    @Test
+    public void requireThatCompositeSpecialTokensAreNotFlattened() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 9).annotate(new Annotation(AnnotationTypes.TERM,
+                                                               new StringFieldValue("foobarbaz")));
+
+        SimpleToken token = token("FOOBARBAZ", "foobarbaz", TokenType.ALPHABETIC).setSpecialToken(true)
+                                                                                 .addComponent(token("FOO", "foo", TokenType.ALPHABETIC).setOffset(0))
+                                                                                 .addComponent(token("BARBAZ", "barbaz", TokenType.ALPHABETIC).setOffset(3)
+                                                                                                                                              .addComponent(token("BAR", "bar", TokenType.ALPHABETIC).setOffset(3))
+                                                                                                                                              .addComponent(token("BAZ", "baz", TokenType.ALPHABETIC).setOffset(6)));
+        assertAnnotations(expected, "foobarbaz", token);
+    }
+
+    @Test
+    public void requireThatErrorTokensAreSkipped() {
+        assertAnnotations(null, "foo", new SimpleToken("foo").setType(TokenType.ALPHABETIC)
+                                                             .setOffset(-1));
+    }
+
+    @Test
+    public void requireThatTermReplacementsAreApplied() {
+        SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        expected.spanList().span(0, 3).annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue("bar")));
+        for (boolean specialToken : List.of(true, false)) {
+            for (TokenType type : TokenType.values()) {
+                if (!specialToken && !type.isIndexable()) {
+                    continue;
+                }
+                assertAnnotations(expected, "foo",
+                                  new AnnotatorConfig(),
+                                  newLinguistics(List.of(token("foo", "foo", type, specialToken)),
+                                                 Map.of("foo", "bar")));
+            }
+        }
+    }
+
+    @Test
+    public void requireThatTokenizeCappingWorks() {
+        runWithBothModes(this::requireThatTokenizeCappingWorksImpl);
+    }
+
+    private void requireThatTokenizeCappingWorksImpl(boolean useSimpleAnnotations) {
+        String shortString = "short string";
+        SpanTree spanTree = new SpanTree(SpanTrees.LINGUISTICS);
+        spanTree.setStringFieldValue(new StringFieldValue(shortString));
+        spanTree.spanList().span(0, 5).annotate(new Annotation(AnnotationTypes.TERM));
+        spanTree.spanList().span(6, 6).annotate(new Annotation(AnnotationTypes.TERM));
+
+        StringFieldValue shortValue = new StringFieldValue(shortString);
+
+        Linguistics linguistics = new SimpleLinguistics();
+
+        LinguisticsAnnotator annotator = new LinguisticsAnnotator(linguistics, new AnnotatorConfig().setMaxTokenizeLength(12));
+
+        assertTrue(annotator.annotate(shortValue));
+        assertEquals(spanTree, shortValue.getSpanTree(SpanTrees.LINGUISTICS));
+        assertEquals(shortString, shortValue.getSpanTree(SpanTrees.LINGUISTICS).getStringFieldValue().getString());
+
+        StringFieldValue cappedValue = new StringFieldValue(shortString + " a longer string");
+        assertTrue(annotator.annotate(cappedValue));
+        assertEquals((shortString + " a longer string"), cappedValue.getSpanTree(SpanTrees.LINGUISTICS).getStringFieldValue().getString());
+    }
+
+    @Test
+    public void requireThatMaxTermOccurrencesIsHonored() {
+        final String inputTerm = "foo";
+        final String stemmedInputTerm = "bar"; // completely different from inputTerm for safer test
+        final String paddedInputTerm = inputTerm + " ";
+        final SpanTree expected = new SpanTree(SpanTrees.LINGUISTICS);
+        final int inputTermOccurence = AnnotatorConfig.DEFAULT_MAX_TERM_OCCURRENCES * 2;
+        for (int i = 0; i < AnnotatorConfig.DEFAULT_MAX_TERM_OCCURRENCES; ++i) {
+            expected.spanList().span(i * paddedInputTerm.length(), inputTerm.length())
+                    .annotate(new Annotation(AnnotationTypes.TERM, new StringFieldValue(stemmedInputTerm)));
+        }
+        for (TokenType type : TokenType.values()) {
+            if (!type.isIndexable()) {
+                continue;
+            }
+            StringBuilder input = new StringBuilder();
+            Token[] tokens = new Token[inputTermOccurence];
+            for (int i = 0; i < inputTermOccurence; ++i) {
+                SimpleToken t = token(inputTerm, stemmedInputTerm, type);
+                t.setOffset(i * paddedInputTerm.length());
+                tokens[i] = t;
+                input.append(paddedInputTerm);
+            }
+            assertAnnotations(expected, input.toString(), tokens);
+        }
+    }
+
+    @Test
+    public void requireThatBinaryDataIsNotAnnotated() {
+        runWithBothModes(this::requireThatBinaryDataIsNotAnnotatedImpl);
+    }
+
+    private void requireThatBinaryDataIsNotAnnotatedImpl(boolean useSimpleAnnotations) {
+        var config = new AnnotatorConfig()
+                .setMaxReplacementCharacters(10)
+                .setMaxReplacementCharactersRatio(0.1d);
+        var annotator = new LinguisticsAnnotator(new SimpleLinguistics(), config);
+
+        Predicate<String> isAnnotated =
+                txt -> annotator.annotate(new StringFieldValue(txt), new DocumentId("id:this:foobar::1"), false);
+
+        assertTrue(isAnnotated.test("\uFFFD".repeat(10) + "a".repeat(90))); // Up to 10 replacement characters allowed
+        assertTrue(isAnnotated.test("\uFFFD".repeat(11) + "a".repeat(100))); // Up to 10% being replacement characters allowed
+        var exception = assertThrows(InvalidInputException.class, () -> isAnnotated.test("\uFFFD".repeat(11) + "a".repeat(90))); // Above both limits, so no annotations
+        var expectedMsg = "Some text of length 101 is classified as binary data" +
+                " as it contains 11 Unicode replacement characters. " +
+                "(max-replacement-character-ratio=10%, max-replacement-characters=10)";
+        assertEquals(expectedMsg, exception.getMessage());
+    }
+
+    @Test
+    public void requireReindexingBinaryDataSilentlyDropsAnnotations() {
+        runWithBothModes(this::requireReindexingBinaryDataSilentlyDropsAnnotationsImpl);
+    }
+
+    private void requireReindexingBinaryDataSilentlyDropsAnnotationsImpl(boolean useSimpleAnnotations) {
+        var config = new AnnotatorConfig()
+                .setMaxReplacementCharacters(1)
+                .setMaxReplacementCharactersRatio(0.01d);
+        var annotator = new LinguisticsAnnotator(new SimpleLinguistics(), config);
+
+        Predicate<Boolean> isAnnotated =
+                isReindexingOperation -> annotator.annotate(
+                        new StringFieldValue("\uFFFD".repeat(2)),
+                        new DocumentId("id:this:foobar::1"),
+                        isReindexingOperation);
+
+        var exception = assertThrows(InvalidInputException.class, () -> isAnnotated.test(false)); // Not reindexing, so exception
+        var expectedMsg = "Some text of length 2 is classified as binary data" +
+                " as it contains 2 Unicode replacement characters. " +
+                "(max-replacement-character-ratio=1%, max-replacement-characters=1)";
+        assertEquals(expectedMsg, exception.getMessage());
+
+        assertFalse(isAnnotated.test(true)); // Reindexing, so no exception, but no annotations either
+    }
+
+    // --------------------------------------------------------------------------------
+    // Utilities
+
+    @FunctionalInterface
+    private interface TestWithMode {
+        void run(boolean useSimpleAnnotations);
+    }
+
+    private static void runWithBothModes(TestWithMode test) {
+        boolean oldValue = com.yahoo.document.annotation.internal.SimpleIndexingAnnotations.isEnabled();
+        try {
+            // Test with simple annotations disabled
+            com.yahoo.document.annotation.internal.SimpleIndexingAnnotations.setEnabled(false);
+            test.run(false);
+
+            // Test with simple annotations enabled
+            com.yahoo.document.annotation.internal.SimpleIndexingAnnotations.setEnabled(true);
+            test.run(true);
+        } finally {
+            com.yahoo.document.annotation.internal.SimpleIndexingAnnotations.setEnabled(oldValue);
+        }
+    }
+
+    private static SimpleToken token(String orig, String stem, TokenType type) {
+        return token(orig, stem, type, false);
+    }
+
+    private static SimpleToken token(String orig, String stem, TokenType type, boolean specialToken) {
+        return new SimpleToken(orig).setTokenString(stem)
+                                    .setType(type)
+                                    .setSpecialToken(specialToken);
+    }
+
+    private static void assertAnnotations(SpanTree expected, String value, Token... tokens) {
+        assertAnnotations(expected, value, new AnnotatorConfig(), newLinguistics(List.of(tokens), Map.of()));
+    }
+
+    private static void assertAnnotations(SpanTree expected, String value, AnnotatorConfig config, Token... tokens) {
+        assertAnnotations(expected, value, config, newLinguistics(List.of(tokens), Map.of()));
+    }
+
+    private static void assertAnnotations(SpanTree expected, String str, AnnotatorConfig config, Linguistics linguistics) {
+        // Test with both simple and full annotation modes using shared helper
+        runWithBothModes(useSimpleAnnotations -> {
+            StringFieldValue val = new StringFieldValue(str);
+            assertEquals(expected != null, new LinguisticsAnnotator(linguistics, config).annotate(val));
+            if (!Objects.equals(expected, val.getSpanTree(SpanTrees.LINGUISTICS))) {
+                System.err.println("Mode: useSimpleAnnotations=" + useSimpleAnnotations);
+                System.err.println("expected: " + expected);
+                System.err.println("got: " + val.getSpanTree(SpanTrees.LINGUISTICS));
+            }
+            assertEquals(expected, val.getSpanTree(SpanTrees.LINGUISTICS));
+        });
+    }
+
+    private static Linguistics newLinguistics(List<? extends Token> tokens, Map<String, String> replacementTerms) {
+        Linguistics linguistics = Mockito.mock(Linguistics.class);
+        Mockito.when(linguistics.getTokenizer()).thenReturn(new MyTokenizer(tokens, replacementTerms));
+        return linguistics;
+    }
+
+    private static class MyTokenizer implements Tokenizer {
+
+        final List<Token> tokens;
+
+        public MyTokenizer(List<? extends Token> tokens, Map<String, String> replacementTerms) {
+            this.tokens = tokens.stream().map(token -> replace(token, replacementTerms)).toList();
+        }
+
+        private Token replace(Token token, Map<String, String> replacementTerms) {
+            String tokenString = token.getTokenString();
+            if (tokenString != null && !replacementTerms.isEmpty()) {
+                var simpleToken = (SimpleToken)token;
+                simpleToken.setTokenString(replacementTerms.getOrDefault(token.getTokenString(), token.getTokenString()));
+            }
+            return token;
+        }
+
+        @Override
+        public Iterable<Token> tokenize(String input, LinguisticsParameters parameters) {
+            return tokens;
+        }
+
+    }
+
+}

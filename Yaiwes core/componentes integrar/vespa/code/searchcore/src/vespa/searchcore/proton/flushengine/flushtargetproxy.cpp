@@ -1,0 +1,47 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "flushtargetproxy.h"
+
+#include "vespa/log/log.h"
+
+namespace proton {
+
+using searchcorespi::FlushStats;
+using searchcorespi::IFlushTarget;
+
+FlushTargetProxy::FlushTargetProxy(const IFlushTarget::SP& target)
+    : IFlushTarget(target->getName(), target->getType(), target->getComponent()), _target(target) {
+}
+
+FlushTargetProxy::FlushTargetProxy(const IFlushTarget::SP& target, const std::string& prefix)
+    : IFlushTarget(prefix + "." + target->getName(), target->getType(), target->getComponent()), _target(target) {
+}
+
+FlushTargetProxy::~FlushTargetProxy() = default;
+
+void FlushTargetProxy::init_flush(SerialNum currentSerial, std::shared_ptr<search::IFlushToken> flush_token,
+                                  TaskPromise task_promise) {
+    _target->init_flush(currentSerial, std::move(flush_token), std::move(task_promise));
+}
+
+bool FlushTargetProxy::can_flush(SerialNum current_serial) const noexcept {
+    return _target->can_flush(current_serial);
+}
+
+uint64_t FlushTargetProxy::get_approx_bytes_to_read_from_disk() const noexcept {
+    return _target->get_approx_bytes_to_read_from_disk();
+}
+
+size_t FlushTargetProxy::reserved_memory_for_flush() const noexcept {
+    return _target->reserved_memory_for_flush();
+}
+
+std::chrono::steady_clock::duration FlushTargetProxy::last_flush_duration() const noexcept {
+    return _target->last_flush_duration();
+}
+
+std::chrono::steady_clock::duration FlushTargetProxy::estimated_flush_duration() const noexcept {
+    return _target->estimated_flush_duration();
+}
+
+} // namespace proton

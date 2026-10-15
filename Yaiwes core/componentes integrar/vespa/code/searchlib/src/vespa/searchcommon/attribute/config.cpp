@@ -1,0 +1,95 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "config.h"
+
+#include <vespa/check_require.h>
+#include <vespa/searchlib/tensor/tensor_quantization.h>
+
+namespace search::attribute {
+
+namespace {
+
+static constexpr uint64_t MAX_UNCOMMITTED_MEMORY = 8000;
+
+vespalib::eval::ValueType to_quantized_type(const vespalib::eval::ValueType& original_tensor_type,
+                                            const QuantizationParams&        qp) {
+    // TODO don't require going via a quantizer instance to compute the type
+    vespalib::quant::EdenQuantizer quantizer(original_tensor_type.dense_subspace_size(), qp.bits(), qp.seed());
+    return tensor::to_quantized_tensor_type(original_tensor_type, quantizer);
+}
+
+} // namespace
+
+Config::Config() noexcept : Config(BasicType::NONE, CollectionType::SINGLE, false) {
+}
+
+Config::Config(BasicType bt, CollectionType ct, bool fastSearch_) noexcept
+    : _basicType(bt),
+      _type(ct),
+      _fastSearch(fastSearch_),
+      _isFilter(false),
+      _fastAccess(false),
+      _mutable(false),
+      _paged(false),
+      _distance_metric(DistanceMetric::Euclidean),
+      _match(Match::UNCASED),
+      _dictionary(),
+      _maxUnCommittedMemory(MAX_UNCOMMITTED_MEMORY),
+      _growStrategy(),
+      _compactionStrategy(),
+      _predicateParams(),
+      _tensorType(vespalib::eval::ValueType::error_type()),
+      _unquantized_tensor_type(vespalib::eval::ValueType::error_type()),
+      _hnsw_index_params() {
+}
+
+Config::Config(const Config&) = default;
+Config& Config::operator=(const Config&) = default;
+Config::Config(Config&&) noexcept = default;
+Config& Config::operator=(Config&&) noexcept = default;
+Config::~Config() = default;
+
+bool Config::operator==(const Config& b) const noexcept {
+    return _basicType == b._basicType && _type == b._type && _fastSearch == b._fastSearch &&
+           _isFilter == b._isFilter && _fastAccess == b._fastAccess && _mutable == b._mutable && _paged == b._paged &&
+           _maxUnCommittedMemory == b._maxUnCommittedMemory && _match == b._match && _dictionary == b._dictionary &&
+           _growStrategy == b._growStrategy && _compactionStrategy == b._compactionStrategy &&
+           _predicateParams == b._predicateParams &&
+           (_basicType.type() != BasicType::Type::TENSOR ||
+            (_tensorType == b._tensorType && _unquantized_tensor_type == b._unquantized_tensor_type)) &&
+           _distance_metric == b._distance_metric && _hnsw_index_params == b._hnsw_index_params &&
+           _quantization_params == b._quantization_params;
+}
+
+Config& Config::setTensorType(const vespalib::eval::ValueType& tensorType_in) {
+    _tensorType = tensorType_in;
+    _unquantized_tensor_type = tensorType_in;
+    _quantization_params.reset();
+    return *this;
+}
+
+Config& Config::set_tensor_type_with_quantization(const vespalib::eval::ValueType& original_tensor_type,
+                                                  const QuantizationParams&        quantization_params) {
+    _tensorType = to_quantized_type(original_tensor_type, quantization_params);
+    _unquantized_tensor_type = original_tensor_type;
+    _quantization_params = quantization_params;
+    return *this;
+}
+
+Config& Config::set_hnsw_index_params(const HnswIndexParams& params) {
+    CHECK(_distance_metric == params.distance_metric());
+    _hnsw_index_params = params;
+    return *this;
+}
+
+std::string Config::type_to_string() const {
+    if (basicType().type() == BasicType::TENSOR) {
+        return tensorType().to_spec();
+    }
+    if (collectionType().type() == CollectionType::SINGLE) {
+        return basicType().asString();
+    }
+    return std::string(collectionType().asString()) + "<" + std::string(basicType().asString()) + ">";
+}
+
+} // namespace search::attribute

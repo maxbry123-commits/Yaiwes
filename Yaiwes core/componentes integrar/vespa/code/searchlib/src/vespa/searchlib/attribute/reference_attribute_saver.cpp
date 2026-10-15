@@ -1,0 +1,65 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "reference_attribute_saver.h"
+
+#include "iattributesavetarget.h"
+
+#include <vespa/searchlib/util/bufferwriter.h>
+
+#include <vespa/vespalib/util/array.hpp>
+
+using document::GlobalId;
+using vespalib::GenerationGuard;
+using vespalib::datastore::AtomicEntryRef;
+using vespalib::datastore::EntryRef;
+
+namespace search::attribute {
+
+ReferenceAttributeSaver::ReferenceAttributeSaver(GenerationGuard&& guard, const AttributeHeader& header,
+                                                 EntryRefVectorSnapshot&& indices_snapshot, Store& store)
+    : AttributeSaver(std::move(guard), header),
+      _indices_snapshot(std::move(indices_snapshot)),
+      _store(store),
+      _enumerator(store.getEnumerator(true)) {
+}
+
+ReferenceAttributeSaver::~ReferenceAttributeSaver() = default;
+
+namespace {
+
+template <class Store> class ValueWriter {
+    const Store&  _store;
+    BufferWriter& _writer;
+
+public:
+    ValueWriter(const Store& store, BufferWriter& writer) : _store(store), _writer(writer) {}
+    void operator()(const AtomicEntryRef& ref) {
+        const GlobalId& gid = _store.get(ref.load_acquire()).gid();
+        _writer.write(&gid, sizeof(GlobalId));
+    }
+};
+
+template <class Store, class Enumerator>
+void writeUdat(IAttributeSaveTarget& saveTarget, const Store& store, const Enumerator& enumerator) {
+    std::unique_ptr<BufferWriter> udatWriter(saveTarget.udatWriter().allocBufferWriter());
+    enumerator.foreach_key(ValueWriter<Store>(store, *udatWriter));
+    udatWriter->flush();
+}
+
+} // namespace
+
+bool ReferenceAttributeSaver::onSave(IAttributeSaveTarget& saveTarget) {
+    writeUdat(saveTarget, _store, _enumerator);
+    std::unique_ptr<search::BufferWriter> datWriter(saveTarget.datWriter().allocBufferWriter());
+
+    _enumerator.enumerateValues();
+    auto indices_span = _indices_snapshot.span();
+    for (const auto& ref : indices_span) {
+        uint32_t enumValue = _enumerator.mapEntryRefToEnumValue(ref);
+        datWriter->write(&enumValue, sizeof(uint32_t));
+    }
+    datWriter->flush();
+    return true;
+}
+
+} // namespace search::attribute

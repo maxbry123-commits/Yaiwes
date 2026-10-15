@@ -1,0 +1,188 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.search.dispatch.searchcluster;
+
+import java.util.List;
+import java.util.logging.Logger;
+
+/**
+ * A group in a search cluster. This class is multithread safe.
+ *
+ * @author bratseth
+ * @author ollivir
+ */
+public class Group {
+
+    private static final Logger log = Logger.getLogger(Group.class.getName());
+
+    private final static double maxContentSkew = 0.10;
+    private final static int minDocsPerNodeToRequireLowSkew = 100;
+
+    private final int id;
+    private final List<Node> nodes;
+    private final String availabilityZone;
+
+    // Using volatile to ensure visibility for reader.
+    // All updates are done in a single writer thread
+    private volatile boolean hasSufficientCoverage = false;
+    private volatile boolean hasFullCoverage = true;
+    private volatile long activeDocuments = 0;
+    private volatile long targetActiveDocuments = 0;
+    private volatile double maxContentShare = 1.0;
+    private volatile boolean isBalanced = true;
+
+    public Group(int id, List<Node> nodes) {
+        this.id = id;
+        this.nodes = List.copyOf(nodes);
+        this.availabilityZone = azOf(nodes);
+
+        int index = 0;
+        for (var node: nodes) {
+            node.setPathIndex(index);
+            index++;
+        }
+    }
+
+    /**
+     * Returns the unique identity of this group.
+     * NOTE: This is a contiguous index from 0, NOT necessarily the group id assigned by the user or node repo.
+     */
+    public int id() { return id; }
+
+    /** Returns the name of the availability zone this group is allocated in. */
+    public String availabilityZone() { return availabilityZone; }
+
+    /** Returns the number of nodes in this. */
+    public int size() { return nodes.size(); }
+
+    /** Returns the nodes in this group as an immutable list */
+    public List<Node> nodes() { return nodes; }
+
+    /**
+     * Returns whether this group has sufficient active documents
+     * (compared to other groups) that should receive traffic
+     */
+    public boolean hasSufficientCoverage() {
+        return hasSufficientCoverage;
+    }
+
+    public void setHasSufficientCoverage(boolean sufficientCoverage) {
+        hasSufficientCoverage = sufficientCoverage;
+    }
+
+    public List<Node> workingNodes() {
+        return nodes.stream().filter(node -> node.isWorking() == Boolean.TRUE).toList();
+    }
+
+    public int workingNodesCount() {
+        return workingNodes().size();
+    }
+
+    /**
+     * Returns whether all nodes in this group are working.
+     */
+    public boolean allNodesWorking() {
+        return workingNodesCount() == size();
+    }
+
+    /** Called every time, and only when, we have received a ping response from every node in the group. */
+    public void aggregateNodeValues() {
+        List<Node> workingNodes = workingNodes();
+        long activeDocs = calculateActiveDocs(workingNodes);
+        activeDocuments = activeDocs;
+        targetActiveDocuments = workingNodes.stream().mapToLong(Node::getTargetActiveDocuments).sum();
+        long maxNodeActiveDocs = workingNodes.stream().mapToLong(Node::getActiveDocuments).max().orElse(0);
+        maxContentShare = activeDocs == 0 ? 1.0 : (double)maxNodeActiveDocs / activeDocs;
+        int numWorkingNodes = workingNodes.size();
+        if (numWorkingNodes > 1) {
+            long average = activeDocs / numWorkingNodes;
+            long skew = workingNodes.stream().mapToLong(node -> Math.abs(node.getActiveDocuments() - average)).sum();
+            boolean balanced = skew <= activeDocs * maxContentSkew;
+            if (balanced != isBalanced) {
+                if (!isSparse())
+                    log.info("Content in " + this + ", with " + numWorkingNodes + "/" + nodes.size() + " working nodes, is " +
+                             (balanced ? "" : "not ") + "well balanced. Current deviation: " + skew * 100 / activeDocs +
+                             "%. Active documents: " + activeDocs + ", skew: " + skew + ", average: " + average +
+                             (balanced ? "" : ". Top-k hit estimation assumes every node holds as much as the largest node."));
+                isBalanced = balanced;
+            }
+        } else {
+            isBalanced = true;
+        }
+    }
+
+    private static long calculateActiveDocs(List<Node> workingNodes) {
+        return workingNodes.stream()
+                           .mapToLong(Node::getActiveDocuments)
+                           .sum();
+    }
+
+    /**
+     * Returns the active documents in this group.
+     * If we have not yet received this information from <i>all</i> nodes in the group, 0 is returned.
+     */
+    public long activeDocuments() { return activeDocuments; }
+
+    /**
+     * Returns the target active documents in this group.
+     * If we have not yet received this information from <i>all</i> nodes in the group, 0 is returned.
+     */
+    public long targetActiveDocuments() { return targetActiveDocuments; }
+
+    /** Returns whether the nodes in the group have about the same number of documents */
+    public boolean isBalanced() { return isBalanced; }
+
+    /**
+     * Returns the share of the active documents in this group held by the working node holding the most.
+     * This is 1/(working nodes) when content is perfectly balanced, and larger when it is skewed.
+     * Returns 1 if we have not yet received active document counts from all nodes.
+     */
+    public double maxContentShare() { return maxContentShare; }
+
+    /** Returns whether this group has too few documents per node to expect it to be balanced */
+    public boolean isSparse() {
+        if (nodes.isEmpty()) return false;
+        return activeDocuments() / nodes.size() < minDocsPerNodeToRequireLowSkew;
+    }
+
+    public boolean fullCoverageStatusChanged(boolean hasFullCoverageNow) {
+        boolean previousState = hasFullCoverage;
+        hasFullCoverage = hasFullCoverageNow;
+        return previousState != hasFullCoverageNow;
+    }
+
+    /**
+     * Returns true if - given the two group's status - it's strictly preferable to route a request to this group
+     * over the given group.
+     */
+    public boolean isPreferableTo(Group other) {
+        if (this.hasSufficientCoverage() && !other.hasSufficientCoverage()) return true;
+        return false;
+    }
+
+    @Override
+    public String toString() { return "group " + id; }
+
+    @Override
+    public int hashCode() { return id; }
+
+    @Override
+    public boolean equals(Object other) {
+        if (other == this) return true;
+        if (!(other instanceof Group)) return false;
+        return ((Group) other).id == this.id;
+    }
+
+    private static String azOf(List<Node> nodes) {
+        String found = null;
+        for (Node n : nodes) {
+            String az = n.availabilityZone();
+            if (found == null) {
+                found = az;
+            } else if (! found.equals(az)) {
+                throw new IllegalArgumentException("group of content nodes has conflicting availability zones: " + found + " != " + az);
+            }
+        }
+        return (found == null) ? "default" : found;
+    }
+
+}

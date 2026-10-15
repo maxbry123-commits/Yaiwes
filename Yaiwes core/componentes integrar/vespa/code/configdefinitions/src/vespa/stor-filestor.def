@@ -1,0 +1,89 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+namespace=vespa.config.content
+
+## PERFORMANCE PARAMETERS
+
+## Number of threads to use for each mountpoint.
+num_threads int default=8 restart
+
+## Number of threads for response processing and delivery
+## 0 will give legacy sync behavior.
+## Negative number will choose a good number based on # cores.
+num_response_threads int default=2 restart
+
+## Number of handler objects that might be created by visitor threads
+## This is a temporary setting that only skilled vespa developers should modify
+## This must be kept in line with stor-visitor:visitorthreads
+num_visitor_threads int default=16 restart
+
+## Number of handler objects that might be created by network threads
+## This is a temporary setting that only skilled vespa developers should modify
+## This must be kept in line with stor-communicationmanager:rpc.num_network_threads
+num_network_threads int default=2 restart
+
+## Type of sequenced thread executor use for persistence replies.
+response_sequencer_type enum {LATENCY, THROUGHPUT, ADAPTIVE} default=ADAPTIVE restart
+
+## Chunksize to use while merging buckets between nodes.
+##
+## Should follow stor-distributormanager:splitsize (16MB).
+bucket_merge_chunk_size int default=16772216 restart
+
+## Whether to use async message handling when scheduling storage messages from FileStorManager.
+##
+## When turned on, the calling thread (e.g. FNET network thread when using Storage API RPC)
+## gets the next async message to handle (if any) as part of scheduling a storage message.
+## This async message is then handled by the calling thread immediately,
+## instead of going via a persistence thread.
+use_async_message_handling_on_schedule bool default=false
+
+## The noise level used when deciding whether a resource usage sample should be reported to the cluster controller.
+##
+## If one of the resource categories (e.g. disk or memory) has a usage delta that is larger than the noise level,
+## the entire resource usage sample is immediately reported to the cluster controller (via host info).
+## This config can be live updated (doesn't require restart).
+resource_usage_reporter_noise_level double default=0.001
+
+## Specify throttling used for async persistence operations. This throttling takes place
+## before operations are dispatched to Proton and serves as a limiter for how many
+## operations may be in flight in Proton's internal queues.
+##
+##  - UNLIMITED is, as it says on the tin, unlimited. Offers no actual throttling, but
+##    has near zero overhead and never blocks.
+##  - DYNAMIC uses DynamicThrottlePolicy under the hood and will block if the window
+##    is full (if a blocking throttler API call is invoked).
+##
+async_operation_throttler.type enum { UNLIMITED, DYNAMIC } default=DYNAMIC
+## Internal throttler tuning parameters that only apply when type == DYNAMIC:
+async_operation_throttler.window_size_increment int default=20
+async_operation_throttler.window_size_decrement_factor double default=1.2
+async_operation_throttler.window_size_backoff double default=0.95
+async_operation_throttler.min_window_size int default=20
+async_operation_throttler.max_window_size int default=-1 # < 0 implies INT_MAX
+async_operation_throttler.resize_rate double default=3.0
+
+## Maximum number of enqueued put/remove/update operations towards a given bucket
+## that can be dispatched asynchronously as a batch under the same write lock.
+## This prevents pipeline stalls when many write operations are in-flight to the
+## same bucket, as each operation would otherwise have to wait for the completion
+## of all prior writes to the bucket.
+max_feed_op_batch_size int default=64
+
+## Specify throttling used for async _maintenance_ operations dispatched to Proton.
+## If enabled (i.e. set to DYNAMIC) this serves as a secondary throttling mechanism
+## for the following operations:
+##  - Put/Remove as part of merge apply diffs
+##  - RemoveByGid as part of bucket deletions
+##  - Remove as part of remove location (i.e. GC)
+##
+## Note that for a maintenance operation to be scheduled it has to _both_ acquire a
+## regular async operation throttler token _and_ a maintenance throttler token, in that
+## exact order.
+maintenance_operation_throttler.type enum { UNLIMITED, DYNAMIC } default=UNLIMITED
+## Internal maintenance throttler tuning parameters that only apply when type == DYNAMIC:
+maintenance_operation_throttler.window_size_increment int default=10
+maintenance_operation_throttler.window_size_decrement_factor double default=1.2
+maintenance_operation_throttler.window_size_backoff double default=0.95
+maintenance_operation_throttler.min_window_size int default=10
+maintenance_operation_throttler.max_window_size int default=-1 # < 0 implies INT_MAX
+maintenance_operation_throttler.resize_rate double default=2.0

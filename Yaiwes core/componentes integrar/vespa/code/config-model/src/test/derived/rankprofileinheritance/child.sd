@@ -1,0 +1,69 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+schema child {
+
+  document child inherits parent1, parent2 {
+
+    field field3 type int {
+      indexing: attribute
+    }
+
+  }
+
+  rank-profile profile3 inherits profile1 {
+
+    function function3() {
+      expression: attribute(field3) + 5
+    }
+
+    summary-features {
+      function3
+      attribute(field3)
+    }
+
+    match-features inherits profile1 {
+      function3
+    }
+
+  }
+
+  rank-profile profile4 inherits profile2 {
+
+    function function4() {
+      expression: attribute(field3) + 5
+    }
+
+    summary-features inherits profile2 {
+      function4
+      attribute(field3)
+    }
+
+  }
+
+  rank-profile profile5 inherits profile1 {
+    match-features {
+      attribute(field3)
+    }
+  }
+
+  rank-profile profile6 inherits profile1 {
+    summary-features { }
+    match-features { }
+  }
+
+  rank-profile profile7 inherits profile1, profile2 {
+    match-features inherits profile1 {
+      attribute(field3)
+    }
+    summary-features inherits profile1, profile2 {
+      attribute(field3)
+    }
+  }
+
+  rank-profile profile8 inherits profile1, profile2 {
+    match-features inherits profile1, profile2 {
+    }
+    summary-features inherits profile2 {
+    }
+  }
+
+}

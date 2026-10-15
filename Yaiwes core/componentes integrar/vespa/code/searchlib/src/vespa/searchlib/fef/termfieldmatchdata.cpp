@@ -1,0 +1,195 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "termfieldmatchdata.h"
+
+#include "match_data_filters.h"
+
+#include <vespa/check_require.h>
+
+#include <algorithm>
+#include <limits>
+
+namespace search::fef {
+
+TermFieldMatchData::TermFieldMatchData()
+    : _docId(invalidId()),
+      _fieldId(ILLEGAL_FIELD_ID),
+      _flags(UNPACK_ALL_FEATURES_MASK),
+      _sz(0),
+      _numOccs(0),
+      _fieldLength(0) {
+    memset(&_data, 0, sizeof(_data));
+}
+
+TermFieldMatchData::TermFieldMatchData(const TermFieldMatchData& rhs)
+    : _docId(rhs.getDocId()),
+      _fieldId(rhs._fieldId),
+      _flags(rhs._flags),
+      _sz(0),
+      _numOccs(rhs._numOccs),
+      _fieldLength(rhs._fieldLength) {
+    memset(&_data, 0, sizeof(_data));
+    if (isRawScore()) {
+        _data._rawScore = rhs._data._rawScore;
+    } else {
+        for (auto it(rhs.begin()), mt(rhs.end()); it != mt; it++) {
+            appendPosition(*it);
+        }
+    }
+}
+
+TermFieldMatchData& TermFieldMatchData::operator=(const TermFieldMatchData& rhs) {
+    if (this != &rhs) {
+        TermFieldMatchData tmp(rhs);
+        swap(tmp);
+    }
+    return *this;
+}
+
+TermFieldMatchData::~TermFieldMatchData() {
+    if (isRawScore()) {
+    } else if (allocated()) {
+        delete[] _data._positions._positions;
+    } else {
+        getFixed()->~TermFieldMatchDataPosition();
+    }
+}
+
+TermFieldMatchData::MutablePositionsIterator TermFieldMatchData::populate_fixed() {
+    CHECK(!allocated());
+    if (_sz == 0) {
+        new (_data._position) TermFieldMatchDataPosition();
+        _sz = 1;
+    }
+    return getFixed();
+}
+
+TermFieldMatchData& TermFieldMatchData::setFieldId(uint32_t fieldId) {
+    if (fieldId == IllegalFieldId) {
+        fieldId = ILLEGAL_FIELD_ID;
+    } else {
+        CHECK(fieldId < ILLEGAL_FIELD_ID);
+    }
+    _fieldId = fieldId;
+    return *this;
+}
+
+namespace {
+
+template <typename T> void sswap(T* a, T* b) {
+    T tmp(*a);
+    *a = *b;
+    *b = tmp;
+}
+
+} // namespace
+
+void TermFieldMatchData::swap(TermFieldMatchData& rhs) {
+    sswap(&_docId, &rhs._docId);
+    sswap(&_fieldId, &rhs._fieldId);
+    sswap(&_flags, &rhs._flags);
+    sswap(&_sz, &rhs._sz);
+    sswap(&_numOccs, &rhs._numOccs);
+    sswap(&_fieldLength, &rhs._fieldLength);
+    char tmp[sizeof(_data)];
+    memcpy(tmp, &rhs._data, sizeof(_data));
+    memcpy(&rhs._data, &_data, sizeof(_data));
+    memcpy(&_data, tmp, sizeof(_data));
+}
+
+namespace {
+
+constexpr size_t MAX_ELEMS = std::numeric_limits<uint16_t>::max();
+constexpr size_t INITIAL_ELEMS = 1024 / sizeof(TermFieldMatchDataPosition);
+
+} // namespace
+
+void TermFieldMatchData::resizePositionVector(size_t sz) {
+    CHECK(allocated());
+    CHECK(sz >= _sz);
+    size_t                      newSize(std::min(MAX_ELEMS, std::max(1ul, sz)));
+    TermFieldMatchDataPosition* n = new TermFieldMatchDataPosition[newSize];
+    for (size_t i(0); i < _data._positions._allocated; i++) {
+        n[i] = _data._positions._positions[i];
+    }
+    delete[] _data._positions._positions;
+    _data._positions._allocated = newSize;
+    _data._positions._positions = n;
+}
+
+void TermFieldMatchData::allocateVector() {
+    CHECK(_sz < 2);
+    CHECK(!allocated());
+    size_t                      newSize = INITIAL_ELEMS;
+    TermFieldMatchDataPosition* n = new TermFieldMatchDataPosition[newSize];
+    if (_sz > 0) {
+        n[0] = *getFixed();
+        _data._positions._maxElementLength = getFixed()->getElementLen();
+    }
+    _flags |= MULTIPOS_FLAG; // set allocated() flag
+    _data._positions._allocated = newSize;
+    _data._positions._positions = n;
+}
+
+void TermFieldMatchData::appendPositionToAllocatedVector(const TermFieldMatchDataPosition& pos) {
+    if (__builtin_expect(_sz >= MAX_ELEMS, false)) {
+        return;
+    }
+    CHECK(allocated());
+    if (__builtin_expect(_sz >= _data._positions._allocated, false)) {
+        resizePositionVector(_sz * 2);
+    }
+    if (__builtin_expect(pos.getElementLen() > _data._positions._maxElementLength, false)) {
+        _data._positions._maxElementLength = pos.getElementLen();
+    }
+    _data._positions._positions[_sz++] = pos;
+}
+
+void TermFieldMatchData::finish_filter_match_data() {
+    if (_sz == 0) {
+        resetOnlyDocId(invalidId());
+    } else if (needs_interleaved_features()) {
+        setNumOccs(_sz);
+    }
+}
+
+template <typename MatchDataFilter>
+void TermFieldMatchData::filter_match_data(uint32_t docid, MatchDataFilter match_data_filter) {
+    if (docid < getDocId()) {
+        return; // Don't touch future match data
+    }
+    if (_sz == 0 || docid != getDocId()) {
+        resetOnlyDocId(invalidId()); // Clear past or empty match data
+        return;
+    }
+    match_data_filter.new_field();
+    auto pos = begin();
+    auto pose = end();
+    auto wpos = mutable_begin();
+    for (; pos != pose; ++pos) {
+        if (match_data_filter.is_filtered(*pos)) {
+            continue;
+        }
+        if (wpos != pos) {
+            *wpos = *pos;
+        }
+        ++wpos;
+    }
+    _sz = wpos - begin();
+    finish_filter_match_data();
+}
+
+void TermFieldMatchData::filter_elements(uint32_t docid, std::span<const uint32_t> element_ids) {
+    filter_match_data(docid, ElementIdMatchDataFilter(element_ids));
+}
+
+void TermFieldMatchData::filter_match_spans(uint32_t docid, std::span<const queryeval::MatchSpan> match_spans) {
+    // Use subspan of match_spans that covers current field
+    auto compare_lower = [](const auto& span, uint32_t field_id) noexcept { return span.field_id() < field_id; };
+    auto compare_upper = [](uint32_t field_id, const auto& span) noexcept { return span.field_id() > field_id; };
+    auto begin_span = std::lower_bound(match_spans.begin(), match_spans.end(), getFieldId(), compare_lower);
+    auto end_span = std::upper_bound(begin_span, match_spans.end(), getFieldId(), compare_upper);
+    filter_match_data(docid, MatchSpanMatchDataFilter({begin_span, end_span}));
+}
+
+} // namespace search::fef

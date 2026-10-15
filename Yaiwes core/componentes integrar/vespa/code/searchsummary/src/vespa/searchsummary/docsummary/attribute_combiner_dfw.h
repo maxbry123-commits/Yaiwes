@@ -1,0 +1,50 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include "combiner_shape.h"
+#include "docsum_field_writer.h"
+
+#include <memory>
+#include <span>
+#include <string>
+
+namespace search::attribute {
+class IAttributeContext;
+}
+
+namespace vespalib {
+class Stash;
+}
+
+namespace search::docsummary {
+
+class DocsumFieldWriterState;
+class DynamicDocsumWriter;
+
+/*
+ * This class reads values from multiple struct field attributes and
+ * inserts them as an array of struct or a map of struct.
+ */
+class AttributeCombinerDFW : public DocsumFieldWriter {
+protected:
+    uint32_t _stateIndex;
+    AttributeCombinerDFW();
+
+protected:
+    virtual DocsumFieldWriterState* allocFieldWriterState(search::attribute::IAttributeContext& context,
+                                                          vespalib::Stash&                      stash) const = 0;
+
+public:
+    ~AttributeCombinerDFW() override;
+    bool isGenerated() const override { return true; }
+    bool setFieldWriterStateIndex(uint32_t fieldWriterStateIndex) override;
+    static std::unique_ptr<DocsumFieldWriter> create(const std::string&                    fieldName,
+                                                     search::attribute::IAttributeContext& attrCtx,
+                                                     std::span<const std::string>          struct_fields,
+                                                     CombinerShape                         declared_shape);
+    void insert_field(uint32_t docid, const IDocsumStoreDocument* doc, GetDocsumsState& state,
+                      search::common::ElementIds selected_elements, vespalib::slime::Inserter& target) const override;
+};
+
+} // namespace search::docsummary

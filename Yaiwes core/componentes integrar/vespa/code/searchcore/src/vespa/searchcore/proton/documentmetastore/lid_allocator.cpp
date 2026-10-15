@@ -1,0 +1,249 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "lid_allocator.h"
+
+#include <vespa/check_require.h>
+#include <vespa/searchlib/common/bitvectoriterator.h>
+#include <vespa/searchlib/fef/matchdata.h>
+#include <vespa/searchlib/fef/termfieldmatchdataarray.h>
+#include <vespa/searchlib/queryeval/blueprint.h>
+#include <vespa/searchlib/queryeval/flow_tuning.h>
+#include <vespa/searchlib/queryeval/full_search.h>
+
+#include <mutex>
+
+#include <vespa/log/log.h>
+LOG_SETUP(".proton.documentmetastore.lid_allocator");
+
+using search::fef::TermFieldMatchDataArray;
+using search::queryeval::Blueprint;
+using search::queryeval::FlowStats;
+using search::queryeval::FullSearch;
+using search::queryeval::SearchIterator;
+using search::queryeval::SimpleLeafBlueprint;
+using vespalib::Generation;
+using vespalib::GenerationHolder;
+
+using namespace search::queryeval::flow;
+
+namespace proton::documentmetastore {
+
+LidAllocator::LidAllocator(uint32_t size, uint32_t capacity, GenerationHolder& genHolder)
+    : _holdLids(),
+      _freeLids(size, capacity, genHolder, true, false),
+      _usedLids(size, capacity, genHolder, false, true),
+      _pendingHoldLids(size, capacity, genHolder, false, false),
+      _activeLids(size, capacity, genHolder, false, false),
+      _numActiveLids(0u),
+      _lidFreeListConstructed(false) {
+}
+
+vespalib::MemoryUsage LidAllocator::getMemoryUsage() const {
+    vespalib::MemoryUsage usage;
+    size_t allocated = sizeof(*this) + _freeLids.byteSize() + _usedLids.byteSize() + _pendingHoldLids.byteSize() +
+                       _activeLids.byteSize() + _holdLids.size();
+    usage.incAllocatedBytes(allocated);
+    usage.incUsedBytes(allocated);
+    return usage;
+}
+
+LidAllocator::~LidAllocator() = default;
+
+LidAllocator::DocId LidAllocator::getFreeLid(DocId lidLimit) {
+    DocId lid = _freeLids.getLowest();
+    if (lid >= lidLimit) {
+        lid = lidLimit;
+    } else {
+        _freeLids.clearBit(lid);
+    }
+    return lid;
+}
+
+LidAllocator::DocId LidAllocator::peekFreeLid(DocId lidLimit) {
+    DocId lid = _freeLids.getLowest();
+    if (lid >= lidLimit) {
+        lid = lidLimit;
+    }
+    return lid;
+}
+
+void LidAllocator::ensureSpace(uint32_t newSize, uint32_t newCapacity) {
+    _freeLids.resizeVector(newSize, newCapacity);
+    _usedLids.resizeVector(newSize, newCapacity);
+    _pendingHoldLids.resizeVector(newSize, newCapacity);
+    _activeLids.resizeVector(newSize, newCapacity);
+}
+
+void LidAllocator::unregisterLid(DocId lid) {
+    CHECK(!_pendingHoldLids.testBit(lid));
+    if (isFreeListConstructed()) {
+        _pendingHoldLids.setBit(lid);
+    }
+    _usedLids.clearBit(lid);
+    if (_activeLids.testBit(lid)) {
+        _activeLids.clearBit(lid);
+        _numActiveLids.store(_activeLids.count(), std::memory_order_relaxed);
+    }
+}
+
+void LidAllocator::unregister_lids(const std::vector<DocId>& lids) {
+    if (lids.empty()) {
+        return;
+    }
+    auto high =
+        isFreeListConstructed() ? _pendingHoldLids.set_bits(lids) : _pendingHoldLids.assert_not_set_bits(lids);
+    CHECK(high < _usedLids.size());
+    _usedLids.clear_bits(lids);
+    CHECK(high < _activeLids.size());
+    _activeLids.consider_clear_bits(lids);
+    _numActiveLids.store(_activeLids.count(), std::memory_order_relaxed);
+}
+
+void LidAllocator::moveLidBegin(DocId fromLid, DocId toLid) {
+    (void)fromLid;
+    CHECK(!_pendingHoldLids.testBit(fromLid));
+    CHECK(!_pendingHoldLids.testBit(toLid));
+    if (isFreeListConstructed()) {
+        CHECK(!_freeLids.testBit(fromLid));
+        CHECK(_freeLids.testBit(toLid));
+        _freeLids.clearBit(toLid);
+    }
+}
+
+void LidAllocator::moveLidEnd(DocId fromLid, DocId toLid) {
+    if (isFreeListConstructed()) {
+        // old lid must be scheduled for hold by caller
+        _pendingHoldLids.setBit(fromLid);
+    }
+    _usedLids.setBit(toLid);
+    _usedLids.clearBit(fromLid);
+    if (_activeLids.testBit(fromLid)) {
+        _activeLids.setBit(toLid);
+        _activeLids.clearBit(fromLid);
+    }
+}
+
+void LidAllocator::holdLids(const std::vector<DocId>& lids, DocId lidLimit, Generation currentGeneration) {
+    (void)lidLimit;
+    for (const auto& lid : lids) {
+        CHECK(lid > 0);
+        CHECK(holdLidOK(lid, lidLimit));
+        _pendingHoldLids.clearBit(lid);
+        _holdLids.add(lid, currentGeneration);
+    }
+}
+
+bool LidAllocator::holdLidOK(DocId lid, DocId lidLimit) const {
+    if (_lidFreeListConstructed && lid != 0 && lid < lidLimit && lid < _usedLids.size() &&
+        lid < _pendingHoldLids.size() && _pendingHoldLids.testBit(lid))
+    {
+        return true;
+    }
+    LOG(error,
+        "LidAllocator::holdLidOK(%u, %u): "
+        "_lidFreeListConstructed=%s, "
+        "_usedLids.size()=%d, "
+        "_pendingHoldLids.size()=%d, "
+        "_pendingHoldLids bit=%s",
+        lid, lidLimit, _lidFreeListConstructed ? "true" : "false", (int)_usedLids.size(),
+        (int)_pendingHoldLids.size(),
+        lid < _pendingHoldLids.size() ? (_pendingHoldLids.testBit(lid) ? "true" : "false") : "invalid");
+    return false;
+}
+
+void LidAllocator::constructFreeList(DocId lidLimit) {
+    CHECK(!isFreeListConstructed());
+    _holdLids.clear();
+    for (uint32_t lid = 1; lid < lidLimit; ++lid) {
+        if (!validLid(lid)) {
+            _freeLids.setBit(lid);
+        }
+    }
+}
+
+namespace {
+
+class WhiteListBlueprint : public SimpleLeafBlueprint {
+private:
+    const search::BitVector&                              _activeLids;
+    bool                                                  _all_lids_active;
+    mutable std::mutex                                    _lock;
+    mutable std::vector<search::fef::TermFieldMatchData*> _matchDataVector;
+
+    std::unique_ptr<SearchIterator> create_search_helper(bool strict) const {
+        auto tfmd = new search::fef::TermFieldMatchData;
+        {
+            std::lock_guard<std::mutex> lock(_lock);
+            _matchDataVector.push_back(tfmd);
+        }
+        return search::BitVectorIterator::create(&_activeLids, get_docid_limit(), *tfmd, strict);
+    }
+    FlowStats calculate_flow_stats(uint32_t docid_limit) const override {
+        double rel_est = abs_to_rel_est(_activeLids.size(), docid_limit);
+        double do_not_make_me_strict = 1000.0;
+        return {rel_est, bitvector_cost(), do_not_make_me_strict * bitvector_strict_cost(rel_est)};
+    }
+    SearchIterator::UP createLeafSearch(const TermFieldMatchDataArray& tfmda) const override {
+        CHECK(tfmda.size() == 0);
+        (void)tfmda;
+        return create_search_helper(strict());
+    }
+
+public:
+    WhiteListBlueprint(const search::BitVector& activeLids, bool all_lids_active, uint32_t numActiveLids)
+        : SimpleLeafBlueprint(),
+          _activeLids(activeLids),
+          _all_lids_active(all_lids_active),
+          _lock(),
+          _matchDataVector() {
+        set_cost_tier(State::COST_TIER_EXPENSIVE);
+        // account for DocId 0 (considered active for estimation purposes)
+        setEstimate(HitEstimate(numActiveLids + 1, false));
+    }
+
+    bool isWhiteList() const noexcept final { return true; }
+
+    SearchIterator::UP createFilterSearchImpl(FilterConstraint) const override {
+        if (_all_lids_active) {
+            return std::make_unique<FullSearch>();
+        }
+        return create_search_helper(strict());
+    }
+
+    ~WhiteListBlueprint() override {
+        for (auto matchData : _matchDataVector) {
+            delete matchData;
+        }
+    }
+};
+
+} // namespace
+
+Blueprint::UP LidAllocator::createWhiteListBlueprint() const {
+    return std::make_unique<WhiteListBlueprint>(_activeLids.getBitVector(), (getNumUsedLids() == getNumActiveLids()),
+                                                getNumActiveLids());
+}
+
+void LidAllocator::updateActiveLids(DocId lid, bool active) {
+    bool oldActive = _activeLids.testBit(lid);
+    if (oldActive != active) {
+        if (active) {
+            _activeLids.setBit(lid);
+        } else {
+            _activeLids.clearBit(lid);
+        }
+        _numActiveLids.store(_activeLids.count(), std::memory_order_relaxed);
+    }
+}
+
+void LidAllocator::clearDocs(DocId lidLow, DocId lidLimit) {
+    (void)lidLow;
+    (void)lidLimit;
+    CHECK(_usedLids.getNextTrueBit(lidLow) >= lidLimit);
+}
+
+void LidAllocator::shrinkLidSpace(DocId committedDocIdLimit) {
+    ensureSpace(committedDocIdLimit, committedDocIdLimit);
+}
+
+} // namespace proton::documentmetastore

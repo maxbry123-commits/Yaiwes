@@ -1,0 +1,182 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.container.plugin.classanalysis;
+
+import com.yahoo.api.annotations.PublicApi;
+import com.yahoo.container.plugin.classanalysis.Analyze.JdkVersionCheck;
+import com.yahoo.osgi.annotation.ExportPackage;
+import com.yahoo.osgi.annotation.Version;
+import org.apache.maven.artifact.versioning.ArtifactVersion;
+import org.objectweb.asm.AnnotationVisitor;
+import org.objectweb.asm.Attribute;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.FieldVisitor;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * Picks up classes used in class files.
+ *
+ * @author Tony Vaagenes
+ * @author ollivir
+ * @author gjoranv
+ */
+class AnalyzeClassVisitor extends ClassVisitor implements ImportCollector {
+
+    private String name = null;
+    private final Set<String> imports = new HashSet<>();
+    private Optional<ExportPackageAnnotation> exportPackageAnnotation = Optional.empty();
+    private boolean isPublicApi = false;
+
+    private final Optional<ArtifactVersion> defaultExportPackageVersion;
+    private final JdkVersionCheck jdkVersionCheck;
+
+    AnalyzeClassVisitor(ArtifactVersion defaultExportPackageVersion, JdkVersionCheck jdkVersionCheck) {
+        super(Opcodes.ASM9);
+        this.defaultExportPackageVersion = Optional.ofNullable(defaultExportPackageVersion);
+        this.jdkVersionCheck = jdkVersionCheck;
+    }
+
+    @Override
+    public Set<String> imports() {
+        return imports;
+    }
+
+    @Override
+    public void visitAttribute(Attribute attribute) {
+        addImport(Type.getObjectType(attribute.type));
+    }
+
+    @Override
+    public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
+        Analyze.getClassName(Type.getReturnType(desc)).ifPresent(imports::add);
+        List.of(Type.getArgumentTypes(desc)).forEach(argType -> Analyze.getClassName(argType).ifPresent(imports::add));
+        if (exceptions != null) {
+            List.of(exceptions).forEach(ex -> Analyze.internalNameToClassName(ex).ifPresent(imports::add));
+        }
+
+        AnalyzeSignatureVisitor.analyzeMethod(signature, this);
+        return new AnalyzeMethodVisitor(this);
+    }
+
+    @Override
+    public FieldVisitor visitField(int access, String name, String desc, String signature, Object value) {
+        Analyze.getClassName(Type.getType(desc)).ifPresent(imports::add);
+
+        AnalyzeSignatureVisitor.analyzeField(signature, this);
+        return new AnalyzeFieldVisitor(this);
+    }
+
+    @Override
+    public void visit(int version, int access, String name, String signature, String superName, String[] interfaces) {
+        this.name = Analyze.internalNameToClassName(name)
+                .orElseThrow(() -> new RuntimeException("Unable to resolve class name for " + name));
+
+        if (version > Opcodes.V25 && jdkVersionCheck == JdkVersionCheck.ENABLED) {
+            var jdkVersion = version - 44;
+            throw new RuntimeException("Class " + name + " is compiled for Java version " + jdkVersion + ", but only Java 17 to 25 is supported");
+        }
+
+        addImportWithInternalName(superName);
+        List.of(interfaces).forEach(this::addImportWithInternalName);
+
+        AnalyzeSignatureVisitor.analyzeClass(signature, this);
+    }
+
+    @Override
+    public void visitInnerClass(String name, String outerName, String innerName, int access) {
+    }
+
+    @Override
+    public void visitOuterClass(String owner, String name, String desc) {
+    }
+
+    @Override
+    public void visitSource(String source, String debug) {
+    }
+
+    @Override
+    public void visitEnd() {
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T defaultVersionValue(String name) {
+        try {
+            return (T) Version.class.getMethod(name).getDefaultValue();
+        } catch (NoSuchMethodException e) {
+            throw new IllegalArgumentException("Could not locate method " + name);
+        }
+    }
+
+    private AnnotationVisitor visitExportPackage() {
+        return new AnnotationVisitor(Opcodes.ASM9) {
+            private int major = defaultExportPackageVersion.map(ArtifactVersion::getMajorVersion)
+                    .orElse(defaultVersionValue("major"));
+            private int minor = defaultExportPackageVersion.map(ArtifactVersion::getMinorVersion)
+                    .orElse(defaultVersionValue("minor"));
+            private int micro = defaultExportPackageVersion.map(ArtifactVersion::getIncrementalVersion)
+                    .orElse(defaultVersionValue("micro"));
+
+            // Default qualifier is the empty string.
+            private String qualifier = defaultVersionValue("qualifier");
+
+            @Override
+            public void visit(String name, Object value) {
+                if (name != null) {
+                    switch (name) {
+                        case "major" -> major = (int) value;
+                        case "minor" -> minor = (int) value;
+                        case "micro" -> micro = (int) value;
+                        case "qualifier" -> qualifier = (String) value;
+                    }
+                }
+            }
+
+            @Override
+            public void visitEnd() {
+                exportPackageAnnotation = Optional.of(new ExportPackageAnnotation(major, minor, micro, qualifier));
+            }
+
+            @Override
+            public void visitEnum(String name, String desc, String value) {
+            }
+
+            @Override
+            public AnnotationVisitor visitArray(String name) {
+                return this;
+            }
+
+            @Override
+            public AnnotationVisitor visitAnnotation(String name, String desc) {
+                return this;
+            }
+        };
+    }
+
+    @Override
+    public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+        if (ExportPackage.class.getName().equals(Type.getType(desc).getClassName())) {
+            return visitExportPackage();
+        } if (PublicApi.class.getName().equals(Type.getType(desc).getClassName())) {
+            isPublicApi = true;
+            return null;
+        } else {
+            if (visible) {
+                addImportWithTypeDesc(desc);
+            }
+            return Analyze.visitAnnotationDefault(this);
+        }
+    }
+
+    ClassFileMetaData result() {
+        assert (!imports.contains("int"));
+        var packageInfo = new PackageInfo(Packages.packageName(name), exportPackageAnnotation, isPublicApi);
+        return new ClassFileMetaData(name, imports, packageInfo);
+    }
+
+}

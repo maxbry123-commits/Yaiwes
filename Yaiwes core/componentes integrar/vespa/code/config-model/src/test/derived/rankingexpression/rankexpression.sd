@@ -1,0 +1,576 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+schema rankexpression {
+
+  struct chunk {
+    field txt type string {}
+    field cnum type int {}
+  }
+
+  document rankexpression {
+
+    field nrtgmp type double {
+      indexing: attribute
+      attribute: fast-search
+    }
+
+    field glmpfw type double {
+      indexing: attribute
+    }
+
+    field artist type string {
+      indexing: summary | index
+    }
+
+    field title type string {
+      indexing: summary | index
+    }
+
+    field surl type string {
+      indexing: summary | attribute
+    }
+
+    field year type int {
+      indexing: summary | attribute
+    }
+
+    field foo1 type int {
+      indexing: attribute
+    }
+
+    field foo2 type int {
+      indexing: attribute
+    }
+
+    field foo3 type int {
+      indexing: attribute
+    }
+
+    field foo4 type int {
+      indexing: attribute
+    }
+
+    field bar1 type int {
+      indexing: attribute
+    }
+
+    field bar2 type int {
+      indexing: attribute
+    }
+
+    field bar3 type int {
+      indexing: attribute
+    }
+
+    field bar4 type int {
+      indexing: attribute
+    }
+
+    field t1 type tensor(m{},v[3]) {
+      indexing: attribute
+    }
+
+    field labels type array<string> {
+      indexing: attribute
+    }
+
+    field textchunks type array<string> {
+      indexing: index
+      index: enable-bm25
+    }
+
+    field m_chunk type array<chunk> {
+      struct-field cnum {
+        indexing: attribute
+      }
+    }
+  }
+
+  rank-profile default {
+      match-phase {
+        attribute: nrtgmp
+        max-hits: 4001
+      }
+      first-phase {
+        expression: classicRank
+        keep-rank-count: 20
+        rank-score-drop-limit: -0.5
+      }
+      second-phase {
+        expression: if(3>2,4,2)
+        rerank-count: 10
+      }
+      rank-features: attribute(foo1).out attribute(bar1)
+      rank-features { attribute(foo2).out attribute(bar2).out }
+      rank-features {
+        attribute(foo3).out attribute(bar3).out
+      }
+      rank-features {
+        attribute(foo4).out
+        attribute(bar4).out
+      }
+      ignore-default-rank-features
+
+      rank-properties {
+          foo: "bar, baz"
+          qux: "quux"
+          foo: "foobar"
+          foo.bar: "foo.bar"
+          foo.bar.baz: 123
+          foo ( bar ) . baz.2  : 123.4
+          foo(bar).baz.qux: "foo(bar)"
+          "nud":"ity"
+      }
+
+  }
+
+  rank-profile static {
+      first-phase {
+        expression { attribute }
+      }
+      second-phase {
+        expression {
+            file:rankexpression
+        }
+      }
+      summary-features: attribute(foo1).out attribute(bar1)
+      summary-features { attribute(foo2).out attribute(bar2).out }
+      summary-features {
+        attribute(foo3).out attribute(bar3).out
+      }
+      summary-features {
+        attribute(foo4).out
+        attribute(bar4).out
+      }
+  }
+
+  rank-profile overflow {
+      first-phase {
+        expression: file:overflow.expression
+        keep-rank-count: 201
+        rank-score-drop-limit: 501.5
+      }
+      second-phase {
+        expression {
+            exp(0) +
+            mysum(attribute(foo),
+                  "attribute( bar )",
+                  "attribute( \"baz\" )")
+        }
+        rerank-count: 101
+      }
+  }
+
+  rank-profile duplicates {
+    rank-properties {
+      fieldMatch(a).proximityLimit: 4
+      fieldMatch(a).proximityTable: 0.2
+      fieldMatch(a).proximityTable: 0.4
+      fieldMatch(a).proximityTable: 0.6
+      fieldMatch(a).proximityTable: 0.8
+      fieldMatch(a).proximityTable: 1
+      fieldMatch(a).proximityTable: 0.8
+      fieldMatch(a).proximityTable: 0.6
+      fieldMatch(a).proximityTable: 0.4
+      fieldMatch(a).proximityTable: 0.2
+    }
+  }
+
+  rank-profile whitespace1 {
+    first-phase {
+      expression
+        	{
+
+        1
+        }}}
+
+  rank-profile whitespace2 {
+    first-phase
+    {
+      expression		{ 1 }
+    }
+  }
+
+  rank-profile macros {
+    match-phase {
+      attribute: nrtgmp
+      max-hits: 8002
+    }
+    first-phase {
+      expression: match + fieldMatch(title) + myfeature
+      total-keep-rank-count: 2345
+    }
+    second-phase {
+      expression: fourtimessum(match,rankBoost)
+      total-rerank-count: 2001
+    }
+    function fourtimessum(var1, var2) {
+      expression: 4*(var1+var2)
+    }
+    function myfeature() {
+       expression {
+         70 * fieldMatch(title).completeness * pow(0 - fieldMatch(title).earliness, 2) +
+         30 * pow(0 - fieldMatch(description).earliness, 2)
+       }
+    }
+    summary-features {
+      fieldMatch(title)
+    }
+  }
+
+  rank-profile macros2 {
+    first-phase {
+      expression: classicRank
+    }
+    rank-properties {
+      foo: "some, list"
+    }
+
+    second-phase {
+      expression: fourtimessum(match,match) + mysummaryfeature + myfeature
+    }
+    function fourtimessum(var1, var2) {
+      expression: 4*(var1+var2)
+    }
+    function myfeature() {
+       expression {
+         70 * fieldMatch(title).completeness * pow(0 - fieldMatch(title).earliness, 2) +
+         30 * pow(0 - fieldMatch(description).earliness, 2)
+       }
+    }
+    function mysummaryfeature() {
+       expression {
+         70 * fieldMatch(title).completeness
+       }
+    }
+    function mysummaryfeature2() {
+       expression {
+         71 * fieldMatch(title).completeness
+       }
+    }
+    summary-features {
+      mysummaryfeature
+      rankingExpression(mysummaryfeature2) # Required form earlier
+    }
+  }
+
+  rank-profile macros3 {
+    function onlyusedinsummaryfeature() {
+      expression: 5
+    }
+    summary-features {
+      rankingExpression(matches(title,rankingExpression(onlyusedinsummaryfeature)))
+    }
+
+  }
+
+  rank-profile macros3-inherited inherits macros3 {
+    summary-features {
+      rankingExpression(matches(title,rankingExpression(onlyusedinsummaryfeature)))
+    }
+  }
+
+  rank-profile macros-inherited inherits macros2 {
+    function mysummaryfeature() {
+       expression {
+         80 * fieldMatch(title).completeness
+       }
+    }
+    first-phase {
+      expression {
+        20000 * myfeature + mysummaryfeature
+      }
+    }
+  }
+
+  rank-profile macros-inherited2 inherits macros-inherited {
+    first-phase {
+      expression {
+        30000 * mysummaryfeature + myfeature
+      }
+    }
+  }
+
+ rank-profile macros-inherited3 inherits macros-inherited2 {
+    function myfeature() {
+       expression {
+         700 * fieldMatch(title).completeness
+       }
+    }
+    second-phase {
+       expression {
+         40000 * mysummaryfeature + myfeature
+       }
+    }
+  }
+
+  rank-profile macros-refering-macros {
+    function m2() {
+      expression: m1 * 67
+    }
+
+    function m1() {
+      expression {
+         700 * fieldMatch(title).completeness
+       }
+    }
+
+    function m4() {
+      expression: file:macro.expression
+    }
+
+    second-phase {
+      expression {
+        40000 * m2 * m4
+      }
+    }
+
+  }
+
+  rank-profile macros-refering-macros-inherited inherits macros-refering-macros {
+    function m3() {
+      expression {
+        if(isNan(attribute(nrtgmp))==1,
+          0.0,
+          (m2)
+        )
+      }
+    }
+    second-phase {
+      expression {
+        3000 * m2 * m4
+      }
+    }
+  }
+
+  rank-profile macros-refering-macros-inherited2 inherits macros-refering-macros {
+    second-phase {
+      expression {
+        3002 * m2
+      }
+    }
+  }
+
+  rank-profile macros-refering-macros-inherited-two-levels inherits macros-refering-macros-inherited {
+    function m5() {
+      expression {
+        if(isNan(attribute(glmpfw))==1,
+          m1,
+          (m4)
+        )
+      }
+    }
+  }
+
+  rank-profile withmf {
+      function myplus() {
+        expression: attribute(foo1)+attribute(foo2)
+      }
+      function mymul() {
+        expression: attribute(t1)*query(fromq)
+      }
+      first-phase {
+        expression: attribute(foo1)
+      }
+      second-phase {
+        expression: attribute(foo2)
+      }
+      match-features: attribute(foo1).out attribute(bar1)
+      match-features { attribute(foo2).out attribute(bar2).out }
+      match-features {
+        attribute(foo3).out attribute(bar3).out
+      }
+      match-features {
+        attribute(foo4)
+        myplus
+        mymul
+        firstPhase
+        secondPhase
+      }
+  }
+
+  rank-profile withboolean {
+      function mytrue() {
+        expression: true
+      }
+      function myfalse() {
+        expression: false
+      }
+      function mybooleanexpression() {
+        expression: true + if(false, 3.0, 4.0)
+      }
+  }
+
+  rank-profile withglobalphase {
+      function myplus() {
+        expression: attribute(foo1)+attribute(foo2)
+      }
+      function mymul() {
+        expression: attribute(t1)*query(fromq)
+      }
+      first-phase {
+        expression: attribute(foo1)
+      }
+      global-phase {
+        expression: myplus()+sum(mymul())+firstPhase + term(0).significance + fieldLength(artist) + fieldTermMatch(title,0).occurrences + termDistance(title,1,2).reverse + closeness(field, t1)
+        rerank-count: 42
+      }
+  }
+
+  rank-profile layered {
+      inputs {
+         query(v) tensor(v[3])
+	query(pickelems) tensor<float>(elemidx{})
+      }
+      function mymul() {
+        expression: tensorFromLabels(attribute(labels), m) * query(v)
+      }
+      function chunkscores() {
+        expression: elementwise(bm25(textchunks), elemidx, float)
+      }
+      function weightedBm25() {
+        expression: sum(chunkscores * query(pickelems))
+      }
+      first-phase {
+        expression: attribute(foo1) + weightedBm25
+      }
+      global-phase {
+        expression: sum(mymul())
+        rerank-count: 123
+      }
+      match-features {
+        mymul
+      }
+  }
+
+  rank-profile withtfl {
+      inputs {
+         query(v) tensor(v[3])
+      }
+      function mymul() {
+        expression: tensorFromLabels(attribute(labels), m) * query(v)
+      }
+      first-phase {
+        expression: attribute(foo1)
+      }
+      global-phase {
+        expression: sum(mymul)
+      }
+      match-features {
+        tensorFromLabels(attribute(labels), m)
+      }
+  }
+
+  rank-profile withtfl2 {
+      inputs {
+         query(v) tensor(v[3])
+      }
+      function mymul() {
+        expression: tensorFromLabels(attribute(labels), m) * query(v)
+      }
+      first-phase {
+        expression: attribute(foo1)
+      }
+      global-phase {
+        expression: sum(mymul)
+      }
+  }
+
+  rank-profile withnorm {
+      first-phase {
+        expression: attribute(foo1)
+      }
+      function normBar() {
+        expression: attribute(foo1) + attribute(year)
+      }
+      global-phase {
+        expression: normalize_linear(nativeRank) + reciprocal_rank(normBar(), 42.0)
+        rerank-count: 123
+      }
+      match-features: nativeRank
+  }
+
+  rank-profile withfusion {
+      first-phase {
+        expression: attribute(foo1)
+      }
+      function normBar() {
+        expression: attribute(foo1) + attribute(year)
+      }
+      global-phase {
+        expression: reciprocal_rank_fusion(normBar, nativeRank)
+        rerank-count: 456
+      }
+      match-features: nativeRank
+  }
+
+  rank-profile function-with-arg-as-summary-feature {
+      function plusOne(x) {
+        expression: x + 1
+      }
+      function useAttr(name, weight) {
+        expression: attribute(name) * weight
+      }
+      first-phase {
+        expression: nativeRank
+      }
+      summary-features {
+        attribute(t1)
+        plusOne(41)
+        useAttr(foo1, 17)
+      }
+  }
+
+  rank-profile function-with-arg-in-global-phase {
+      function plusOne(x) {
+        expression: x + 1
+      }
+      function useAttr(name, weight) {
+        expression: attribute(name) * weight
+      }
+      function withIndirect(name) {
+        expression: useAttr(name, 1.25)
+      }
+      first-phase {
+        expression: nativeRank
+      }
+      global-phase {
+        expression: sum(useAttr(t1, 42) + plusOne(2) + withIndirect(foo1) + plusOne(attribute(foo2)))
+      }
+      match-features {
+          plusOne(attribute(foo2))
+      }
+  }
+
+  rank-profile withstringcompare {
+      inputs {
+        query(myquerystring) string
+        query(mybadlong) long
+        query(mybadfloat) float
+      }
+      first-phase {
+        expression: if (attribute(surl) == query(myquerystring), 0.75, 0.25)
+      }
+      second-phase {
+        expression: if (attribute(surl) == query(undeclaredinput), 0.75, 0.25)
+      }
+  }
+
+  rank-profile with_corpus_features {
+      first-phase {
+        expression: bm25(textchunks)
+      }
+      second-phase {
+        expression: reduce(queryTermDocumentFrequency(textchunks), sum, term) + queryTermDocumentFrequency(textchunks){term:"0"}
+      }
+      rank-features { averageFieldLength(textchunks) num_docs_indexed }
+      match-features { averageFieldLength(textchunks) num_docs_indexed }
+      summary-features { averageFieldLength(textchunks) num_docs_indexed queryTermDocumentFrequency(textchunks) }
+  }
+
+  rank-profile with_tensor_from_dotted_attr {
+      summary-features {
+          tensorFromLabelsWithOffset(attribute(m_chunk.cnum), i, offset)
+          attribute(m_chunk.cnum)
+      }
+  }
+}

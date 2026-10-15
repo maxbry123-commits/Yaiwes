@@ -1,0 +1,1435 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.select;
+
+import com.yahoo.json.Jackson;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.yahoo.prelude.Index;
+import com.yahoo.prelude.IndexModel;
+import com.yahoo.prelude.IndexFacts;
+import com.yahoo.prelude.SearchDefinition;
+import com.yahoo.prelude.query.AndItem;
+import com.yahoo.prelude.query.ExactStringItem;
+import com.yahoo.prelude.query.FuzzyItem;
+import com.yahoo.prelude.query.IntItem;
+import com.yahoo.prelude.query.Item;
+import com.yahoo.prelude.query.NumericInItem;
+import com.yahoo.prelude.query.PhraseItem;
+import com.yahoo.prelude.query.PrefixItem;
+import com.yahoo.prelude.query.RegExpItem;
+import com.yahoo.prelude.query.SegmentingRule;
+import com.yahoo.prelude.query.StringInItem;
+import com.yahoo.prelude.query.StringRangeItem;
+import com.yahoo.prelude.query.Substring;
+import com.yahoo.prelude.query.SubstringItem;
+import com.yahoo.prelude.query.SuffixItem;
+import com.yahoo.prelude.query.WeakAndItem;
+import com.yahoo.prelude.query.SameElementItem;
+import com.yahoo.prelude.query.WordAlternativesItem;
+import com.yahoo.prelude.query.WordItem;
+import com.yahoo.container.jdisc.HttpRequest;
+import com.yahoo.processing.IllegalInputException;
+import com.yahoo.search.Query;
+import com.yahoo.search.grouping.GroupingRequest;
+import com.yahoo.search.grouping.request.AllOperation;
+import com.yahoo.search.grouping.request.AttributeValue;
+import com.yahoo.search.grouping.request.CountAggregator;
+import com.yahoo.search.grouping.request.EachOperation;
+import com.yahoo.search.grouping.request.GroupingOperation;
+import com.yahoo.search.grouping.request.MaxAggregator;
+import com.yahoo.search.grouping.request.MinAggregator;
+import com.yahoo.search.query.QueryTree;
+import com.yahoo.search.query.Select;
+import com.yahoo.search.query.SelectParser;
+import com.yahoo.yolean.Exceptions;
+import com.yahoo.search.query.parser.Parsable;
+import com.yahoo.search.query.parser.ParserEnvironment;
+import com.yahoo.search.yql.VespaGroupingStep;
+import com.yahoo.search.yql.VespaSerializer;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import com.yahoo.language.Language;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+/**
+ * Tests Query.Select
+ *
+ * @author henrhoi
+ * @author bratseth
+ */
+public class SelectTestCase {
+
+    private static final ObjectMapper jsonMapper = Jackson.mapper();
+
+    private SelectParser parser;
+
+    @BeforeEach
+    public void setUp() throws Exception {
+        ParserEnvironment env = new ParserEnvironment();
+        parser = new SelectParser(env);
+    }
+
+    @AfterEach
+    public void tearDown() throws Exception {
+        parser = null;
+    }
+
+    static private IndexFacts createIndexFactsForInTest() {
+        SearchDefinition sd = new SearchDefinition("default");
+        Index fieldIndex = new Index("field");
+        fieldIndex.setInteger(true);
+        sd.addIndex(fieldIndex);
+        Index stringIndex = new Index("string");
+        stringIndex.setString(true);
+        sd.addIndex(stringIndex);
+        Index floatIndex = new Index("float");
+        sd.addIndex(floatIndex);
+        Index mixedIndex = new Index("mixed");
+        mixedIndex.setInteger(true);
+        mixedIndex.setString(true);
+        sd.addIndex(mixedIndex);
+        return new IndexFacts(new IndexModel(sd));
+    }
+
+    //------------------------------------------------------------------- "where" tests
+
+    @Test
+    void testSimple() {
+        assertParse("{'contains' : ['title', 'madonna']}", "title:madonna");
+    }
+
+    @Test
+    void test_contains() {
+        ObjectNode json = jsonMapper.createObjectNode();
+        ArrayNode arrayNode = jsonMapper.createArrayNode();
+        arrayNode.add("default").add("foo");
+        json.set("contains", arrayNode);
+        assertParse(json.toString(), "default:foo");
+    }
+
+    @Test
+    void testStemmingPhrase() {
+        QueryTree parsed = parseWhere("{'contains': ['default', {'phrase': ['Registered', 'Nurse']}]}");
+        Query query = new Query();
+        query.getModel().getQueryTree().setRoot(parsed.getRoot());
+        assertEquals("default contains phrase(\"Registered\", \"Nurse\")", VespaSerializer.serialize(query));
+    }
+
+    @Test
+    void testWhereWithBoolean() {
+        assertParse("true", "TRUE");
+        assertParse("false", "FALSE");
+    }
+
+    @Test
+    void testDottedFieldNames() {
+        assertParse("{ 'contains' : ['my.nested.title', 'madonna']}",
+                    "my.nested.title:madonna");
+    }
+
+    @Test
+    void testIn() {
+        parser = new SelectParser(new ParserEnvironment().setIndexFacts(createIndexFactsForInTest()));
+
+        // Numeric
+        Select selectNumeric = new Select("{\"in\" : [\"field\", 42, 22, -7, 26, 25, -11, 24]}", "", new Query());
+        var query = parser.parse(new Parsable().setSelect(selectNumeric));
+        assertNumericInItem("field", new long[]{-11, -7, 22, 24, 25, 26, 42}, query);
+
+        // String
+        Select selectString = new Select("{\"in\" : [\"string\", 'a','b', 'this', \"might\", \"work\"]}", "", new Query());
+        query = parser.parse(new Parsable().setSelect(selectString));
+        assertStringInItem("string", new String[]{"a","b","might","this", "work"}, query);
+
+        assertParseFail("{\"in\" : [\"field\", 29.9, -7.4]}",
+                new IllegalArgumentException("The field 'field' is an integer field, "
+                        + "but the argument 29.9 is of type DOUBLE"));
+        assertParseFail("{\"in\" : [\"string\", 'a', 25]}",
+                new IllegalArgumentException("The field 'string' is a string field, "
+                        + "but the argument 25 is of type LONG"));
+        assertParseFail("{\"in\" : [\"field\", 'a', 25]}",
+                new IllegalArgumentException("The field 'field' is an integer field, "
+                        + "but the argument \"a\" is of type STRING"));
+        assertParseFail("{\"in\" : [\"nofield\", 'a', 25]}",
+                new IllegalArgumentException("Field 'nofield' does not exist."));
+        assertParseFail("{\"not in\" : [\"field\", 25]}",
+                new IllegalArgumentException("Expected and, and_not, call, contains, equals, in, matches, not, or or range, got not in."));
+        assertParseFail("{\"in\" : [\"float\", 25]}",
+                new IllegalArgumentException("The in operator is only supported for integer and string fields. " +
+                        "The field 'float' is not of these types"));
+        assertParseFail("{\"in\" : [\"mixed\", 25]}",
+                new IllegalArgumentException("The in operator is not supported for fieldsets with a mix of integer " +
+                        "and string fields. The fieldset 'mixed' has both"));
+    }
+
+    @Test
+    void testOr() {
+        ObjectNode json_two_or = jsonMapper.createObjectNode();
+        ObjectNode json_three_or = jsonMapper.createObjectNode();
+        ArrayNode contains1 = jsonMapper.createArrayNode().add("title").add("madonna");
+        ArrayNode contains2 = jsonMapper.createArrayNode().add("title").add("saint");
+        ArrayNode contains3 = jsonMapper.createArrayNode().add("title").add("angel");
+
+        ObjectNode contains_json1 = jsonMapper.createObjectNode();
+        ObjectNode contains_json2 = jsonMapper.createObjectNode();
+        ObjectNode contains_json3 = jsonMapper.createObjectNode();
+        contains_json1.set("contains", contains1);
+        contains_json2.set("contains", contains2);
+        contains_json3.set("contains", contains3);
+
+        json_two_or.set("or", jsonMapper.createArrayNode().add(contains_json1).add(contains_json2));
+        json_three_or.set("or", jsonMapper.createArrayNode().add(contains_json1).add(contains_json2).add(contains_json3));
+
+        assertParse(json_two_or.toString(), "OR title:madonna title:saint");
+        assertParse(json_three_or.toString(), "OR title:madonna title:saint title:angel");
+    }
+
+    @Test
+    void testAnd() {
+        ObjectNode json_two_and = jsonMapper.createObjectNode();
+        ObjectNode json_three_and = jsonMapper.createObjectNode();
+        ArrayNode contains1 = jsonMapper.createArrayNode().add("title").add("madonna");
+        ArrayNode contains2 = jsonMapper.createArrayNode().add("title").add("saint");
+        ArrayNode contains3 = jsonMapper.createArrayNode().add("title").add("angel");
+
+        ObjectNode contains_json1 = jsonMapper.createObjectNode();
+        ObjectNode contains_json2 = jsonMapper.createObjectNode();
+        ObjectNode contains_json3 = jsonMapper.createObjectNode();
+        contains_json1.set("contains", contains1);
+        contains_json2.set("contains", contains2);
+        contains_json3.set("contains", contains3);
+
+        json_two_and.set("and", jsonMapper.createArrayNode().add(contains_json1).add(contains_json2));
+        json_three_and.set("and", jsonMapper.createArrayNode().add(contains_json1).add(contains_json2).add(contains_json3));
+
+        assertParse(json_two_and.toString(), "AND title:madonna title:saint");
+        assertParse(json_three_and.toString(), "AND title:madonna title:saint title:angel");
+    }
+
+    @Test
+    void testAndNot() {
+        ObjectNode json_and_not = jsonMapper.createObjectNode();
+        ArrayNode contains1 = jsonMapper.createArrayNode().add("title").add("madonna");
+        ArrayNode contains2 = jsonMapper.createArrayNode().add("title").add("saint");
+
+        ObjectNode contains_json1 = jsonMapper.createObjectNode();
+        ObjectNode contains_json2 = jsonMapper.createObjectNode();
+        contains_json1.set("contains", contains1);
+        contains_json2.set("contains", contains2);
+
+        json_and_not.set("and_not", jsonMapper.createArrayNode().add(contains_json1).add(contains_json2));
+
+        assertParse(json_and_not.toString(),
+                "+title:madonna -title:saint");
+    }
+
+    @Test
+    void testNot() {
+        assertParse("{\"not\": {\"contains\": [\"title\", \"madonna\"]}}",
+                "-title:madonna");
+    }
+
+    @Test
+    void testNotWithRange() {
+        assertParse("{\"not\": {\"range\": [\"price\", {\">=\": 100}]}}",
+                "-price:[100;]");
+    }
+
+    @Test
+    void testNotWithAnd() {
+        assertParse("{\"not\": {\"and\": [{\"contains\": [\"title\", \"a\"]}, {\"contains\": [\"title\", \"b\"]}]}}",
+                "-(AND title:a title:b)");
+    }
+
+    @Test
+    void testMultipleNotWithAnd() {
+        assertParse("{\"and\": [{\"not\": {\"contains\": [\"title\", \"madonna\"]}}, " +
+                           "{\"not\": {\"contains\": [\"title\", \"saint\"]}}]}",
+                "AND (-title:madonna) (-title:saint)");
+    }
+
+    @Test
+    void testNotWithBoolean() {
+        assertParse("{\"not\": true}", "-TRUE");
+        assertParse("{\"not\": false}", "-FALSE");
+    }
+
+    @Test
+    void testDoubleNegation() {
+        assertParse("{\"not\": {\"not\": {\"contains\": [\"title\", \"madonna\"]}}}",
+                "-(-title:madonna)");
+    }
+
+    @Test
+    void testLessThan() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put("<", 500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:<500");
+    }
+
+    @Test
+    void testGreaterThan() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put(">", 500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:>500");
+    }
+
+    @Test
+    void testLessThanOrEqual() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put("<=", 500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:[;500]");
+    }
+
+    @Test
+    void testGreaterThanOrEqual() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put(">=", 500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:[500;]");
+    }
+
+    @Test
+    void testEquality() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put("=", 500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:500");
+    }
+
+    @Test
+    void testNegativeLessThan() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put("<", -500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:<-500");
+    }
+
+    @Test
+    void testNegativeGreaterThan() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put(">", -500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:>-500");
+    }
+
+    @Test
+    void testNegativeLessThanOrEqual() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put("<=", -500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:[;-500]");
+    }
+
+    @Test
+    void testNegativeGreaterThanOrEqual() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put(">=", -500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:[-500;]");
+    }
+
+    @Test
+    void testNegativeEquality() {
+        ObjectNode range_json = jsonMapper.createObjectNode();
+        ObjectNode operators = jsonMapper.createObjectNode();
+        operators.put("=", -500);
+
+        ArrayNode range = jsonMapper.createArrayNode().add("price").add(operators);
+
+        range_json.set("range", range);
+
+        assertParse(range_json.toString(),
+                "price:-500");
+    }
+
+    @Test
+    void testAnnotatedLessThan() {
+        String jsonString = "{ \"range\": { \"children\" : [\"price\", {\"<\" : -500}], \"attributes\" : {\"filter\" : true} } }";
+        assertParse(jsonString, "|price:<-500");
+    }
+
+    @Test
+    void testAnnotatedGreaterThan() {
+        String jsonString = "{ \"range\": { \"children\" : [\"price\", {\">\" : 500}], \"attributes\" : {\"filter\" : true} } }";
+        assertParse(jsonString, "|price:>500");
+    }
+
+    @Test
+    void testAnnotatedLessThanOrEqual() {
+        String jsonString = "{ \"range\": { \"children\" : [\"price\", {\"<=\" : -500}], \"attributes\" : {\"filter\" : true} } }";
+        assertParse(jsonString, "|price:[;-500]");
+    }
+
+    @Test
+    void testAnnotatedGreaterThanOrEqual() {
+        String jsonString = "{ \"range\": { \"children\" : [\"price\", {\">=\" : 500}], \"attributes\" : {\"filter\" : true} } }";
+        assertParse(jsonString, "|price:[500;]");
+    }
+
+
+    @Test
+    void testAnnotatedEquality() {
+        String jsonString = "{ \"range\": { \"children\" : [\"price\", {\"=\" : -500}], \"attributes\" : {\"filter\" : true} } }";
+        assertParse(jsonString, "|price:-500");
+    }
+
+    @Test
+    void testTermAnnotations() {
+        assertEquals("merkelapp",
+                getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"label\" : \"merkelapp\"} } }").getLabel());
+        assertEquals("another",
+                getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"annotations\" : {\"cox\" : \"another\"} } } }").getAnnotation("cox"));
+        assertEquals(23.0, getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"significance\" : 23.0 } } }").getSignificance(), 1E-6);
+        assertEquals(150, getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"weight\" : 150 } } }").getWeight());
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"usePositionData\" : false } } }").usePositionData());
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"filter\" : true } } }").isFilter());
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"ranked\" : false } } }").isRanked());
+        Substring origin = getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"origin\": {\"original\": \"abc\", \"offset\": 1, \"length\": 2}} } }").getOrigin();
+        assertEquals("abc", origin.string);
+        assertEquals(1, origin.start);
+        assertEquals(3, origin.end);
+    }
+
+    @Test
+    void testSameElement() {
+        assertParse("{ \"contains\": [ \"baz\", {\"sameElement\" : [ { \"contains\" : [\"f1\", \"a\"] }, { \"contains\" : [\"f2\", \"b\"] } ]} ] }",
+                "baz:{f1:a f2:b}");
+
+        assertParse("{ \"contains\": [ \"baz\", {\"sameElement\" : [ { \"contains\" : [\"f1\", \"a\"] }, {\"range\":[\"f2\",{\"=\":10}] } ]} ] }",
+                "baz:{f1:a f2:10}");
+
+        assertParse("{ \"contains\": [ \"baz\", {\"sameElement\" : [ { \"contains\" : [\"key\", \"a\"] }, {\"range\":[\"value.f2\",{\"=\":10}] } ]} ] }",
+                "baz:{key:a value.f2:10}");
+
+        // Negative numbers inside sameElement keep their sign.
+        assertParse("{ \"contains\": [ \"baz\", {\"sameElement\" : [ { \"contains\" : [\"key\", \"a\"] }, {\"equals\":[\"value\", -10] } ]} ] }",
+                "baz:{key:a value:-10}");
+        assertParse("{ \"contains\": [ \"baz\", {\"sameElement\" : [ {\"range\":[\"value\",{\">=\":-8, \"<=\":-1}] } ]} ] }",
+                "baz:{value:[-8;-1]}");
+    }
+
+    @Test
+    void testPhrase() {
+        assertParse("{ \"contains\": [ \"baz\", {\"phrase\" : [ \"a\", \"b\"] } ] }",
+                "baz:\"a b\"");
+    }
+
+    @Test
+    void testNestedPhrase() {
+        assertParse("{ \"contains\": [ \"baz\", {\"phrase\" : [ \"a\", \"b\", {\"phrase\" : [ \"c\", \"d\"] }] } ] }",
+                "baz:\"a b c d\"");
+    }
+
+    @Test
+    void testStemming() {
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"stem\" : false} } }").isStemmed());
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"stem\" : true} } }").isStemmed());
+        assertFalse(getRootWord("{ \"contains\": [\"baz\", \"colors\"] }").isStemmed());
+    }
+
+    @Test
+    void testRaw() {
+        Item root = parseWhere("{ \"contains\":[ \"baz\", \"yoni jo dima\" ] }").getRoot();
+        assertInstanceOf(WordItem.class, root);
+        assertFalse(root instanceof ExactStringItem);
+        assertEquals("yoni jo dima", ((WordItem) root).getWord());
+
+        root = parseWhere("{ \"contains\": { \"children\" : [\"baz\", \"yoni jo dima\"], \"attributes\" : {\"grammar\" : \"raw\"} } }").getRoot();
+        assertInstanceOf(WordItem.class, root);
+        assertFalse(root instanceof ExactStringItem);
+        assertEquals("yoni jo dima", ((WordItem) root).getWord());
+    }
+
+    @Test
+    void testAccentDropping() {
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"accentDrop\" : false} } }").isNormalizable());
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"accentDrop\" : true} } }").isNormalizable());
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"] } }").isNormalizable());
+    }
+
+    @Test
+    void testCaseNormalization() {
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"normalizeCase\" : false} } }").isLowercased());
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"normalizeCase\" : true} } }").isLowercased());
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"] } }").isLowercased());
+    }
+
+    @Test
+    void testSegmentingRule() {
+        assertEquals(SegmentingRule.PHRASE,
+                getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"andSegmenting\" : false} } }").getSegmentingRule());
+        assertEquals(SegmentingRule.BOOLEAN_AND,
+                getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"andSegmenting\" : true} } }").getSegmentingRule());
+        assertEquals(SegmentingRule.LANGUAGE_DEFAULT,
+                getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"colors\"] } }").getSegmentingRule());
+    }
+
+    @Test
+    void testNfkc() {
+        assertEquals("a\u030a", getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"a\\u030a\"], \"attributes\" : {\"nfkc\" : false} } }").getWord());
+        assertEquals("\u00e5", getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"a\\u030a\"], \"attributes\" : {\"nfkc\" : true} } }").getWord());
+        assertEquals("a\u030a", getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"a\\u030a\"] } } ").getWord(), "No NKFC by default");
+    }
+
+    @Test
+    void testImplicitTransforms() {
+        assertFalse(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"cox\"], \"attributes\" : {\"implicitTransforms\" : false} } }").isFromQuery());
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"cox\"], \"attributes\" : {\"implicitTransforms\" : true} } }").isFromQuery());
+        assertTrue(getRootWord("{ \"contains\": { \"children\" : [\"baz\", \"cox\"] } }").isFromQuery());
+    }
+
+    @Test
+    void testConnectivity() {
+        QueryTree parsed = parseWhere("{ \"and\": [ {\"contains\" : { \"children\" : [\"title\", \"madonna\"], \"attributes\" : {\"id\": 1, \"connectivity\": {\"id\": 3, \"weight\": 7.0}} } }, " +
+                "{ \"contains\" : { \"children\" : [\"title\", \"saint\"], \"attributes\" : {\"id\": 2} } }, " +
+                "{ \"contains\" : { \"children\" : [\"title\", \"angel\"], \"attributes\" : {\"id\": 3} } } ] }");
+        assertEquals("AND title:madonna title:saint title:angel", parsed.toString());
+
+        AndItem root = (AndItem) parsed.getRoot();
+        WordItem first = (WordItem) root.getItem(0);
+        WordItem second = (WordItem) root.getItem(1);
+        WordItem third = (WordItem) root.getItem(2);
+        assertEquals(third, first.getConnectedItem());
+        assertEquals(first.getConnectivity(), 7.0d, 1E-6);
+        assertNull(second.getConnectedItem());
+
+        assertParseFail("{ \"and\": [ {\"contains\" : { \"children\" : [\"title\", \"madonna\"], \"attributes\" : {\"id\": 1, \"connectivity\": {\"id\": 4, \"weight\": 7.0}} } }, " +
+                "{ \"contains\" : { \"children\" : [\"title\", \"saint\"], \"attributes\" : {\"id\": 2} } }, " +
+                "{ \"contains\" : { \"children\" : [\"title\", \"angel\"], \"attributes\" : {\"id\": 3} } } ] }",
+                new IllegalArgumentException("Item 'title:madonna' was specified to connect to item with ID 4, " +
+                        "which does not exist in the query."));
+    }
+
+    @Test
+    void testAnnotatedPhrase() {
+        QueryTree parsed = parseWhere("{ \"contains\": [\"baz\", { \"phrase\": { \"children\": [\"a\", \"b\"], \"attributes\": { \"label\": \"hello world\" } } }] }");
+        assertEquals("baz:\"a b\"", parsed.toString());
+        PhraseItem phrase = (PhraseItem) parsed.getRoot();
+        assertEquals("hello world", phrase.getLabel());
+    }
+
+    @Test
+    void testRange() {
+        QueryTree parsed = parseWhere("{ \"range\": [\"baz\", { \">=\": 1, \"<=\": 8 }] }");
+        assertEquals("baz:[1;8]", parsed.toString());
+    }
+
+    @Test
+    void testNegativeRange() {
+        QueryTree parsed = parseWhere("{ \"range\": [\"baz\", { \">=\": -8, \"<=\": -1 }] }");
+        assertEquals("baz:[-8;-1]", parsed.toString());
+    }
+
+    @Test
+    void testRangeIllegalArguments() {
+        assertParseFail("{ \"range\": [\"baz\", { \">=\": \"cox\", \"<=\": -1 }] }",
+                new IllegalArgumentException("Expected a numeric argument to range, but got the string 'cox'"));
+    }
+
+    @Test
+    void testStringRange() {
+        parser = new SelectParser(new ParserEnvironment().setIndexFacts(createIndexFactsForInTest()));
+        assertParse("{ \"range\": [\"string\", { \">=\": \"aaa\", \"<=\": \"zzz\" }] }",
+                    "STRING_RANGE string:[\"aaa\";\"zzz\"]");
+        assertParse("{ \"range\": [\"string\", { \">\": \"aaa\", \"<=\": \"zzz\" }] }",
+                    "STRING_RANGE string:<\"aaa\";\"zzz\"]");
+        assertParse("{ \"range\": [\"string\", { \">=\": \"aaa\", \"<\": \"zzz\" }] }",
+                    "STRING_RANGE string:[\"aaa\";\"zzz\">");
+        assertParse("{ \"range\": [\"string\", { \">\": \"aaa\", \"<\": \"zzz\" }] }",
+                    "STRING_RANGE string:<\"aaa\";\"zzz\">");
+        assertParse("{ \"range\": [\"string\", { \"=\": \"aaa\" }] }",
+                    "STRING_RANGE string:[\"aaa\";\"aaa\"]");
+    }
+
+    @Test
+    void testUnboundedStringRange() {
+        parser = new SelectParser(new ParserEnvironment().setIndexFacts(createIndexFactsForInTest()));
+        assertParse("{ \"range\": [\"string\", { \"<=\": \"zzz\" }] }",
+                    "STRING_RANGE string:<-Infinity;\"zzz\"]");
+        assertParse("{ \"range\": [\"string\", { \"<\": \"zzz\" }] }",
+                    "STRING_RANGE string:<-Infinity;\"zzz\">");
+        assertParse("{ \"range\": [\"string\", { \">=\": \"aaa\" }] }",
+                    "STRING_RANGE string:[\"aaa\";Infinity>");
+        assertParse("{ \"range\": [\"string\", { \">\": \"aaa\" }] }",
+                    "STRING_RANGE string:<\"aaa\";Infinity>");
+
+        // Unbounded in both directions, as range(string, -Infinity, Infinity) in YQL: matches everything
+        assertParse("{ \"range\": [\"string\", { }] }",
+                    "STRING_RANGE string:<-Infinity;Infinity>");
+    }
+
+    @Test
+    void testStringRangeStyleSettings() {
+        parser = new SelectParser(new ParserEnvironment().setIndexFacts(createIndexFactsForInTest()));
+        QueryTree parsed = parseWhere("{ \"range\": { \"children\": [\"string\", { \">=\": \"aaa\", \"<=\": \"zzz\" }], " +
+                                      "\"attributes\": { \"filter\": true, \"label\": \"myLabel\" } } }");
+        StringRangeItem range = (StringRangeItem)parsed.getRoot();
+        assertTrue(range.isFilter());
+        assertEquals("myLabel", range.getLabel());
+    }
+
+    @Test
+    void testStringRangeProvidesOrigin() {
+        parser = new SelectParser(new ParserEnvironment().setIndexFacts(createIndexFactsForInTest()));
+        QueryTree parsed = parseWhere("{ \"range\": { \"children\": [\"string\", { \">=\": \"aaa\", \"<=\": \"zzz\" }], " +
+                                      "\"attributes\": { \"origin\": { \"original\": \"foo\", \"offset\": 0, \"length\": 3 } } } }");
+        StringRangeItem range = (StringRangeItem)parsed.getRoot();
+        assertEquals("foo", range.getRawWord());
+    }
+
+    @Test
+    void testStringRangeIllegalArguments() {
+        parser = new SelectParser(new ParserEnvironment().setIndexFacts(createIndexFactsForInTest()));
+        assertParseFail("{ \"range\": [\"string\", { \">=\": 1, \"<=\": \"zzz\" }] }",
+                        new IllegalArgumentException("The field 'string' is a string field, but the argument 1 to range is of type LONG"));
+        assertParseFail("{ \"range\": [\"string\", { \"<>\": \"zzz\" }] }",
+                        new IllegalArgumentException("Expected =, <, <=, > or >=, got <>."));
+    }
+
+    @Test
+    void testNear() {
+        assertParse("{ \"contains\": [\"description\", { \"near\": [\"a\", \"b\"] }] }",
+                "NEAR(2) description:a description:b");
+        assertParse("{ \"contains\": [\"description\", { \"near\": { \"children\": [\"a\", \"b\"], \"attributes\": { \"distance\": 100 } } } ] }",
+                "NEAR(100) description:a description:b");
+    }
+
+    @Test
+    void testOrderedNear() {
+        assertParse("{ \"contains\": [\"description\", { \"onear\": [\"a\", \"b\"] }] }",
+                "ONEAR(2) description:a description:b");
+        assertParse("{ \"contains\": [\"description\", { \"onear\": { \"children\": [\"a\", \"b\"], \"attributes\": { \"distance\": 100 } } } ] }",
+                "ONEAR(100) description:a description:b");
+    }
+
+    @Test
+    void testWand() {
+        assertParse("{ \"wand\": [\"description\", { \"a\": 1, \"b\": 2 }] }",
+                "WAND description{[1]:\"a\",[2]:\"b\"}");
+        assertParse("{ \"wand\": { \"children\": [\"description\", { \"a\": 1, \"b\": 2 }], \"attributes\": { \"scoreThreshold\": 13.3, \"targetHits\": 7, \"thresholdBoostFactor\": 2.3 } } }",
+                "WAND(7) {scoreThreshold=13.3, thresholdBoostFactor=2.3} description{[1]:\"a\",[2]:\"b\"}");
+    }
+
+    @Test
+    void testNumericWand() {
+        String numWand = "WAND description{[1]:\"11\",[2]:\"37\"}";
+        assertParse("{ \"wand\" : [\"description\", [[11,1], [37,2]] ]}", numWand);
+        assertParseFail("{ \"wand\" : [\"description\", 12] }",
+                new IllegalArgumentException("Expected ARRAY or OBJECT, got LONG."));
+    }
+
+    @Test
+    void testWeightedSet() {
+        assertParse("{ \"weightedSet\" : [\"description\", {\"a\":1, \"b\":2} ]}",
+                "WEIGHTEDSET description{[1]:\"a\",[2]:\"b\"}");
+        assertParseFail("{ \"weightedSet\" : [\"description\", {\"a\":\"g\", \"b\":2} ]}",
+                new IllegalArgumentException("Expected an integer argument, but got the string 'g'"));
+        assertParseFail("{ \"weightedSet\" : [\"description\" ]}",
+                new IllegalArgumentException("Expected 2 arguments, got 1."));
+    }
+
+    @Test
+    void testDotProduct() {
+        assertParse("{ \"dotProduct\" : [\"description\", {\"a\":1, \"b\":2} ]}",
+                "DOTPRODUCT description{[1]:\"a\",[2]:\"b\"}");
+        assertParse("{ \"dotProduct\" : [\"description\", {\"a\":2} ]}",
+                "DOTPRODUCT description{[2]:\"a\"}");
+    }
+
+    @Test
+    void testPredicate() {
+        assertParse("{ \"predicate\" : [\"predicate_field\", {\"gender\":\"male\", \"hobby\":[\"music\", \"hiking\"]}, {\"age\":23} ]}",
+                "PREDICATE_QUERY_ITEM gender=male, hobby=music, hobby=hiking, age:23");
+        assertParse("{ \"predicate\" : [\"predicate_field\", 0, \"void\" ]}",
+                "PREDICATE_QUERY_ITEM ");
+    }
+
+    @Test
+    void testRank() {
+        assertParse("{ \"rank\": [{ \"contains\": [\"a\", \"A\"] }, { \"contains\": [\"b\", \"B\"] } ] }",
+                "RANK a:A b:B");
+        assertParse("{ \"rank\": [{ \"contains\": [\"a\", \"A\"] }, { \"contains\": [\"b\", \"B\"] }, { \"contains\": [\"c\", \"C\"] } ] }",
+                "RANK a:A b:B c:C");
+        assertParse("{ \"rank\": [{ \"contains\": [\"a\", \"A\"] }, { \"or\": [{ \"contains\": [\"b\", \"B\"] }, { \"contains\": [\"c\", \"C\"] }] }] }",
+                "RANK a:A (OR b:B c:C)");
+    }
+
+    @Test
+    void testGeoLocation() {
+        assertParse("{ \"geoLocation\": [ \"workplace\", 63.418417, 10.433033, \"0.5 deg\" ] }",
+                "GEO_LOCATION workplace:(2,10433033,63418417,500000,0,1,0,1921876103)");
+        assertParse("{ \"geoLocation\": [ \"headquarters\", \"37.416383\", \"-122.024683\", \"100 miles\" ] }",
+                "GEO_LOCATION headquarters:(2,-122024683,37416383,1450561,0,1,0,3411238761)");
+        assertParse("{ \"geoLocation\": [ \"home\", \"E10.433033\", \"N63.418417\", \"5km\" ] }",
+                "GEO_LOCATION home:(2,10433033,63418417,45066,0,1,0,1921876103)");
+        assertParse("{ \"geoLocation\": [ \"workplace\", -12.0, -34.0, \"-77 deg\" ] }",
+                "GEO_LOCATION workplace:(2,-34000000,-12000000,-1,0,1,0,4201111954)");
+    }
+
+    @Test
+    void testGeoBoundingBox() {
+        assertParse("{ \"geoBoundingBox\": [ \"workplace\", -63.418, -10.433, 63.500, 10.500 ] }",
+                    "GEO_LOCATION workplace:[2,-10433000,-63418000,10500000,63500000]");
+    }
+
+    @Test
+    void testNearestNeighbor() {
+        assertParse("{ \"nearestNeighbor\": [ \"f1field\", \"q2prop\" ] }",
+                "NEAREST_NEIGHBOR {field=f1field,queryTensorName=q2prop}");
+        assertParse("{ \"nearestNeighbor\": { \"children\" : [ \"f3field\", \"q4prop\" ], \"attributes\" : {\"targetHits\": 37, \"hnsw.exploreAdditionalHits\": 42, \"distanceThreshold\": 100100.25 } }}",
+                "NEAREST_NEIGHBOR {field=f3field,queryTensorName=q4prop,targetHits=37,distanceThreshold=100100.25,hnsw.exploreAdditionalHits=42}");
+        assertParse("{ \"nearestNeighbor\": { \"children\" : [ \"f3field\", \"q4prop\" ], \"attributes\" : {\"totalTargetHits\": 100, \"minTargetHits\": 11, \"hnsw.exploreAdditionalHits\": 42, \"distanceThreshold\": 100100.25 } }}",
+                    "NEAREST_NEIGHBOR {field=f3field,queryTensorName=q4prop,totalTargetHits=100,minTargetHits=11,distanceThreshold=100100.25,hnsw.exploreAdditionalHits=42}");
+    }
+
+    @Test
+    void testWeakAnd() {
+        assertParse("{ \"weakAnd\": [{ \"contains\": [\"a\", \"A\"] }, { \"contains\": [\"b\", \"B\"] } ] }",
+                "WEAKAND a:A b:B");
+        assertParse("{ \"weakAnd\": { \"children\" : [{ \"contains\": [\"a\", \"A\"] }, { \"contains\": [\"b\", \"B\"] } ], \"attributes\" : {\"targetHits\": 37} }}",
+                "WEAKAND(37) a:A b:B");
+
+        QueryTree tree = parseWhere("{ \"weakAnd\": { \"children\" : [{ \"contains\": [\"a\", \"A\"] }, { \"contains\": [\"b\", \"B\"] } ] }}");
+        assertEquals("WEAKAND a:A b:B", tree.toString());
+        assertEquals(WeakAndItem.class, tree.getRoot().getClass());
+    }
+
+    @Test
+    void testEquiv() {
+        assertParse("{ \"contains\" : [\"fieldName\", {\"equiv\" : [\"A\",\"B\"]}]}",
+                "EQUIV fieldName:A fieldName:B");
+
+        assertParse("{ \"contains\" : [\"fieldName\", {\"equiv\" : [\"ny\",{\"phrase\" : [ \"new\",\"york\" ] } ] } ] }",
+                "EQUIV fieldName:ny fieldName:\"new york\"");
+
+        assertParseFail("{ \"contains\" : [\"fieldName\", {\"equiv\" : [\"ny\"] } ] }",
+                new IllegalArgumentException("Expected 2 or more arguments, got 1."));
+        assertParseFail("{ \"contains\" : [\"fieldName\", {\"equiv\" : [\"ny\",{\"nalle\" : [ \"void\" ] } ] } ] }",
+                new IllegalArgumentException("Expected operator phrase, got nalle."));
+        assertParseFail("{ \"contains\" : [\"fieldName\", {\"equiv\" : [\"ny\", 42]}]}",
+                new IllegalArgumentException("The word of a word item cannot be empty"));
+    }
+
+    @Test
+    void testAffixItems() {
+        assertRootClass("{ \"contains\" : { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"suffix\": true} } }",
+                SuffixItem.class);
+
+
+        assertRootClass("{ \"contains\" : { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"prefix\": true} } }",
+                PrefixItem.class);
+        assertRootClass("{ \"contains\" : { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"substring\": true} } }",
+                SubstringItem.class);
+        assertParseFail("{ \"contains\" : { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"suffix\": true, \"prefix\" : true} } }",
+                new IllegalArgumentException("Only one of prefix, substring and suffix can be set."));
+        assertParseFail("{ \"contains\" : { \"children\" : [\"baz\", \"colors\"], \"attributes\" : {\"suffix\": true, \"substring\" : true} } }",
+                new IllegalArgumentException("Only one of prefix, substring and suffix can be set."));
+    }
+
+    @Test
+    void testLongNumberInSimpleExpression() {
+        assertParse("{ \"range\" : [ \"price\", { \"=\" : 8589934592 }]}",
+                "price:8589934592");
+    }
+
+    @Test
+    void testNegativeLongNumberInSimpleExpression() {
+        assertParse("{ \"range\" : [ \"price\", { \"=\" : -8589934592 }]}",
+                "price:-8589934592");
+    }
+
+    @Test
+    void testNegativeHitLimit() {
+        assertParse(
+                "{ \"range\" : { \"children\":[ \"foo\", { \">=\" : 0, \"<=\" : 1 }], \"attributes\" : {\"hitLimit\": -38 } } }",
+                "foo:[0;1;-38]");
+    }
+
+    @Test
+    void testRangeSearchHitPopulationOrdering() {
+        assertParse("{ \"range\" : { \"children\":[ \"foo\", { \">=\" : 0, \"<=\" : 1 }], \"attributes\" : {\"hitLimit\": 38 ,\"ascending\": true} } }", "foo:[0;1;38]");
+        assertParse("{ \"range\" : { \"children\":[ \"foo\", { \">=\" : 0, \"<=\" : 1 }], \"attributes\" : {\"hitLimit\": 38 ,\"ascending\": false} } }", "foo:[0;1;-38]");
+        assertParse("{ \"range\" : { \"children\":[ \"foo\", { \">=\" : 0, \"<=\" : 1 }], \"attributes\" : {\"hitLimit\": 38 ,\"descending\": true} } }", "foo:[0;1;-38]");
+        assertParse("{ \"range\" : { \"children\":[ \"foo\", { \">=\" : 0, \"<=\" : 1 }], \"attributes\" : {\"hitLimit\": 38 ,\"descending\": false} } }", "foo:[0;1;38]");
+
+        boolean gotExceptionFromParse = false;
+        try {
+            parseWhere("{ \"range\" : { \"children\":[ \"foo\", { \">=\" : 0, \"<=\" : 1 }], \"attributes\" : {\"hitLimit\": 38, \"ascending\": true, \"descending\": false} } }");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getCause().getMessage().contains("both ascending and descending ordering set"),
+                    "Expected information about abuse of settings.");
+            gotExceptionFromParse = true;
+        }
+        assertTrue(gotExceptionFromParse);
+    }
+
+    // NB: Uses operator-keys to set bounds, not annotations
+    @Test
+    void testOpenIntervals() {
+        assertParse("{ \"range\" : { \"children\":[ \"title\", { \">=\" : 0.0, \"<=\" : 500.0 }] } }" +
+                "select * from sources * where range(title, 0.0, 500.0)",
+                "title:[0.0;500.0]");
+        assertParse(
+                "{ \"range\" : { \"children\":[ \"title\", { \">\" : 0.0, \"<\" : 500.0 }] } }",
+                "title:<0.0;500.0>");
+        assertParse(
+                "{ \"range\" : { \"children\":[ \"title\", { \">\" : 0.0, \"<=\" : 500.0 }]  } }",
+                "title:<0.0;500.0]");
+        assertParse(
+                "{ \"range\" : { \"children\":[ \"title\", { \">=\" : 0.0, \"<\" : 500.0 }] } }",
+                "title:[0.0;500.0>");
+    }
+
+    @Test
+    void testEquals() {
+        assertParse("{\"equals\": [\"public\",true]}", "public:true");
+        assertParse("{\"equals\": [\"public\",5]}", "public:5");
+        assertParse("{\"equals\": {\"field\": \"public\", \"value\": true}}", "public:true");
+        assertParse("{\"equals\": {\"field\": \"public\", \"value\": 5}}", "public:5");
+        assertParse("{\"equals\": [\"public\",-5]}", "public:-5");
+        assertParse("{\"equals\": {\"field\": \"public\", \"value\": -5}}", "public:-5");
+    }
+
+    @Test
+    void testEqualsWithArrayIndex() {
+        // Boolean value
+        assertParse("{\"equals\": {\"field\": \"my_arr\", \"index\": 2, \"value\": true }}",
+                    "my_arr[2]:{true}");
+        var boolTree = parseWhere("{\"equals\": {\"field\": \"my_arr\", \"index\": 2, \"value\": true }}");
+        var boolSameElement = assertInstanceOf(SameElementItem.class, boolTree.getRoot());
+        assertEquals("my_arr", boolSameElement.getFieldName());
+        assertEquals(List.of(2), boolSameElement.getElementFilter());
+        assertEquals(1, boolSameElement.getItemCount());
+
+        // Integer value
+        assertParse("{\"equals\": {\"field\": \"my_arr\", \"index\": 0, \"value\": 42 }}",
+                    "my_arr[0]:{42}");
+        var intTree = parseWhere("{\"equals\": {\"field\": \"my_arr\", \"index\": 0, \"value\": 42 }}");
+        var intSameElement = assertInstanceOf(SameElementItem.class, intTree.getRoot());
+        assertEquals(List.of(0), intSameElement.getElementFilter());
+        assertInstanceOf(IntItem.class, intSameElement.getItem(0));
+
+        // String value
+        assertParse("{\"equals\": {\"field\": \"my_arr\", \"index\": 1, \"value\": \"hello\" }}",
+                    "my_arr[1]:{hello}");
+
+        // Double value
+        assertParse("{\"equals\": {\"field\": \"my_arr\", \"index\": 0, \"value\": 3.14 }}",
+                    "my_arr[0]:{3.14}");
+
+        // Negative values keep their sign and are numeric equality terms, as in YQL.
+        assertParse("{\"equals\": {\"field\": \"my_arr\", \"index\": 0, \"value\": -42 }}",
+                    "my_arr[0]:{-42}");
+        var negativeTree = parseWhere("{\"equals\": {\"field\": \"my_arr\", \"index\": 0, \"value\": -42 }}");
+        var negativeSameElement = assertInstanceOf(SameElementItem.class, negativeTree.getRoot());
+        assertEquals(List.of(0), negativeSameElement.getElementFilter());
+        IntItem negativeValue = assertInstanceOf(IntItem.class, negativeSameElement.getItem(0));
+        assertEquals("-42", negativeValue.getNumber());
+        assertParse("{\"equals\": {\"field\": \"my_arr\", \"index\": 0, \"value\": -3.14 }}",
+                    "my_arr[0]:{-3.14}");
+    }
+
+    @Test
+    void testEqualsWithArrayIndexErrors() {
+        assertParseFail("{\"equals\": {\"field\": \"my_arr\", \"index\": 2 }}",
+                new IllegalArgumentException("Expected 'value' in 'equals' but is missing."));
+        assertParseFail("{\"equals\": {\"field\": \"my_arr\", \"index\": -1, \"value\": true }}",
+                new IllegalArgumentException("element id must be non-negative, got: -1"));
+        assertParseFail("{\"equals\": {\"field\": \"my_arr\", \"index\": 3000000000, \"value\": true }}",
+                new IllegalArgumentException("element id must fit in int32 range, got: 3000000000"));
+        assertParseFail("{\"equals\": {\"field\": \"my_arr\", \"index\": 1.5, \"value\": true }}",
+                new IllegalArgumentException("'index' in 'equals' should be an integer but was DOUBLE"));
+    }
+
+    @Test
+    void testRegexp() {
+        QueryTree x = parseWhere("{ \"matches\" : [\"foo\", \"a b\"]}");
+        Item root = x.getRoot();
+        assertSame(RegExpItem.class, root.getClass());
+        assertEquals("a b", ((RegExpItem) root).stringValue());
+    }
+
+    @Test
+    void testWordAlternatives() {
+        QueryTree x = parseWhere("{\"contains\" : [\"foo\", {\"alternatives\" : [{\"trees\": 1.0, \"tree\": 0.7}]}]}");
+        Item root = x.getRoot();
+        assertSame(WordAlternativesItem.class, root.getClass());
+        WordAlternativesItem alternatives = (WordAlternativesItem) root;
+        checkWordAlternativesContent(alternatives);
+    }
+
+    @Test
+    void testFuzzy() {
+        QueryTree x = parseWhere("{ \"contains\": [\"description\", { \"fuzzy\": [\"a b\"] }] }");
+        Item root = x.getRoot();
+        assertSame(FuzzyItem.class, root.getClass());
+        var fuzzy = (FuzzyItem) root;
+        assertEquals("description", fuzzy.getIndexName());
+        assertEquals("a b", fuzzy.stringValue());
+        assertEquals(FuzzyItem.DEFAULT_MAX_EDIT_DISTANCE, fuzzy.getMaxEditDistance());
+        assertEquals(FuzzyItem.DEFAULT_PREFIX_LENGTH, fuzzy.getPrefixLength());
+        assertFalse(fuzzy.isPrefixMatch());
+    }
+
+    @Test
+    void fuzzy_with_annotations() {
+        var where = """
+                {
+                  "contains": ["description", {
+                    "fuzzy": {
+                      "children": ["a b"],
+                      "attributes": {
+                        "maxEditDistance": 3,
+                        "prefixLength": 10,
+                        "prefix": true
+                      }
+                    }
+                  }]
+                }
+                """;
+        QueryTree x = parseWhere(where);
+        Item root = x.getRoot();
+        assertSame(FuzzyItem.class, root.getClass());
+        var fuzzy = (FuzzyItem) root;
+        assertEquals("description", fuzzy.getIndexName());
+        assertEquals("a b", fuzzy.stringValue());
+        assertEquals(3, fuzzy.getMaxEditDistance());
+        assertEquals(10, fuzzy.getPrefixLength());
+        assertTrue(fuzzy.isPrefixMatch());
+    }
+
+    //------------------------------------------------------------------- grouping tests
+
+    @Test
+    void testGrouping() {
+        String grouping = "[ { \"all\" : { \"group\" : \"time.year(a)\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        String expected = "[[]all(group(time.year(a)) each(output(count())))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testMultipleGroupings() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : \"count()\"}}}, { \"all\" : { \"group\" : \"b\", \"each\" : { \"output\" : \"count()\"}}} ]";
+        String expected = "[[]all(group(a) each(output(count()))), []all(group(b) each(output(count())))]";
+
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingWithPredefinedBuckets() {
+        String grouping = "[ { \"all\" : { \"group\" : { \"predefined\" : [ \"foo\", { \"bucket\": [1,2]}, { \"bucket\": [3,4]} ] } } } ]";
+        String expected = "[[]all(group(predefined(foo, bucket[1, 2>, bucket[3, 4>)))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testMultipleOutputs() {
+        String grouping = "[ { \"all\" : { \"group\" : \"b\", \"each\" : {\"output\": [ \"count()\", \"avg(foo)\" ] } } } ]";
+        String expected = "[[]all(group(b) each(output(count(), avg(foo))))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingWithLabelOnAll() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"mylabel\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        String expected = "[[]all(group(a) each(output(count())) as(mylabel))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingWithLabelOnAllCardinalityShape() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"mycard\", \"output\" : \"count()\" } } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("requires an 'each' operation"),
+                "Message should explain that all-level labels require 'each': " + e.getMessage());
+        assertTrue(e.getMessage().contains("count() as(foo)"),
+                "Message should point users to output expression labels: " + e.getMessage());
+    }
+
+    @Test
+    void testGroupingWithOutputExpressionLabelWithoutEach() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"output\" : \"count() as(mycard)\" } } ]";
+        String expected = "[[]all(group(a) output(count() as(mycard)))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingWithLabelOnAllAndDirectOutputLabelsOnlyDirectEach() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"output\" : \"count() as(total)\", \"label\" : \"by_a\", \"each\" : { \"output\" : \"avg(foo)\" } } } ]";
+        String expected = "[[]all(group(a) output(count() as(total)) each(output(avg(foo))) as(by_a))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingWithLabelContainingSpacesOnAll() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"my label\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        GroupingOperation root = parseGrouping(grouping).get(0).getOperation(); // AllOperation
+        assertEquals("my label", root.getChildren().get(0).getLabel());
+    }
+
+    @Test
+    void testGroupingLabelOnAllCanBeAParameter() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"@name\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        GroupingOperation root = parser.getGroupingSteps(grouping, Map.<String, String>of("name", "my label")::get).get(0).getOperation();
+        assertEquals("my label", root.getChildren().get(0).getLabel());
+
+        var e = assertThrows(IllegalArgumentException.class, () -> parser.getGroupingSteps(grouping, Map.<String, String>of()::get));
+        assertTrue(e.getMessage().contains("Input 'name' is not set"), e.getMessage());
+
+        // Not a parameter reference: a literal label
+        String literal = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"@1\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        root = parser.getGroupingSteps(literal, Map.<String, String>of()::get).get(0).getOperation();
+        assertEquals("@1", root.getChildren().get(0).getLabel());
+    }
+
+    @Test
+    void testGroupingWithLabelContainingQuoteAndBackslashOnAll() {
+        // Raw JSON: "label" : "a\"b\\c"  -> decoded label should be the 5-char string a"b\c
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"a\\\"b\\\\c\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        GroupingOperation root = parseGrouping(grouping).get(0).getOperation(); // AllOperation
+        assertEquals("a\"b\\c", root.getChildren().get(0).getLabel());
+    }
+
+    @Test
+    void testGroupingLabelOrderIsIrrelevantOnAll() {
+        // label before the nested "each"
+        String before = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"lbl\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        // label after the nested "each"
+        String after  = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : \"count()\" }, \"label\" : \"lbl\" } } ]";
+        String expected = "[[]all(group(a) each(output(count())) as(lbl))]";
+        assertGrouping(expected, parseGrouping(before));
+        assertGrouping(expected, parseGrouping(after));
+    }
+
+    @Test
+    void testNestedGroupingLabelsUnderAllAttachToDirectEachOperations() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"by_a\", \"each\" : { \"all\" : { \"group\" : \"b\", \"label\" : \"by_b\", \"each\" : { \"output\" : \"count()\" } } } } } ]";
+        String expected = "[[]all(group(a) each(all(group(b) each(output(count())) as(by_b))) as(by_a))]";
+        assertGrouping(expected, parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelInsideOutputObjectIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : { \"label\" : \"x\" } } } } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("'output'"), "Message should name 'output' context: " + e.getMessage());
+    }
+
+    @Test
+    void testGroupingLabelInsideOutputArrayElementIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : [ \"count()\", { \"label\" : \"x\" } ] } } } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("'output'"), "Message should name 'output' context: " + e.getMessage());
+    }
+
+    @Test
+    void testGroupingLabelInsideEachIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : \"count()\", \"label\" : \"x\" } } } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("'each'"), "Message should name 'each' context: " + e.getMessage());
+    }
+
+    @Test
+    void testGroupingLabelInArrayWrappedOperationBodyIsRejected() {
+        // The label is not a direct field of the operation (the "all" value is an array), so it is
+        // rejected rather than silently dropped.
+        String grouping = "[ { \"all\" : [ { \"group\" : \"a\", \"label\" : \"x\", \"each\" : { \"output\" : \"count()\" } } ] } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("array under 'all'"),
+                "Message should name the array-wrapped 'all' context: " + e.getMessage());
+
+        // The same shape without the label converts to exactly the expected operation (not merely no-throw).
+        // This is to keep pre-label behavior. But we don't want label-bearing shapes to support "all" arrays,
+        // because they don't make sense and were never actually supported - they worked accidentally.
+        String noLabel = "[ { \"all\" : [ { \"group\" : \"a\", \"each\" : { \"output\" : \"count()\" } } ] } ]";
+        assertGrouping("[[]all(group(a) each(output(count())))]", parseGrouping(noLabel));
+    }
+
+    @Test
+    void testGroupingLabelInsideGroupValueObjectIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : { \"label\" : \"x\" }, \"each\" : { \"output\" : \"count()\" } } } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("'group'"), "Message should name 'group' context: " + e.getMessage());
+    }
+
+    @Test
+    void testGroupingLabelAtTopLevelIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : \"count()\" } }, \"label\" : \"x\" } ]";
+        var e = assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+        assertTrue(e.getMessage().contains("top-level"), "Message should name the top-level context: " + e.getMessage());
+    }
+
+    @Test
+    void testGroupingLabelNumberIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : 5, \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelNullIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : null, \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelBooleanIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : true, \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelArrayIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : [ \"x\" ], \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelObjectIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : { \"value\" : \"x\" }, \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelEmptyIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    @Test
+    void testGroupingLabelWhitespaceOnlyIsRejected() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"label\" : \"   \", \"each\" : { \"output\" : \"count()\" } } } ]";
+        assertThrows(IllegalInputException.class, () -> parseGrouping(grouping));
+    }
+
+    //------------------------------------------------------------------- Other tests
+
+    @Test
+    void testOverridingOtherQueryTree() {
+        Query query = new Query("?query=default:query");
+        assertEquals("WEAKAND default:query", query.getModel().getQueryTree().toString());
+        assertEquals(Query.Type.WEAKAND, query.getModel().getType());
+
+        query.getSelect().setWhereString("{\"contains\" : [\"default\", \"select\"] }");
+        assertEquals("default:select", query.getModel().getQueryTree().toString());
+        assertEquals(Query.Type.SELECT, query.getModel().getType());
+    }
+
+    @Test
+    void testOverridingWhereQueryTree() {
+        Query query = new Query("?query=default:query");
+        query.getSelect().setWhereString("{\"contains\" : [\"default\", \"select\"] }");
+        assertEquals("default:select", query.getModel().getQueryTree().toString());
+        assertEquals(Query.Type.SELECT, query.getModel().getType());
+
+        query.getModel().setQueryString("default:query");
+        query.getModel().setType("all");
+        assertEquals("default:query", query.getModel().getQueryTree().toString());
+        assertEquals(Query.Type.ALL, query.getModel().getType());
+    }
+
+    @Test
+    void testProgrammaticAssignment() {
+        Query query = new Query();
+        query.getSelect().setGroupingString("[ { \"all\" : { \"group\" : \"time.year(a)\", \"each\" : { \"output\" : \"count()\" } } } ]");
+        assertEquals(1, query.getSelect().getGrouping().size());
+        assertEquals("all(group(time.year(a)) each(output(count())))", query.getSelect().getGrouping().get(0).getRootOperation().toString());
+
+        // Setting from string resets the grouping expression
+        query.getSelect().setGroupingString("[ { \"all\" : { \"group\" : \"time.dayofmonth(a)\", \"each\" : { \"output\" : \"count()\" } } } ]");
+        assertEquals(1, query.getSelect().getGrouping().size());
+        assertEquals("all(group(time.dayofmonth(a)) each(output(count())))", query.getSelect().getGrouping().get(0).getRootOperation().toString());
+    }
+
+    /** Parameters referenced in select.grouping are resolved when the query is complete, not in request parameter order. */
+    @Test
+    void testGroupingParametersAreResolvedRegardlessOfRequestParameterOrder() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"filter\" : \"regex(@pattern, a)\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        var requestMap = new java.util.LinkedHashMap<String, String>();
+        requestMap.put("select.grouping", grouping);
+        requestMap.put("pattern", "ba.*");
+        Query query = new Query(HttpRequest.createTestRequest("?", com.yahoo.jdisc.http.HttpRequest.Method.GET), requestMap, null);
+        assertEquals(1, query.getSelect().getGrouping().size());
+        assertEquals("all(group(a) filter(regex(\"ba.*\", a)) each(output(count())))",
+                     query.getSelect().getGrouping().get(0).getRootOperation().toString());
+
+        var missing = new java.util.LinkedHashMap<String, String>();
+        missing.put("select.grouping", grouping);
+        var e = assertThrows(IllegalArgumentException.class,
+                             () -> new Query(HttpRequest.createTestRequest("?", com.yahoo.jdisc.http.HttpRequest.Method.GET), missing, null));
+        assertTrue(Exceptions.toMessageString(e).contains("Input 'pattern' is not set"), Exceptions.toMessageString(e));
+    }
+
+    /** A grouping which fails to resolve stays pending, so it is not lost and can be resolved once the parameter is set. */
+    @Test
+    void testGroupingWhichFailsToResolveIsNotDiscarded() {
+        String grouping = "[ { \"all\" : { \"group\" : \"a\", \"each\" : { \"output\" : \"count()\" } } }, " +
+                          "  { \"all\" : { \"group\" : \"b\", \"max\" : \"@max\", \"each\" : { \"output\" : \"count()\" } } } ]";
+        Query query = new Query();
+        query.getSelect().setGroupingString(grouping);
+
+        var e = assertThrows(IllegalArgumentException.class, () -> query.getSelect().getGrouping());
+        assertTrue(Exceptions.toMessageString(e).contains("Input 'max' is not set"), Exceptions.toMessageString(e));
+        // Still failing on repeated access, with the same error, rather than silently returning no grouping
+        e = assertThrows(IllegalArgumentException.class, () -> query.getSelect().getGrouping());
+        assertTrue(Exceptions.toMessageString(e).contains("Input 'max' is not set"), Exceptions.toMessageString(e));
+
+        query.properties().set("max", "3");
+        assertEquals(2, query.getSelect().getGrouping().size());
+        assertEquals("all(group(a) each(output(count())))",
+                     query.getSelect().getGrouping().get(0).getRootOperation().toString());
+        assertEquals("all(group(b) max(3) each(output(count())))",
+                     query.getSelect().getGrouping().get(1).getRootOperation().toString());
+        // Resolved once: not re-resolved on later access
+        query.properties().set("max", "4");
+        assertEquals("all(group(b) max(3) each(output(count())))",
+                     query.getSelect().getGrouping().get(1).getRootOperation().toString());
+    }
+
+    @Test
+    void testConstructionAndClone() {
+        Query query = new Query();
+        query.getSelect().setWhereString("{\"contains\" : [\"default\", \"select\"] }");
+        query.getSelect().setGroupingString("[ { \"all\" : { \"group\" : \"time.dayofmonth(a)\", \"each\" : { \"output\" : \"count()\" } } } ]");
+        GroupingRequest secondRequest = GroupingRequest.newInstance(query);
+        assertEquals("default:select", query.getModel().getQueryTree().toString());
+        assertEquals(2, query.getSelect().getGrouping().size());
+        assertEquals("all(group(time.dayofmonth(a)) each(output(count())))", query.getSelect().getGrouping().get(0).toString());
+
+        Query clone = query.clone();
+        assertEquals(clone.getSelect().getGroupingExpressionString(), query.getSelect().getGroupingExpressionString());
+        assertNotSame(query.getSelect(), clone.getSelect());
+        assertNotSame(query.getSelect().getGrouping(), clone.getSelect().getGrouping());
+        assertNotSame(query.getSelect().getGrouping().get(0), clone.getSelect().getGrouping().get(0));
+        assertNotSame(query.getSelect().getGrouping().get(1), clone.getSelect().getGrouping().get(1));
+        assertEquals(query.getSelect().getWhereString(), clone.getSelect().getWhereString());
+        assertEquals(query.getSelect().getGroupingString(), clone.getSelect().getGroupingString());
+        assertEquals(query.getSelect().getGrouping().get(0).toString(), clone.getSelect().getGrouping().get(0).toString());
+        assertEquals(query.getSelect().getGrouping().get(1).toString(), clone.getSelect().getGrouping().get(1).toString());
+    }
+
+    @Test
+    void testCloneWithGroupingExpressionString() {
+        Query query = new Query();
+        query.getSelect().setGroupingExpressionString("all(group(foo) each(output(count())))");
+
+        Query clone = query.clone();
+        assertEquals(clone.getSelect().getGroupingExpressionString(), query.getSelect().getGroupingExpressionString());
+    }
+
+    @Test
+    void testProgrammaticBuilding() {
+        String expected =
+                "all(group(myfield) max(10000) each(" +
+                        "output(min(foo), max(bar)) " +
+                        "all(group(foo) max(10000) output(count()))" +
+                        "))";
+        Query query = new Query();
+        GroupingRequest grouping = GroupingRequest.newInstance(query);
+        AllOperation root = new AllOperation();
+        root.setGroupBy(new AttributeValue("myfield"));
+        root.setMax(10000);
+        EachOperation each = new EachOperation();
+        each.addOutput(new MinAggregator(new AttributeValue("foo")));
+        each.addOutput(new MaxAggregator(new AttributeValue("bar")));
+        AllOperation all = new AllOperation();
+        all.setGroupBy(new AttributeValue("foo"));
+        all.setMax(10000);
+        all.addOutput(new CountAggregator());
+        each.addChild(all);
+        root.addChild(each);
+        grouping.setRootOperation(root);
+
+        assertEquals(expected, query.getSelect().getGrouping().get(0).toString());
+    }
+
+    //------------------------------------------------------------------- Assert methods
+
+    private void assertParse(String where, String expectedQueryTree) {
+        String queryTree = parseWhere(where).toString();
+        assertEquals(expectedQueryTree, queryTree);
+    }
+
+    private void assertParseFail(String where, Throwable expectedException) {
+        try {
+            parseWhere(where).toString();
+            fail("Parse succeeded: " + where);
+        } catch (Throwable outer) {
+            assertEquals(IllegalInputException.class, outer.getClass());
+            assertEquals("Illegal JSON query", outer.getMessage());
+            Throwable cause = outer.getCause();
+            assertEquals(expectedException.getClass(), cause.getClass());
+            assertEquals(expectedException.getMessage(), cause.getMessage());
+        }
+    }
+
+    private void assertRootClass(String where, Class<? extends Item> expectedRootClass) {
+        assertEquals(expectedRootClass, parseWhere(where).getRoot().getClass());
+    }
+
+    private void assertGrouping(String expected, List<VespaGroupingStep> steps) {
+        List<String> actual = new ArrayList<>(steps.size());
+        for (VespaGroupingStep step : steps) {
+            actual.add(step.continuations().toString() +
+                    step.getOperation());
+        }
+        assertEquals(expected, actual.toString());
+    }
+
+    //------------------------------------------------------------------- Parse methods
+
+    private QueryTree parseWhere(String where) {
+        Select select = new Select(where, "", new Query());
+
+        return parser.parse(new Parsable().setSelect(select));
+    }
+
+    private List<VespaGroupingStep> parseGrouping(String grouping) {
+        return parser.getGroupingSteps(grouping);
+    }
+
+    //------------------------------------------------------------------- Other methods
+
+    private WordItem getRootWord(String yqlQuery) {
+        Item root = parseWhere(yqlQuery).getRoot();
+        assertTrue(root instanceof WordItem);
+        return (WordItem)root;
+    }
+
+    private void checkWordAlternativesContent(WordAlternativesItem alternatives) {
+        boolean seenTree = false;
+        boolean seenForest = false;
+        final String forest = "trees";
+        final String tree = "tree";
+        assertEquals(2, alternatives.getAlternatives().size());
+        for (WordAlternativesItem.Alternative alternative : alternatives.getAlternatives()) {
+            if (tree.equals(alternative.word)) {
+                assertFalse(seenTree, "Duplicate term introduced");
+                seenTree = true;
+                assertEquals(.7d, alternative.exactness, 1e-15d);
+            } else if (forest.equals(alternative.word)) {
+                assertFalse(seenForest, "Duplicate term introduced");
+                seenForest = true;
+                assertEquals(1.0d, alternative.exactness, 1e-15d);
+            } else {
+                fail("Unexpected term: " + alternative.word);
+            }
+        }
+    }
+
+    private static void assertNumericInItem(String field, long[] values, QueryTree query) {
+        var exp = buildNumericInItem(field, values);
+        assertEquals(exp, query.getRoot());
+    }
+
+    private static void assertStringInItem(String field, String[] values, QueryTree query) {
+        var exp = buildStringInItem(field, values);
+        assertEquals(exp, query.getRoot());
+    }
+
+    private static NumericInItem buildNumericInItem(String field, long[] values) {
+        var item = new NumericInItem(field);
+        for (var value : values) item.addToken(value);
+        return item;
+    }
+
+    private static StringInItem buildStringInItem(String field, String[] values) {
+        var item = new StringInItem(field);
+        for (var value : values) item.addToken(value);
+        return item;
+    }
+
+    @Test
+    void testExplicitEnglishLanguageSetsEnglish() {
+        Item root = parseWhere("{ \"contains\": { \"children\": [\"baz\", \"hello\"], \"attributes\": { \"language\": \"en\" } } }").getRoot();
+        assertEquals(Language.ENGLISH, root.getLanguage(),
+                "Explicit language: 'en' should set ENGLISH, not UNKNOWN");
+    }
+
+    @Test
+    void testExplicitFrenchLanguageSetsFrench() {
+        Item root = parseWhere("{ \"contains\": { \"children\": [\"baz\", \"hello\"], \"attributes\": { \"language\": \"fr\" } } }").getRoot();
+        assertEquals(Language.FRENCH, root.getLanguage(),
+                "Explicit language: 'fr' should set FRENCH");
+    }
+
+    @Test
+    void testNoLanguageAnnotationStaysUnknown() {
+        Item root = parseWhere("{ \"contains\": [\"baz\", \"hello\"] }").getRoot();
+        assertEquals(Language.UNKNOWN, root.getLanguage(),
+                "No language annotation should leave UNKNOWN");
+    }
+}

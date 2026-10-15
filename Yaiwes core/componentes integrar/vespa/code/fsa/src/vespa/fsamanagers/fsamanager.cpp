@@ -1,0 +1,128 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+/**
+ * @author  Peter Boros
+ * @date    2004/08/20
+ * @version $Id$
+ * @file    fsamanager.cpp
+ * @brief
+ *
+ */
+
+#include "fsamanager.h"
+
+namespace fsa {
+
+// {{{ FSAManager::~FSAManager()
+
+FSAManager::~FSAManager() {
+    for (LibraryIterator it = _library.begin(); it != _library.end(); ++it) {
+        delete it->second;
+    }
+}
+
+// }}}
+// {{{ FSAManager::load()
+
+bool FSAManager::load(const std::string& id, const std::string& url) {
+    std::string file = url;
+
+    if (!url.compare(0, 7, "http://")) {
+        unsigned int pos = url.find_last_of('/');
+        if (pos == url.size() - 1) {
+            return false;
+        }
+        {
+            std::lock_guard guard(_cacheLock);
+            file = _cacheDir;
+        }
+        if (file.size() > 0 && file[file.size() - 1] != '/') {
+            file += '/';
+        }
+        file += url.substr(pos + 1);
+        if (!getUrl(url, file)) {
+            return false;
+        }
+    }
+
+    FSA::Handle* newdict = new FSA::Handle(file);
+    if (!newdict->isOk()) {
+        delete newdict;
+        return false;
+    }
+
+    std::lock_guard guard(_lock);
+    {
+        LibraryIterator it = _library.find(id);
+        if (it != _library.end()) {
+            delete it->second;
+            it->second = newdict;
+        } else {
+            _library.insert(Library::value_type(id, newdict));
+        }
+    }
+
+    return true;
+}
+
+// }}}
+// {{{ FSAManager::getUrl()
+
+bool FSAManager::getUrl(const std::string& url, const std::string& file) {
+    (void)url;
+    (void)file;
+    return false;
+}
+
+// }}}
+// {{{ FSAManager::get()
+
+FSA::Handle* FSAManager::get(const std::string& id) const {
+    FSA::Handle*     newhandle = nullptr;
+    std::shared_lock guard(_lock);
+    {
+        LibraryConstIterator it = _library.find(id);
+        if (it != _library.end()) {
+            newhandle = new FSA::Handle(*(it->second));
+        }
+    }
+    return newhandle;
+}
+
+// }}}
+// {{{ FSAManager::drop()
+
+void FSAManager::drop(const std::string& id) {
+    std::lock_guard guard(_lock);
+    {
+        LibraryIterator it = _library.find(id);
+        if (it != _library.end()) {
+            delete it->second;
+            _library.erase(it);
+        }
+    }
+}
+
+// }}}
+// {{{ FSAManager::clear()
+
+void FSAManager::clear() {
+    std::lock_guard guard(_lock);
+    {
+        for (LibraryIterator it = _library.begin(); it != _library.end(); ++it) {
+            delete it->second;
+        }
+        _library.clear();
+    }
+}
+
+// }}}
+// {{{ FSAManager::setCacheDir()
+
+void FSAManager::setCacheDir(const std::string& dir) {
+    std::lock_guard guard(_cacheLock);
+    _cacheDir = dir;
+}
+
+// }}}
+
+} // namespace fsa

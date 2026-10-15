@@ -1,0 +1,22 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include <vespa/searchcore/proton/documentmetastore/i_document_meta_store.h>
+#include <vespa/searchlib/common/serialnum.h>
+
+namespace proton::bucketdb {
+
+/**
+ * The IBucketDBHandlerInitiaizer class handles initialization of a
+ * BucketDBHandler.
+ */
+class IBucketDBHandlerInitializer {
+public:
+    IBucketDBHandlerInitializer() {}
+    virtual ~IBucketDBHandlerInitializer() = default;
+
+    virtual void addDocumentMetaStore(IDocumentMetaStore* dms, search::SerialNum flushedSerialNum) = 0;
+};
+
+} // namespace proton::bucketdb

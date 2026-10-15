@@ -1,0 +1,204 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+namespace=vespa.config.content.core
+
+## The total size of unique documents in a bucket before we split it due to
+## being too big. By default this is now 16 MB. Should be kept in sync with stor-filestor.def:bucket_merge_chunk_size.
+splitsize int default=16772216
+
+## The maximum amount of entries in a file before we should attempt to split it.
+## A metadata entry in a slotfile currently uses 40 bytes. It is probably
+## good to have the split size, such that all metadata entries are normally
+## read when you do the initial read. With the default of 1024, metadata will
+## take up around 40 kB, and the default initial read is 64 kB, allowing the
+## file to grow a bit above max and still all be read in initial read.
+splitcount int default=1024
+
+## The maximum size of unique documents that allows the system to reduce
+## the number of split bits on the bucket, or join two buckets together.
+## The size must be lower than this number, and the count must be lower than
+## joincount.
+joinsize int default=16000000
+
+## The maximum number of unique documents that allows for joining (see
+## joinsize).
+joincount int default=512
+
+## Minimum level of splitting for buckets
+minsplitcount int default=16
+
+## If non-empty, continuously delete all the documents matching this selection.
+garbagecollection.selectiontoremove string default=""
+
+## The interval with which each bucket is purged using the selection above.
+## If 0, no garbage collection is done.
+garbagecollection.interval int default=0
+
+## If false, dont do splits inline with feeding.
+inlinebucketsplitting bool default=true
+
+## Maximum nodes involved in a merge operation. Currently, this cannot be more
+## than 16 nodes due to protocol limitations. However, decreasing the max may
+## be useful if 16 node merges ends up too expensive.
+maximum_nodes_per_merge int default=16
+
+## For internal in process debugging, it may be useful to not start the
+## distributor thread to be able to call tick() manually and run single threaded
+start_distributor_thread bool default=true restart
+
+## The distributor can send joins that "lift" a bucket without any siblings
+## higher up in the bucket tree hierarchy. The assumption is that if this
+## is done for all sibling-less buckets, they will all eventually reach a
+## level in the tree where they do in fact have a sibling and may (if their
+## sizes allow) be joined into a single bucket.
+enable_join_for_sibling_less_buckets bool default=false
+
+## There exists a distribution edge case where bucket siblings end up having
+## non-equal ideal locations. This will normally inhibit join operations, as
+## these are only allowed when all nodes have all source buckets involved in
+## the join operation. Setting this property to true means such buckets may
+## still be joined at the cost of transient inconsistencies for the buckets
+## being joined into.
+enable_inconsistent_join bool default=false
+
+## For each available node, the distributor will report back to the cluster
+## controller a value which indicates the minimum replication factor for any
+## bucket contained on said node. This config exposes a way to alter how this
+## replication factor is computed.
+##
+## Valid enum values and their semantics:
+##
+## TRUSTED - only trusted replicas are counted.
+## ANY - any replica present is counted. This may return an overly optimistic
+##       view of the system. E.g. if there are 3 replicas, 1 having 1000 docs
+##       and 2 having 1 doc, all being out of sync, counting with ANY will still
+##       treat this as a minimum replication factor of 3. Conversely, with
+##       TRUSTED such a bucket would most likely have a factor of 0 (or 1 iff
+##       the trusted status for the replica with 1000 docs is known).
+minimum_replica_counting_mode enum { TRUSTED, ANY } default=TRUSTED
+
+## Bucket activation only makes sense for indexed search clusters, but Proton
+## may also be run in store-only or streaming mode, in which case it does not
+## actually require any activations. If the model infers that Proton is running
+## in such a mode, activation will be explicitly disabled.
+##
+## Activation is always disabled entirely for clusters using VDS as their
+## engine, regardless of the value of this setting.
+disable_bucket_activation bool default=false
+
+
+## Maximum clock skew across nodes in the cluster, in whole seconds.
+## Used to prevent timestamp collisions during distributor bucket ownership
+## transfers.
+## Zero means this mechanism is disabled.
+max_cluster_clock_skew_sec int default=1
+
+## Number of seconds that scheduling of new merge operations should be inhibited
+## towards a node if it has indicated that its merge queues are full or it is
+## suffering from resource exhaustion.
+inhibit_merge_sending_on_busy_node_duration_sec int default=1
+
+## If set, enables potentially stale reads during cluster state transitions where
+## buckets change ownership. This also implicitly enables support for two-phase
+## cluster state transitions on the distributor.
+## For this option to take effect, the cluster controller must also have two-phase
+## states enabled.
+allow_stale_reads_during_cluster_state_transitions bool default=false
+
+## If greater than zero, injects a thread sleep into certain parts of the bucket
+## processing logic. This allows for easier testing of racing edge cases where the
+## main distributor thread is CPU-blocked processing large amounts of buckets, but
+## without actually needing to use a lot of buckets in the test itself.
+## Setting any of these values only makes sense for testing!
+simulated_db_pruning_latency_msec int default=0
+simulated_db_merging_latency_msec int default=0
+
+## If set, no merge operations may be generated for any reason by a distributor.
+## This is ONLY intended for system testing of certain transient edge cases and
+## MUST NOT be set to true in a production environment.
+merge_operations_disabled bool default=false
+
+## If set, Get operations that are initiated by the client (i.e. _not_ Get operations
+## that are initiated by the distributor) will be forwarded to the backend with
+## a flag signalling that weak read consistency may be used. This allows the
+## backend to minimize internal locking. The downside is that it's not guaranteed
+## to observe the most recent writes to the document, nor to observe an atomically
+## consistent view of fields across document versions.
+## This is mostly useful in a system that is effectively read-only.
+use_weak_internal_read_consistency_for_client_gets bool default=false
+
+## If a distributor main thread tick is constantly processing requests or responses
+## originating from other nodes, setting this value above zero will prevent implicit
+## maintenance scans from being done as part of the tick for up to N rounds of ticking.
+## This is to reduce the amount of CPU spent on ideal state calculations and bucket DB
+## accesses when the distributor is heavily loaded with feed operations.
+max_consecutively_inhibited_maintenance_ticks int default=20
+
+## If set, activation of bucket replicas is limited to only those replicas that have
+## bucket info consistent with a majority of the other replicas for that bucket.
+## Multiple active replicas is only a feature that is enabled for grouped clusters,
+## and this feature is intended to prevent nodes in stale groups (whose buckets are
+## likely to be out of sync) from serving query traffic until they have gotten back
+## into sync.
+## Up to the given number of groups can have their replica activation inhibited
+## by this feature. If zero, the feature is functionally disabled.
+## If more groups are out of sync than the configured number N, the inhibited groups
+## will be the N first groups present in the distribution config.
+## Note: this feature only kicks in if the number of groups in the cluster is greater
+## than 1.
+max_activation_inhibited_out_of_sync_groups int default=0
+
+## Specifies the number of stripes over which a distributor internally distributes
+## its buckets and operation processing. Every stripe receives its own thread.
+## If <= 0, the number of stripes is inferred automatically based on the number of
+## CPU cores available. If > 0, the number of stripes is explicitly overridden.
+## Stripe counts must be a power of two.
+num_distributor_stripes int default=0 restart
+
+## If true, changes in the cluster where a subset of the nodes become unavailable or buckets
+## change ownership between distributors will trigger an explicit cancellation of all pending
+## requests partially or fully "invalidated" by such a change.
+enable_operation_cancellation bool default=false
+
+## Iff true there will be an 1-1 symmetry between the replicas chosen as feed targets
+## for Put operations and the replica selection logic for bucket activation. In particular,
+## the most preferred replica for feed will be the most preferred bucket for activation.
+## This helps ensure that new versions of documents are routed to replicas that are most
+## likely to reflect these changes as part of visible search results.
+symmetric_put_and_activate_replica_selection bool default=false
+
+## Iff set to a value > 0, will enforce a size check on Put and Update operations arriving
+## at the distributor, where over-sized messages will be explicitly rejected with a
+## non-retryable error code. Intended as a safety measure to prevent overly large documents
+## from being accepted into the cluster.
+##
+## The message size is estimated based on the uncompressed on-wire serialized payload size,
+## so it's only a (possibly inaccurate) proxy for the actual impact the underlying document
+## operation will have on the backend. But it's a "free" heuristic since we already have
+## that information available from the RPC subsystem.
+##
+## Any number <= 0 implicitly defaults to 2GiB (INT32_MAX), i.e. effectively unbounded.
+max_document_operation_message_size_bytes int default=134217728
+
+## TODO GC very soon, it has no effect.
+priority_merge_out_of_sync_copies int default=120
+
+## TODO GC as it has no effect
+use_btree_database bool default=true
+
+##
+## Node hardware info; this is a subset of what's present in `proton.def`, allowing
+## distributor processes to make an informed decision about how to scale internal
+## resource pools and limits. Content nodes already get their HW info directly from
+## Proton, as it owns the content node components.
+## If there is no host flavor associated with the node, these fields will be zero
+## and the node will fall back to default (and/or locally inferred) values.
+##
+
+## The size of the disk partition (in bytes) on which the node's basedir is located.
+hwinfo.disk.size long default = 0 restart
+
+## The size of physical memory (in bytes) available to the distributor.
+hwinfo.memory.size long default = 0 restart
+
+## The number of cores on the cpu.
+hwinfo.cpu.cores int default = 0 restart

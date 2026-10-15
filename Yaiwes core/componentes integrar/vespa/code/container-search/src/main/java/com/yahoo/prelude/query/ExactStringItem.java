@@ -1,0 +1,47 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.prelude.query;
+
+import ai.vespa.searchlib.searchprotocol.protobuf.SearchProtocol;
+
+/**
+ * Used to signal that this term requires exact match if the backend supports it.
+ *
+ * @author baldersheim
+ */
+
+public class ExactStringItem extends WordItem {
+
+    public ExactStringItem(String substring) {
+        this(substring, false);
+    }
+
+    public ExactStringItem(String substring, boolean isFromQuery) {
+        super(substring, isFromQuery);
+    }
+
+    @Override
+    public ItemType getItemType() {
+        return ItemType.EXACT;
+    }
+
+    @Override
+    public String getName() {
+        return "EXACTSTRING";
+    }
+
+    @Override
+    public String stringValue() {
+        return getWord();
+    }
+
+    @Override
+    SearchProtocol.QueryTreeItem toProtobuf(SerializationContext context) {
+        var builder = SearchProtocol.ItemExactStringTerm.newBuilder();
+        builder.setProperties(ToProtobuf.buildTermProperties(this, getIndexName()));
+        builder.setWord(getWord());
+        return SearchProtocol.QueryTreeItem.newBuilder()
+                .setItemExactstringTerm(builder.build())
+                .build();
+    }
+
+}

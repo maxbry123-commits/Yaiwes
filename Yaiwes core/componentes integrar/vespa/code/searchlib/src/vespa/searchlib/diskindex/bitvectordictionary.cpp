@@ -1,0 +1,132 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "bitvectordictionary.h"
+
+#include <vespa/check_require.h>
+#include <vespa/fastos/file.h>
+#include <vespa/searchlib/common/bitvector.h>
+#include <vespa/searchlib/common/fileheadertags.h>
+#include <vespa/searchlib/common/read_stats.h>
+#include <vespa/vespalib/data/fileheader.h>
+#include <vespa/vespalib/util/error.h>
+
+#include <vespa/log/log.h>
+LOG_SETUP(".diskindex.bitvectordictionary");
+
+using search::common::CreateAndFreezeTimes;
+using search::index::BitVectorDictionaryLookupResult;
+using search::index::PostingListFileRange;
+
+namespace search::diskindex {
+
+using namespace tags;
+
+BitVectorDictionary::BitVectorDictionary()
+    : _docIdLimit(0u),
+      _entries(),
+      _vectorSize(0u),
+      _datFile(),
+      _datHeaderLen(0u),
+      _memory_mapped(false),
+      _create_and_freeze_times() {
+}
+
+BitVectorDictionary::~BitVectorDictionary() = default;
+
+bool BitVectorDictionary::open(const std::string& pathPrefix, const TuneFileRandRead& tuneFileRead,
+                               BitVectorKeyScope scope) {
+    {
+        std::string booloccIdxName = pathPrefix + "boolocc" + getBitVectorKeyScopeSuffix(scope);
+        FastOS_File idxFile;
+        idxFile.OpenReadOnly(booloccIdxName.c_str());
+        if (!idxFile.IsOpened()) {
+            LOG(error, "Could not open bitvector idx file '%s': %s", booloccIdxName.c_str(),
+                vespalib::getLastErrorString().c_str());
+            return false;
+        }
+
+        vespalib::FileHeader idxHeader;
+        uint32_t             idxHeaderLen = idxHeader.readFile(idxFile);
+        idxFile.SetPosition(idxHeaderLen);
+        CHECK(idxHeader.hasTag(FROZEN));
+        CHECK(idxHeader.hasTag(DOCID_LIMIT));
+        CHECK(idxHeader.hasTag(NUM_KEYS));
+        CHECK(idxHeader.getTag(FROZEN).asInteger() != 0);
+        _docIdLimit = idxHeader.getTag(DOCID_LIMIT).asInteger();
+        uint32_t numEntries = idxHeader.getTag(NUM_KEYS).asInteger();
+        if (idxHeader.hasTag(ENTRY_SIZE)) {
+            _vectorSize = idxHeader.getTag(ENTRY_SIZE).asInteger();
+        } else {
+            constexpr size_t LEGACY_ALIGNMENT = 0x40;
+            BitVector::Index bytes = BitVector::legacy_num_bytes_with_single_guard_bit(_docIdLimit);
+            _vectorSize = bytes + (-bytes & (LEGACY_ALIGNMENT - 1));
+        }
+        _create_and_freeze_times = CreateAndFreezeTimes(idxHeader);
+
+        _entries.resize(numEntries);
+        size_t bufSize = sizeof(WordSingleKey) * numEntries;
+        CHECK(idxFile.getSize() >= static_cast<int64_t>(idxHeaderLen + bufSize));
+        if (bufSize > 0) {
+            ssize_t has_read = idxFile.Read(&_entries[0], bufSize);
+            CHECK(has_read == ssize_t(bufSize));
+        }
+    }
+
+    std::string booloccDatName = pathPrefix + "boolocc.bdat";
+    _datFile = std::make_unique<FastOS_File>();
+    _datFile->setFAdviseOptions(tuneFileRead.getAdvise());
+
+    if (tuneFileRead.getWantMemoryMap()) {
+        _datFile->enableMemoryMap(tuneFileRead.getMemoryMapFlags());
+    } else if (tuneFileRead.getWantDirectIO()) {
+        _datFile->EnableDirectIO();
+    }
+    _datFile->OpenReadOnly(booloccDatName.c_str());
+    if (!_datFile->IsOpened()) {
+        LOG(error, "Could not open bitvector dat file '%s': %s", booloccDatName.c_str(),
+            vespalib::getLastErrorString().c_str());
+        return false;
+    }
+    vespalib::FileHeader datHeader(64);
+    _datHeaderLen = datHeader.readFile(*_datFile);
+    CHECK(_datFile->getSize() >= static_cast<int64_t>(_vectorSize * _entries.size() + _datHeaderLen));
+    _memory_mapped = (_datFile->MemoryMapPtr(0) != nullptr);
+    _create_and_freeze_times.merge(CreateAndFreezeTimes(datHeader));
+    return true;
+}
+
+BitVectorDictionaryLookupResult BitVectorDictionary::lookup(uint64_t wordNum) {
+    WordSingleKey key;
+    key._wordNum = wordNum;
+    auto itr = std::lower_bound(_entries.begin(), _entries.end(), key);
+    if (itr == _entries.end() || key < *itr) {
+        return {};
+    }
+    return BitVectorDictionaryLookupResult(itr - _entries.begin());
+}
+
+std::unique_ptr<const BitVector> BitVectorDictionary::read_bitvector(BitVectorDictionaryLookupResult lookup_result,
+                                                                     ReadStats&                      read_stats) {
+    if (!lookup_result.valid()) {
+        return {};
+    }
+    int64_t offset = ((int64_t)_vectorSize) * lookup_result.idx + _datHeaderLen;
+    return BitVector::create(_docIdLimit, *_datFile, offset, _vectorSize, _entries[lookup_result.idx]._numDocs,
+                             read_stats);
+}
+
+std::unique_ptr<const BitVector> BitVectorDictionary::read_bitvector(BitVectorDictionaryLookupResult lookup_result) {
+    ReadStats read_stats;
+    return read_bitvector(lookup_result, read_stats);
+}
+
+PostingListFileRange
+BitVectorDictionary::get_bitvector_file_range(index::BitVectorDictionaryLookupResult lookup_result) const {
+    if (!lookup_result.valid()) {
+        return {0, 0};
+    }
+    uint64_t offset = ((uint64_t)_vectorSize) * lookup_result.idx + _datHeaderLen;
+    return {offset, offset + _vectorSize};
+}
+
+} // namespace search::diskindex

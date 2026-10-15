@@ -1,0 +1,275 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.config.provision;
+
+import com.yahoo.component.Version;
+import com.yahoo.config.provision.NodeResources.DiskSpeed;
+
+import java.util.Map;
+import java.util.TreeMap;
+
+import static com.yahoo.config.provision.NodeResources.Architecture;
+import static com.yahoo.config.provision.NodeResources.Architecture.x86_64;
+import static java.util.Objects.requireNonNull;
+
+/**
+ * Defines the policies for assigning cluster capacity in various environments.
+ *
+ * @author bratseth
+ */
+public class CapacityPolicies {
+
+    private static final NodeResources MIN_KUBERNETES_RESOURCES = new NodeResources(0.5, 1, 10, 0.3);
+
+    public record Tuning(Architecture adminClusterArchitecture, double logserverMemoryGiB,
+                         double clusterControllerMemoryGiB, long contentNodes) {
+
+        public Tuning(Architecture adminClusterArchitecture, double logserverMemoryGiB, long contentNodes) {
+            this(adminClusterArchitecture, logserverMemoryGiB, 0.0, contentNodes);
+        }
+
+        public Tuning(Architecture adminClusterArchitecture, double logserverMemoryGiB, double clusterControllerMemoryGiB) {
+            this(adminClusterArchitecture, logserverMemoryGiB, clusterControllerMemoryGiB, 0);
+        }
+
+        double logserverMem(double v) {
+            double override = logserverMemoryGiB();
+            return (override > 0) ? override : v;
+        }
+
+        double clusterControllerMem(double v) {
+            double override = clusterControllerMemoryGiB();
+            return (override > 0) ? override : v;
+        }
+
+    }
+
+    private final Zone zone;
+    private final Exclusivity exclusivity;
+    private final ApplicationId applicationId;
+    private final Tuning tuning;
+    private final double cpuCap;
+
+    public CapacityPolicies(Zone zone, Exclusivity exclusivity, ApplicationId applicationId, Tuning tuning) {
+        this(zone, exclusivity, applicationId, tuning, 1.0);
+    }
+
+    public CapacityPolicies(Zone zone, Exclusivity exclusivity, ApplicationId applicationId, Tuning tuning, double cpuCap) {
+        this.zone = zone;
+        this.exclusivity = exclusivity;
+        this.applicationId = applicationId;
+        this.tuning = tuning;
+        this.cpuCap = cpuCap;
+    }
+
+    // TODO: Remove after October 2026
+    public Capacity applyOn(Capacity capacity, boolean exclusive) {
+        return applyOn(capacity, exclusive, 1);
+    }
+
+    public Capacity applyOn(ClusterSpec cluster) {
+        return applyOn(cluster.capacity(), cluster.isExclusive(), cluster.availabilityZones().size());
+    }
+
+    private Capacity applyOn(Capacity capacity, boolean exclusive, int availabilityZoneCount) {
+        var min = applyOn(capacity.minResources(), capacity, exclusive, availabilityZoneCount);
+        var max = applyOn(capacity.maxResources(), capacity, exclusive, availabilityZoneCount);
+        var groupSize = capacity.groupSize().fromAtMost(max.nodes() / min.groups())
+                                .toAtLeast(min.nodes() / max.groups());
+        return capacity.withLimits(min, max, groupSize);
+    }
+
+    private ClusterResources applyOn(ClusterResources resources, Capacity capacity, boolean exclusive, int availabilityZoneCount) {
+        int nodes = decideCount(resources.nodes(), capacity.isRequired(), applicationId.instance().isTester(), availabilityZoneCount);
+        int groups = decideGroups(resources.nodes(), resources.groups(), nodes);
+        var nodeResources = decideNodeResources(resources.nodeResources(), capacity.isRequired(), exclusive);
+        return new ClusterResources(nodes, groups, nodeResources);
+    }
+
+    private int decideCount(int requested, boolean required, boolean isTester, int availabilityZoneCount) {
+        if (isTester) return 1;
+
+        if (required) return requested;
+        return switch (zone.environment()) {
+            case dev -> Math.min(requested, availabilityZoneCount);
+            case test -> 1;
+            case perf -> Math.min(requested, 3);
+            case staging -> requested <= 1 ? requested : Math.max(2, (int)(0.05 * requested));
+            case prod -> requested;
+        };
+    }
+
+    private int decideGroups(int requestedNodes, int requestedGroups, int decidedNodes) {
+        if (requestedNodes == decidedNodes) return requestedGroups;
+        int groups = Math.min(requestedGroups, decidedNodes); // cannot have more groups than nodes
+        while (groups > 1 && decidedNodes % groups != 0)
+            groups--; // Must be divisible by the number of groups
+        return groups;
+    }
+
+    private NodeResources decideNodeResources(NodeResources target, boolean required, boolean exclusive) {
+        if (required || exclusive) return target;  // Cannot downsize if resources are required, or exclusively allocated
+        if (target.isUnspecified()) return target; // Cannot be modified
+
+        if (zone.environment() == Environment.dev && zone.cloud().allowHostSharing()) {
+            if (cpuCap <= 0.001) {
+                // If cpu cap is > 0, we will use the specified resource.
+                // If it is 0, allocate just a small amount exclusively  (see internal repo for how
+                // we then adjust cpu share given to each container on a host)
+                target = target.withVcpu(0.1).withBandwidthGbps(0.1);
+            }
+
+            // Allocate without GPU in dev
+            target = target.with(NodeResources.GpuResources.zero());
+        }
+
+        // Allow slow storage in zones which are not performance sensitive
+        if (zone.system().isCdLike() || zone.environment() == Environment.test)
+            target = target.with(NodeResources.DiskSpeed.any).with(NodeResources.StorageType.any).withBandwidthGbps(0.1);
+        else if (zone.environment() == Environment.dev) {
+            target = target.withBandwidthGbps(0.1);
+        }
+
+        return target;
+    }
+
+    public ClusterResources specifyFully(ClusterResources resources, ClusterSpec clusterSpec) {
+        return resources.with(specifyFully(resources.nodeResources(), clusterSpec));
+    }
+
+    public NodeResources specifyFully(NodeResources resources, ClusterSpec clusterSpec) {
+        boolean diskWasUnspecified = resources.diskIsUnspecified();
+        NodeResources specified = resources.withUnspecifiedFieldsFrom(defaultResources(clusterSpec).with(DiskSpeed.any));
+
+        // Ensure disk size meets minimum requirements based on cluster type, but only if it was originally unspecified
+        if (diskWasUnspecified) {
+            double minDiskGb = minDiskGbForClusterType(specified, clusterSpec);
+            if (specified.diskGb() < minDiskGb) {
+                specified = specified.withDiskGb(minDiskGb);
+            }
+        }
+        return specified;
+    }
+
+    private NodeResources defaultResources(ClusterSpec clusterSpec) {
+        var adminClusterArchitecture = tuning.adminClusterArchitecture();
+        if (clusterSpec.type() == ClusterSpec.Type.admin) {
+            if (exclusivity.allocation(clusterSpec) && !zone.system().isKubernetesLike()) {
+                return smallestExclusiveResources().with(adminClusterArchitecture);
+            }
+
+            if (clusterSpec.id().value().equals("cluster-controllers")) {
+                return clusterControllerResources(clusterSpec, adminClusterArchitecture, tuning.contentNodes()).with(adminClusterArchitecture);
+            }
+
+            if (clusterSpec.id().value().equals("logserver")) {
+                return logserverResources(adminClusterArchitecture).with(adminClusterArchitecture);
+            }
+
+            return versioned(clusterSpec, Map.of(new Version(0), smallestSharedResources())).with(adminClusterArchitecture);
+        }
+
+        if (clusterSpec.type() == ClusterSpec.Type.content) {
+            // When changing defaults here update https://docs.vespa.ai/en/reference/applications/services/services.html#resources
+            return zone.cloud().dynamicProvisioning()
+                   ? versioned(clusterSpec, Map.of(new Version(0), new NodeResources(2, 16, 300, 0.3)))
+                   : versioned(clusterSpec, Map.of(new Version(0), new NodeResources(1.5, 8, 50, 0.3)));
+        }
+        else {
+            // When changing defaults here update https://docs.vespa.ai/en/reference/applications/services/services.html#resources
+            return zone.cloud().dynamicProvisioning()
+                   ? versioned(clusterSpec, Map.of(new Version(0), new NodeResources(2.0, 8, 50, 0.3)))
+                   : versioned(clusterSpec, Map.of(new Version(0), new NodeResources(1.5, 8, 50, 0.3)));
+        }
+    }
+
+    private NodeResources clusterControllerResources(ClusterSpec clusterSpec, Architecture architecture, long contentNodes) {
+        // 1.32 fits floor(8/1.32) = 6 cluster controllers on each 8Gb host, and each will have
+        // 1.32-(0.7+0.6)*(1.32/8) = 1.1 Gb real memory given current taxes.
+        var memory = architecture == x86_64
+                ? tuning.clusterControllerMem(1.32)
+                : tuning.clusterControllerMem(1.50);
+
+        var adjustedMemory = adjustClusterControllerMemory(memory, contentNodes);
+        // But go back to use overridden memory if set (through feature flag)
+        if (tuning.clusterControllerMemoryGiB() > 0.0) {
+            adjustedMemory = memory;
+        }
+
+        return versioned(clusterSpec, Map.of(new Version(0), new NodeResources(0.25, adjustedMemory, 10, 0.3)));
+    }
+
+    // Adjust memory based on number of content nodes in all content clusters
+    // Note: nodeCount is 0 if unknown.
+    private static double adjustClusterControllerMemory(double memory, long nodeCount) {
+        int count = (int) nodeCount;
+        // Adjust node resource memory based on number of content nodes (which is
+        // a simple way to model the O(n^2) behavior of the increase in communication
+        // between cluster controller and nodes (and thus memory)).
+        // Increase in steps to avoid changes of memory allocation with small changes in node count.
+        double adjustmentFactor = 0.2; // 0.2 GiB increase per step
+        var step = Math.min(4, count / 50); // max 4 steps (200+ nodes)
+        double adjustment = step * adjustmentFactor;
+
+        return memory + adjustment;
+    }
+
+    private NodeResources logserverResources(Architecture architecture) {
+        if (zone.cloud().name() == CloudName.AZURE)
+            return new NodeResources(2, tuning.logserverMem(4.0), 50, 0.3);
+
+        if (zone.cloud().name() == CloudName.GCP)
+            return new NodeResources(1, tuning.logserverMem(4.0), 50, 0.3);
+
+        return architecture == Architecture.arm64
+                ? new NodeResources(0.5, tuning.logserverMem(2.5), 50, 0.3)
+                : new NodeResources(0.5, tuning.logserverMem(2.0), 50, 0.3);
+    }
+
+    // The lowest amount of resources that can be exclusive allocated (i.e. a matching host flavor for this exists)
+    private NodeResources smallestExclusiveResources() {
+        if (zone.system().isKubernetesLike()) return MIN_KUBERNETES_RESOURCES;
+        return zone.cloud().name() == CloudName.AZURE || zone.cloud().name() == CloudName.GCP
+                ? new NodeResources(2, 8, 50, 0.3)
+                : new NodeResources(0.5, 8, 50, 0.3);
+    }
+
+    // The lowest amount of resources that can be shared (i.e. a matching host flavor for this exists)
+    private NodeResources smallestSharedResources() {
+        return zone.cloud().name() == CloudName.GCP
+                ? new NodeResources(1, 4, 50, 0.3)
+                : new NodeResources(0.5, 2, 50, 0.3);
+    }
+
+    /** Returns whether the nodes requested can share physical host with other applications */
+    public ClusterSpec decideExclusivity(ClusterSpec requestedCluster) {
+        if ( ! requestedCluster.capacity().cloudAccount().isUnspecified()) return requestedCluster.withExclusivity(true); // Implicit exclusive
+        boolean exclusive = requestedCluster.isExclusive() && (requestedCluster.capacity().isRequired() || zone.environment() == Environment.prod);
+        return requestedCluster.withExclusivity(exclusive);
+    }
+
+    /**
+     * Returns the resources for the newest version not newer than that requested in the cluster spec.
+     */
+    private static NodeResources versioned(ClusterSpec spec, Map<Version, NodeResources> resources) {
+        return requireNonNull(new TreeMap<>(resources).floorEntry(spec.vespaVersion()),
+                              "no default resources applicable for " + spec + " among: " + resources)
+                       .getValue();
+    }
+
+    /**
+     * Calculates the minimum disk size (in GiB) for the given cluster based on both
+     * the memory specified in {@code resources} and the {@link ClusterSpec.Type}.
+     * <p>
+     * For content clusters, the minimum disk is 3x the memory; for all other cluster
+     * types, it is 2x the memory. If memory is unspecified, this returns 0.
+     */
+    private double minDiskGbForClusterType(NodeResources resources, ClusterSpec clusterSpec) {
+        if (resources.memoryIsUnspecified()) return 0;
+
+        return resources.memoryGiB() * switch (clusterSpec.type()) {
+            case content -> 3.0;  // 3x memory for content nodes
+            default -> 2.0; // 2x memory for other nodes
+        };
+    }
+
+}

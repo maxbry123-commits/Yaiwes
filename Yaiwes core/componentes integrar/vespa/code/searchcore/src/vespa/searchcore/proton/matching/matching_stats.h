@@ -1,0 +1,324 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include <vespa/vespalib/datastore/atomic_value_wrapper.h>
+#include <vespa/vespalib/util/time.h>
+
+#include <cstddef>
+#include <vector>
+
+namespace search::queryeval {
+class QueryEvalStats;
+class QuerySetupStats;
+} // namespace search::queryeval
+
+namespace proton::matching {
+
+/**
+ * Statistics for the matching pipeline. Used for internal aggregation
+ * before inserting numbers into the metrics framework. The values
+ * produced by a single search are set on a single object. Values are
+ * aggregated by adding objects together.
+ **/
+struct MatchingStats {
+private:
+    class Avg {
+        double _value;
+        size_t _count;
+        double _min;
+        double _max;
+
+    public:
+        Avg() noexcept : _value(0.0), _count(0), _min(0.0), _max(0.0) {}
+        Avg& set(double value) noexcept {
+            _value = value;
+            _count = 1;
+            _min = value;
+            _max = value;
+            return *this;
+        }
+        double avg() const noexcept { return (_count > 0) ? (_value / _count) : 0; }
+        size_t count() const noexcept { return _count; }
+        double min() const noexcept { return _min; }
+        double max() const noexcept { return _max; }
+        void add(const Avg& other) noexcept {
+            if (_count == 0) {
+                _min = other._min;
+                _max = other._max;
+            } else if (other._count > 0) {
+                _min = std::min(_min, other._min);
+                _max = std::max(_max, other._max);
+            }
+            _value += other._value;
+            _count += other._count;
+        }
+    };
+
+public:
+    /**
+     * Matching statistics that are tracked separately for each match
+     * thread.
+     **/
+    class Partition {
+        size_t _docsCovered;
+        size_t _docsMatched;
+        size_t _docsRanked;
+        size_t _docsReRanked;
+        size_t _softDoomed;
+        Avg    _doomOvertime;
+        Avg    _active_time;
+        Avg    _wait_time;
+        friend MatchingStats;
+
+    public:
+        Partition() noexcept
+            : _docsCovered(0),
+              _docsMatched(0),
+              _docsRanked(0),
+              _docsReRanked(0),
+              _softDoomed(0),
+              _doomOvertime(),
+              _active_time(),
+              _wait_time() {}
+
+        Partition& docsCovered(size_t value) noexcept {
+            _docsCovered = value;
+            return *this;
+        }
+        size_t docsCovered() const noexcept { return _docsCovered; }
+        Partition& docsMatched(size_t value) noexcept {
+            _docsMatched = value;
+            return *this;
+        }
+        size_t docsMatched() const noexcept { return _docsMatched; }
+        Partition& docsRanked(size_t value) noexcept {
+            _docsRanked = value;
+            return *this;
+        }
+        size_t docsRanked() const noexcept { return _docsRanked; }
+        Partition& docsReRanked(size_t value) noexcept {
+            _docsReRanked = value;
+            return *this;
+        }
+        size_t docsReRanked() const noexcept { return _docsReRanked; }
+        Partition& softDoomed(bool v) noexcept {
+            _softDoomed += v ? 1 : 0;
+            return *this;
+        }
+        size_t softDoomed() const noexcept { return _softDoomed; }
+        Partition& doomOvertime(vespalib::duration overtime) noexcept {
+            _doomOvertime.set(vespalib::to_s(overtime));
+            return *this;
+        }
+        vespalib::duration doomOvertime() const noexcept { return vespalib::from_s(_doomOvertime.max()); }
+
+        Partition& active_time(double time_s) noexcept {
+            _active_time.set(time_s);
+            return *this;
+        }
+        double active_time_avg() const noexcept { return _active_time.avg(); }
+        size_t active_time_count() const noexcept { return _active_time.count(); }
+        double active_time_min() const noexcept { return _active_time.min(); }
+        double active_time_max() const noexcept { return _active_time.max(); }
+        Partition& wait_time(double time_s) noexcept {
+            _wait_time.set(time_s);
+            return *this;
+        }
+        double wait_time_avg() const noexcept { return _wait_time.avg(); }
+        size_t wait_time_count() const noexcept { return _wait_time.count(); }
+        double wait_time_min() const noexcept { return _wait_time.min(); }
+        double wait_time_max() const noexcept { return _wait_time.max(); }
+
+        Partition& add(const Partition& rhs) noexcept {
+            _docsCovered += rhs.docsCovered();
+            _docsMatched += rhs._docsMatched;
+            _docsRanked += rhs._docsRanked;
+            _docsReRanked += rhs._docsReRanked;
+            _softDoomed += rhs._softDoomed;
+            _doomOvertime.add(rhs._doomOvertime);
+
+            _active_time.add(rhs._active_time);
+            _wait_time.add(rhs._wait_time);
+            return *this;
+        }
+    };
+
+private:
+    size_t _queries;
+    size_t _limited_queries;
+    size_t _docidSpaceCovered;
+    size_t _docsMatched;
+    size_t _docsRanked;
+    size_t _docsReRanked;
+    size_t _exact_nns_distances_computed;
+    size_t _approximate_nns_distances_computed;
+    size_t _approximate_nns_nodes_visited;
+    size_t _approximate_nns_timed_out_queries;
+    size_t _softDoomed;
+    Avg    _doomOvertime;
+    using SoftDoomFactor = vespalib::datastore::AtomicValueWrapper<double>;
+    SoftDoomFactor         _softDoomFactor;
+    Avg                    _querySetupTime;
+    Avg                    _approximate_nns_time;
+    Avg                    _queryLatency;
+    Avg                    _matchTime;
+    Avg                    _groupingTime;
+    Avg                    _rerankTime;
+    std::vector<Partition> _partitions;
+
+public:
+    static constexpr double INITIAL_SOFT_DOOM_FACTOR = 0.5;
+    MatchingStats(const MatchingStats&) = delete;
+    MatchingStats& operator=(const MatchingStats&) = delete;
+    MatchingStats(MatchingStats&&) noexcept = default;
+    MatchingStats& operator=(MatchingStats&&) noexcept = default;
+    MatchingStats() noexcept : MatchingStats(INITIAL_SOFT_DOOM_FACTOR) {}
+    MatchingStats(double prev_soft_doom_factor) noexcept;
+    ~MatchingStats();
+
+    MatchingStats& queries(size_t value) {
+        _queries = value;
+        return *this;
+    }
+    size_t queries() const { return _queries; }
+
+    MatchingStats& limited_queries(size_t value) {
+        _limited_queries = value;
+        return *this;
+    }
+    size_t limited_queries() const { return _limited_queries; }
+
+    MatchingStats& docidSpaceCovered(size_t value) {
+        _docidSpaceCovered = value;
+        return *this;
+    }
+    size_t docidSpaceCovered() const { return _docidSpaceCovered; }
+
+    MatchingStats& docsMatched(size_t value) {
+        _docsMatched = value;
+        return *this;
+    }
+    size_t docsMatched() const { return _docsMatched; }
+
+    MatchingStats& docsRanked(size_t value) {
+        _docsRanked = value;
+        return *this;
+    }
+    size_t docsRanked() const { return _docsRanked; }
+
+    MatchingStats& docsReRanked(size_t value) {
+        _docsReRanked = value;
+        return *this;
+    }
+    size_t docsReRanked() const { return _docsReRanked; }
+
+    MatchingStats& exact_nns_distances_computed(size_t value) {
+        _exact_nns_distances_computed = value;
+        return *this;
+    }
+    size_t exact_nns_distances_computed() const { return _exact_nns_distances_computed; }
+
+    MatchingStats& approximate_nns_distances_computed(size_t value) {
+        _approximate_nns_distances_computed = value;
+        return *this;
+    }
+    size_t approximate_nns_distances_computed() const { return _approximate_nns_distances_computed; }
+
+    MatchingStats& approximate_nns_nodes_visited(size_t value) {
+        _approximate_nns_nodes_visited = value;
+        return *this;
+    }
+    size_t approximate_nns_nodes_visited() const { return _approximate_nns_nodes_visited; }
+
+    MatchingStats& softDoomed(size_t value) {
+        _softDoomed = value;
+        return *this;
+    }
+    size_t softDoomed() const { return _softDoomed; }
+
+    MatchingStats& approximate_nns_timed_out_queries(size_t value) {
+        _approximate_nns_timed_out_queries = value;
+        return *this;
+    }
+    size_t approximate_nns_timed_out_queries() const { return _approximate_nns_timed_out_queries; }
+
+    vespalib::duration doomOvertime() const { return vespalib::from_s(_doomOvertime.max()); }
+
+    MatchingStats& softDoomFactor(double value) {
+        _softDoomFactor.store_relaxed(value);
+        return *this;
+    }
+    double softDoomFactor() const { return _softDoomFactor.load_relaxed(); }
+    MatchingStats& updatesoftDoomFactor(vespalib::duration hardLimit, vespalib::duration softLimit,
+                                        vespalib::duration duration);
+
+    MatchingStats& querySetupTime(double time_s) {
+        _querySetupTime.set(time_s);
+        return *this;
+    }
+    double querySetupTimeAvg() const { return _querySetupTime.avg(); }
+    size_t querySetupTimeCount() const { return _querySetupTime.count(); }
+    double querySetupTimeMin() const { return _querySetupTime.min(); }
+    double querySetupTimeMax() const { return _querySetupTime.max(); }
+
+    MatchingStats& approximate_nns_time(double time_s) {
+        _approximate_nns_time.set(time_s);
+        return *this;
+    }
+    double approximate_nns_time_avg() const { return _approximate_nns_time.avg(); }
+    size_t approximate_nns_time_count() const { return _approximate_nns_time.count(); }
+    double approximate_nns_time_min() const { return _approximate_nns_time.min(); }
+    double approximate_nns_time_max() const { return _approximate_nns_time.max(); }
+
+    MatchingStats& queryLatency(double time_s) {
+        _queryLatency.set(time_s);
+        return *this;
+    }
+    double queryLatencyAvg() const { return _queryLatency.avg(); }
+    size_t queryLatencyCount() const { return _queryLatency.count(); }
+    double queryLatencyMin() const { return _queryLatency.min(); }
+    double queryLatencyMax() const { return _queryLatency.max(); }
+
+    MatchingStats& matchTime(double time_s) {
+        _matchTime.set(time_s);
+        return *this;
+    }
+    double matchTimeAvg() const { return _matchTime.avg(); }
+    size_t matchTimeCount() const { return _matchTime.count(); }
+    double matchTimeMin() const { return _matchTime.min(); }
+    double matchTimeMax() const { return _matchTime.max(); }
+
+    MatchingStats& groupingTime(double time_s) {
+        _groupingTime.set(time_s);
+        return *this;
+    }
+    double groupingTimeAvg() const { return _groupingTime.avg(); }
+    size_t groupingTimeCount() const { return _groupingTime.count(); }
+    double groupingTimeMin() const { return _groupingTime.min(); }
+    double groupingTimeMax() const { return _groupingTime.max(); }
+
+    MatchingStats& rerankTime(double time_s) {
+        _rerankTime.set(time_s);
+        return *this;
+    }
+    double rerankTimeAvg() const { return _rerankTime.avg(); }
+    size_t rerankTimeCount() const { return _rerankTime.count(); }
+    double rerankTimeMin() const { return _rerankTime.min(); }
+    double rerankTimeMax() const { return _rerankTime.max(); }
+
+    // used to merge in stats from each match thread
+    MatchingStats& merge_partition(const Partition& partition, size_t id);
+    size_t getNumPartitions() const { return _partitions.size(); }
+    const Partition& getPartition(size_t index) const { return _partitions[index]; }
+
+    // Merge in stats from query setup from a separate QuerySetupStats object
+    MatchingStats& add_query_setup_stats(const search::queryeval::QuerySetupStats& stats) noexcept;
+    // Merge in stats from query evaluation from a separate, thread-safe QueryEvalStats object
+    MatchingStats& add_query_eval_stats(const search::queryeval::QueryEvalStats& stats) noexcept;
+
+    // used to aggregate accross searches (and configurations)
+    MatchingStats& add(const MatchingStats& rhs) noexcept;
+};
+
+} // namespace proton::matching

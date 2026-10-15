@@ -1,0 +1,14 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+schema product {
+  document product {
+    struct mystruct {
+        field zero type string {}
+        field one type string {}
+        field two type string {}
+        field three type string {}
+    }
+    field more_stuff type map<string, mystruct> {
+      indexing: summary
+    }
+  }
+}

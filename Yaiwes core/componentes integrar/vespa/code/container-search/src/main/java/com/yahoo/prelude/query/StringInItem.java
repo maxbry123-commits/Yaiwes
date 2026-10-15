@@ -1,0 +1,125 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.prelude.query;
+
+import ai.vespa.searchlib.searchprotocol.protobuf.SearchProtocol;
+import com.yahoo.compress.IntegerCompressor;
+import com.yahoo.prelude.query.textualrepresentation.Discloser;
+
+import java.nio.ByteBuffer;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * Class representing an IN operator with a set of string values.
+ *
+ * @author toregge
+ */
+public class StringInItem extends InItem {
+
+    private Set<String> tokens;
+
+    public StringInItem(String indexName) {
+        super(indexName);
+        tokens = new HashSet<>(1000);
+    }
+
+    public StringInItem(String indexName, Set<String> tokens) {
+        super(indexName);
+        this.tokens = new HashSet<>(tokens);
+    }
+
+    @Override
+    public ItemType getItemType() {
+        return ItemType.STRING_IN;
+    }
+
+    @Override
+    public int encode(ByteBuffer buffer, SerializationContext context) {
+        encodeThis(buffer, context);
+        return 1;
+    }
+
+    @Override
+    protected void encodeThis(ByteBuffer buffer, SerializationContext context) {
+        super.encodeThis(buffer, context);
+        IntegerCompressor.putCompressedPositiveNumber(tokens.size(), buffer);
+        putString(getIndexName(), buffer);
+        for (var entry : tokens) {
+            putString(entry, buffer);
+        }
+    }
+
+    @Override
+    public int getTermCount() {
+        return 1;
+    }
+
+    @Override
+    protected void appendBodyString(StringBuilder buffer) {
+        buffer.append(getIndexName());
+        buffer.append("{");
+        for (var entry : tokens) {
+            buffer.append("\"");
+            buffer.append(entry);
+            buffer.append("\",");
+        }
+        if (!tokens.isEmpty()) {
+            buffer.deleteCharAt(buffer.length() - 1); // remove extra ","
+        }
+        buffer.append("}");
+    }
+
+    public void addToken(String token) {
+        Objects.requireNonNull(token, "Token string must not be null");
+        tokens.add(token);
+    }
+
+    public void removeToken(String token) {
+        tokens.remove(token);
+    }
+
+    public Collection<String> getTokens() {return Set.copyOf(tokens);}
+
+    @Override
+    public void disclose(Discloser discloser) {
+        super.disclose(discloser);
+        for (String token : tokens)
+            discloser.addChild(new WordItem(token));
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!super.equals(o)) return false;
+        var other = (StringInItem) o;
+        if (!Objects.equals(this.tokens, other.tokens)) return false;
+        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(super.hashCode(), tokens);
+    }
+
+    @Override
+    public StringInItem clone() {
+        StringInItem clone = (StringInItem) super.clone();
+        clone.tokens = new HashSet<>(tokens);
+        return clone;
+    }
+
+    @Override
+    SearchProtocol.QueryTreeItem toProtobuf(SerializationContext context) {
+        var builder = SearchProtocol.ItemStringIn.newBuilder();
+        builder.setProperties(ToProtobuf.buildTermProperties(this, getIndexName()));
+        for (String token : tokens) {
+            builder.addWords(token);
+        }
+        return SearchProtocol.QueryTreeItem.newBuilder()
+                .setItemStringIn(builder.build())
+                .build();
+    }
+
+}

@@ -1,0 +1,17 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "save_utils.h"
+
+#include <vespa/check_require.h>
+
+namespace search::attribute {
+
+EntryRefVectorSnapshot
+make_entry_ref_vector_snapshot(const vespalib::TypeStableVectorBase<vespalib::datastore::AtomicEntryRef>& ref_vector,
+                               uint32_t                                                                   size) {
+    CHECK(size <= ref_vector.get_size());
+    auto* source = &ref_vector.get_elem_ref(0);
+    return EntryRefVectorSnapshot({source, size});
+}
+
+} // namespace search::attribute

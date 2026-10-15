@@ -1,0 +1,316 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "lid_space_compaction_job.h"
+
+#include "i_document_scan_iterator.h"
+#include "i_lid_space_compaction_handler.h"
+#include "i_operation_storer.h"
+#include "i_resource_usage_notifier.h"
+#include "iclusterstatechangednotifier.h"
+#include "maintenance_job_token_source.h"
+#include "remove_operations_rate_tracker.h"
+
+#include <vespa/check_require.h>
+#include <vespa/document/fieldvalue/document.h>
+#include <vespa/persistence/spi/bucket_tasks.h>
+#include <vespa/searchcore/proton/common/eventlogger.h>
+#include <vespa/searchcore/proton/feedoperation/compact_lid_space_operation.h>
+#include <vespa/searchcore/proton/feedoperation/moveoperation.h>
+#include <vespa/searchcorespi/index/i_thread_service.h>
+#include <vespa/vespalib/util/destructor_callbacks.h>
+#include <vespa/vespalib/util/gate.h>
+#include <vespa/vespalib/util/lambdatask.h>
+
+#include <vespa/log/log.h>
+LOG_SETUP(".proton.server.lidspace.compactionjob");
+
+using search::DocumentMetadata;
+using search::LidUsageStats;
+using storage::spi::Bucket;
+using storage::spi::makeBucketTask;
+using vespalib::makeLambdaTask;
+using vespalib::RetainGuard;
+
+namespace proton::lidspace {
+
+namespace {
+
+bool isSameDocument(const search::DocumentMetadata& a, const search::DocumentMetadata& b) {
+    // TODO Timestamp check can be removed once logic has proved itself in large scale.
+    return (a.lid == b.lid) && (a.bucketId == b.bucketId) && (a.gid == b.gid) && (a.timestamp == b.timestamp);
+}
+
+} // namespace
+
+class CompactionJob::MoveTask : public storage::spi::BucketTask {
+public:
+    MoveTask(std::shared_ptr<CompactionJob> job, const search::DocumentMetadata& meta,
+             IDestructorCallback::SP opsTracker)
+        : _job(std::move(job)), _meta(meta), _opsTracker(std::move(opsTracker)) {}
+    void run(const Bucket& bucket, IDestructorCallback::SP onDone) override {
+        CHECK(bucket.getBucketId() == _meta.bucketId);
+        using DoneContext = vespalib::KeepAlive<std::pair<IDestructorCallback::SP, IDestructorCallback::SP>>;
+        CompactionJob::moveDocument(
+            std::move(_job), _meta,
+            std::make_shared<DoneContext>(std::make_pair(std::move(_opsTracker), std::move(onDone))));
+    }
+    void fail(const Bucket& bucket) override {
+        CHECK(bucket.getBucketId() == _meta.bucketId);
+        auto& master = _job->_master;
+        if (_job->stopped()) {
+            return;
+        }
+        master.execute(makeLambdaTask([job = std::move(_job)] { job->_scanItr.reset(); }));
+    }
+
+private:
+    std::shared_ptr<CompactionJob> _job;
+    const search::DocumentMetadata _meta;
+    IDestructorCallback::SP        _opsTracker;
+};
+
+bool CompactionJob::scanDocuments(const LidUsageStats& stats) {
+    if (_scanItr->valid()) {
+        DocumentMetadata document = getNextDocument(stats);
+        if (document.valid()) {
+            Bucket metaBucket(document::Bucket(_bucketSpace, document.bucketId));
+            _bucketExecutor.execute(
+                metaBucket, std::make_unique<MoveTask>(shared_from_this(), document, getLimiter().beginOperation()));
+            if (isBlocked(BlockedReason::OUTSTANDING_OPS)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void CompactionJob::moveDocument(std::shared_ptr<CompactionJob> job, const search::DocumentMetadata& metaThen,
+                                 std::shared_ptr<IDestructorCallback> context) {
+    if (job->stopped()) {
+        return; // TODO Remove once lidtracker is no longer in use.
+    }
+    // The real lid must be sampled in the master thread.
+    // TODO remove target lid from createMoveOperation interface
+    auto op = job->_handler->createMoveOperation(metaThen, 0);
+    if (!op || !op->getDocument()) {
+        return;
+    }
+    // Early detection and force md5 calculation outside of master thread
+    if (metaThen.gid != op->getDocument()->getId().getGlobalId()) {
+        return;
+    }
+
+    auto& master = job->_master;
+    if (job->stopped()) {
+        return;
+    }
+    master.execute(makeLambdaTask(
+        [self = std::move(job), meta = metaThen, moveOp = std::move(op), onDone = std::move(context)]() mutable {
+            if (self->stopped()) {
+                return;
+            }
+            self->completeMove(meta, std::move(moveOp), std::move(onDone));
+        }));
+}
+
+void CompactionJob::completeMove(const search::DocumentMetadata& metaThen, std::unique_ptr<MoveOperation> moveOp,
+                                 std::shared_ptr<IDestructorCallback> onDone) {
+    // Reread metadata as document might have been altered after move was initiated
+    // If so it will fail the timestamp sanity check later on.
+    search::DocumentMetadata metaNow = _handler->getMetadata(metaThen.lid);
+    if (!isSameDocument(metaThen, metaNow)) {
+        return;
+    }
+    if (metaNow.gid != moveOp->getDocument()->getId().getGlobalId()) {
+        return;
+    }
+
+    uint32_t lowestLid = _handler->getLidStatus().getLowestFreeLid();
+    if (lowestLid >= metaNow.lid) {
+        return;
+    }
+    moveOp->setTargetLid(lowestLid);
+    _opStorer.appendOperation(*moveOp, onDone);
+    _handler->handleMove(*moveOp, std::move(onDone));
+}
+
+CompactionJob::CompactionJob(const DocumentDBLidSpaceCompactionConfig& config, RetainGuard dbRetainer,
+                             std::shared_ptr<ILidSpaceCompactionHandler> handler, IOperationStorer& opStorer,
+                             IThreadService& master, BucketExecutor& bucketExecutor,
+                             IResourceUsageNotifier&              resource_usage_notifier,
+                             const BlockableMaintenanceJobConfig& blockableConfig,
+                             IClusterStateChangedNotifier&        clusterStateChangedNotifier,
+                             bool node_retired_or_maintenance, document::BucketSpace bucketSpace,
+                             std::shared_ptr<MaintenanceJobTokenSource> maintenance_job_token_source)
+    : BlockableMaintenanceJob("lid_space_compaction." + handler->getName(), config.getDelay(), config.getInterval(),
+                              blockableConfig),
+      IResourceUsageListener(),
+      IClusterStateChangedHandler(),
+      std::enable_shared_from_this<CompactionJob>(),
+      _cfg(config),
+      _handler(std::move(handler)),
+      _opStorer(opStorer),
+      _scanItr(),
+      _resource_usage_notifier(resource_usage_notifier),
+      _clusterStateChangedNotifier(clusterStateChangedNotifier),
+      _ops_rate_tracker(std::make_shared<RemoveOperationsRateTracker>(config.get_remove_batch_block_rate(),
+                                                                      config.get_remove_block_rate())),
+      _is_disabled(false),
+      _shouldCompactLidSpace(false),
+      _master(master),
+      _bucketExecutor(bucketExecutor),
+      _dbRetainer(std::move(dbRetainer)),
+      _bucketSpace(bucketSpace) {
+    _token_source = std::move(maintenance_job_token_source);
+    _resource_usage_notifier.add_resource_usage_listener(this);
+    _clusterStateChangedNotifier.addClusterStateChangedHandler(this);
+    if (node_retired_or_maintenance) {
+        setBlocked(BlockedReason::CLUSTER_STATE);
+    }
+    _handler->set_operation_listener(_ops_rate_tracker);
+}
+
+CompactionJob::~CompactionJob() {
+    _clusterStateChangedNotifier.removeClusterStateChangedHandler(this);
+    _resource_usage_notifier.remove_resource_usage_listener(this);
+}
+
+std::shared_ptr<CompactionJob> CompactionJob::create(
+    const DocumentDBLidSpaceCompactionConfig& config, RetainGuard dbRetainer,
+    std::shared_ptr<ILidSpaceCompactionHandler> handler, IOperationStorer& opStorer, IThreadService& master,
+    BucketExecutor& bucketExecutor, IResourceUsageNotifier& resource_usage_notifier,
+    const BlockableMaintenanceJobConfig& blockableConfig, IClusterStateChangedNotifier& clusterStateChangedNotifier,
+    bool node_retired_or_maintenance, document::BucketSpace bucketSpace,
+    std::shared_ptr<MaintenanceJobTokenSource> maintenance_job_token_source) {
+    return std::shared_ptr<CompactionJob>(
+        new CompactionJob(config, std::move(dbRetainer), std::move(handler), opStorer, master, bucketExecutor,
+                          resource_usage_notifier, blockableConfig, clusterStateChangedNotifier,
+                          node_retired_or_maintenance, bucketSpace, maintenance_job_token_source),
+        [&master](auto job) {
+            auto failed = master.execute(makeLambdaTask([job]() { delete job; }));
+            CHECK(!failed);
+        });
+}
+
+DocumentMetadata CompactionJob::getNextDocument(const LidUsageStats& stats) {
+    return _scanItr->next(std::max(stats.getLowestFreeLid(), stats.getUsedLids()));
+}
+
+bool CompactionJob::run() {
+    if (isBlocked()) {
+        return true; // indicate work is done since no work can be done
+    }
+    if (_token_source && !_token && !_token_source->get_token(shared_from_this())) {
+        return true; // Blocked on job token
+    }
+    if (remove_batch_is_ongoing()) {
+        // Note that we don't set the job as blocked as the decision to un-block it is not driven externally.
+        if (!_is_disabled) {
+            LOG(info, "%s: Lid space compaction is disabled while remove batch (delete buckets) is ongoing",
+                _handler->getName().c_str());
+            _is_disabled = true;
+        }
+        return true;
+    }
+    if (remove_is_ongoing()) {
+        // Note that we don't set the job as blocked as the decision to un-block it is not driven externally.
+        if (!_is_disabled) {
+            LOG(info, "%s: Lid space compaction is disabled while remove operations are ongoing",
+                _handler->getName().c_str());
+            _is_disabled = true;
+        }
+        return true;
+    }
+    if (_is_disabled) {
+        LOG(info, "%s: Lid space compaction is re-enabled as remove operations are no longer ongoing",
+            _handler->getName().c_str());
+        _is_disabled = false;
+    }
+
+    if (_scanItr && !_scanItr->valid()) {
+        if (!getLimiter().drain()) {
+            return true; // job blocked until all outstanding operations have completed
+        }
+        LidUsageStats stats = _handler->getLidStatus();
+        if (shouldRestartScanDocuments(stats)) {
+            EventLogger::lidSpaceCompactionRestart(_handler->getName(), stats.getUsedLids(),
+                                                   _cfg.getAllowedLidBloat(), stats.getHighestUsedLid(),
+                                                   stats.getLowestFreeLid());
+            _scanItr = _handler->getIterator();
+        } else {
+            _scanItr.reset();
+            _shouldCompactLidSpace = true;
+            return false;
+        }
+    }
+
+    LidUsageStats stats = _handler->getLidStatus();
+    if (_scanItr) {
+        return scanDocuments(stats);
+    } else if (_shouldCompactLidSpace) {
+        compactLidSpace(stats);
+    } else if (hasTooMuchLidBloat(stats)) {
+        CHECK(!_scanItr);
+        EventLogger::lidSpaceCompactionStart(_handler->getName(), stats.getLidBloat(), _cfg.getAllowedLidBloat(),
+                                             stats.getLidBloatFactor(), _cfg.getAllowedLidBloatFactor(),
+                                             stats.getLidLimit(), stats.getLowestFreeLid());
+        _scanItr = _handler->getIterator();
+        return scanDocuments(stats);
+    }
+    _token.reset();
+    return true;
+}
+
+bool CompactionJob::remove_batch_is_ongoing() const {
+    return _ops_rate_tracker->remove_batch_above_threshold();
+}
+
+bool CompactionJob::remove_is_ongoing() const {
+    return _ops_rate_tracker->remove_above_threshold();
+}
+
+bool CompactionJob::hasTooMuchLidBloat(const LidUsageStats& stats) const {
+    return ((stats.getLidBloat() >= _cfg.getAllowedLidBloat()) &&
+            (stats.getLidBloatFactor() >= _cfg.getAllowedLidBloatFactor()) &&
+            (stats.getLidLimit() > stats.getLowestFreeLid()));
+}
+
+bool CompactionJob::shouldRestartScanDocuments(const LidUsageStats& stats) const {
+    return ((stats.getUsedLids() + _cfg.getAllowedLidBloat()) < stats.getHighestUsedLid()) &&
+           (stats.getLowestFreeLid() < stats.getHighestUsedLid());
+}
+
+void CompactionJob::compactLidSpace(const LidUsageStats& stats) {
+    uint32_t                 wantedLidLimit = stats.getHighestUsedLid() + 1;
+    CompactLidSpaceOperation op(_handler->getSubDbId(), wantedLidLimit);
+    vespalib::Gate           gate;
+    auto commit_result = _opStorer.appendAndCommitOperation(op, std::make_shared<vespalib::GateCallback>(gate));
+    gate.await();
+    _handler->handleCompactLidSpace(
+        op, std::make_shared<vespalib::KeepAlive<decltype(commit_result)>>(std::move(commit_result)));
+    EventLogger::lidSpaceCompactionComplete(_handler->getName(), wantedLidLimit);
+    _shouldCompactLidSpace = false;
+}
+
+void CompactionJob::notify_resource_usage(const ResourceUsageState& state) {
+    // Called by master write thread
+    internal_notify_resource_usage(state);
+}
+
+void CompactionJob::notifyClusterStateChanged(const std::shared_ptr<IBucketStateCalculator>& newCalc) {
+    // Called by master write thread
+    bool node_retired_or_maintenance = newCalc->node_retired_or_maintenance();
+    if (!node_retired_or_maintenance) {
+        if (isBlocked(BlockedReason::CLUSTER_STATE)) {
+            LOG(info, "%s: Lid space compaction is un-blocked as node is no longer retired or in maintenance",
+                _handler->getName().c_str());
+            unBlock(BlockedReason::CLUSTER_STATE);
+        }
+    } else if (!isBlocked(BlockedReason::CLUSTER_STATE)) {
+        LOG(info, "%s: Lid space compaction is blocked as node is retired or in maintenance",
+            _handler->getName().c_str());
+        setBlocked(BlockedReason::CLUSTER_STATE);
+    }
+}
+
+} // namespace proton::lidspace

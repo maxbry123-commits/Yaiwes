@@ -1,0 +1,94 @@
+{
+  "bundle_bytes": 146758498,
+  "bundle_sha256": "235682ba7b0a23d763168c4495ac399a6d77f5c53886730f15f21269c273f6ec",
+  "extracted_tree": {
+    "bytes": 272620339,
+    "files": 22467,
+    "sha256": "d9532254b4ec2f3b2e8f9faa3bcae61b114afcda8e57b323c50b1a5770476126"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0001",
+      "sha256": "9625474a443e6341dd867c6c1b39e99d84a02b93504badc3c8c1b9d1fbb3845d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0002",
+      "sha256": "c92803fe889bb1cee6cee7e094db8a30e9ca8037093020c43ec76ce519fd5722"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0003",
+      "sha256": "79670970a9a6bc05cde60fe1235a5c82b8dda266f456400d8085b1b08d9633b0"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0004",
+      "sha256": "3887c555337fa59623f9df672222b99be49f37351aea42d912c9a22e65e00ecc"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0005",
+      "sha256": "35d072f54ecf0062c807045034e4eede25f68d286a88a416fd7756c21c6afe49"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0006",
+      "sha256": "c922acae3701a912d29315a97a9ce29a25f5164865f21b593e019a63bb6cde0e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0007",
+      "sha256": "30f71312e0533998c94886ea9bba6130197b13720554eb1f89d34df65a743a6f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0008",
+      "sha256": "01685ec6c9728010b09cd07eaaa1ceaaf60add0b15a6bbf9f360f548b118bc7c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0009",
+      "sha256": "3c106acdd924c04389d76a3797dc892da54e93e2590738281270ae53b845c809"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0010",
+      "sha256": "e757f641d73a63dc3713380c0116494cdf39d87c75a81113cd31834a6cd7df0f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "vespa.bundle.zip.part-0011",
+      "sha256": "ad713b0064d693892fe49a132e35a51040d7c70989f2b9fe7c1108d67a2adc43"
+    },
+    {
+      "bytes": 8346466,
+      "name": "vespa.bundle.zip.part-0012",
+      "sha256": "a3429944ca016db580eaf3dfb6393a75740f4b5bea23556fb67cac36516ccbde"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "fileacquirer/src/vespa/fileacquirer/filedistributorrpc.def",
+    "jrt_test/src/binref/progctl.sh",
+    "messagebus_test/src/binref/progctl.sh"
+  ],
+  "skipped_special_count": 3,
+  "slug": "vespa",
+  "source_bytes": 272620339,
+  "source_commit": "42db6e7a1128e7d7945c4cca81458e9dbe4d81b9",
+  "source_files": 22467,
+  "source_ref": "master",
+  "source_repo": "vespa-engine/vespa",
+  "source_tree": {
+    "bytes": 272620339,
+    "files": 22467,
+    "sha256": "d9532254b4ec2f3b2e8f9faa3bcae61b114afcda8e57b323c50b1a5770476126"
+  }
+}

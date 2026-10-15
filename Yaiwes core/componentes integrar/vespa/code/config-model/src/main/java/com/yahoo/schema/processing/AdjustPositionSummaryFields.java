@@ -1,0 +1,99 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.schema.processing;
+
+import com.yahoo.config.application.api.DeployLogger;
+import com.yahoo.config.model.api.ModelContext;
+import com.yahoo.document.ArrayDataType;
+import com.yahoo.document.DataType;
+import com.yahoo.document.PositionDataType;
+import com.yahoo.schema.RankProfileRegistry;
+import com.yahoo.schema.Schema;
+import com.yahoo.schema.document.Attribute;
+import com.yahoo.schema.document.GeoPos;
+import com.yahoo.schema.document.ImmutableSDField;
+import com.yahoo.vespa.documentmodel.DocumentSummary;
+import com.yahoo.vespa.documentmodel.SummaryField;
+import com.yahoo.vespa.documentmodel.SummaryField.Source;
+import com.yahoo.vespa.documentmodel.SummaryTransform;
+import com.yahoo.vespa.model.container.search.QueryProfiles;
+
+/*
+ * Sets summary transform and source for position summary fields.
+ */
+public class AdjustPositionSummaryFields extends Processor {
+
+    public AdjustPositionSummaryFields(Schema schema, DeployLogger deployLogger, RankProfileRegistry rankProfileRegistry, QueryProfiles queryProfiles) {
+        super(schema, deployLogger, rankProfileRegistry, queryProfiles);
+    }
+
+    @Override
+    public void process(boolean validate, boolean documentsOnly, ModelContext.Properties properties) {
+        process(validate, documentsOnly);
+    }
+
+    @Override
+    public void process(boolean validate, boolean documentsOnly) {
+        for (DocumentSummary summary : schema.getSummaries().values()) {
+            scanSummary(summary);
+        }
+    }
+
+    private void scanSummary(DocumentSummary summary) {
+        for (SummaryField summaryField : summary.getSummaryFields().values()) {
+            if ( ! GeoPos.isAnyPos(summaryField.getDataType())) continue;
+
+            String originalSource = summaryField.getSingleSource();
+            if (originalSource.indexOf('.') == -1) { // Eliminate summary fields with pos.x or pos.y as source
+                ImmutableSDField sourceField = schema.getField(originalSource);
+                if (sourceField != null) {
+                    String zCurve = null;
+                    if (sourceField.getDataType().equals(summaryField.getDataType())) {
+                        zCurve = PositionDataType.getZCurveFieldName(originalSource);
+                    } else if (sourceField.getDataType().equals(makeZCurveDataType(summaryField.getDataType())) &&
+                               hasZCurveSuffix(originalSource)) {
+                        zCurve = originalSource;
+                    }
+                    if (zCurve != null) {
+                        if (hasPositionAttribute(zCurve)) {
+                            Source source = new Source(zCurve);
+                            adjustPositionField(summaryField, source);
+                        } else if (sourceField.isImportedField() || !summaryField.getName().equals(originalSource)) {
+                            fail(summaryField, "No position attribute '" + zCurve + "'");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void adjustPositionField(SummaryField summaryField, Source source) {
+        summaryField.setTransform(SummaryTransform.GEOPOS);
+        summaryField.getSources().clear();
+        summaryField.addSource(source);
+    }
+
+    private boolean hasPositionAttribute(String name) {
+        Attribute attribute = schema.getAttribute(name);
+        if (attribute == null) {
+            ImmutableSDField field = schema.getField(name);
+            if (field != null && field.isImportedField()) {
+                attribute = field.getAttribute();
+            }
+        }
+        return attribute != null && attribute.isPosition();
+    }
+
+    private static boolean hasZCurveSuffix(String name) {
+        String suffix = PositionDataType.getZCurveFieldName("");
+        return name.length() > suffix.length() && name.substring(name.length() - suffix.length()).equals(suffix);
+    }
+
+    private static DataType makeZCurveDataType(DataType dataType) {
+        return dataType instanceof ArrayDataType ? DataType.getArray(DataType.LONG) : DataType.LONG;
+    }
+
+    private void fail(SummaryField summaryField, String msg) {
+        throw newProcessException(schema.getName(), summaryField.getName(), msg);
+    }
+
+}

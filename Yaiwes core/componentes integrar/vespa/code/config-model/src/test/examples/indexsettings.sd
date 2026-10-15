@@ -1,0 +1,60 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+search indexsettings {
+
+  stemming: shortest
+
+  document indexsettings {
+
+    field allstemmed type string {
+        stemming: shortest
+    }
+
+    field usingdefault type string {
+    }
+
+    field notstemmed type string {
+        stemming: none
+    }
+
+    field multiplestems type string {
+        stemming: multiple
+    }
+
+    field l1 type string {
+        linguistics {
+            profile: p1
+        }
+    }
+
+    field l2 type string {
+        linguistics {
+            profile {
+                search: p1
+                index: p2
+            }
+        }
+    }
+
+    field l3 type string {
+        linguistics {
+            profile: p1
+            tokens: alternatives
+        }
+    }
+
+    field l4 type string {
+        linguistics {
+            index {
+                profile: p2
+                tokens: original
+            }
+            search {
+                profile: p1
+                tokens: original-and-alternatives
+            }
+        }
+    }
+
+  }
+
+}

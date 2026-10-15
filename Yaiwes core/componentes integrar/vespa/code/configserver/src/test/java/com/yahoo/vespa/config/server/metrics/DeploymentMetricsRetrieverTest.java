@@ -1,0 +1,165 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.config.server.metrics;
+
+import com.yahoo.config.ConfigInstance;
+import com.yahoo.config.FileReference;
+import com.yahoo.config.model.api.HostInfo;
+import com.yahoo.config.model.api.Model;
+import com.yahoo.config.model.api.ServiceInfo;
+import com.yahoo.config.provision.AllocatedHosts;
+import com.yahoo.config.provision.ApplicationId;
+import com.yahoo.config.provision.NodeSuspensionProvider;
+import com.yahoo.vespa.config.ConfigKey;
+import com.yahoo.vespa.config.buildergen.ConfigDefinition;
+import com.yahoo.vespa.config.server.application.Application;
+import org.junit.Test;
+
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * @author olaa
+ */
+public class DeploymentMetricsRetrieverTest {
+
+    @Test
+    public void getMetrics()  {
+        MockModel mockModel = new MockModel(mockHosts());
+        MockDeploymentMetricsRetriever mockMetricsRetriever = new MockDeploymentMetricsRetriever();
+        Application application = new Application(mockModel, null, 0,
+                                                  null, null, ApplicationId.fromSerializedForm("tenant:app:instance"));
+
+        DeploymentMetricsRetriever clusterMetricsRetriever =
+                new DeploymentMetricsRetriever(mockMetricsRetriever, NodeSuspensionProvider.EMPTY);
+        clusterMetricsRetriever.getMetrics(application);
+
+        assertEquals(2, mockMetricsRetriever.hosts.size()); // Verify that logserver was ignored
+    }
+
+    @Test
+    public void defaultConsumerIsClusterDeploymentMetrics() {
+        MockModel mockModel = new MockModel(mockHosts());
+        MockDeploymentMetricsRetriever mockMetricsRetriever = new MockDeploymentMetricsRetriever();
+        Application application = new Application(mockModel, null, 0,
+                                                  null, null, ApplicationId.fromSerializedForm("tenant:app:instance"));
+
+        DeploymentMetricsRetriever clusterMetricsRetriever =
+                new DeploymentMetricsRetriever(mockMetricsRetriever, NodeSuspensionProvider.EMPTY);
+        clusterMetricsRetriever.getMetrics(application);
+
+        assertTrue(mockMetricsRetriever.hosts.stream().allMatch(uri -> uri.getQuery().equals("consumer=cluster-deployment-metrics")));
+    }
+
+    @Test
+    public void suspendedHostsAreFiltered() {
+        MockModel mockModel = new MockModel(mockHosts());
+        MockDeploymentMetricsRetriever mockMetricsRetriever = new MockDeploymentMetricsRetriever();
+        ApplicationId applicationId = ApplicationId.fromSerializedForm("tenant:app:instance");
+        Application application = new Application(mockModel, null, 0,
+                                                  null, null, applicationId);
+
+        NodeSuspensionProvider suspensionProvider = id -> Set.of("host1");
+        DeploymentMetricsRetriever retriever =
+                new DeploymentMetricsRetriever(mockMetricsRetriever, suspensionProvider);
+        retriever.getMetrics(application);
+
+        assertEquals(1, mockMetricsRetriever.hosts.size()); // logserver (host3) and suspended host1 are ignored
+        assertTrue(mockMetricsRetriever.hosts.stream().anyMatch(uri -> uri.getHost().equals("host2")));
+        assertTrue(mockMetricsRetriever.hosts.stream().noneMatch(uri -> uri.getHost().equals("host1")));
+    }
+
+    @Test
+    public void noSuspendedHostsWhenProviderReturnsEmptySet() {
+        MockModel mockModel = new MockModel(mockHosts());
+        MockDeploymentMetricsRetriever mockMetricsRetriever = new MockDeploymentMetricsRetriever();
+        ApplicationId applicationId = ApplicationId.fromSerializedForm("tenant:app:instance");
+        Application application = new Application(mockModel, null, 0,
+                null, null, applicationId);
+
+        NodeSuspensionProvider suspensionProvider = id -> Set.of();
+        DeploymentMetricsRetriever retriever =
+                new DeploymentMetricsRetriever(mockMetricsRetriever, suspensionProvider);
+        retriever.getMetrics(application);
+        // With an empty suspension set, behavior should be the same as without a provider: only logserver is ignored
+        assertEquals(2, mockMetricsRetriever.hosts.size());
+        assertTrue(mockMetricsRetriever.hosts.stream().anyMatch(uri -> uri.getHost().equals("host1")));
+        assertTrue(mockMetricsRetriever.hosts.stream().anyMatch(uri -> uri.getHost().equals("host2")));
+    }
+
+    private Collection<HostInfo> mockHosts() {
+
+        HostInfo hostInfo1 = new HostInfo("host1",
+                List.of(new ServiceInfo("content", "searchnode", null, null, "", "host1"))
+        );
+        HostInfo hostInfo2 = new HostInfo("host2",
+                List.of(new ServiceInfo("default", "container", null, null, "", "host2"))
+        );
+        HostInfo hostInfo3 = new HostInfo("host3",
+                List.of(new ServiceInfo("default", "logserver",  null, null, "", "host3"))
+        );
+
+        return List.of(hostInfo1, hostInfo2, hostInfo3);
+    }
+
+    static class MockDeploymentMetricsRetriever extends ClusterDeploymentMetricsRetriever {
+
+        Collection<URI> hosts = new ArrayList<>();
+
+        @Override
+        public Map<ClusterInfo, DeploymentMetricsAggregator> requestMetricsGroupedByCluster(Collection<URI> hosts) {
+            this.hosts = hosts;
+
+            return Map.of(
+                    new ClusterInfo("content_cluster_id", "content"),
+                    new DeploymentMetricsAggregator().addDocumentCount(1000),
+                    new ClusterInfo("container_cluster_id", "container"),
+                    new DeploymentMetricsAggregator().addContainerLatency(123, 5)
+            );
+        }
+    }
+
+    static class MockModel implements Model {
+
+        final Collection<HostInfo> hosts;
+
+        MockModel(Collection<HostInfo> hosts) {
+            this.hosts = hosts;
+        }
+
+        @Override
+        public ConfigInstance.Builder getConfigInstance(ConfigKey<?> configKey, ConfigDefinition targetDef) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Set<ConfigKey<?>> allConfigsProduced() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Collection<HostInfo> getHosts() {
+            return hosts;
+        }
+
+        @Override
+        public Set<String> allConfigIds() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Set<FileReference> fileReferences() { return new HashSet<>(); }
+
+        @Override
+        public AllocatedHosts allocatedHosts() {
+            throw new UnsupportedOperationException();
+        }
+    }
+}

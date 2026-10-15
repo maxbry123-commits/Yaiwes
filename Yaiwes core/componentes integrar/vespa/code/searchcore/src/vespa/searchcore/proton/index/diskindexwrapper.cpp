@@ -1,0 +1,49 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "diskindexwrapper.h"
+
+#include <vespa/check_require.h>
+#include <vespa/searchcorespi/index/indexreadutilities.h>
+#include <vespa/searchcorespi/index/indexsearchablevisitor.h>
+
+using search::TuneFileSearch;
+using search::diskindex::IPostingListCache;
+using search::index::FieldLengthInfo;
+using searchcorespi::index::IndexReadUtilities;
+
+namespace proton {
+
+DiskIndexWrapper::DiskIndexWrapper(const std::string& indexDir, const TuneFileSearch& tuneFileSearch,
+                                   std::shared_ptr<IPostingListCache> posting_list_cache)
+    : _index(indexDir, std::move(posting_list_cache)), _serialNum(0) {
+    bool setupIndexOk = _index.setup(tuneFileSearch);
+    CHECK(setupIndexOk);
+    (void)setupIndexOk;
+    _serialNum = IndexReadUtilities::readSerialNum(indexDir);
+}
+
+DiskIndexWrapper::DiskIndexWrapper(const DiskIndexWrapper& oldIndex, const TuneFileSearch& tuneFileSearch)
+    : _index(oldIndex._index.getIndexDir(), oldIndex._index.get_posting_list_cache()), _serialNum(0) {
+    bool setupIndexOk = _index.setup(tuneFileSearch, oldIndex._index);
+    CHECK(setupIndexOk);
+    (void)setupIndexOk;
+    _serialNum = oldIndex.getSerialNum();
+}
+
+search::SerialNum DiskIndexWrapper::getSerialNum() const {
+    return _serialNum;
+}
+
+void DiskIndexWrapper::accept(searchcorespi::IndexSearchableVisitor& visitor) const {
+    visitor.visit(*this);
+}
+
+FieldLengthInfo DiskIndexWrapper::get_field_length_info(const std::string& field_name) const {
+    return _index.get_field_length_info(field_name);
+}
+
+const search::common::CreateAndFreezeTimes& DiskIndexWrapper::create_and_freeze_times() const noexcept {
+    return _index.create_and_freeze_times();
+}
+
+} // namespace proton

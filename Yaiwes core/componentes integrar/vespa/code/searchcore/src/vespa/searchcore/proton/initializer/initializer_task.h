@@ -1,0 +1,40 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+#pragma once
+
+#include "initializer_task_visitor.h"
+
+#include <memory>
+#include <vector>
+
+namespace proton::initializer {
+
+class LoadMemoryUsage;
+
+/*
+ * Class representign an initializer task, used to load a data
+ * structure from disk during proton startup.
+ */
+class InitializerTask {
+public:
+    using SP = std::shared_ptr<InitializerTask>;
+    using List = std::vector<SP>;
+    enum class State { BLOCKED, RUNNING, DONE };
+
+private:
+    State _state;
+    List  _dependencies;
+
+public:
+    InitializerTask() noexcept;
+    virtual ~InitializerTask();
+    [[nodiscard]] State getState() const noexcept { return _state; }
+    [[nodiscard]] const List& getDependencies() const noexcept { return _dependencies; }
+    void setRunning() noexcept { _state = State::RUNNING; }
+    void setDone() noexcept { _state = State::DONE; }
+    void addDependency(SP dependency);
+    virtual void run() = 0;
+    [[nodiscard]] virtual LoadMemoryUsage get_load_memory_usage() const noexcept;
+    virtual void accept_visitor(InitializerTaskVisitor& visitor);
+};
+
+} // namespace proton::initializer

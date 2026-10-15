@@ -1,0 +1,37 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include "i_gid_to_lid_change_handler.h"
+
+#include <vespa/document/base/globalid.h>
+#include <vespa/vespalib/stllike/hash_map.h>
+
+#include <mutex>
+#include <vector>
+
+namespace searchcorespi {
+namespace index {
+struct IThreadService;
+}
+} // namespace searchcorespi
+
+namespace proton {
+
+/*
+ * Dummy class for registering listeners that get notification when
+ * gid to lid mapping changes.
+ */
+class DummyGidToLidChangeHandler : public IGidToLidChangeHandler {
+public:
+    DummyGidToLidChangeHandler();
+    ~DummyGidToLidChangeHandler() override;
+
+    void notifyPut(IDestructorCallbackSP context, GlobalId gid, uint32_t lid, SerialNum serial_num) override;
+    void notifyRemoves(IDestructorCallbackSP context, const std::vector<GlobalId>& gid, SerialNum serialNum) override;
+    void addListener(std::unique_ptr<IGidToLidChangeListener> listener) override;
+    void removeListeners(const std::string& docTypeName, const std::set<std::string>& keepNames) override;
+    std::unique_ptr<IPendingGidToLidChanges> grab_pending_changes() override;
+};
+
+} // namespace proton

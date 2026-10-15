@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>vespa-engine/renovate-config"
+  ],
+  "prHourlyLimit": 20,
+  "prConcurrentLimit": 20,
+  "packageRules": [
+    {
+      "matchPackageNames": [
+        "net.bytebuddy:byte-buddy",
+        "net.bytebuddy:byte-buddy-agent"
+      ],
+      "allowedVersions": "!/-jdk5$/"
+    },
+    // Need to wait for Vespa 9 before using Jetty 12.1.x or higher
+    {
+      "separateMinorPatch": true,
+      "enabled": false,
+      "matchPackageNames": [
+        "org.eclipse.jetty:{/,}**",
+        "org.eclipse.jetty.http2:{/,}**"
+      ]
+    },
+    // Don't update, need to keep it in sync with netty and we have a check through netty bom that takes care of that
+    {
+      "matchPackageNames": [
+	"io.netty:netty-tcnative",
+	"io.netty:netty-tcnative-boringssl-static"
+      ],
+      "enabled": false
+    }
+  ]
+}

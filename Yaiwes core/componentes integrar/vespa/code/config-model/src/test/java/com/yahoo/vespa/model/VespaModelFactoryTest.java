@@ -1,0 +1,220 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.model;
+
+import com.yahoo.component.Version;
+import com.yahoo.config.application.api.ApplicationPackage;
+import com.yahoo.component.ComponentId;
+import com.yahoo.component.provider.ComponentRegistry;
+import com.yahoo.config.model.api.AdditionalContent;
+import com.yahoo.config.provision.Zone;
+import com.yahoo.vespa.model.productdiscovery.ProductDiscoveryProvider;
+import com.yahoo.config.model.MockModelContext;
+import com.yahoo.config.model.api.ApplicationClusterEndpoint;
+import com.yahoo.config.model.api.ContainerEndpoint;
+import com.yahoo.config.model.api.HostInfo;
+import com.yahoo.config.model.api.HostProvisioner;
+import com.yahoo.config.model.api.Model;
+import com.yahoo.config.model.api.ModelContext;
+import com.yahoo.config.model.api.ModelCreateResult;
+import com.yahoo.config.model.api.ServiceInfo;
+import com.yahoo.config.model.api.ValidationParameters;
+import com.yahoo.config.model.deploy.TestProperties;
+import com.yahoo.config.model.test.MockApplicationPackage;
+import com.yahoo.config.provision.AzName;
+import com.yahoo.config.provision.Capacity;
+import com.yahoo.config.provision.ClusterMembership;
+import com.yahoo.config.provision.ClusterSpec;
+import com.yahoo.config.provision.HostSpec;
+import com.yahoo.config.provision.NodeResources;
+import com.yahoo.config.provision.ProvisionContext;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * @author Ulf Lilleengen
+ */
+public class VespaModelFactoryTest {
+
+    private ModelContext testModelContext;
+
+    @BeforeEach
+    public void setupContext() {
+        testModelContext = new MockModelContext();
+    }
+
+    @Test
+    void testThatFactoryCanBuildModel() {
+        VespaModelFactory modelFactory =  VespaModelFactory.createTestFactory();
+        Model model = modelFactory.createModel(testModelContext);
+        assertNotNull(model);
+        assertInstanceOf(VespaModel.class, model);
+    }
+
+    // Uses an application package that throws IllegalArgumentException when validating
+    @Test
+    void testThatFactoryModelValidationFailsWithIllegalArgumentException() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            VespaModelFactory modelFactory = VespaModelFactory.createTestFactory();
+            modelFactory.createAndValidateModel(new MockModelContext(createApplicationPackageThatFailsWhenValidating()), new ValidationParameters());
+        });
+    }
+
+    // Uses a MockApplicationPackage that throws UnsupportedOperationException (rethrown as RuntimeException) when validating
+    @Test
+    void testThatFactoryModelValidationFails() {
+        assertThrows(RuntimeException.class, () -> {
+            VespaModelFactory modelFactory = VespaModelFactory.createTestFactory();
+            modelFactory.createAndValidateModel(testModelContext, new ValidationParameters());
+        });
+    }
+
+    @Test
+    void testThatFactoryModelValidationCanBeIgnored() {
+        VespaModelFactory modelFactory = VespaModelFactory.createTestFactory();
+        ModelCreateResult createResult = modelFactory.createAndValidateModel(
+                new MockModelContext(createApplicationPackageThatFailsWhenValidating()),
+                new ValidationParameters(ValidationParameters.IgnoreValidationErrors.TRUE));
+        assertNotNull(createResult.getModel());
+        assertNotNull(createResult.getConfigChangeActions());
+        assertTrue(createResult.getConfigChangeActions().isEmpty());
+    }
+
+    @Test
+    void hostedVespaZoneApplicationAllocatesNodesFromNodeRepo() {
+        String hostName = "test-host-name";
+        String routingClusterName = "routing-cluster";
+        String services =
+                "<?xml version='1.0' encoding='utf-8' ?>\n" +
+                        "<services version='1.0' xmlns:deploy='vespa'>\n" +
+                        "    <admin version='2.0'>\n" +
+                        "        <adminserver hostalias='proxy1' />\n" +
+                        "    </admin>" +
+                        "    <container id='" + routingClusterName + "' version='1.0'>\n" +
+                        "        <nodes type='proxy'/>\n" +
+                        "    </container>\n" +
+                        "</services>";
+
+        var host = new HostSpec(hostName,
+                                NodeResources.unspecified(), NodeResources.unspecified(), NodeResources.unspecified(),
+                                ClusterMembership.from(ClusterSpec.builder(ClusterSpec.Type.container,
+                                                                           new ClusterSpec.Id(routingClusterName),
+                                                                           Capacity.unspecified(),
+                                                                           new Version("6.42")).build(), 0, 0),
+                                Optional.empty(), Optional.empty(), Optional.empty(),
+                                AzName.defaultName());
+        var mockProvisioner = new MockProvisioner(List.of(host));
+        ModelContext modelContext = createMockModelContext(null, services, mockProvisioner, routingClusterName);
+        Model model = VespaModelFactory.createTestFactory().createModel(modelContext);
+
+        List<HostInfo> allocatedHosts = new ArrayList<>(model.getHosts());
+        assertEquals(1, allocatedHosts.size());
+        HostInfo hostInfo = allocatedHosts.get(0);
+
+        assertEquals(hostName, hostInfo.getHostname());
+        assertTrue(hostInfo.getServices().stream()
+                        .map(ServiceInfo::getConfigId)
+                        .anyMatch(configId -> configId.contains(routingClusterName)),
+                "Routing service should run on host " + hostName);
+    }
+
+    private ModelContext createMockModelContext(String hosts, String services, HostProvisioner provisionerToOverride, String clusterName) {
+        return new MockModelContext() {
+            @Override
+            public ApplicationPackage applicationPackage() {
+                return new MockApplicationPackage.Builder().withHosts(hosts).withServices(services).build();
+            }
+
+            @Override
+            public HostProvisioner getHostProvisioner() { return provisionerToOverride; }
+
+            @Override
+            public Properties properties() { return new TestProperties()
+                    .setHostedVespa(true)
+                    .setContainerEndpoints(Set.of(new ContainerEndpoint(clusterName, ApplicationClusterEndpoint.Scope.zone, List.of("tc.example.com")))); }
+        };
+    }
+
+    /** Without a builder, self-hosted must be told Vespa Cloud is required, and hosted that the version is unknown. */
+    @Test
+    void productDiscoveryWithoutABuilderFailsWithATailoredMessage() {
+        var services = """
+                <services version="1.0">
+                    <product-discovery version="1.1"/>
+                </services>""";
+        for (boolean hostedVespa : new boolean[] { false, true }) {
+            String message = assertThrows(IllegalArgumentException.class, () ->
+                    VespaModelFactory.createTestFactory().createModel(new MockModelContext() {
+                        @Override
+                        public ApplicationPackage applicationPackage() {
+                            return new MockApplicationPackage.Builder().withServices(services).build();
+                        }
+                        @Override
+                        public Properties properties() { return new TestProperties().setHostedVespa(hostedVespa); }
+                    })).getMessage();
+            String expected = hostedVespa ? "<product-discovery version=\"1.1\"> is not available on Vespa"
+                                          : "<product-discovery> requires Vespa Cloud";
+            assertTrue(message.contains(expected), message);
+        }
+    }
+
+    /** Lock in feature flag and hosted as gating for the provider for now. */
+    @Test
+    void productDiscoveryProviderIsConsultedOnlyInHostedVespaWithTheFlagEnabled() {
+        assertFalse(providerConsulted(false, false));
+        assertFalse(providerConsulted(true, false));
+        assertFalse(providerConsulted(false, true));
+        assertTrue(providerConsulted(true, true));
+    }
+
+    private boolean providerConsulted(boolean hostedVespa, boolean flagEnabled) {
+        AtomicBoolean consulted = new AtomicBoolean(false);
+        ProductDiscoveryProvider provider = applicationPackage -> {
+            consulted.set(true);
+            return AdditionalContent.none();
+        };
+        var providers = new ComponentRegistry<ProductDiscoveryProvider>();
+        providers.register(ComponentId.fromString("test-provider"), provider);
+        var factory = new VespaModelFactory(new ComponentRegistry<>(), new ComponentRegistry<>(),
+                                            new ComponentRegistry<>(), providers, Zone.defaultZone());
+        factory.createModel(new MockModelContext() {
+            @Override
+            public Properties properties() {
+                return new TestProperties().setHostedVespa(hostedVespa).productDiscovery(flagEnabled);
+            }
+        });
+        return consulted.get();
+    }
+
+    ApplicationPackage createApplicationPackageThatFailsWhenValidating() {
+        return new MockApplicationPackage.Builder().withEmptyHosts().withEmptyServices().failOnValidateXml().build();
+    }
+
+    static class MockProvisioner implements HostProvisioner {
+
+        private final List<HostSpec> hosts;
+
+        public MockProvisioner(List<HostSpec> hosts) {
+            this.hosts = hosts;
+        }
+
+        @Override
+        public List<HostSpec> prepare(ClusterSpec cluster, ProvisionContext context) {
+            return hosts;
+        }
+
+    }
+
+}

@@ -1,0 +1,169 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.search.query.ranking;
+
+import com.yahoo.processing.IllegalInputException;
+import com.yahoo.processing.request.CompoundName;
+import com.yahoo.search.query.Ranking;
+import com.yahoo.search.query.profile.types.FieldDescription;
+import com.yahoo.search.query.profile.types.QueryProfileFieldType;
+import com.yahoo.search.query.profile.types.QueryProfileType;
+
+import java.util.Objects;
+
+/**
+ * The match phase ranking settings of this query.
+ * These are the same settings for match phase that can be set in a rank profile
+ * and is used for achieving reasonable query behavior given a query which causes too many matches:
+ * The engine will fall back to retrieving the best values according to the attribute given here
+ * during matching.
+ * <p>
+ * For this feature to work well, the order given by the attribute should correlate reasonably with the order
+ * of results produced if full evaluation is performed.
+ *
+ * @author bratseth
+ */
+public class MatchPhase implements Cloneable {
+
+    /** For internal use only. */
+    public static final String maxHitsProperty = "vespa.matchphase.degradation.maxhits";
+
+    /** For internal use only. */
+    public static final String totalMaxHitsProperty = "vespa.matchphase.degradation.totalMaxhits";
+
+    /** The type representing the property arguments consumed by this */
+    private static final QueryProfileType argumentType;
+
+    public static final String MATCH_PHASE = "matchPhase";
+    public static final String ATTRIBUTE = "attribute";
+    public static final String ASCENDING = "ascending";
+    public static final String MAX_HITS = "maxHits";
+    public static final String TOTAL_MAX_HITS = "totalMaxHits";
+    public static final String MAX_FILTER_COVERAGE = "maxFilterCoverage";
+
+    static {
+        argumentType = new QueryProfileType(MATCH_PHASE);
+        argumentType.setStrict(true);
+        argumentType.setBuiltin(true);
+        argumentType.addField(new FieldDescription(ATTRIBUTE, "string"));
+        argumentType.addField(new FieldDescription(ASCENDING, "boolean"));
+        argumentType.addField(new FieldDescription(MAX_HITS, "long"));
+        argumentType.addField(new FieldDescription(TOTAL_MAX_HITS, "long"));
+        argumentType.addField(new FieldDescription(MAX_FILTER_COVERAGE, "double"));
+        argumentType.addField(new FieldDescription(Diversity.DIVERSITY, new QueryProfileFieldType(Diversity.getArgumentType())));
+        argumentType.freeze();
+    }
+    public static QueryProfileType getArgumentType() { return argumentType; }
+
+    private String attribute = null;
+    private boolean ascending = false;
+    private Long maxHits = null;
+    private Long totalMaxHits = null;
+    private Double maxFilterCoverage = 0.2;
+    private Diversity diversity = new Diversity();
+
+    /**
+     * Sets the attribute field which will be used to decide the best matches after it has been determined
+     * during matching that this query is going to cause too many matches.
+     * Set to null (default) to disable degradation.
+     * <p>
+     * If this is set, make sure to also set the maxHits value.
+     * Otherwise, the attribute setting is ignored.
+     * <p>
+     * This attribute should have fast-search turned on.
+     */
+    public void setAttribute(String attribute) { this.attribute = attribute; }
+
+    /** Returns the attribute to use for degradation, or null if none */
+    public String getAttribute() { return attribute; }
+
+    /**
+     * Set to true to sort by the attribute in ascending order when this is in use during the match phase,
+     * false (default) to use descending order.
+     */
+    public void setAscending(boolean ascending) { this.ascending = ascending; }
+
+    /**
+     * Returns the order to sort the attribute during the path phase when this takes effect.
+     */
+    public boolean getAscending() { return ascending; }
+
+    /**
+     * Sets the max hits per node to aim for producing in the match phase.
+     * This or totalMaxHits must be set if an attribute value is set.
+     * It should be set to a reasonable fraction of the total documents on the node.
+     */
+    public void setMaxHits(long count) { this.maxHits = count; }
+
+    /**
+     * Sets the total max hits over all nodes to aim for producing in the match phase.
+     * This or maxHits must be set if an attribute value is set.
+     * It should be set to a reasonable fraction of the total documents across all nodes.
+     */
+    public void setTotalMaxHits(long count) { this.totalMaxHits = count; }
+
+    public void setMaxFilterCoverage(double maxFilterCoverage) {
+        if ((maxFilterCoverage < 0.0) || (maxFilterCoverage > 1.0)) {
+            throw new IllegalInputException("maxFilterCoverage must be in the range [0.0, 1.0], but is " + maxFilterCoverage);
+        }
+
+        this.maxFilterCoverage = maxFilterCoverage;
+    }
+
+    /** Returns the max hits to aim for producing in the match phase on each content node, or null to use totalMaxHits */
+    public Long getMaxHits() { return maxHits; }
+
+    /** Returns the max hits to aim for producing in the match phase across all content nodes, or null if not set */
+    public Long getTotalMaxHits() { return totalMaxHits; }
+
+    public Double getMaxFilterCoverage() { return maxFilterCoverage; }
+
+    public Diversity getDiversity() { return diversity; }
+
+    public void setDiversity(Diversity diversity) {
+        this.diversity = diversity;
+    }
+
+    /** Internal operation - DO NOT USE */
+    public void prepare(RankProperties rankProperties) {
+        if (attribute == null || (maxHits == null && totalMaxHits == null)) return;
+
+        rankProperties.put("vespa.matchphase.degradation.attribute", attribute);
+        if (ascending) { // backend default is descending
+            rankProperties.put("vespa.matchphase.degradation.ascendingorder", "true");
+        }
+        rankProperties.put("vespa.matchphase.degradation.maxfiltercoverage", String.valueOf(maxFilterCoverage));
+        diversity.prepare(rankProperties);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(ascending, attribute, maxHits, totalMaxHits, diversity, maxFilterCoverage);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if ( ! (o instanceof MatchPhase other)) return false;
+
+        if ( this.ascending != other.ascending) return false;
+        if ( ! Objects.equals(this.attribute, other.attribute)) return false;
+        if ( ! Objects.equals(this.maxHits, other.maxHits)) return false;
+        if ( ! Objects.equals(this.totalMaxHits, other.totalMaxHits)) return false;
+        if ( ! Objects.equals(this.diversity, other.diversity)) return false;
+        if ( ! Objects.equals(this.maxFilterCoverage, other.maxFilterCoverage)) return false;
+        return true;
+    }
+
+    @Override
+    public MatchPhase clone() {
+        try {
+            MatchPhase clone = (MatchPhase)super.clone();
+            clone.diversity = diversity.clone();
+            return clone;
+        }
+        catch (CloneNotSupportedException e) {
+            throw new RuntimeException("Won't happen", e);
+        }
+    }
+
+}

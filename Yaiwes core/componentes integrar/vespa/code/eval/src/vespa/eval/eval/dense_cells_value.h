@@ -1,0 +1,28 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include <vespa/check_require.h>
+#include <vespa/eval/eval/value.h>
+
+namespace vespalib::eval {
+
+/**
+ * A dense-only value that just owns a vector of cells.
+ **/
+template <typename T> class DenseCellsValue : public Value {
+private:
+    ValueType      _type;
+    std::vector<T> _cells;
+
+public:
+    DenseCellsValue(const ValueType& type_ref, std::vector<T> cells) : _type(type_ref), _cells(std::move(cells)) {
+        CHECK(check_cell_type<T>(_type.cell_type()));
+        CHECK(_cells.size() == _type.dense_subspace_size());
+    }
+    const ValueType& type() const override { return _type; }
+    TypedCells cells() const override { return TypedCells(_cells); }
+    const Index& index() const override { return TrivialIndex::get(); }
+    MemoryUsage get_memory_usage() const override;
+    ~DenseCellsValue();
+};
+
+} // namespace vespalib::eval

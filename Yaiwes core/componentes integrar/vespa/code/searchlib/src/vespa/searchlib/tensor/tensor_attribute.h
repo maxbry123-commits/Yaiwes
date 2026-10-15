@@ -1,0 +1,138 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include "i_tensor_attribute.h"
+#include "prepare_result.h"
+#include "subspace_type.h"
+#include "tensor_quantization.h"
+#include "tensor_store.h"
+#include "typed_cells_comparator.h"
+
+#include <vespa/document/update/tensor_update.h>
+#include <vespa/searchlib/attribute/not_implemented_attribute.h>
+#include <vespa/vespalib/util/type_stable_vector.h>
+
+#include <atomic>
+
+namespace vespalib::eval {
+struct Value;
+struct ValueBuilderFactory;
+} // namespace vespalib::eval
+
+namespace search::tensor {
+
+class NearestNeighborIndexFactory;
+
+/**
+ * Attribute vector class used to store tensors for all documents in memory.
+ */
+class TensorAttribute : public NotImplementedAttribute, public ITensorAttribute {
+protected:
+    using AtomicEntryRef = vespalib::datastore::AtomicEntryRef;
+    using EntryRef = TensorStore::EntryRef;
+    using RefVector = vespalib::TypeStableVectorBase<AtomicEntryRef>;
+
+    RefVector                                _refVector;   // docId -> ref in data store for serialized tensor
+    TensorStore&                             _tensorStore; // data store for serialized tensors
+    std::unique_ptr<DistanceFunctionFactory> _distance_function_factory;
+    std::unique_ptr<NearestNeighborIndex>    _index;
+    bool                                     _is_dense;
+    bool                                     _is_quantized;
+    std::unique_ptr<vespalib::eval::Value>   _emptyTensor;
+    vespalib::Generation                     _compactGeneration; // Generation when last compact occurred
+    SubspaceType                             _subspace_type;
+    TypedCellsComparator                     _comp;
+    uint64_t                                 _memory_usage_empty;
+    uint64_t                                 _memory_usage_at_save_start;
+    std::atomic<double>                      _size_on_disk_factor; // size on disk / memory usage
+
+    void checkTensorType(const vespalib::eval::Value& tensor) const;
+    void setTensorRef(DocId docId, EntryRef ref);
+    void internal_set_tensor(DocId docid, const vespalib::eval::Value& tensor);
+    void consider_remove_from_index(DocId docid);
+    virtual vespalib::MemoryUsage update_stat();
+    void populate_address_space_usage(AddressSpaceUsage& usage) const override;
+    EntryRef acquire_entry_ref(DocId doc_id) const noexcept {
+        return _refVector.acquire_elem_ref(doc_id).load_acquire();
+    }
+    bool onLoad(vespalib::Executor* executor) override;
+    std::unique_ptr<AttributeSaver> onInitSave(std::string_view fileName) override;
+    bool tensor_cells_are_unchanged(DocId docid, VectorBundle vectors) const;
+
+    void prefetch_docid(DocId docid) const noexcept override { _refVector.prefetch_elem_ref(docid); }
+    void setup_memory_usage_empty();
+
+public:
+    TensorAttribute(std::string_view name, const Config& cfg, TensorStore& tensor_store,
+                    const NearestNeighborIndexFactory& index_factory);
+    ~TensorAttribute() override;
+    const ITensorAttribute* asTensorAttribute() const override;
+
+    [[nodiscard]] bool is_quantized() const noexcept final { return _is_quantized; }
+    [[nodiscard]] const vespalib::eval::ValueType& unquantized_tensor_type() const noexcept final;
+    /*
+     * Returns a new TensorQuantizer instance that can be used to transform full-precision
+     * input tensors of the schema-configured tensor type to a quantized shape and type
+     * matching `unquantized_tensor_type()`.
+     *
+     * A TensorQuantizer constructed from one TensorAttribute must never be attempted used
+     * on the tensor data inserted into another, unrelated TensorAttribute.
+     *
+     * Important: individual TensorQuantizer instances are _not_ thread safe.
+     *
+     * Precondition: is_quantized() == true
+     */
+    [[nodiscard]] std::unique_ptr<TensorQuantizer> make_quantizer() const;
+    [[nodiscard]] std::unique_ptr<TensorDequantizer> make_dequantizer() const override;
+
+    uint32_t clearDoc(DocId docId) override;
+    void onCommit() override;
+    void onUpdateStat(CommitParam::UpdateStats updateStats) override;
+    void reclaim_memory(vespalib::Generation oldest_used_gen) override;
+    void before_inc_generation(vespalib::Generation current_gen) override;
+    bool addDoc(DocId& docId) override;
+    std::unique_ptr<vespalib::eval::Value> getTensor(DocId docId) const override;
+    std::unique_ptr<vespalib::eval::Value> getEmptyTensor() const override;
+    vespalib::eval::TypedCells extract_cells_ref(uint32_t docid) const override;
+    const vespalib::eval::Value& get_tensor_ref(uint32_t docid) const override;
+    SerializedTensorRef get_serialized_tensor_ref(uint32_t docid) const override;
+    bool supports_extract_cells_ref() const override { return false; }
+    bool supports_get_tensor_ref() const override { return false; }
+    bool supports_get_serialized_tensor_ref() const override;
+    const vespalib::eval::ValueType& getTensorType() const override;
+    DistanceFunctionFactory& distance_function_factory() const override;
+    const NearestNeighborIndex* nearest_neighbor_index() const override;
+    std::unique_ptr<vespalib::StateExplorer> make_state_explorer() const override;
+    void clearDocs(DocId lidLow, DocId lidLimit, bool in_shrink_lid_space) override;
+    void onShrinkLidSpace() override;
+    uint32_t getVersion() const override;
+    virtual void setTensor(DocId docId, const vespalib::eval::Value& tensor);
+    virtual void update_tensor(DocId docId, const document::TensorUpdate& update, bool create_empty_if_non_existing);
+    DistanceMetric distance_metric() const override;
+    uint32_t get_num_docs() const override { return getNumDocs(); }
+
+    /**
+     * Performs the prepare step in a two-phase operation to set a tensor for a document.
+     *
+     * This function can be called by any thread.
+     * It should return the result of the costly and non-modifying part of such operation.
+     */
+    virtual std::unique_ptr<PrepareResult> prepare_set_tensor(DocId docid, const vespalib::eval::Value& tensor) const;
+
+    /**
+     * Performs the complete step in a two-phase operation to set a tensor for a document.
+     *
+     * This function is only called by the attribute writer thread.
+     * It uses the result from the prepare step to do the modifying changes.
+     */
+    virtual void complete_set_tensor(DocId docid, const vespalib::eval::Value& tensor,
+                                     std::unique_ptr<PrepareResult> prepare_result);
+    void set_memory_usage_at_save_start(uint64_t memory_usage) noexcept;
+    void set_size_on_disk(uint64_t value) noexcept override;
+    uint64_t getEstimatedSaveByteSize() const override;
+    void incGeneration() override;
+    void reclaim_unused_memory() override;
+};
+
+} // namespace search::tensor

@@ -1,0 +1,999 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include <vespa/searchcore/proton/flushengine/active_flush_stats.h>
+#include <vespa/searchcore/proton/flushengine/cachedflushtarget.h>
+#include <vespa/searchcore/proton/flushengine/flush_engine_explorer.h>
+#include <vespa/searchcore/proton/flushengine/flushengine.h>
+#include <vespa/searchcore/proton/flushengine/i_tls_stats_factory.h>
+#include <vespa/searchcore/proton/flushengine/threadedflushtarget.h>
+#include <vespa/searchcore/proton/flushengine/tls_stats_map.h>
+#include <vespa/searchcore/proton/server/igetserialnum.h>
+#include <vespa/searchcore/proton/test/dummy_flush_handler.h>
+#include <vespa/searchcore/proton/test/dummy_flush_target.h>
+#include <vespa/searchlib/common/flush_token.h>
+#include <vespa/vespalib/data/slime/slime.h>
+#include <vespa/vespalib/gtest/gtest.h>
+
+#include <limits>
+#include <mutex>
+#include <thread>
+
+#include <vespa/log/log.h>
+LOG_SETUP("flushengine_test");
+
+using namespace proton;
+using namespace proton::flushengine;
+using namespace vespalib::slime;
+using searchcorespi::FlushTask;
+using searchcorespi::IFlushTarget;
+using vespalib::Slime;
+
+constexpr vespalib::duration LONG_TIMEOUT = 66666ms;
+constexpr vespalib::duration SHORT_TIMEOUT = 1ms;
+constexpr vespalib::duration IINTERVAL = 1s;
+
+class SimpleExecutor : public vespalib::Executor {
+public:
+    vespalib::Gate _done;
+
+public:
+    SimpleExecutor() : _done() {}
+
+    Task::UP execute(Task::UP task) override {
+        task->run();
+        _done.countDown();
+        return Task::UP();
+    }
+    void wakeup() override {}
+};
+
+class SimpleGetSerialNum : public IGetSerialNum {
+    search::SerialNum getSerialNum() const override { return 0u; }
+};
+
+class SimpleTlsStatsFactory : public flushengine::ITlsStatsFactory {
+    flushengine::TlsStatsMap create() override {
+        vespalib::hash_map<std::string, flushengine::TlsStats> map;
+        map.insert(std::make_pair("handler", TlsStats(1000000, 2, 200)));
+        return flushengine::TlsStatsMap(std::move(map));
+    }
+};
+
+class SimpleHandler;
+
+class WrappedFlushTask : public searchcorespi::FlushTask {
+    searchcorespi::FlushTask::UP _task;
+    SimpleHandler&               _handler;
+
+public:
+    void run() override;
+    WrappedFlushTask(searchcorespi::FlushTask::UP task, SimpleHandler& handler)
+        : _task(std::move(task)), _handler(handler) {}
+
+    search::SerialNum getFlushSerial() const override { return _task->getFlushSerial(); }
+};
+
+class WrappedFlushTarget : public FlushTargetProxy {
+    SimpleHandler& _handler;
+
+public:
+    WrappedFlushTarget(const IFlushTarget::SP& target, SimpleHandler& handler)
+        : FlushTargetProxy(target), _handler(handler) {}
+
+    void init_flush(SerialNum currentSerial, std::shared_ptr<search::IFlushToken> flush_token,
+                    TaskPromise task_promise) override {
+        Task::UP task(_target->initFlush(currentSerial, std::move(flush_token)));
+        if (task) {
+            task_promise.set_value(std::make_unique<WrappedFlushTask>(std::move(task), _handler));
+        } else {
+            task_promise.set_value({});
+        }
+    }
+
+    [[nodiscard]] bool can_flush(SerialNum current_serial) const noexcept override {
+        return _target->can_flush(current_serial);
+    }
+};
+
+using Targets = std::vector<IFlushTarget::SP>;
+
+using FlushDoneHistory = std::vector<search::SerialNum>;
+
+class SimpleHandler : public test::DummyFlushHandler {
+public:
+    Targets                  _targets;
+    search::SerialNum        _oldestSerial;
+    search::SerialNum        _currentSerial;
+    uint32_t                 _pendingDone;
+    uint32_t                 _taskDone;
+    mutable std::mutex       _lock;
+    vespalib::CountDownLatch _done;
+    FlushDoneHistory         _flushDoneHistory;
+
+public:
+    using SP = std::shared_ptr<SimpleHandler>;
+
+    SimpleHandler(const Targets& targets, const std::string& name = "anon", search::SerialNum currentSerial = -1)
+        : test::DummyFlushHandler(name),
+          _targets(targets),
+          _oldestSerial(0),
+          _currentSerial(currentSerial),
+          _pendingDone(0u),
+          _taskDone(0u),
+          _lock(),
+          _done(targets.size()),
+          _flushDoneHistory() {}
+
+    search::SerialNum getCurrentSerialNumber() const override {
+        LOG(info, "SimpleHandler(%s)::getCurrentSerialNumber()", getName().c_str());
+        return _currentSerial;
+    }
+
+    std::vector<IFlushTarget::SP> getFlushTargets() override {
+        {
+            std::lock_guard guard(_lock);
+            _pendingDone += _taskDone;
+            _taskDone = 0;
+        }
+        LOG(info, "SimpleHandler(%s)::getFlushTargets()", getName().c_str());
+        std::vector<IFlushTarget::SP> wrappedTargets;
+        for (const auto& target : _targets) {
+            wrappedTargets.push_back(std::make_shared<WrappedFlushTarget>(target, *this));
+        }
+        return wrappedTargets;
+    }
+
+    // Called once by flush engine thread for each task done
+    void taskDone() {
+        std::lock_guard guard(_lock);
+        ++_taskDone;
+    }
+
+    // Called by flush engine master thread after flush handler is
+    // added to flush engine and when one or more flush tasks related
+    // to flush handler have completed.
+    void flushDone(search::SerialNum oldestSerial) override {
+        std::lock_guard guard(_lock);
+        LOG(info, "SimpleHandler(%s)::flushDone(%" PRIu64 ")", getName().c_str(), oldestSerial);
+        _oldestSerial = std::max(_oldestSerial, oldestSerial);
+        _flushDoneHistory.push_back(oldestSerial);
+        while (_pendingDone > 0) {
+            --_pendingDone;
+            _done.countDown();
+        }
+    }
+
+    FlushDoneHistory getFlushDoneHistory() {
+        std::lock_guard guard(_lock);
+        return _flushDoneHistory;
+    }
+
+    [[nodiscard]] search::SerialNum oldest_serial() const noexcept {
+        std::lock_guard guard(_lock);
+        return _oldestSerial;
+    }
+};
+
+void WrappedFlushTask::run() {
+    _task->run();
+    _handler.taskDone();
+}
+
+class SimpleTask : public searchcorespi::FlushTask {
+    std::atomic<search::SerialNum>& _flushedSerial;
+    search::SerialNum&              _currentSerial;
+
+public:
+    vespalib::Gate& _start;
+    vespalib::Gate& _done;
+    vespalib::Gate* _proceed;
+
+public:
+    SimpleTask(vespalib::Gate& start, vespalib::Gate& done, vespalib::Gate* proceed,
+               std::atomic<search::SerialNum>& flushedSerial, search::SerialNum& currentSerial)
+        : _flushedSerial(flushedSerial),
+          _currentSerial(currentSerial),
+          _start(start),
+          _done(done),
+          _proceed(proceed) {}
+
+    virtual void on_run() {}
+    void run() override {
+        _start.countDown();
+        if (_proceed != nullptr) {
+            _proceed->await();
+        }
+        on_run();
+        _flushedSerial.store(_currentSerial, std::memory_order_relaxed);
+        _done.countDown();
+    }
+
+    search::SerialNum getFlushSerial() const override { return 0u; }
+};
+
+class SimpleTarget : public test::DummyFlushTarget {
+public:
+    std::atomic<search::SerialNum> _flushedSerial;
+    search::SerialNum              _currentSerial;
+    vespalib::Gate                 _proceed;
+    vespalib::Gate                 _initDone;
+    vespalib::Gate                 _taskStart;
+    vespalib::Gate                 _taskDone;
+    Task::UP                       _task;
+
+protected:
+    SimpleTarget(const std::string& name, const Type& type, search::SerialNum flushedSerial = 0,
+                 bool proceedImmediately = true)
+        : test::DummyFlushTarget(name, type, Component::OTHER),
+          _flushedSerial(flushedSerial),
+          _currentSerial(0),
+          _proceed(),
+          _initDone(),
+          _taskStart(),
+          _taskDone(),
+          _task(std::make_unique<SimpleTask>(_taskStart, _taskDone, &_proceed, _flushedSerial, _currentSerial)) {
+        if (proceedImmediately) {
+            _proceed.countDown();
+        }
+    }
+
+    struct no_task_tag {};
+    SimpleTarget(const std::string& name, const Type& type, no_task_tag) noexcept
+        : test::DummyFlushTarget(name, type, Component::OTHER),
+          _flushedSerial(0),
+          _currentSerial(0),
+          _proceed(),
+          _initDone(),
+          _taskStart(),
+          _taskDone(),
+          _task() {}
+
+public:
+    using SP = std::shared_ptr<SimpleTarget>;
+
+    SimpleTarget(Task::UP task, const std::string& name) noexcept : SimpleTarget(name, Type::OTHER, no_task_tag()) {
+        _task = std::move(task);
+    }
+
+    SimpleTarget(search::SerialNum flushedSerial = 0, bool proceedImmediately = true)
+        : SimpleTarget("anon", flushedSerial, proceedImmediately) {}
+
+    SimpleTarget(const std::string& name, search::SerialNum flushedSerial = 0, bool proceedImmediately = true)
+        : SimpleTarget(name, Type::OTHER, flushedSerial, proceedImmediately) {}
+
+    ~SimpleTarget() override;
+
+    Time getLastFlushTime() const override { return vespalib::system_clock::now(); }
+
+    SerialNum getFlushedSerialNum() const override {
+        LOG(info, "SimpleTarget(%s)::getFlushedSerialNum() = %" PRIu64, getName().c_str(),
+            _flushedSerial.load(std::memory_order_relaxed));
+        return _flushedSerial.load(std::memory_order_relaxed);
+    }
+
+    void init_flush(SerialNum   currentSerial, std::shared_ptr<search::IFlushToken>,
+                    TaskPromise task_promise) override {
+        LOG(info, "SimpleTarget(%s)::init_flush(%" PRIu64 ")", getName().c_str(), currentSerial);
+        _currentSerial = currentSerial;
+        _initDone.countDown();
+        task_promise.set_value(std::move(_task));
+    }
+
+    [[nodiscard]] bool can_flush(SerialNum) const noexcept override { return true; }
+};
+
+class GCTarget : public SimpleTarget {
+public:
+    GCTarget(const std::string& name, search::SerialNum flushedSerial)
+        : SimpleTarget(name, Type::GC, flushedSerial) {}
+};
+
+class HighPriorityTarget : public SimpleTarget {
+public:
+    HighPriorityTarget(const std::string& name, search::SerialNum flushedSerial, bool proceed)
+        : SimpleTarget(name, Type::OTHER, flushedSerial, proceed) {}
+
+    Priority getPriority() const override { return Priority::HIGH; }
+};
+
+SimpleTarget::~SimpleTarget() = default;
+
+class AssertedTarget : public SimpleTarget {
+public:
+    mutable bool _mgain;
+    mutable bool _serial;
+
+public:
+    using SP = std::shared_ptr<AssertedTarget>;
+
+    AssertedTarget() : SimpleTarget("anon"), _mgain(false), _serial(false) {}
+
+    MemoryGain getApproxMemoryGain() const override {
+        LOG_ASSERT(_mgain == false);
+        _mgain = true;
+        return SimpleTarget::getApproxMemoryGain();
+    }
+
+    search::SerialNum getFlushedSerialNum() const override {
+        LOG_ASSERT(_serial == false);
+        _serial = true;
+        return SimpleTarget::getFlushedSerialNum();
+    }
+};
+
+class ReservedDiskSpaceAndMemoryTask : public SimpleTask {
+    IFlushTarget::DiskGain& _disk_gain;
+    void on_run() override {
+        // Assume that future flushes will use the same amount of disk space (no more growth).
+        _disk_gain = IFlushTarget::DiskGain(_disk_gain.getAfter(), _disk_gain.getAfter());
+    }
+
+public:
+    ReservedDiskSpaceAndMemoryTask(vespalib::Gate& start, vespalib::Gate& done, vespalib::Gate* proceed,
+                                   std::atomic<search::SerialNum>& flushedSerial, search::SerialNum& currentSerial,
+                                   IFlushTarget::DiskGain& disk_gain)
+        : SimpleTask(start, done, proceed, flushedSerial, currentSerial), _disk_gain(disk_gain) {}
+};
+
+class ReservedDiskSpaceAndMemoryTarget : public SimpleTarget {
+    DiskGain _disk_gain;
+    size_t   _reserved_memory_for_flush;
+
+public:
+    ReservedDiskSpaceAndMemoryTarget(const std::string& name, search::SerialNum flushedSerial, DiskGain disk_gain,
+                                     size_t reserved_memory_for_flush_in)
+        : SimpleTarget(name, Type::OTHER, no_task_tag()),
+          _disk_gain(disk_gain),
+          _reserved_memory_for_flush(reserved_memory_for_flush_in) {
+        _flushedSerial = flushedSerial;
+        _task = std::make_unique<ReservedDiskSpaceAndMemoryTask>(_taskStart, _taskDone, &_proceed, _flushedSerial,
+                                                                 _currentSerial, _disk_gain);
+    }
+    ~ReservedDiskSpaceAndMemoryTarget() override;
+    DiskGain getApproxDiskGain() const override { return _disk_gain; }
+    size_t reserved_memory_for_flush() const noexcept override { return _reserved_memory_for_flush; }
+};
+
+ReservedDiskSpaceAndMemoryTarget::~ReservedDiskSpaceAndMemoryTarget() = default;
+
+class SimpleStrategy : public IFlushStrategy {
+public:
+    using SP = std::shared_ptr<SimpleStrategy>;
+    enum class OrderBy { INDEX_OF, SERIAL };
+    std::vector<IFlushTarget::SP> _targets;
+    OrderBy                       _orderBy;
+    bool                          _priority_strategy;
+
+    struct CompareIndexOf {
+        CompareIndexOf(const SimpleStrategy& flush) : _flush(flush) {}
+        bool operator()(const FlushContext::SP& lhs, const FlushContext::SP& rhs) const {
+            return _flush.compare(lhs->getTarget(), rhs->getTarget());
+        }
+        const SimpleStrategy& _flush;
+    };
+
+    FlushStrategyResult getFlushTargets(const FlushContext::List& targetList, const flushengine::TlsStatsMap&,
+                                        const flushengine::ActiveFlushStats&) const override {
+        FlushContext::List fv(targetList);
+        if (_orderBy == OrderBy::INDEX_OF) {
+            std::sort(fv.begin(), fv.end(), CompareIndexOf(*this));
+        } else {
+            std::sort(fv.begin(), fv.end(), [](const auto& a, const auto& b) {
+                return a->getTarget()->getFlushedSerialNum() < b->getTarget()->getFlushedSerialNum();
+            });
+        }
+        return FlushStrategyResult(std::move(fv), name(), _id, _priority_strategy, order_name());
+    }
+
+    std::string name() const override { return "flush_simple"; }
+
+    std::string order_name() const noexcept {
+        switch (_orderBy) {
+        case OrderBy::INDEX_OF:
+            return "index_of";
+        case OrderBy::SERIAL:
+        default:
+            return "serial";
+        }
+    }
+
+    bool compare(const IFlushTarget::SP& lhs, const IFlushTarget::SP& rhs) const {
+        LOG(info, "SimpleStrategy::compare(%p, %p)", lhs.get(), rhs.get());
+        return indexOf(lhs) < indexOf(rhs);
+    }
+
+    SimpleStrategy(OrderBy orderBy, bool priority_strategy) noexcept
+        : _targets(), _orderBy(orderBy), _priority_strategy(priority_strategy) {}
+
+    uint32_t indexOf(const IFlushTarget::SP& target) const {
+        IFlushTarget*      raw = target.get();
+        CachedFlushTarget* cached = dynamic_cast<CachedFlushTarget*>(raw);
+        if (cached != nullptr) {
+            raw = cached->getFlushTarget().get();
+        }
+        WrappedFlushTarget* wrapped = dynamic_cast<WrappedFlushTarget*>(raw);
+        if (wrapped != nullptr) {
+            raw = wrapped->getFlushTarget().get();
+        }
+        for (uint32_t i = 0, len = _targets.size(); i < len; ++i) {
+            if (raw == _targets[i].get()) {
+                LOG(info, "Index of target %p is %d.", raw, i);
+                return i;
+            }
+        }
+        LOG(info, "Target %p not found.", raw);
+        return -1;
+    }
+};
+
+class NoFlushStrategy : public SimpleStrategy {
+public:
+    NoFlushStrategy() noexcept : SimpleStrategy(OrderBy::INDEX_OF, false) {}
+    FlushStrategyResult getFlushTargets(const FlushContext::List&, const flushengine::TlsStatsMap&,
+                                        const flushengine::ActiveFlushStats&) const override {
+        return FlushStrategyResult({}, name(), _id, false, name());
+    }
+    std::string name() const override { return "flush_nothing"; }
+};
+
+// --------------------------------------------------------------------------------
+//
+// Tests.
+//
+// --------------------------------------------------------------------------------
+
+class AppendTask : public FlushTask {
+public:
+    AppendTask(const std::string& name, std::vector<std::string>& list, vespalib::Gate& done)
+        : _list(list), _done(done), _name(name) {}
+    void run() override {
+        _list.push_back(_name);
+        _done.countDown();
+    }
+    search::SerialNum getFlushSerial() const override { return 0u; }
+    std::vector<std::string>& _list;
+    vespalib::Gate&           _done;
+    std::string               _name;
+};
+
+struct Fixture {
+    std::shared_ptr<flushengine::ITlsStatsFactory> tlsStatsFactory;
+    SimpleStrategy::SP                             strategy;
+    FlushEngine                                    engine;
+
+    Fixture(uint32_t numThreads, vespalib::duration idleInterval, SimpleStrategy::SP strategy_)
+        : tlsStatsFactory(std::make_shared<SimpleTlsStatsFactory>()),
+          strategy(strategy_),
+          engine(tlsStatsFactory, strategy, numThreads, idleInterval, std::numeric_limits<uint64_t>::max()) {}
+
+    Fixture(uint32_t numThreads, vespalib::duration idleInterval)
+        : Fixture(numThreads, idleInterval,
+                  std::make_shared<SimpleStrategy>(SimpleStrategy::OrderBy::INDEX_OF, false)) {}
+
+    ~Fixture();
+
+    void putFlushHandler(const std::string& docTypeName, IFlushHandler::SP handler) {
+        engine.putFlushHandler(DocTypeName(docTypeName), handler);
+    }
+
+    void addTargetToStrategy(IFlushTarget::SP target) { strategy->_targets.push_back(std::move(target)); }
+
+    std::shared_ptr<SimpleHandler> addSimpleHandler(Targets targets) {
+        auto handler = std::make_shared<SimpleHandler>(targets, "handler", 20);
+        engine.putFlushHandler(DocTypeName("handler"), handler);
+        engine.start();
+        return handler;
+    }
+
+    void assertOldestSerial(SimpleHandler& handler, search::SerialNum expOldestSerial) {
+        using namespace std::chrono_literals;
+        for (int pass = 0; pass < 600; ++pass) {
+            std::this_thread::sleep_for(100ms);
+            if (handler.oldest_serial() == expOldestSerial) {
+                break;
+            }
+        }
+        EXPECT_EQ(expOldestSerial, handler.oldest_serial());
+    }
+};
+
+Fixture::~Fixture() = default;
+
+TEST(FlushEngineTest, require_that_leaf_defaults_are_sane) {
+    test::DummyFlushTarget leaf("dummy");
+    EXPECT_FALSE(leaf.needUrgentFlush());
+    EXPECT_EQ(0.0, leaf.get_replay_operation_cost());
+    EXPECT_TRUE(IFlushTarget::Priority::NORMAL == leaf.getPriority());
+    EXPECT_TRUE(50 == static_cast<int>(IFlushTarget::Priority::NORMAL));
+    EXPECT_TRUE(100 == static_cast<int>(IFlushTarget::Priority::HIGH));
+    EXPECT_TRUE(IFlushTarget::Priority::NORMAL < IFlushTarget::Priority::HIGH);
+    EXPECT_TRUE(IFlushTarget::Priority::HIGH > IFlushTarget::Priority::NORMAL);
+}
+
+TEST(FlushEngineTest, require_that_strategy_controls_flush_target) {
+    Fixture                  f(1, IINTERVAL);
+    vespalib::Gate           fooG, barG;
+    std::vector<std::string> order;
+    auto foo = std::make_shared<SimpleTarget>(std::make_unique<AppendTask>("foo", order, fooG), "foo");
+    auto bar = std::make_shared<SimpleTarget>(std::make_unique<AppendTask>("bar", order, barG), "bar");
+    f.addTargetToStrategy(foo);
+    f.addTargetToStrategy(bar);
+
+    auto handler = std::make_shared<SimpleHandler>(Targets({bar, foo}), "anon");
+    f.putFlushHandler("anon", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(fooG.await(LONG_TIMEOUT));
+    EXPECT_TRUE(barG.await(LONG_TIMEOUT));
+    EXPECT_EQ(2u, order.size());
+    EXPECT_EQ("foo", order[0]);
+    EXPECT_EQ("bar", order[1]);
+}
+
+TEST(FlushEngineTest, require_that_zero_handlers_does_not_core) {
+    Fixture f(2, 50ms);
+    f.engine.start();
+}
+
+TEST(FlushEngineTest, require_that_zero_targets_does_not_core) {
+    Fixture f(2, 50ms);
+    f.putFlushHandler("foo", std::make_shared<SimpleHandler>(Targets(), "foo"));
+    f.putFlushHandler("bar", std::make_shared<SimpleHandler>(Targets(), "bar"));
+    f.engine.start();
+}
+
+TEST(FlushEngineTest, require_that_oldest_serial_is_found) {
+    Fixture f(1, IINTERVAL);
+    auto    foo = std::make_shared<SimpleTarget>("foo", 10);
+    auto    bar = std::make_shared<SimpleTarget>("bar", 20);
+    f.addTargetToStrategy(foo);
+    f.addTargetToStrategy(bar);
+
+    auto handler = std::make_shared<SimpleHandler>(Targets({foo, bar}), "anon", 25);
+    f.putFlushHandler("anon", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(handler->_done.await(LONG_TIMEOUT));
+    EXPECT_EQ(25ul, handler->_oldestSerial);
+    FlushDoneHistory handlerFlushDoneHistory(handler->getFlushDoneHistory());
+    if (handlerFlushDoneHistory.size() == 2u) {
+        // Lost sample of oldest serial might happen when system load is high
+        EXPECT_EQ(FlushDoneHistory({10, 25}), handlerFlushDoneHistory);
+    } else {
+        EXPECT_EQ(FlushDoneHistory({10, 20, 25}), handlerFlushDoneHistory);
+    }
+}
+
+TEST(FlushEngineTest, require_that_GC_targets_are_not_considered_when_oldest_serial_is_found) {
+    Fixture f(1, IINTERVAL);
+    auto    foo = std::make_shared<SimpleTarget>("foo", 5);
+    auto    bar = std::make_shared<GCTarget>("bar", 10);
+    auto    baz = std::make_shared<SimpleTarget>("baz", 20);
+    f.addTargetToStrategy(foo);
+    f.addTargetToStrategy(bar);
+    f.addTargetToStrategy(baz);
+
+    auto handler = std::make_shared<SimpleHandler>(Targets({foo, bar, baz}), "handler", 25);
+    f.putFlushHandler("handler", handler);
+    f.engine.start();
+
+    // The targets are flushed in sequence: 'foo', 'bar', 'baz'
+    EXPECT_TRUE(handler->_done.await(LONG_TIMEOUT));
+    EXPECT_EQ(25ul, handler->_oldestSerial);
+
+    // Before anything is flushed the oldest serial is 5.
+    // After 'foo' has been flushed the oldest serial is 20 as GC target 'bar' is not considered.
+    FlushDoneHistory history = handler->getFlushDoneHistory();
+    EXPECT_TRUE(history.end() == std::find(history.begin(), history.end(), 10));
+    auto last_unique = std::unique(history.begin(), history.end());
+    history.erase(last_unique, history.end());
+    EXPECT_EQ(FlushDoneHistory({5, 20, 25}), history);
+}
+
+TEST(FlushEngineTest, require_that_oldest_serial_is_found_in_group) {
+    Fixture f(2, IINTERVAL);
+    auto    fooT1 = std::make_shared<SimpleTarget>("fooT1", 10);
+    auto    fooT2 = std::make_shared<SimpleTarget>("fooT2", 20);
+    auto    barT1 = std::make_shared<SimpleTarget>("barT1", 5);
+    auto    barT2 = std::make_shared<SimpleTarget>("barT2", 15);
+    f.addTargetToStrategy(fooT1);
+    f.addTargetToStrategy(fooT2);
+    f.addTargetToStrategy(barT1);
+    f.addTargetToStrategy(barT2);
+
+    auto fooH = std::make_shared<SimpleHandler>(Targets({fooT1, fooT2}), "fooH", 25);
+    f.putFlushHandler("foo", fooH);
+
+    auto barH = std::make_shared<SimpleHandler>(Targets({barT1, barT2}), "barH", 20);
+    f.putFlushHandler("bar", barH);
+
+    f.engine.start();
+
+    EXPECT_TRUE(fooH->_done.await(LONG_TIMEOUT));
+    EXPECT_EQ(25ul, fooH->_oldestSerial);
+    // [ 10, 25 ], [10, 10, 25], [ 10, 25, 25 ] and [ 10, 20, 25 ] are
+    // legal histories
+    FlushDoneHistory fooHFlushDoneHistory(fooH->getFlushDoneHistory());
+    if (fooHFlushDoneHistory != FlushDoneHistory({10, 25}) &&
+        fooHFlushDoneHistory != FlushDoneHistory({10, 10, 25}) &&
+        fooHFlushDoneHistory != FlushDoneHistory({10, 25, 25}))
+    {
+        EXPECT_EQ(FlushDoneHistory({10, 20, 25}), fooHFlushDoneHistory);
+    }
+    EXPECT_TRUE(barH->_done.await(LONG_TIMEOUT));
+    EXPECT_EQ(20ul, barH->_oldestSerial);
+    // [ 5, 20 ], [5, 5, 20], [ 5, 20, 20 ] and [ 5, 15, 20 ] are
+    // legal histories
+    FlushDoneHistory barHFlushDoneHistory(barH->getFlushDoneHistory());
+    if (barHFlushDoneHistory != FlushDoneHistory({5, 20}) && barHFlushDoneHistory != FlushDoneHistory({5, 5, 20}) &&
+        barHFlushDoneHistory != FlushDoneHistory({5, 20, 20}))
+    {
+        EXPECT_EQ(FlushDoneHistory({5, 15, 20}), barHFlushDoneHistory);
+    }
+}
+
+TEST(FlushEngineTest, require_that_target_can_refuse_flush) {
+    Fixture f(2, IINTERVAL);
+    auto    target = std::make_shared<SimpleTarget>();
+    auto    handler = std::make_shared<SimpleHandler>(Targets({target}));
+    target->_task = searchcorespi::FlushTask::UP();
+    f.putFlushHandler("anon", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(target->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(!target->_taskDone.await(SHORT_TIMEOUT));
+    EXPECT_TRUE(!handler->_done.await(SHORT_TIMEOUT));
+}
+
+TEST(FlushEngineTest, require_that_targets_are_flushed_when_nothing_new_to_flush) {
+    Fixture f(2, IINTERVAL);
+    auto    target = std::make_shared<SimpleTarget>("anon", 5); // oldest unflushed serial num = 5
+    auto    handler = std::make_shared<SimpleHandler>(Targets({target}), "anon", 4); // current serial num = 4
+    f.putFlushHandler("anon", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(target->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target->_taskDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(handler->_done.await(LONG_TIMEOUT));
+}
+
+TEST(FlushEngineTest, require_that_flushing_targets_are_skipped) {
+    Fixture f(2, IINTERVAL);
+    auto    foo = std::make_shared<SimpleTarget>("foo");
+    auto    bar = std::make_shared<SimpleTarget>("bar");
+    f.addTargetToStrategy(foo);
+    f.addTargetToStrategy(bar);
+
+    auto handler = std::make_shared<SimpleHandler>(Targets({bar, foo}));
+    f.putFlushHandler("anon", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(foo->_taskDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(bar->_taskDone.await(LONG_TIMEOUT)); /* this is the key check */
+}
+
+TEST(FlushEngineTest, require_that_updated_targets_are_not_skipped) {
+    Fixture f(2, IINTERVAL);
+    auto    target = std::make_shared<SimpleTarget>("target", 1);
+    f.addTargetToStrategy(target);
+
+    auto handler = std::make_shared<SimpleHandler>(Targets({target}), "handler", 0);
+    f.putFlushHandler("handler", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(target->_taskDone.await(LONG_TIMEOUT));
+}
+
+TEST(FlushEngineTest, require_that_threaded_target_works) {
+    SimpleExecutor     executor;
+    SimpleGetSerialNum getSerialNum;
+    auto               target =
+        std::make_shared<ThreadedFlushTarget>(executor, getSerialNum, std::make_shared<SimpleTarget>(), "0.ready");
+
+    EXPECT_FALSE(executor._done.await(SHORT_TIMEOUT));
+    EXPECT_TRUE(target->initFlush(0, std::make_shared<search::FlushToken>()));
+    EXPECT_TRUE(executor._done.await(LONG_TIMEOUT));
+}
+
+TEST(FlushEngineTest, require_that_cached_target_works) {
+    auto target = std::make_shared<CachedFlushTarget>(std::make_shared<AssertedTarget>());
+    for (uint32_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(0l, target->getApproxMemoryGain().getBefore());
+        EXPECT_EQ(0l, target->getApproxMemoryGain().getAfter());
+        EXPECT_EQ(0ul, target->getFlushedSerialNum());
+    }
+}
+
+TEST(FlushEngineTest, require_that_trigger_flush_works) {
+    Fixture f(2, IINTERVAL);
+    auto    target = std::make_shared<SimpleTarget>("target", 1);
+    f.addTargetToStrategy(target);
+
+    auto handler = std::make_shared<SimpleHandler>(Targets({target}), "handler", 9);
+    f.putFlushHandler("handler", handler);
+    f.engine.start();
+    f.engine.trigger_flush2().wait();
+    EXPECT_TRUE(target->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target->_taskDone.await(LONG_TIMEOUT));
+}
+
+bool asserCorrectHandlers(const FlushEngine::FlushMetaSet& current1, const std::vector<std::string>& targets) {
+    bool retval(targets.size() == current1.size());
+    auto curr = current1.begin();
+    if (retval) {
+        for (auto& target : targets) {
+            if (target != (curr++)->getName()) {
+                return false;
+            }
+        }
+    }
+    return retval;
+}
+
+void assertThatHandlersInCurrentSet(FlushEngine& engine, const std::vector<std::string>& targets) {
+    FlushEngine::FlushMetaSet current1 = engine.getCurrentlyFlushingSet();
+    while ((current1.size() < targets.size()) || !asserCorrectHandlers(current1, targets)) {
+        std::this_thread::sleep_for(1ms);
+        current1 = engine.getCurrentlyFlushingSet();
+    }
+}
+
+TEST(FlushEngineTest, require_that_concurrency_works) {
+    Fixture f(2, 1ms);
+    auto    target1 = std::make_shared<SimpleTarget>("target1", 1, false);
+    auto    target2 = std::make_shared<SimpleTarget>("target2", 2, false);
+    auto    target3 = std::make_shared<SimpleTarget>("target3", 3, false);
+    auto    handler = std::make_shared<SimpleHandler>(Targets({target1, target2, target3}), "handler", 9);
+    f.putFlushHandler("handler", handler);
+    f.engine.start();
+
+    EXPECT_TRUE(target1->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target2->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(!target3->_initDone.await(SHORT_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target1", "handler.target2"});
+    EXPECT_TRUE(!target3->_initDone.await(SHORT_TIMEOUT));
+    target1->_proceed.countDown();
+    EXPECT_TRUE(target1->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target2", "handler.target3"});
+    target3->_proceed.countDown();
+    target2->_proceed.countDown();
+}
+
+TEST(FlushEngineTest, require_that_there_is_room_for_one_and_only_one_high_pri_target) {
+    Fixture f(2, 1ms, std::make_unique<SimpleStrategy>(SimpleStrategy::OrderBy::SERIAL, false));
+    auto    target1 = std::make_shared<SimpleTarget>("target1", 1, false);
+    auto    target2 = std::make_shared<SimpleTarget>("target2", 2, false);
+    auto    target3 = std::make_shared<HighPriorityTarget>("target3", 3, false);
+    auto    target4 = std::make_shared<HighPriorityTarget>("target4", 4, false);
+    auto    handler = std::make_shared<SimpleHandler>(Targets({target1, target2, target3, target4}), "handler", 9);
+    f.putFlushHandler("handler", handler);
+    f.engine.start();
+    EXPECT_EQ(2u, f.engine.maxConcurrentNormal());
+    EXPECT_EQ(3u, f.engine.maxConcurrentTotal());
+    EXPECT_EQ(f.engine.maxConcurrentTotal(), f.engine.get_executor().getNumThreads());
+
+    EXPECT_TRUE(target1->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target2->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target3->_initDone.await(LONG_TIMEOUT));
+    EXPECT_FALSE(target4->_initDone.await(SHORT_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target1", "handler.target2", "handler.target3"});
+    target1->_proceed.countDown();
+    EXPECT_TRUE(target1->_taskDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target4->_initDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target2", "handler.target3", "handler.target4"});
+    target2->_proceed.countDown();
+    EXPECT_TRUE(target2->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target3", "handler.target4"});
+    target3->_proceed.countDown();
+    EXPECT_TRUE(target3->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target4"});
+    target4->_proceed.countDown();
+    EXPECT_TRUE(target4->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {});
+}
+
+TEST(FlushEngineTest, require_that_high_priority_does_not_jump_the_queue) {
+    Fixture f(2, 1ms, std::make_unique<SimpleStrategy>(SimpleStrategy::OrderBy::SERIAL, false));
+    auto    target1 = std::make_shared<SimpleTarget>("target1", 1, false);
+    auto    target2 = std::make_shared<SimpleTarget>("target2", 2, false);
+    auto    target3 = std::make_shared<SimpleTarget>("target3", 3, false);
+    auto    target4 = std::make_shared<HighPriorityTarget>("target4", 4, false);
+    auto    handler = std::make_shared<SimpleHandler>(Targets({target1, target2, target3, target4}), "handler", 9);
+    f.putFlushHandler("handler", handler);
+    f.engine.start();
+    EXPECT_EQ(2u, f.engine.maxConcurrentNormal());
+    EXPECT_EQ(3u, f.engine.maxConcurrentTotal());
+    EXPECT_EQ(f.engine.maxConcurrentTotal(), f.engine.get_executor().getNumThreads());
+
+    EXPECT_TRUE(target1->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target2->_initDone.await(LONG_TIMEOUT));
+    EXPECT_FALSE(target3->_initDone.await(SHORT_TIMEOUT));
+    EXPECT_FALSE(target4->_initDone.await(SHORT_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target1", "handler.target2"});
+    target1->_proceed.countDown();
+    EXPECT_TRUE(target1->_taskDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target3->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target4->_initDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target2", "handler.target3", "handler.target4"});
+    target2->_proceed.countDown();
+    EXPECT_TRUE(target2->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target3", "handler.target4"});
+    target3->_proceed.countDown();
+    EXPECT_TRUE(target3->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target4"});
+    target4->_proceed.countDown();
+    EXPECT_TRUE(target4->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {});
+}
+
+TEST(FlushEngineTest, require_that_concurrency_works_with_triggerFlush) {
+    Fixture f(2, 1ms);
+    auto    target1 = std::make_shared<SimpleTarget>("target1", 1, false);
+    auto    target2 = std::make_shared<SimpleTarget>("target2", 2, false);
+    auto    target3 = std::make_shared<SimpleTarget>("target3", 3, false);
+    auto    handler = std::make_shared<SimpleHandler>(Targets({target1, target2, target3}), "handler", 9);
+    f.putFlushHandler("handler", handler);
+    std::thread thread([&f]() { f.engine.trigger_flush2().wait(); });
+    std::this_thread::sleep_for(1s);
+    f.engine.start();
+
+    EXPECT_TRUE(target1->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target2->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(!target3->_initDone.await(SHORT_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target1", "handler.target2"});
+    EXPECT_TRUE(!target3->_initDone.await(SHORT_TIMEOUT));
+    target1->_proceed.countDown();
+    EXPECT_TRUE(target1->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target2", "handler.target3"});
+    target3->_proceed.countDown();
+    target2->_proceed.countDown();
+    thread.join();
+}
+
+TEST(FlushEngineTest, require_that_state_explorer_can_list_flush_targets) {
+    Fixture f(1, 1ms);
+    auto    target = std::make_shared<SimpleTarget>("target1", 100, false);
+    f.putFlushHandler("handler",
+                      std::make_shared<SimpleHandler>(
+                          Targets({target, std::make_shared<SimpleTarget>("target2", 50, true)}), "handler", 9));
+    f.engine.start();
+    target->_initDone.await(LONG_TIMEOUT);
+    target->_taskStart.await(LONG_TIMEOUT);
+
+    FlushEngineExplorer explorer(f.engine, PrepareRestartCostsConfig(1.0, 1.0, 1.0, 1.0));
+    Slime               state;
+    SlimeInserter       inserter(state);
+    explorer.get_state(inserter, true);
+
+    Inspector& all = state.get()["allTargets"];
+    EXPECT_EQ(2u, all.children());
+    EXPECT_EQ("handler.target2", all[0]["name"].asString().make_string());
+    EXPECT_EQ(50, all[0]["flushedSerialNum"].asLong());
+    EXPECT_EQ("handler.target1", all[1]["name"].asString().make_string());
+    EXPECT_EQ(100, all[1]["flushedSerialNum"].asLong());
+
+    Inspector& flushing = state.get()["flushingTargets"];
+    EXPECT_EQ(1u, flushing.children());
+    EXPECT_EQ("handler.target1", flushing[0]["name"].asString().make_string());
+
+    target->_proceed.countDown();
+    target->_taskDone.await(LONG_TIMEOUT);
+}
+
+TEST(FlushEngineTest, require_that_oldest_serial_is_updated_when_closing_engine) {
+    Fixture f(1, 100ms);
+    auto    target1 = std::make_shared<SimpleTarget>("target1", 10, false);
+    auto    handler = f.addSimpleHandler({target1});
+    f.assertOldestSerial(*handler, 10);
+    target1->_proceed.countDown();
+    f.engine.close();
+    EXPECT_EQ(20u, handler->_oldestSerial);
+}
+
+TEST(FlushEngineTest, require_that_oldest_serial_is_updated_when_finishing_priority_flush_strategy) {
+    Fixture f(1, 100ms, std::make_shared<NoFlushStrategy>());
+    auto    target1 = std::make_shared<SimpleTarget>("target1", 10, true);
+    auto    handler = f.addSimpleHandler({target1});
+    f.assertOldestSerial(*handler, 10);
+    f.engine.set_strategy(std::make_shared<SimpleStrategy>(SimpleStrategy::OrderBy::INDEX_OF, true)).wait();
+    EXPECT_EQ(20u, handler->_oldestSerial);
+}
+
+TEST(FlushEngineTest, the_oldest_start_time_is_tracked_per_flush_handler_in_ActiveFlushStats) {
+    using seconds = std::chrono::seconds;
+    using vespalib::system_time;
+    system_time      now = vespalib::system_clock::now();
+    system_time      t1 = now + seconds(1);
+    system_time      t2 = now + seconds(2);
+    system_time      t3 = now + seconds(3);
+    system_time      t4 = now + seconds(4);
+    ActiveFlushStats stats;
+    EXPECT_FALSE(stats.oldest_start_time("h1").has_value());
+    stats.set_start_time("h1", t2);
+    stats.set_start_time("h2", t4);
+    EXPECT_EQ(t2, stats.oldest_start_time("h1").value());
+    EXPECT_EQ(t4, stats.oldest_start_time("h2").value());
+
+    stats.set_start_time("h1", t1);
+    EXPECT_EQ(t1, stats.oldest_start_time("h1").value());
+    stats.set_start_time("h1", t3);
+    EXPECT_EQ(t1, stats.oldest_start_time("h1").value());
+}
+
+TEST(FlushEngineTest, reserved_disk_space_and_memory_is_calculated) {
+    Fixture f(2, 50ms); // 2 normal flush threads, 3 total flush threads
+    auto    target1 =
+        std::make_shared<ReservedDiskSpaceAndMemoryTarget>("target1", 1, IFlushTarget::DiskGain(10, 20), 10);
+    auto target2 =
+        std::make_shared<ReservedDiskSpaceAndMemoryTarget>("target2", 2, IFlushTarget::DiskGain(100, 200), 100);
+    auto target3 =
+        std::make_shared<ReservedDiskSpaceAndMemoryTarget>("target3", 3, IFlushTarget::DiskGain(1000, 2000), 1000);
+    auto target4 =
+        std::make_shared<ReservedDiskSpaceAndMemoryTarget>("target4", 4, IFlushTarget::DiskGain(10000, 20000), 10000);
+    auto handler = std::make_shared<SimpleHandler>(Targets({target1, target2, target3, target4}), "handler", 9);
+    f.putFlushHandler("handler", handler);
+
+    /*
+     * Reserved disk space for flush is limited by 3 total flush threads
+     * Reserved disk space for flush:  2000 + 20000
+     * Reserved disk space for growth: 10 + 100 + 1000 + 10000
+     */
+    EXPECT_EQ(33110, f.engine.get_reserved_disk_space_and_memory().reserved_disk_space());
+    EXPECT_EQ(11000, f.engine.get_reserved_disk_space_and_memory().reserved_memory());
+    f.engine.start();
+
+    EXPECT_TRUE(target1->_initDone.await(LONG_TIMEOUT));
+    EXPECT_TRUE(target2->_initDone.await(LONG_TIMEOUT));
+    EXPECT_FALSE(target3->_initDone.await(SHORT_TIMEOUT));
+    EXPECT_FALSE(target4->_initDone.await(SHORT_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target1", "handler.target2"});
+    EXPECT_FALSE(target3->_initDone.await(SHORT_TIMEOUT));
+    /*
+     * Reserved disk space for flush:  2000 + 20000
+     * Reserved disk space for growth: 10 + 100 + 1000 + 10000
+     */
+    EXPECT_EQ(33110, f.engine.get_reserved_disk_space_and_memory().reserved_disk_space());
+    EXPECT_EQ(11000, f.engine.get_reserved_disk_space_and_memory().reserved_memory());
+    target1->_proceed.countDown();
+    EXPECT_TRUE(target1->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target2", "handler.target3"});
+    /*
+     * Assumes no more growth for target1, cf. ReservedDiskSpaceTask::on_run
+     * Reserved disk space for flush:  2000 + 20000
+     * Reserved disk space for growth: 100 + 1000 + 10000
+     */
+    EXPECT_EQ(33100, f.engine.get_reserved_disk_space_and_memory().reserved_disk_space());
+    EXPECT_EQ(11000, f.engine.get_reserved_disk_space_and_memory().reserved_memory());
+    target3->_proceed.countDown();
+    EXPECT_TRUE(target3->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target2", "handler.target4"});
+    /*
+     * Assumes no more growth for target1 and target3
+     * Reserved disk space for flush:  2000 + 20000
+     * Reserved disk space for growth: 100 + 10000
+     */
+    EXPECT_EQ(32100, f.engine.get_reserved_disk_space_and_memory().reserved_disk_space());
+    EXPECT_EQ(11000, f.engine.get_reserved_disk_space_and_memory().reserved_memory());
+    target2->_proceed.countDown();
+    EXPECT_TRUE(target2->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {"handler.target4"});
+    /*
+     * Assumes no more growth for target1, target2 and target3
+     * Reserved disk space for flush:  2000 + 20000
+     * Reserved disk space for growth: 10000
+     */
+    EXPECT_EQ(32000, f.engine.get_reserved_disk_space_and_memory().reserved_disk_space());
+    EXPECT_EQ(11000, f.engine.get_reserved_disk_space_and_memory().reserved_memory());
+    target4->_proceed.countDown();
+    EXPECT_TRUE(target4->_taskDone.await(LONG_TIMEOUT));
+    assertThatHandlersInCurrentSet(f.engine, {});
+    /*
+     * Assumes no more growth for target1, target2, target3 and target4
+     * Reserved disk space for flush:  2000 + 20000
+     * Reserved disk space for growth: 0
+     */
+    EXPECT_EQ(22000, f.engine.get_reserved_disk_space_and_memory().reserved_disk_space());
+    EXPECT_EQ(11000, f.engine.get_reserved_disk_space_and_memory().reserved_memory());
+}
+
+GTEST_MAIN_RUN_ALL_TESTS()

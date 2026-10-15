@@ -1,0 +1,407 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "attributedfw.h"
+
+#include "docsum_field_writer_state.h"
+#include "docsumstate.h"
+#include "docsumwriter.h"
+#include "empty_docsum_field_writer_state.h"
+#include "summary_elements_selector.h"
+
+#include <vespa/check_require.h>
+#include <vespa/eval/eval/value.h>
+#include <vespa/eval/eval/value_codec.h>
+#include <vespa/searchcommon/attribute/i_array_bool_read_view.h>
+#include <vespa/searchcommon/attribute/i_multi_value_attribute.h>
+#include <vespa/searchcommon/attribute/multi_value_traits.h>
+#include <vespa/searchlib/attribute/iattributemanager.h>
+#include <vespa/searchlib/common/matching_elements.h>
+#include <vespa/searchlib/common/matching_elements_fields.h>
+#include <vespa/searchlib/tensor/i_tensor_attribute.h>
+#include <vespa/searchlib/tensor/tensor_quantization.h>
+#include <vespa/vespalib/data/slime/slime.h>
+#include <vespa/vespalib/objects/nbostream.h>
+#include <vespa/vespalib/util/issue.h>
+
+#include <vespa/log/log.h>
+LOG_SETUP(".searchlib.docsummary.attributedfw");
+
+using namespace search;
+using attribute::BasicType;
+using attribute::IArrayBoolReadView;
+using attribute::IAttributeContext;
+using attribute::IAttributeVector;
+using attribute::IMultiValueAttribute;
+using attribute::IMultiValueReadView;
+using common::ElementIds;
+using vespalib::Issue;
+using vespalib::Memory;
+using vespalib::eval::Value;
+using vespalib::slime::Cursor;
+using vespalib::slime::Inserter;
+using vespalib::slime::Symbol;
+
+namespace search::docsummary {
+
+AttrDFW::AttrDFW(const std::string& attrName) : _attrName(attrName) {
+}
+
+const IAttributeVector& AttrDFW::get_attribute(const GetDocsumsState& s) const {
+    return *s.getAttribute(getIndex());
+}
+
+namespace {
+
+class SingleAttrDFW : public AttrDFW {
+public:
+    explicit SingleAttrDFW(const std::string& attrName) : AttrDFW(attrName) {}
+    void insert_field(uint32_t docid, const IDocsumStoreDocument* doc, GetDocsumsState& state,
+                      ElementIds selected_elements, Inserter& target) const override;
+    bool isDefaultValue(uint32_t docid, const GetDocsumsState& state) const override {
+        return get_attribute(state).isUndefined(docid);
+    }
+};
+
+void SingleAttrDFW::insert_field(uint32_t docid, const IDocsumStoreDocument*, GetDocsumsState& state, ElementIds,
+                                 Inserter& target) const {
+    const auto& v = get_attribute(state);
+    switch (v.getBasicType()) {
+    case BasicType::Type::UINT2:
+    case BasicType::Type::UINT4:
+    case BasicType::Type::INT8:
+    case BasicType::Type::INT16:
+    case BasicType::Type::INT32:
+    case BasicType::Type::INT64: {
+        int64_t val = v.getInt(docid);
+        target.insertLong(val);
+        break;
+    }
+    case BasicType::Type::BOOL: {
+        uint8_t val = v.getInt(docid);
+        target.insertBool(val != 0);
+        break;
+    }
+    case BasicType::Type::FLOAT:
+    case BasicType::Type::DOUBLE: {
+        double val = v.getFloat(docid);
+        target.insertDouble(val);
+        break;
+    }
+    case BasicType::Type::TENSOR: {
+        break; // Not handled by this field writer
+    }
+    case BasicType::STRING: {
+        auto s = v.get_raw(docid);
+        target.insertString(Memory(s.data(), s.size()));
+        break;
+    }
+    case BasicType::RAW: {
+        auto s = v.get_raw(docid);
+        target.insertData(Memory(s.data(), s.size()));
+        break;
+    }
+    case BasicType::REFERENCE:
+    case BasicType::PREDICATE:
+        break; // Should never use attribute docsum field writer
+    default:
+        break; // Unknown type
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+class TensorAttrDFW : public AttrDFW {
+    uint32_t _state_index; // index into _fieldWriterStates in GetDocsumsState
+
+public:
+    TensorAttrDFW(const std::string& attr_name) : AttrDFW(attr_name), _state_index(0) {}
+    bool setFieldWriterStateIndex(uint32_t field_writer_state_index) override {
+        _state_index = field_writer_state_index;
+        return true;
+    }
+    void insert_field(uint32_t docid, const IDocsumStoreDocument* doc, GetDocsumsState& state,
+                      ElementIds selected_elements, Inserter& target) const override;
+};
+
+class TensorAttrDFWState : public DocsumFieldWriterState {
+    const tensor::ITensorAttribute&            _tensor_attr;
+    std::unique_ptr<tensor::TensorDequantizer> _dequantizer;
+
+public:
+    explicit TensorAttrDFWState(const tensor::ITensorAttribute& attr);
+    ~TensorAttrDFWState() override;
+    void insertField(uint32_t docid, ElementIds selected_elements, Inserter& target) override;
+};
+
+TensorAttrDFWState::TensorAttrDFWState(const tensor::ITensorAttribute& attr)
+    : _tensor_attr(attr),
+      _dequantizer(attr.is_quantized() ? attr.make_dequantizer() : std::unique_ptr<tensor::TensorDequantizer>()) {
+}
+
+TensorAttrDFWState::~TensorAttrDFWState() = default;
+
+void TensorAttrDFWState::insertField(uint32_t docid, ElementIds, Inserter& target) {
+    if (auto tensor = _tensor_attr.getTensor(docid)) {
+        if (_dequantizer) {
+            tensor = _dequantizer->dequantize(*tensor);
+        }
+        vespalib::nbostream str;
+        encode_value(*tensor, str);
+        target.insertData(Memory(str.peek(), str.size()));
+    }
+}
+
+void TensorAttrDFW::insert_field(uint32_t docid, const IDocsumStoreDocument*, GetDocsumsState& state,
+                                 ElementIds selected_elements, Inserter& target) const {
+    auto& field_writer_state = state._fieldWriterStates[_state_index];
+    if (!field_writer_state) {
+        const auto& attr = get_attribute(state);
+        const auto* as_tensor_attr = attr.asTensorAttribute();
+        CHECK(as_tensor_attr != nullptr);
+        field_writer_state = &state.get_stash().create<TensorAttrDFWState>(*as_tensor_attr);
+    }
+    field_writer_state->insertField(docid, selected_elements, target);
+}
+
+//-----------------------------------------------------------------------------
+
+template <typename MultiValueType>
+const IMultiValueReadView<MultiValueType>* make_read_view(const IAttributeVector& attribute, vespalib::Stash& stash) {
+    auto multi_value_attribute = attribute.as_multi_value_attribute();
+    if (multi_value_attribute != nullptr) {
+        return multi_value_attribute->make_read_view(IMultiValueAttribute::MultiValueTag<MultiValueType>(), stash);
+    }
+    return nullptr;
+}
+
+template <typename MultiValueType> class MultiAttrDFWState : public DocsumFieldWriterState {
+    const std::string&                         _field_name;
+    const IMultiValueReadView<MultiValueType>* _read_view;
+
+public:
+    MultiAttrDFWState(const std::string& field_name, const IAttributeVector& attr, vespalib::Stash& stash);
+    ~MultiAttrDFWState() override;
+    void insertField(uint32_t docid, ElementIds selected_elements, Inserter& target) override;
+};
+
+template <typename MultiValueType>
+MultiAttrDFWState<MultiValueType>::MultiAttrDFWState(const std::string& field_name, const IAttributeVector& attr,
+                                                     vespalib::Stash& stash)
+    : _field_name(field_name), _read_view(make_read_view<MultiValueType>(attr, stash)) {
+}
+
+template <typename MultiValueType> MultiAttrDFWState<MultiValueType>::~MultiAttrDFWState() = default;
+
+template <typename V> void set_value(V value, Symbol item_symbol, Cursor& cursor) {
+    if constexpr (std::is_same_v<V, const char*>) {
+        cursor.setString(item_symbol, value);
+    } else if constexpr (std::is_floating_point_v<V>) {
+        cursor.setDouble(item_symbol, value);
+    } else {
+        cursor.setLong(item_symbol, value);
+    }
+}
+
+template <typename V> void append_value(V value, Cursor& arr) {
+    if constexpr (std::is_same_v<V, const char*>) {
+        arr.addString(value);
+    } else if constexpr (std::is_floating_point_v<V>) {
+        arr.addDouble(value);
+    } else {
+        arr.addLong(value);
+    }
+}
+
+Memory ITEM("item");
+Memory WEIGHT("weight");
+
+template <typename MultiValueType>
+void MultiAttrDFWState<MultiValueType>::insertField(uint32_t docid, ElementIds selected_elements, Inserter& target) {
+    using ValueType = multivalue::ValueType_t<MultiValueType>;
+    if (!_read_view) {
+        return;
+    }
+    auto elements = _read_view->get_values(docid);
+    if (elements.empty()) {
+        return;
+    }
+    if (!selected_elements.all_elements()) {
+        if (selected_elements.empty() || selected_elements.back() >= elements.size()) {
+            return;
+        }
+        Cursor& arr = target.insertArray(elements.size());
+        if constexpr (multivalue::is_WeightedValue_v<MultiValueType>) {
+            Symbol itemSymbol = arr.resolve(ITEM);
+            Symbol weightSymbol = arr.resolve(WEIGHT);
+            for (uint32_t id_to_keep : selected_elements) {
+                auto&   element = elements[id_to_keep];
+                Cursor& elemC = arr.addObject();
+                set_value<ValueType>(element.value(), itemSymbol, elemC);
+                elemC.setLong(weightSymbol, element.weight());
+            }
+        } else {
+            for (uint32_t id_to_keep : selected_elements) {
+                append_value<ValueType>(elements[id_to_keep], arr);
+            }
+        }
+    } else {
+        Cursor& arr = target.insertArray(elements.size());
+        if constexpr (multivalue::is_WeightedValue_v<MultiValueType>) {
+            Symbol itemSymbol = arr.resolve(ITEM);
+            Symbol weightSymbol = arr.resolve(WEIGHT);
+            for (const auto& element : elements) {
+                Cursor& elemC = arr.addObject();
+                set_value<ValueType>(element.value(), itemSymbol, elemC);
+                elemC.setLong(weightSymbol, element.weight());
+            }
+        } else {
+            for (const auto& element : elements) {
+                append_value<ValueType>(element, arr);
+            }
+        }
+    }
+}
+
+class MultiAttrDFWStateBool : public DocsumFieldWriterState {
+    const IArrayBoolReadView* _read_view;
+
+public:
+    MultiAttrDFWStateBool(const IAttributeVector& attr, vespalib::Stash& stash);
+    ~MultiAttrDFWStateBool() override;
+    void insertField(uint32_t docid, ElementIds selected_elements, Inserter& target) override;
+};
+
+MultiAttrDFWStateBool::MultiAttrDFWStateBool(const IAttributeVector& attr, vespalib::Stash& stash)
+    : _read_view(nullptr) {
+    auto multi_value_attribute = attr.as_multi_value_attribute();
+    if (multi_value_attribute != nullptr) {
+        _read_view = multi_value_attribute->make_read_view(IMultiValueAttribute::ArrayBoolTag(), stash);
+    }
+}
+
+MultiAttrDFWStateBool::~MultiAttrDFWStateBool() = default;
+
+void MultiAttrDFWStateBool::insertField(uint32_t docid, ElementIds selected_elements, Inserter& target) {
+    if (!_read_view) {
+        return;
+    }
+    auto elements = _read_view->get_values(docid);
+    if (elements.empty()) {
+        return;
+    }
+    if (!selected_elements.all_elements()) {
+        if (selected_elements.empty() || selected_elements.back() >= elements.size()) {
+            return;
+        }
+        Cursor& arr = target.insertArray();
+        for (uint32_t id_to_keep : selected_elements) {
+            arr.addBool(elements[id_to_keep]);
+        }
+    } else {
+        Cursor& arr = target.insertArray(elements.size());
+        for (bool element : elements) {
+            arr.addBool(element);
+        }
+    }
+}
+
+class MultiAttrDFW : public AttrDFW {
+    uint32_t _state_index; // index into _fieldWriterStates in GetDocsumsState
+
+public:
+    MultiAttrDFW(const std::string& attr_name) : AttrDFW(attr_name), _state_index(0) {}
+    bool setFieldWriterStateIndex(uint32_t fieldWriterStateIndex) override;
+    void insert_field(uint32_t docid, const IDocsumStoreDocument* doc, GetDocsumsState& state,
+                      ElementIds selected_elements, Inserter& target) const override;
+};
+
+bool MultiAttrDFW::setFieldWriterStateIndex(uint32_t fieldWriterStateIndex) {
+    _state_index = fieldWriterStateIndex;
+    return true;
+}
+
+template <typename DataType>
+DocsumFieldWriterState* make_field_writer_state_helper(const std::string& field_name, const IAttributeVector& attr,
+                                                       vespalib::Stash& stash) {
+    bool is_weighted_set = attr.hasWeightedSetType();
+    if (is_weighted_set) {
+        return &stash.create<MultiAttrDFWState<multivalue::WeightedValue<DataType>>>(field_name, attr, stash);
+    } else {
+        return &stash.create<MultiAttrDFWState<DataType>>(field_name, attr, stash);
+    }
+}
+
+DocsumFieldWriterState* make_field_writer_state(const std::string& field_name, const IAttributeVector& attr,
+                                                vespalib::Stash& stash) {
+    auto type = attr.getBasicType();
+    switch (type) {
+    case BasicType::Type::STRING:
+        return make_field_writer_state_helper<const char*>(field_name, attr, stash);
+    case BasicType::Type::INT8:
+        return make_field_writer_state_helper<int8_t>(field_name, attr, stash);
+    case BasicType::Type::INT16:
+        return make_field_writer_state_helper<int16_t>(field_name, attr, stash);
+    case BasicType::Type::INT32:
+        return make_field_writer_state_helper<int32_t>(field_name, attr, stash);
+    case BasicType::Type::INT64:
+        return make_field_writer_state_helper<int64_t>(field_name, attr, stash);
+    case BasicType::Type::FLOAT:
+        return make_field_writer_state_helper<float>(field_name, attr, stash);
+    case BasicType::Type::DOUBLE:
+        return make_field_writer_state_helper<double>(field_name, attr, stash);
+    case BasicType::Type::BOOL:
+        return &stash.create<MultiAttrDFWStateBool>(attr, stash);
+    default:;
+    }
+    return &stash.create<EmptyDocsumFieldWriterState>();
+}
+
+void MultiAttrDFW::insert_field(uint32_t docid, const IDocsumStoreDocument*, GetDocsumsState& state,
+                                ElementIds selected_elements, Inserter& target) const {
+    auto& field_writer_state = state._fieldWriterStates[_state_index];
+    if (!field_writer_state) {
+        const auto& attr = get_attribute(state);
+        field_writer_state = make_field_writer_state(getAttributeName(), attr, state.get_stash());
+    }
+    field_writer_state->insertField(docid, selected_elements, target);
+}
+
+std::unique_ptr<DocsumFieldWriter> create_multi_writer(const IAttributeVector& attr) {
+    auto type = attr.getBasicType();
+    switch (type) {
+    case BasicType::STRING:
+    case BasicType::INT8:
+    case BasicType::INT16:
+    case BasicType::INT32:
+    case BasicType::INT64:
+    case BasicType::FLOAT:
+    case BasicType::DOUBLE:
+    case BasicType::BOOL:
+        return std::make_unique<MultiAttrDFW>(attr.getName());
+    default:
+        // should not happen
+        LOG(error, "Bad value for attribute type: %u", type);
+        LOG_ASSERT(false);
+    }
+}
+
+} // namespace
+
+std::unique_ptr<DocsumFieldWriter> AttributeDFWFactory::create(const IAttributeManager& attr_mgr,
+                                                               const std::string&       attr_name) {
+    auto        ctx = attr_mgr.createContext();
+    const auto* attr = ctx->getAttribute(attr_name);
+    if (attr == nullptr) {
+        Issue::report("No valid attribute vector found: '%s'", attr_name.c_str());
+        return {};
+    }
+    if (attr->hasMultiValue()) {
+        return create_multi_writer(*attr);
+    } else if (attr->getBasicType() == BasicType::TENSOR) {
+        return std::make_unique<TensorAttrDFW>(attr->getName());
+    } else {
+        return std::make_unique<SingleAttrDFW>(attr->getName());
+    }
+}
+
+} // namespace search::docsummary

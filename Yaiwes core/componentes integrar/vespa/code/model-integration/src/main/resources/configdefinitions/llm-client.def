@@ -1,0 +1,32 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package=ai.vespa.llm.clients
+
+# The name of the secret containing the api key
+apiKeySecretName string default=""
+apiKeySecretRef string default=""
+
+# Endpoint for LLM client - if not set reverts to default for client
+endpoint string default=""
+
+# LLM APIs often provide several models, e.g. gpt-4o and gpt-4o-mini from OpenAI.
+# Specify a model to use by default when not overwritten by inference parameters.
+# Empty means use default for the API.
+model string default=""
+
+# Sampling temperature, between 0 and 1.
+# Higher values make the output more random, while lower values are more focused and deterministic.
+# -1 means use default for the API.
+temperature double default=-1
+
+# The maximum number of tokens that can be generated in the completion.
+# -1 means use default for the API.
+maxTokens int default=-1
+# Constrains effort on reasoning for reasoning models, e.g. "low", "medium", "high".
+# Accepted values depend on the provider (OpenAI also accepts "minimal"; Google's
+# OpenAI-compatible API accepts "none"). Passed through to the API as-is.
+# Empty means use default for the API.
+reasoningEffort string default=""
+
+# Whether to ask the API to follow the JSON schema of structured output exactly ("strict" mode in OpenAI).
+# The schema must then meet the API's requirements, e.g. additionalProperties false and all properties required.
+jsonSchemaStrict bool default=false
