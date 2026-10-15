@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python evaluation/extract_answer.py \
+    --model_name_or_path "Qwen/Qwen2.5-32B-Instruct" \
+    --data_name extract_answer \
+    --prompt_type qwen-instruct \
+    --split aqua \
+    --temperature 0.6 \
+    --start_idx 0 \
+    --end_idx -1 \
+    --max_tokens 16384 \
+    --seed 42 \
+    --top_p 0.95 \
+    --surround_with_messages \

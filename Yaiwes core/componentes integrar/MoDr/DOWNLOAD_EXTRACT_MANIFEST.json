@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 16699218,
+  "bundle_sha256": "23400eff7ebe25493064f6b385127f5573643a608c94282e1baf0506715b3aef",
+  "extracted_tree": {
+    "bytes": 62853452,
+    "files": 95,
+    "sha256": "357d5771265a7bcaffb60c8c7d53f6c0775758ce0a8bdd251a12298d01d846ce"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "MoDr.bundle.zip.part-0001",
+      "sha256": "7c2eb06dd474b2afc1de7d7490b7c0dfe41b1b7212bdd878b6bcff7138021bc9"
+    },
+    {
+      "bytes": 4116306,
+      "name": "MoDr.bundle.zip.part-0002",
+      "sha256": "6a4d5702ad61a46cdd70b801fb7e3696b099cd4cf401d3606f606f8d78a24dd1"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "MoDr",
+  "source_bytes": 62853452,
+  "source_commit": "4d77e558bcabfb551258daaacbee47ced3661987",
+  "source_files": 95,
+  "source_ref": "main",
+  "source_repo": "zhangxjohn/MoDr",
+  "source_tree": {
+    "bytes": 62853452,
+    "files": 95,
+    "sha256": "357d5771265a7bcaffb60c8c7d53f6c0775758ce0a8bdd251a12298d01d846ce"
+  }
+}

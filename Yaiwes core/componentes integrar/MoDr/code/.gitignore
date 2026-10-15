@@ -1,0 +1,4 @@
+# Does not upload large files to GitHub
+datasets/codefeedback_python_79k.json
+datasets/gpqa_diamond.json
+datasets/SuperGPQA-all.jsonl
