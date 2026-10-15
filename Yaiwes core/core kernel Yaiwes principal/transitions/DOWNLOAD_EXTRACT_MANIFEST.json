@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1167976,
+  "bundle_sha256": "b88571fda2b7fff375f946f446be68e32b39b43c62b7657c448af4e5269df208",
+  "extracted_tree": {
+    "bytes": 2139911,
+    "files": 82,
+    "sha256": "48c80540abfdc93d324417f74749ea415e8a2f5491687c75fd12be99309072a9"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1167976,
+      "name": "transitions.bundle.zip.part-0001",
+      "sha256": "b88571fda2b7fff375f946f446be68e32b39b43c62b7657c448af4e5269df208"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "transitions",
+  "source_bytes": 2139911,
+  "source_commit": "bd42b38f3627e6bca7274fb4d9af2e105f75da7c",
+  "source_files": 82,
+  "source_ref": "master",
+  "source_repo": "pytransitions/transitions",
+  "source_tree": {
+    "bytes": 2139911,
+    "files": 82,
+    "sha256": "48c80540abfdc93d324417f74749ea415e8a2f5491687c75fd12be99309072a9"
+  }
+}
