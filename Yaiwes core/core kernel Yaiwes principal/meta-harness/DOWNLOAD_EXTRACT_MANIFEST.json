@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1108681,
+  "bundle_sha256": "8ded3624d0f2ad5d73035833b7413c92b498beef24266276420d9a1f8dab276a",
+  "extracted_tree": {
+    "bytes": 2524602,
+    "files": 104,
+    "sha256": "7eb7803191571ac801a7382bc8b5b5ebcc31a4b4f14a20645876b5d887cafa8c"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1108681,
+      "name": "meta-harness.bundle.zip.part-0001",
+      "sha256": "8ded3624d0f2ad5d73035833b7413c92b498beef24266276420d9a1f8dab276a"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "meta-harness",
+  "source_bytes": 2524602,
+  "source_commit": "8123ccabe2b19fa1123090b2e5f1bacc20963ce8",
+  "source_files": 104,
+  "source_ref": "main",
+  "source_repo": "stanford-iris-lab/meta-harness",
+  "source_tree": {
+    "bytes": 2524602,
+    "files": 104,
+    "sha256": "7eb7803191571ac801a7382bc8b5b5ebcc31a4b4f14a20645876b5d887cafa8c"
+  }
+}
