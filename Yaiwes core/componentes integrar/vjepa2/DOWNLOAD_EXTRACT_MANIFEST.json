@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 4689312,
+  "bundle_sha256": "1b1a837b45db767ea25249eb0eff9fec1671d1f937382d2c771af89d1f047c12",
+  "extracted_tree": {
+    "bytes": 5534579,
+    "files": 173,
+    "sha256": "3ee5d20f857d5c2798f068901dc8f2e21955e4c9dd8f23aeb392834801ad1fdb"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 4689312,
+      "name": "vjepa2.bundle.zip.part-0001",
+      "sha256": "1b1a837b45db767ea25249eb0eff9fec1671d1f937382d2c771af89d1f047c12"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "vjepa2",
+  "source_bytes": 5534579,
+  "source_commit": "204698b45b3712590f06245fbfba32d3be539812",
+  "source_files": 173,
+  "source_ref": "main",
+  "source_repo": "facebookresearch/vjepa2",
+  "source_tree": {
+    "bytes": 5534579,
+    "files": 173,
+    "sha256": "3ee5d20f857d5c2798f068901dc8f2e21955e4c9dd8f23aeb392834801ad1fdb"
+  }
+}
