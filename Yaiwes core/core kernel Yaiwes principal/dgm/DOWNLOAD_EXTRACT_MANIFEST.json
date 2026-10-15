@@ -1,35 +1,24 @@
 {
-  "bundle_bytes": 11299441,
-  "bundle_sha256": "a8d0c135c1f26256b35e746562a4a5580703d939f04a95526bbfbb77805d0562",
-  "extracted_tree": {
-    "bytes": 53195497,
-    "files": 1650,
-    "sha256": "1380efab368b555c1d7b64fd286646bd5aa414fb5478f68860e6a7a3599cbd87"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 11299441,
-      "name": "dgm.bundle.zip.part-0001",
-      "sha256": "a8d0c135c1f26256b35e746562a4a5580703d939f04a95526bbfbb77805d0562"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [],
-  "skipped_special_count": 0,
-  "slug": "dgm",
-  "source_bytes": 53195497,
-  "source_commit": "a565fd2d1dca504ef5104a7cc0f3bdc4ab9b4fd2",
-  "source_files": 1650,
-  "source_ref": "main",
-  "source_repo": "jennyzzt/dgm",
-  "source_tree": {
-    "bytes": 53195497,
-    "files": 1650,
-    "sha256": "1380efab368b555c1d7b64fd286646bd5aa414fb5478f68860e6a7a3599cbd87"
-  }
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
+ "source_repo": "jennyzzt/dgm",
+ "source_commit": "a565fd2d1dca504ef5104a7cc0f3bdc4ab9b4fd2",
+ "slug": "dgm",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 1649,
+  "sha256": "a017481428ded383c82bd7c86ee97c9301091d3a29a468c805dcc51b0847b863"
+ },
+ "extracted_tree": {
+  "files": 1649,
+  "sha256": "a017481428ded383c82bd7c86ee97c9301091d3a29a468c805dcc51b0847b863"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [],
+ "gitattributes_lfs_removed": [
+  ".gitattributes (archivo eliminado: solo tenía reglas LFS)"
+ ],
+ "excluded_non_lfs": {},
+ "skipped_symlinks": [],
+ "no_lfs": true
 }
