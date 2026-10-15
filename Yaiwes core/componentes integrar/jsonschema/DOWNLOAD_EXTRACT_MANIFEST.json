@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 631442,
+  "bundle_sha256": "23fea6bcedb137f95f46cffe4792794acb51e0c81e80f55766c08ee9aaa68f19",
+  "extracted_tree": {
+    "bytes": 3565201,
+    "files": 626,
+    "sha256": "ad92b2c1c61b8960328b227a1e1bbdb154de3f833eb2de63f0b9a18f569bb573"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 631442,
+      "name": "jsonschema.bundle.zip.part-0001",
+      "sha256": "23fea6bcedb137f95f46cffe4792794acb51e0c81e80f55766c08ee9aaa68f19"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "json/tests/latest"
+  ],
+  "skipped_special_count": 1,
+  "slug": "jsonschema",
+  "source_bytes": 3565201,
+  "source_commit": "c497561ea0a95f5aac09cd63d15eb1420eb7bbec",
+  "source_files": 626,
+  "source_ref": "main",
+  "source_repo": "python-jsonschema/jsonschema",
+  "source_tree": {
+    "bytes": 3565201,
+    "files": 626,
+    "sha256": "ad92b2c1c61b8960328b227a1e1bbdb154de3f833eb2de63f0b9a18f569bb573"
+  }
+}
