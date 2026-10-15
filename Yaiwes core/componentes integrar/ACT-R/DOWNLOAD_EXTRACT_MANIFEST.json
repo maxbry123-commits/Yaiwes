@@ -1,0 +1,60 @@
+{
+  "bundle_bytes": 73942851,
+  "bundle_sha256": "ca6d3206c874ede18944f636b1f522318505c9f0f8cd3735d735b551d531155e",
+  "extracted_tree": {
+    "bytes": 170211939,
+    "files": 448,
+    "sha256": "ef9e3beddd80efc8f5c3f0effc5885384a1fed30e7b499d829c37ced71713e5a"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "ACT-R.bundle.zip.part-0001",
+      "sha256": "9257d546c9647ab4dc3debebb2ab8bfcbf54d72d761a9575b89a3699a532df99"
+    },
+    {
+      "bytes": 12582912,
+      "name": "ACT-R.bundle.zip.part-0002",
+      "sha256": "0e3079a67ed3522bdce39c0490f0b00cd4ef376a28501e2f092cb1d00bf52e1a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "ACT-R.bundle.zip.part-0003",
+      "sha256": "54eb69288d63beec94938e3f13a7c39805087d6d59ae63d6aa02650d585b6242"
+    },
+    {
+      "bytes": 12582912,
+      "name": "ACT-R.bundle.zip.part-0004",
+      "sha256": "9ae99b2a5db34ae0a1314b99d80e3d348d3fd63799b2c8744ee835339b85a288"
+    },
+    {
+      "bytes": 12582912,
+      "name": "ACT-R.bundle.zip.part-0005",
+      "sha256": "8ec24439bf870f97dc86551809e4f06c4c478d959dac7fe7b097280c27896ab2"
+    },
+    {
+      "bytes": 11028291,
+      "name": "ACT-R.bundle.zip.part-0006",
+      "sha256": "20ef868b4e6e322d5a0ef3d217a230a64cd859c56af941b0fe290cc5de606312"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "ACT-R",
+  "source_bytes": 170211939,
+  "source_commit": "8984d96d8eb7b49d2dd403894fdb80f15da43be6",
+  "source_files": 448,
+  "source_ref": "main",
+  "source_repo": "asmaloney/ACT-R",
+  "source_tree": {
+    "bytes": 170211939,
+    "files": 448,
+    "sha256": "ef9e3beddd80efc8f5c3f0effc5885384a1fed30e7b499d829c37ced71713e5a"
+  }
+}
