@@ -117,3 +117,10 @@ Otros agentes empujan a `Yaiwes` main a la vez. Reglas:
 
 ---
 
+
+
+---
+## Cierre final Yaiwes core (2026-10-15)
+- core kernel Yaiwes principal: 103 repos + 7 enlazados a shark imput (110/110 de la lista t126u).
+- componentes para integrar al core Yaiwes: 49 repos. Los 115 cubiertos: 107 en Yaiwes core + 8 en shark imput.
+- Forense blob a blob contra upstream: idéntico salvo renovate (1 archivo excluido por push protection) y MoDr (upstream vacío hoy).

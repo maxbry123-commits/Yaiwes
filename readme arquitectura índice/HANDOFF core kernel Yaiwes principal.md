@@ -11,4 +11,12 @@
 ## Reanudar / auditar
 1. Cada `<slug>/` tiene `code/` + `DOWNLOAD_EXTRACT_MANIFEST.json`.
 2. Recuento archivos `code/` = `extracted_tree.files`; si no cuadra, se conserva `_archives/` (fuente completa verificada por sha256).
-3. Fallidos pendientes: qdrant, autogen, agent-framework (LFS en origen), renovate (reglas de push).
+3. Sin fallidos pendientes (ver cierre final).
+
+
+---
+## Cierre final 2026-10-15 (America/Bogota)
+- 65 repos con árbol≠manifiesto: 3227 archivos faltantes recuperados desde `_archives` con motor_1 (CRC + tree hash = manifiesto) y `_archives` borrado. Causa: archivos ignorados por el `.gitignore` del propio repo al hacer `git add`.
+- qdrant, autogen, agent-framework: importados sin LFS (punteros LFS quedan como punteros: 1, 51, 2). renovate: importado excluyendo solo `docs/usage/docker.md` (push protection).
+- Forense upstream↔destino blob a blob en 152 repos: idénticos (198 archivos alineados con el blob upstream por normalización EOL). Excepciones: renovate (1 excluido) y MoDr (upstream vacío hoy).
+- Sin `_archives`, sin duplicados, sin sueltos en `Yaiwes core/`.
