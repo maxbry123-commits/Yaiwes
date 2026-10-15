@@ -1,0 +1,16 @@
+{
+  "name": "gha",
+  "engineVersion": "v0.21.9",
+  "sdk": {
+    "source": "go"
+  },
+  "dependencies": [
+    {
+      "name": "wolfi",
+      "source": "dagger.io/linux/wolfi@main"
+    }
+  ],
+  "codegen": {
+    "automaticGitignore": false
+  }
+}

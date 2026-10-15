@@ -1,0 +1,291 @@
+package core
+
+// These tests cover `dagger mcp`, the Model Context Protocol server exposed by
+// the CLI over stdio. Under the object-tools scheme
+// (hack/designs/workspace-agents.md) the CLI binds each workspace module's
+// main object via LLM.withTools, so the module's eligible methods are served
+// directly as MCP tools alongside the builtins (ReadLogs, ListServices,
+// skills).
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/dagger/testctx"
+	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/require"
+)
+
+type MCPSuite struct{}
+
+func TestMCP(t *testing.T) {
+	testctx.New(t, Middleware()...).RunTests(MCPSuite{})
+}
+
+func (MCPSuite) TestModuleWithoutPrivilegedExposesModuleMethods(ctx context.Context, t *testctx.T) {
+	modDir := initMCPTestModule(ctx, t)
+	cli := startMCPClient(ctx, t, modDir)
+
+	tools := listToolNames(ctx, t, cli)
+	require.Contains(t, tools, "greeting")
+	require.NotContains(t, tools, "container")
+
+	require.Contains(t, callToolText(ctx, t, cli, "greeting", map[string]any{}), "hello from module")
+
+	// There is no conversation behind a standalone server, so an LLM argument
+	// is unsatisfiable: a method that requires one is not offered, and an
+	// optional one is left unset rather than failing the call.
+	require.NotContains(t, tools, "compact")
+	require.Contains(t, tools, "annotate")
+	require.Equal(t, "no conversation", callToolText(ctx, t, cli, "annotate", map[string]any{}))
+}
+
+func (MCPSuite) TestWithoutModuleAndWithoutPrivilegedFails(ctx context.Context, t *testctx.T) {
+	emptyDir := t.TempDir()
+
+	_, err := hostDaggerExec(ctx, t, emptyDir, "--progress=plain", "mcp")
+	require.Error(t, err)
+	requireErrOut(t, err, "no module found and --env-privileged not specified")
+}
+
+func (MCPSuite) TestWithoutModuleAndWithPrivilegedServesBuiltins(ctx context.Context, t *testctx.T) {
+	emptyDir := t.TempDir()
+	cli := startMCPClient(ctx, t, emptyDir, "--env-privileged")
+
+	// With no module there is no object to bind, so only the builtin tools
+	// are served.
+	tools := listToolNames(ctx, t, cli)
+	require.Contains(t, tools, "ReadLogs")
+	require.Contains(t, tools, "LoadTrace")
+	require.Contains(t, tools, "ReadTrace")
+	require.Contains(t, tools, "FindSpans")
+	require.Contains(t, tools, "FindCalls")
+	require.Contains(t, tools, "InspectCall")
+	require.Contains(t, tools, "ListServices")
+	require.NotContains(t, tools, "container")
+}
+
+func (MCPSuite) TestModuleWithPrivilegedStillExposesModuleMethods(ctx context.Context, t *testctx.T) {
+	modDir := initMCPTestModule(ctx, t)
+	cli := startMCPClient(ctx, t, modDir, "--env-privileged")
+
+	tools := listToolNames(ctx, t, cli)
+	require.Contains(t, tools, "greeting")
+
+	require.Contains(t, callToolText(ctx, t, cli, "greeting", map[string]any{}), "hello from module")
+}
+
+func (MCPSuite) TestFailureIncludesDiagnosticLogs(ctx context.Context, t *testctx.T) {
+	modDir := t.TempDir()
+	for name, contents := range map[string]string{
+		"dagger.toml": "[modules.test]\nsource = \".\"\nentrypoint = true\n",
+		"dagger.json": `{"name":"test","engineVersion":"v1.0.0","sdk":"dang"}`,
+		"main.dang": `type Test {
+  broken: Module! {
+    directory
+      .withNewFile("dagger.json", contents: "{\"name\":\"broken\",\"engineVersion\":\"v1.0.0\",\"sdk\":\"dang\"}")
+      .withNewFile("main.dang", contents: "type Broken {\n  hello: IntentionallyUndefinedType! { \"hi\" }\n}\n")
+      .asModule
+  }
+
+  execFailure: Container! {
+    container.from("alpine:3.20")
+      .withExec(["sh", "-c", "echo exec-stdout-diagnostic; echo exec-stderr-diagnostic >&2; exit 1"])
+  }
+}
+`,
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(modDir, name), []byte(contents), 0o644))
+	}
+	initGitRepo(ctx, t, modDir)
+	cli := startMCPClient(ctx, t, modDir)
+	res, err := cli.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "broken", Arguments: map[string]any{}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.IsError)
+	text := toolResultText(t, res)
+	t.Logf("MCP failure result:\n%s", text)
+	require.Contains(t, text, "unresolved type: IntentionallyUndefinedType")
+	require.Contains(t, text, "[traceparent:")
+	require.NotContains(t, text, "== DIAGNOSTIC LOGS ==")
+	require.Contains(t, text, "main.dang:2:10")
+	require.Contains(t, text, `hello: IntentionallyUndefinedType! { "hi" }`)
+	require.NotContains(t, text, "\033[")
+
+	// Exec failures must use the same captured output, not a second copy
+	// serialized from stdout/stderr error extensions.
+	res, err = cli.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "execFailure", Arguments: map[string]any{}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.IsError)
+	text = toolResultText(t, res)
+	t.Logf("MCP exec failure result:\n%s", text)
+	require.Contains(t, text, "exit code: 1")
+	require.Contains(t, text, "[traceparent:")
+	require.Equal(t, 1, strings.Count(text, "\nexec-stdout-diagnostic"))
+	require.Equal(t, 1, strings.Count(text, "\nexec-stderr-diagnostic"))
+	require.NotContains(t, text, "<stdout>")
+	require.NotContains(t, text, "<stderr>")
+	require.NotContains(t, text, "<exitCode>")
+}
+
+// A method returning LLMContent is served as native MCP content: text and
+// media in order, not a description of the LLMContent object.
+func (MCPSuite) TestLLMContentResult(ctx context.Context, t *testctx.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
+	modDir := t.TempDir()
+	for name, contents := range map[string]string{
+		"dagger.toml": "[modules.test]\nsource = \".\"\nentrypoint = true\n",
+		"dagger.json": `{"name":"test","engineVersion":"v1.0.0","sdk":"dang"}`,
+		"main.dang": `type Test {
+  screenshots: LLMContent! {
+    llmContent
+      .withText("the page")
+      .withData(data: "` + png + `", mimeType: "image/png")
+  }
+
+  screenshot: LLMContent! {
+    llmContent.withData(data: "` + png + `", mimeType: "image/png")
+  }
+}
+`,
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(modDir, name), []byte(contents), 0o644))
+	}
+	initGitRepo(ctx, t, modDir)
+	cli := startMCPClient(ctx, t, modDir)
+
+	res, err := cli.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "screenshots", Arguments: map[string]any{}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.IsError, "%+v", res.Content)
+	require.Len(t, res.Content, 2)
+	text, ok := res.Content[0].(mcp.TextContent)
+	require.True(t, ok, "%T", res.Content[0])
+	require.Equal(t, "the page", text.Text)
+	image, ok := res.Content[1].(mcp.ImageContent)
+	require.True(t, ok, "%T", res.Content[1])
+	require.Equal(t, "image/png", image.MIMEType)
+	require.Equal(t, png, image.Data)
+
+	res, err = cli.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "screenshot", Arguments: map[string]any{}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.IsError, "%+v", res.Content)
+	require.Len(t, res.Content, 1)
+	image, ok = res.Content[0].(mcp.ImageContent)
+	require.True(t, ok, "%T", res.Content[0])
+	require.Equal(t, png, image.Data)
+}
+
+func initMCPTestModule(ctx context.Context, t testing.TB) string {
+	t.Helper()
+
+	modDir := t.TempDir()
+	copyTestdataFixture(ctx, t, modDir, "workspaces", "mcp-greeting")
+	initGitRepo(ctx, t, modDir)
+
+	functionsOut, err := hostDaggerExec(ctx, t, modDir, "api", "functions")
+	require.NoError(t, err)
+	require.Contains(t, string(functionsOut), "greeting")
+
+	return modDir
+}
+
+// MCP tests run the CLI on the host so the stdio transport can talk directly
+// to the subprocess.
+func startMCPClient(ctx context.Context, t testing.TB, workdir string, extraArgs ...string) *mcpclient.Client {
+	t.Helper()
+
+	args := append([]string{"--progress=plain", "mcp"}, extraArgs...)
+	stdio := transport.NewStdioWithOptions(
+		daggerCliPath(t),
+		nil,
+		args,
+		transport.WithCommandFunc(func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
+			cmd := exec.CommandContext(ctx, command, args...)
+			cleanupExec(t, cmd)
+			cmd.Dir = workdir
+			cmd.Env = append(os.Environ(), env...)
+			return cmd, nil
+		}),
+	)
+	cli := mcpclient.NewClient(stdio)
+	t.Cleanup(func() {
+		_ = cli.Close()
+	})
+
+	require.NoError(t, cli.Start(ctx))
+
+	_, err := cli.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ClientInfo: mcp.Implementation{
+				Name:    "dagger-integration-test",
+				Version: "1.0.0",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	return cli
+}
+
+// listToolNames lists the MCP server's tools via the MCP protocol. Tools are
+// the bound module objects' methods plus builtins.
+func listToolNames(ctx context.Context, t testing.TB, cli *mcpclient.Client) []string {
+	t.Helper()
+
+	res, err := cli.ListTools(ctx, mcp.ListToolsRequest{})
+	require.NoError(t, err)
+
+	names := make([]string, 0, len(res.Tools))
+	for _, tool := range res.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+// callToolText invokes a tool by name and returns its text output.
+func callToolText(
+	ctx context.Context,
+	t testing.TB,
+	cli *mcpclient.Client,
+	tool string,
+	args map[string]any,
+) string {
+	t.Helper()
+
+	res, err := cli.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      tool,
+			Arguments: args,
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, res.IsError, "tool %q errored: %s", tool, toolResultText(t, res))
+
+	return strings.TrimSpace(toolResultText(t, res))
+}
+
+func toolResultText(t testing.TB, result *mcp.CallToolResult) string {
+	t.Helper()
+
+	var content strings.Builder
+	for _, item := range result.Content {
+		text, ok := item.(mcp.TextContent)
+		require.Truef(t, ok, "unexpected MCP content type %T", item)
+		content.WriteString(text.Text)
+	}
+
+	return content.String()
+}

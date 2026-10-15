@@ -1,0 +1,1024 @@
+package schema
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+
+	"github.com/dagger/dagger/core"
+	"github.com/dagger/dagger/dagql"
+	"github.com/dagger/dagger/dagql/call"
+	"github.com/dagger/dagger/engine/slog"
+)
+
+type llmSchema struct {
+}
+
+var _ SchemaResolvers = &llmSchema{}
+
+func (s llmSchema) Install(srv *dagql.Server) {
+	dagql.Fields[*core.Query]{
+		dagql.NodeFunc("llm", s.llm).
+			WithInput(dagql.PerSessionInput).
+			Experimental("LLM support is not yet stabilized").
+			Doc(`Initialize a new LLM conversation.`).
+			Args(
+				dagql.Arg("model").Doc(
+					`The model to converse with, e.g. "claude-sonnet-4-5" or "gpt-5.4". Defaults to the configured default model.`),
+				dagql.Arg("provider").Doc(
+					`The provider serving the model, e.g. "openai". Overrides the provider otherwise inferred from the model name — useful when the name matches no known pattern (e.g. a fine-tune), or matches the wrong one.`).
+					View(AfterVersion("v1.0.0-0")),
+				dagql.Arg("maxAPICalls").Doc("Cap the number of API calls for this LLM").
+					View(BeforeVersion("v1.0.0-0")),
+			),
+		dagql.Func("llmContent", s.llmContent).
+			View(AfterVersion("v1.0.0-0")).
+			Experimental("LLM support is not yet stabilized").
+			Doc(`Start an empty run of text and media content, independent of any conversation.`,
+				`Add blocks with withText, withFile, and withData. A function exposed as an LLM tool can return the content to give the model text and media as the tool's result, e.g. a caption and a screenshot for the model to look at.`),
+	}.Install(srv)
+	// Like the content-block message model below, the content builder is only
+	// visible to v1+ views.
+	srv.InstallObject(dagql.NewClass[*core.LLMContent](srv).View(AfterVersion("v1.0.0-0")))
+	dagql.Fields[*core.LLMContent]{
+		dagql.Func("withText", s.llmContentWithText).
+			Doc(`Append a block of text.`).
+			Args(
+				dagql.Arg("text").Doc("The text."),
+			),
+		dagql.Func("withFile", s.llmContentWithFile).
+			Doc(`Append an image, audio, or PDF file as an inline media block. The media kind follows the MIME type.`).
+			Args(
+				dagql.Arg("file").Doc("The media file. Its contents become the block's inline bytes."),
+				dagql.Arg("mimeType").Doc(`The media MIME type, e.g. "image/png". Inferred from the file's contents when omitted.`),
+			),
+		dagql.Func("withData", s.llmContentWithData).
+			Doc(`Append image, audio, or PDF bytes as an inline media block. The media kind follows the MIME type.`,
+				`Prefer withFile for anything but small payloads: the bytes become part of the content's identity, so they travel with every reference to it.`).
+			Args(
+				dagql.Arg("data").Doc("The media bytes."),
+				dagql.Arg("mimeType").Doc(`The media MIME type, e.g. "image/png".`),
+			),
+	}.Install(srv)
+	dagql.Fields[*core.LLM]{
+		dagql.NodeFunc("compose", s.compose).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Run expertise in list order, passing this conversation through each function. Retain existing contributions.").
+			Args(dagql.Arg("expertise").Doc("The expertise to run. Each reference retains its source workspace.")),
+		dagql.NodeFunc("recompose", s.recompose).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Run expertise in list order, replacing their modules' contributions and preserving compatible tool state.",
+				"Clear each selected module's contributions once before execution. Retain unowned contributions and contributions from other modules. Keep this LLM's workspace.",
+				"A change to a tool binding's version resets its state. Removed bindings, changed identities, and incompatible state are errors.").
+			Args(dagql.Arg("expertise").Doc("The expertise to run. Each reference retains its source workspace.")),
+		dagql.Func("__withoutComposition", func(_ context.Context, llm *core.LLM, args struct {
+			Owner string
+		}) (*core.LLM, error) {
+			return llm.WithoutComposition(args.Owner), nil
+		}).View(AfterVersion("v1.0.0-0")),
+		dagql.Func("model", s.model).
+			Doc("The model the conversation is running against, after resolving any configured default."),
+		dagql.Func("provider", s.provider).
+			Doc(`The provider serving the model, e.g. "anthropic", "openai", "google", or "local".`),
+		dagql.Func("contextWindow", s.contextWindow).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("The model's total context window in tokens, or null if unknown (e.g. a local or uncatalogued model)."),
+		dagql.Func("messages", s.messages).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("The full message history, as structured messages."),
+		dagql.Func("transcript", s.transcript).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("The message history rendered as a plain-text transcript, suitable for feeding back to an LLM (e.g. for summarization)."),
+		dagql.Func("withoutMessageHistory", s.withoutMessageHistory).
+			Doc("Clear the message history, keeping only the system prompts."),
+		dagql.Func("withoutSystemPrompts", s.withoutSystemPrompts).
+			Doc("Clear the user-added system prompts, keeping only the default system prompt."),
+		dagql.Func("lastReply", s.lastReply).
+			Doc("The text of the model's most recent reply."),
+		dagql.Func("withWorkspace", s.withWorkspace).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Bind the LLM to a workspace, exposing its modules as tools exactly as the Dagger CLI would serve them for that workspace.").
+			Args(
+				dagql.Arg("workspace").Doc("The workspace to work in."),
+			),
+		dagql.Func("workspace", s.workspace).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Return the workspace the LLM is bound to."),
+		// No per-call input: the scope depends only on the receiver, whose
+		// ID records its bound tools and bound workspace, and the selection
+		// is lazy, so it caches like any other field.
+		dagql.Func("artifacts", s.artifacts).
+			View(AfterVersion("v1.0.0-0")).
+			Experimental("Agent APIs are likely to change.").
+			Doc("Discover every artifact this conversation can address, as one selection, without evaluating their values.",
+				"Tool objects bound with withTools contribute their modules' artifacts, rooted at their current values: evaluating one reads the live state of the bound tools, not a fresh construction. If a module's main object is bound, only its tree is included; otherwise each bound object of that module contributes its own tree. Addresses start with the module name. These artifacts have no workspace of their own: they evaluate in the LLM's bound workspace, if any, whoever evaluates them.",
+				"The workspace part is the artifacts of the workspace bound with withWorkspace, as returned by Workspace.artifacts; an LLM with no bound workspace has none. A workspace module with the same name as a module with bound tool objects is omitted: the bound tools shadow it. Unless they are only a plain construction of the module, which has no state of its own: then the workspace module's artifacts are kept instead.",
+				"Tool arguments that take an address resolve it here: a DAG address to one object, or, for Artifacts and Artifact arguments, a selection filtered like filterUri.").
+			Args(dagql.Arg("include").Doc("Only include artifacts matching these path patterns, as with Workspace.artifacts. A path selects that path and its children.")),
+		dagql.Func("withModel", s.withModel).
+			Doc("Change the model for the rest of the conversation. The message history is preserved; the new model takes effect on the next step.").
+			Args(
+				dagql.Arg("model").Doc(`The model to use, e.g. "claude-sonnet-4-5" or "gpt-5.4".`),
+				dagql.Arg("provider").Doc(
+					`The provider serving the model, e.g. "openai". Overrides the provider otherwise inferred from the model name — useful when the name matches no known pattern (e.g. a fine-tune), or matches the wrong one.`).
+					View(AfterVersion("v1.0.0-0")),
+			),
+		dagql.NodeFunc("withSmallModel", s.withSmallModel).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Switch to the configured small model for the current provider, or that provider's recommended default. The message history is preserved; unknown providers without a small-model configuration keep their current model."),
+		dagql.Func("reasoningEffort", s.reasoningEffort).
+			View(AfterVersion("v1.0.0-0")).
+			Doc(`The reasoning effort in use, e.g. "low", "medium", or "high". Empty or "none" when reasoning is disabled.`),
+		dagql.Func("withReasoningEffort", s.withReasoningEffort).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Change the reasoning effort for the rest of the conversation, overriding any configured default. The message history is preserved; the new effort takes effect on the next step.").
+			Args(
+				dagql.Arg("effort").Doc(
+					`The reasoning effort, e.g. "low", "medium", or "high"; "none" disables reasoning. Supported levels are model-specific — some models also accept e.g. "minimal", "xhigh", or "max".`),
+			),
+		dagql.Func("withPrompt", s.withPrompt).
+			Doc("Queue a user prompt, to be sent to the model on the next step or loop.").
+			Args(
+				dagql.Arg("prompt").Doc("The prompt to send"),
+				dagql.Arg("origin").
+					Experimental("Agent APIs are likely to change.").
+					View(AfterVersion("v1.0.0-0")).
+					Doc("The message's recorded provenance, when it arrived through an agent mailbox rather than from the user. Rendered to the model as an attribution header at request-build time."),
+			),
+		dagql.NodeFunc("__mcp", func(ctx context.Context, self dagql.ObjectResult[*core.LLM], _ struct{}) (dagql.Nullable[core.Void], error) {
+			currentSrv, err := core.CurrentDagqlServer(ctx)
+			if err != nil {
+				return dagql.Null[core.Void](), err
+			}
+			return dagql.Null[core.Void](), self.Self().MCP(ctx, currentSrv, self)
+		}).
+			Doc("instantiates an mcp server"),
+		dagql.Func("withContent", s.withContent).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Queue one user message containing ordered text and media blocks.").
+			Args(
+				dagql.Arg("content").Doc("The ordered message content."),
+				dagql.Arg("origin").Doc("The message's recorded provenance."),
+			),
+		dagql.Func("withContentFile", s.withContentFile).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Queue an image, audio, or PDF file as one user message. Media bytes are stored in the conversation.").
+			Args(
+				dagql.Arg("file").Doc("The media file."),
+				dagql.Arg("mimeType").Doc("The media MIME type; inferred from the file's contents when omitted."),
+			),
+		dagql.Func("withPromptFile", s.withPromptFile).
+			Doc("Queue a file's contents as a user prompt, like withPrompt.").
+			Args(
+				dagql.Arg("file").Doc("The file to read the prompt from"),
+			),
+		withLLMCallerOwner(dagql.Func("withSystemPrompt", s.withSystemPrompt)).
+			Doc("Add a system prompt, instructing the model across the whole conversation.").
+			Args(
+				dagql.Arg("prompt").Doc("The system prompt to send"),
+			),
+		dagql.Func("withResponse", s.withResponse).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Append an assistant response to the message history without calling the model, e.g. to reconstruct a conversation from another source.").
+			Args(
+				dagql.Arg("content").Doc("The response content"),
+				dagql.Arg("inputTokens").Doc("Uncached input tokens sent"),
+				dagql.Arg("outputTokens").Doc("Tokens received from the model, including text and tool calls"),
+				dagql.Arg("cachedTokenReads").Doc("Cached input tokens read"),
+				dagql.Arg("cachedTokenWrites").Doc("Cached input tokens written"),
+				dagql.Arg("totalTokens").Doc("Total tokens consumed by this response"),
+			),
+		dagql.Func("withToolResult", s.withToolResult).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Append the result of a tool call to the message history.").
+			Args(
+				dagql.Arg("callId").Doc("The ID of the tool call this result responds to"),
+				dagql.Arg("content").Doc("Text returned by the tool, placed before blocks"),
+				dagql.Arg("errored").Doc("Whether the tool call resulted in an error"),
+				dagql.Arg("blocks").Doc("Ordered text and media returned by the tool"),
+			),
+		withLLMCallerOwner(dagql.Func("withTools", s.withTools)).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Expose an object's methods as tools. Every eligible method of the bound object becomes a tool; a tool that returns this object's own type replaces it as the new state. Repeatable to bind several objects.").
+			Args(
+				// @expectedType(Node) lets a statically typed caller (e.g. Dang) pass
+				// any object where this ID! is wanted, since every object implements
+				// the universal Node interface; the value is conveyed as its id.
+				dagql.Arg("object").Doc("The object whose methods become tools.").
+					Directive(dagql.ExpectedTypeDirective("Node")).
+					// The bound object's value is not needed to reconstruct the
+					// conversation when loaded — only its type, to expose its methods
+					// as tools — so carry it by reference and load it lazily. This
+					// keeps restoring a persisted session from re-running the call
+					// that produced the object (which may have side effects or may
+					// no longer be reproducible).
+					LazyRef(),
+				dagql.Arg("except").Doc("Method names to exclude from the toolset (e.g. constructors, entrypoints)."),
+				dagql.Arg("version").Doc("Version of this binding's state contract. Recomposition preserves compatible state when the version is unchanged and resets to the newly bound object's defaults when it differs. Change this when the state layout changes incompatibly. Same-type tool returns retain the version. Module identity and ownership checks still apply."),
+			),
+		dagql.Func("withoutDefaultSystemPrompt", s.withoutDefaultSystemPrompt).
+			Doc("Disable the default system prompt"),
+		dagql.Func("withMCPServer", s.withMCPServer).
+			Doc("Add an external MCP server to the LLM").
+			Args(
+				dagql.Arg("name").Doc("The name of the MCP server"),
+				dagql.Arg("service").Doc("The MCP service to run and communicate with over stdio"),
+			),
+		withLLMCallerOwner(dagql.Func("withSkills", s.withSkills)).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Install skills from a directory, adding them to the skills the model discovers with ListSkills and reads with ReadSkill. " +
+				"Each skill is a directory containing a SKILL.md with name and description frontmatter, discovered anywhere in the tree. " +
+				"Installed skills take precedence over skills discovered in the workspace, but cannot shadow the engine's built-in skills.").
+			Args(
+				dagql.Arg("directory").Doc("A directory containing skills, each a subdirectory holding a SKILL.md."),
+			),
+		dagql.Func("skills", s.skills).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("The skills visible to the model, exactly as the ListSkills tool serves them: engine-embedded skills, skills installed with withSkills, and skills discovered in the workspace."),
+		dagql.NodeFunc("sync", func(ctx context.Context, self dagql.ObjectResult[*core.LLM], _ struct{}) (res dagql.ID[*core.LLM], _ error) {
+			id, err := self.ID()
+			if err != nil {
+				return res, err
+			}
+			return dagql.NewID[*core.LLM](id), nil
+		}).
+			Doc("Force evaluation of the conversation's pending operations (prompts, steps, loops) in the engine."),
+		dagql.NodeFunc("loop", s.loop).
+			Doc("Send the queued prompt and step the model against the available tools, until it ends its turn: a reply with no tool calls and nothing left queued.").
+			Args(
+				dagql.Arg("maxSteps").Doc("Cap the number of steps. The loop fails if the cap is reached before the model ends its turn.").
+					View(AfterVersion("v1.0.0-0")),
+				dagql.Arg("maxTokens").Doc("Cap the model's output tokens on each step. Defaults to the model's maximum.").
+					View(AfterVersion("v1.0.0-0")),
+			),
+		dagql.NodeFunc("step", s.step).
+			Doc("Advance the conversation by a single step: send the queued prompt or tool results to the model, evaluate any tool calls it makes, and queue their results. Use loop to step until the model ends its turn.").
+			Args(
+				dagql.Arg("maxTokens").Doc("Cap the model's output tokens for this step. Defaults to the model's maximum.").
+					View(AfterVersion("v1.0.0-0")),
+			),
+		dagql.NodeFunc("spawn", s.spawn).
+			Experimental("Agent APIs are likely to change.").
+			View(AfterVersion("v1.0.0-0")).
+			DoNotCache("Every spawn mints a distinct agent instance.").Reevaluate().
+			Doc(`Spawn the conversation as an agent: a startable, addressable evaluation loop seeded with this conversation's state, tools, and workspace.`,
+				`Every spawn mints a unique agent instance — two spawns of an identical conversation are two distinct agents, like two calls to a process spawn. The result is pinned to the instance (via the agent lookup field), so re-loading its ID re-addresses the same agent from any request in the session.`,
+				`The loop is not started: the agent spends nothing until it is prompted or resumed, and any input pending on the conversation is stepped then.`,
+				`With a handle, spawn restores an instance instead of minting one: this conversation becomes the committed history of the agent that handle names, so prompting it continues where it left off — rebuild a conversation's ID from a trace, load it, and spawn it under the handle it belonged to. Fails if that instance already has a runtime entry in this session: a restore must happen before anything else addresses the instance, since by then it may have stepped.`).
+			Args(
+				dagql.Arg("name").Doc("Display label for the agent — telemetry and error messages; carries no identity. Defaults to a short name derived from the conversation."),
+				dagql.Arg("handle").Doc(`The runtime handle to restore the instance under, as published on its loop span as dagger.io/agent.id. Omit to mint a fresh instance.`),
+				dagql.Arg("state").Doc(`The lifecycle state to create the agent in, as facts on the entry: IDLE is ready to be prompted, PAUSED parks it, FAILED holds an error a resume retries past, STOPPED preserves a dormant snapshot that send or resume can relaunch.`,
+					`RUNNING and WAITING_INPUT are refused: they describe a loop, and a restored loop died with the session that published it — restore such an agent as IDLE, its interrupted turn's input still pending on the conversation.`),
+				dagql.Arg("parentHandle").Doc(`Recorded parent handle when restoring an agent. Lineage does not install a notification subscription. Requires a supplied handle. The parent must already be restored in this session and cannot be the agent itself or its descendant.`),
+				dagql.Arg("error").Doc(`The loop error to create the agent with, for state FAILED. Refused with any other state.`),
+			),
+		// agent is deliberately cached (no DoNotCache): the runtime handle
+		// argument pins the lookup to one spawned instance, so the same
+		// chain always denotes the same agent value — which is exactly what
+		// lets spawn pin its result's identity by re-exec: re-loading a
+		// spawned agent's ID replays …llm!agent(handle:…) and lands on the same
+		// value, never re-minting an instance.
+		dagql.NodeFunc("agent", s.agent).
+			Experimental("Agent APIs are likely to change.").
+			View(AfterVersion("v1.0.0-0")).
+			Doc(`Reconstruct a spawned agent from its runtime handle.`,
+				`This is the lookup spawn pins its result's identity through: the returned handle's ID is an honest, replayable chain denoting the one instance the spawn minted. It never creates an instance itself.`).
+			Args(
+				dagql.Arg("handle").Doc("The opaque runtime handle minted by the spawn that created the agent."),
+				dagql.Arg("name").Doc("The agent's display name, as recorded by the spawn."),
+			),
+		dagql.Func("hasPending", s.hasPending).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Report whether anything is queued to send to the model: an unsent prompt or unevaluated tool results. When true, another step will do work; when false, the turn is complete."),
+		dagql.Func("fork", s.fork).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("Fork the conversation, so that otherwise-identical follow-ups evaluate independently instead of deduplicating to a single cached result.").
+			Args(
+				dagql.Arg("label").Doc(`A label distinguishing this fork from its siblings, e.g. "attempt-2" when retrying a flaky evaluation.`),
+			),
+		// attempt is superseded in v1 by fork, but remains visible to pre-v1
+		// module views (e.g. the evaluator module).
+		dagql.Func("attempt", s.attempt).
+			View(BeforeVersion("v1.0.0-0")).
+			Doc("create a branch in the LLM's history"),
+		dagql.Func("tools", s.tools).
+			Doc("Render documentation for the tools currently exposed to the model."),
+		dagql.Func("tokenUsage", s.tokenUsage).
+			Doc("The cumulative token usage, summed across every API call in the conversation."),
+		dagql.Func("contextTokens", s.contextTokens).
+			View(AfterVersion("v1.0.0-0")).
+			Doc("estimated number of tokens currently occupying the context window; unlike tokenUsage this is not cumulative over the session"),
+	}.Install(srv)
+	dagql.Fields[*core.LLMTokenUsage]{}.Install(srv)
+	// The content-block message model is only visible to v1+ module views;
+	// installing the classes with a view filter also filters their generated
+	// ID/load fields and Env/Binding extensions.
+	srv.InstallObject(dagql.NewClass[*core.LLMMessage](srv).View(AfterVersion("v1.0.0-0")))
+	srv.InstallObject(dagql.NewClass[*core.LLMContentBlock](srv).View(AfterVersion("v1.0.0-0")))
+	srv.InstallObject(dagql.NewClass[*core.LLMSkill](srv).View(AfterVersion("v1.0.0-0")))
+	srv.InstallObject(dagql.NewClass[*core.LLMMessageOrigin](srv).View(AfterVersion("v1.0.0-0")))
+	dagql.Fields[*core.LLMMessage]{
+		// Origin is an explicit nullable accessor rather than field:"true":
+		// absent (the user's own prompts, model output, tool results) is the
+		// common case, and a struct-derived pointer field renders non-null.
+		dagql.Func("origin", s.messageOrigin).
+			Experimental("Agent APIs are likely to change.").
+			Doc(`Who put this message on the record, when it arrived through an agent mailbox.`,
+				`Null for the user's own prompts and for everything the model or tools produced.`),
+	}.Install(srv)
+	dagql.Fields[*core.LLMContentBlock]{}.Install(srv)
+	dagql.Fields[*core.LLMSkill]{}.Install(srv)
+	dagql.Fields[*core.LLMMessageOrigin]{}.Install(srv)
+	core.LLMMessageRoles.Install(srv, AfterVersion("v1.0.0-0"))
+	core.LLMContentBlockKinds.Install(srv, AfterVersion("v1.0.0-0"))
+	core.LLMMessageOriginKinds.Install(srv, AfterVersion("v1.0.0-0"))
+	dagql.MustInputSpec(core.LLMContentBlockInput{}).Install(srv, AfterVersion("v1.0.0-0"))
+	dagql.MustInputSpec(core.LLMMessageOriginInput{}).Install(srv, AfterVersion("v1.0.0-0"))
+}
+
+func (s *llmSchema) messageOrigin(_ context.Context, msg *core.LLMMessage, _ struct{}) (dagql.Nullable[*core.LLMMessageOrigin], error) {
+	if msg.Origin == nil {
+		return dagql.Null[*core.LLMMessageOrigin](), nil
+	}
+	return dagql.NonNull(msg.Origin), nil
+}
+
+func (s *llmSchema) withWorkspace(ctx context.Context, llm *core.LLM, args struct {
+	Workspace dagql.ID[*core.Workspace]
+}) (*core.LLM, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ws, err := args.Workspace.Load(ctx, srv)
+	if err != nil {
+		return nil, err
+	}
+	return llm.WithWorkspace(ws), nil
+}
+
+func (s *llmSchema) workspace(ctx context.Context, llm *core.LLM, args struct{}) (res dagql.ObjectResult[*core.Workspace], _ error) {
+	ws := llm.Workspace()
+	if ws.Self() == nil {
+		// llm() starts unbound; a workspace is only present once the caller
+		// binds one via withWorkspace. Return an error rather than a
+		// zero-value Workspace!, which nil-derefs in the Workspace field
+		// resolvers and crashes the engine.
+		return res, fmt.Errorf("no workspace is bound to this LLM (bind one with withWorkspace)")
+	}
+	return ws, nil
+}
+
+func (s *llmSchema) artifacts(ctx context.Context, llm *core.LLM, args struct {
+	Include dagql.Optional[dagql.ArrayInput[dagql.String]]
+}) (*core.Artifacts, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return llm.Artifacts(ctx, srv, workspaceIncludePatterns(args.Include))
+}
+
+func (s *llmSchema) model(ctx context.Context, llm *core.LLM, args struct{}) (string, error) {
+	ep, err := llm.Endpoint(ctx)
+	if err != nil {
+		return "", err
+	}
+	return ep.Model, nil
+}
+
+func (s *llmSchema) contextWindow(ctx context.Context, llm *core.LLM, args struct{}) (dagql.Nullable[dagql.Int], error) {
+	none := dagql.Null[dagql.Int]()
+	ep, err := llm.Endpoint(ctx)
+	if err != nil {
+		return none, err
+	}
+	if ep.ContextWindow <= 0 {
+		return none, nil
+	}
+	return dagql.NonNull(dagql.NewInt(int(ep.ContextWindow))), nil
+}
+
+func (s *llmSchema) provider(ctx context.Context, llm *core.LLM, args struct{}) (string, error) {
+	ep, err := llm.Endpoint(ctx)
+	if err != nil {
+		return "", err
+	}
+	return string(ep.Provider), nil
+}
+
+func (s *llmSchema) lastReply(ctx context.Context, llm *core.LLM, args struct{}) (dagql.String, error) {
+	reply, _ := llm.LastReply()
+	return dagql.NewString(reply), nil
+}
+
+func (s *llmSchema) withModel(ctx context.Context, llm *core.LLM, args struct {
+	Model    string
+	Provider dagql.Optional[dagql.String]
+}) (*core.LLM, error) {
+	return llm.WithModel(args.Model, args.Provider.Value.String()), nil
+}
+
+func (s *llmSchema) withSmallModel(ctx context.Context, parent dagql.ObjectResult[*core.LLM], _ struct{}) (res dagql.ObjectResult[*core.LLM], _ error) {
+	model, provider, err := parent.Self().SmallModelRoute(ctx)
+	if err != nil {
+		return res, err
+	}
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return res, err
+	}
+	return res, srv.Select(ctx, parent, &res, dagql.Selector{
+		Field: "withModel",
+		Args: []dagql.NamedInput{
+			{Name: "model", Value: dagql.NewString(model)},
+			{Name: "provider", Value: dagql.Opt(dagql.NewString(provider))},
+		},
+	})
+}
+
+func (s *llmSchema) reasoningEffort(ctx context.Context, llm *core.LLM, args struct{}) (string, error) {
+	ep, err := llm.Endpoint(ctx)
+	if err != nil {
+		return "", err
+	}
+	return ep.ReasoningEffort, nil
+}
+
+func (s *llmSchema) withReasoningEffort(ctx context.Context, llm *core.LLM, args struct {
+	Effort string
+}) (*core.LLM, error) {
+	return llm.WithReasoningEffort(args.Effort), nil
+}
+
+func (s *llmSchema) withPrompt(ctx context.Context, llm *core.LLM, args struct {
+	Prompt string
+	Origin dagql.Optional[dagql.InputObject[core.LLMMessageOriginInput]]
+}) (*core.LLM, error) {
+	var origin *core.LLMMessageOrigin
+	if args.Origin.Valid {
+		origin = args.Origin.Value.Value.ToLLMMessageOrigin()
+	}
+	return llm.WithPromptOrigin(args.Prompt, origin), nil
+}
+
+func resolveLLMContent(ctx context.Context, inputs []dagql.InputObject[core.LLMContentBlockInput]) ([]*core.LLMContentBlock, error) {
+	blocks := make([]*core.LLMContentBlock, len(inputs))
+	for i, input := range inputs {
+		block, err := input.Value.Resolve(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("content %d: %w", i, err)
+		}
+		blocks[i] = block
+	}
+	if err := core.ValidateLLMContent(blocks); err != nil {
+		return nil, err
+	}
+	return blocks, nil
+}
+
+func (s *llmSchema) llmContent(ctx context.Context, _ *core.Query, _ struct{}) (*core.LLMContent, error) {
+	return &core.LLMContent{}, nil
+}
+
+func (s *llmSchema) llmContentWithText(ctx context.Context, content *core.LLMContent, args struct {
+	Text string
+}) (*core.LLMContent, error) {
+	return content.WithBlock(&core.LLMContentBlock{Kind: core.LLMContentText, Text: args.Text})
+}
+
+// llmContentWithFile resolves the file to inline bytes exactly as
+// LLM.withContentFile does, so the media kind is inferred the same way.
+func (s *llmSchema) llmContentWithFile(ctx context.Context, content *core.LLMContent, args struct {
+	File     core.FileID
+	MIMEType string `name:"mimeType" default:""`
+}) (*core.LLMContent, error) {
+	block, err := core.LLMContentFromFile(ctx, args.File, args.MIMEType)
+	if err != nil {
+		return nil, err
+	}
+	return content.WithBlock(block)
+}
+
+func (s *llmSchema) llmContentWithData(ctx context.Context, content *core.LLMContent, args struct {
+	Data     dagql.Bytes
+	MIMEType string `name:"mimeType"`
+}) (*core.LLMContent, error) {
+	block, err := core.LLMContentFromBytes(args.Data, args.MIMEType)
+	if err != nil {
+		return nil, err
+	}
+	return content.WithBlock(block)
+}
+
+func (s *llmSchema) withContent(ctx context.Context, llm *core.LLM, args struct {
+	Content []dagql.InputObject[core.LLMContentBlockInput]
+	Origin  dagql.Optional[dagql.InputObject[core.LLMMessageOriginInput]]
+}) (*core.LLM, error) {
+	blocks, err := resolveLLMContent(ctx, args.Content)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range blocks {
+		if b.Kind != core.LLMContentText && b.Kind != core.LLMContentImage && b.Kind != core.LLMContentAudio && b.Kind != core.LLMContentDocument {
+			return nil, fmt.Errorf("%s is not user content", b.Kind)
+		}
+	}
+	var origin *core.LLMMessageOrigin
+	if args.Origin.Valid {
+		origin = args.Origin.Value.Value.ToLLMMessageOrigin()
+	}
+	return llm.WithContent(blocks, origin), nil
+}
+
+func (s *llmSchema) withContentFile(ctx context.Context, llm *core.LLM, args struct {
+	File     core.FileID
+	MIMEType string `name:"mimeType" default:""`
+}) (*core.LLM, error) {
+	block, err := core.LLMContentFromFile(ctx, args.File, args.MIMEType)
+	if err != nil {
+		return nil, err
+	}
+	return llm.WithContent([]*core.LLMContentBlock{block}, nil), nil
+}
+
+// withLLMCallerOwner records the installing module before cache lookup. Ownership
+// is a property of each contribution, not ambient state on the LLM or the bound
+// object. Explicit stamps (including empty ones) survive replay by another caller.
+func withLLMCallerOwner(field dagql.Field[*core.LLM]) dagql.Field[*core.LLM] {
+	field.Spec.GetDynamicInput = func(ctx context.Context, _ dagql.AnyResult, _ map[string]dagql.Input, _ call.View, req *dagql.CallRequest) error {
+		if owner := req.Arg("owner"); owner != nil && owner.Value != nil && owner.Value.Kind != dagql.ResultCallLiteralKindNull {
+			return nil
+		}
+		query, err := core.CurrentQuery(ctx)
+		if err != nil {
+			return err
+		}
+		mod, err := query.CurrentModule(ctx)
+		if err != nil && !errors.Is(err, core.ErrNoCurrentModule) {
+			return fmt.Errorf("resolve LLM contribution owner: %w", err)
+		}
+		owner := ""
+		if mod.Self() != nil {
+			owner = mod.Self().Name()
+		}
+		return req.SetArgInput(ctx, "owner", dagql.Opt(dagql.String(owner)), false)
+	}
+	return field
+}
+
+func (s *llmSchema) withSystemPrompt(ctx context.Context, llm *core.LLM, args struct {
+	Prompt string
+	Owner  dagql.Optional[dagql.String] `internal:"true"`
+}) (*core.LLM, error) {
+	return llm.WithSystemPromptOwner(args.Prompt, string(args.Owner.Value)), nil
+}
+
+func (s *llmSchema) withResponse(ctx context.Context, llm *core.LLM, args struct {
+	Content           []dagql.InputObject[core.LLMContentBlockInput]
+	InputTokens       int64 `default:"0"`
+	OutputTokens      int64 `default:"0"`
+	CachedTokenReads  int64 `default:"0"`
+	CachedTokenWrites int64 `default:"0"`
+	TotalTokens       int64 `default:"0"`
+}) (*core.LLM, error) {
+	blocks, err := resolveLLMContent(ctx, args.Content)
+	if err != nil {
+		return nil, err
+	}
+	return llm.WithResponse(blocks, core.LLMTokenUsage{
+		InputTokens:       args.InputTokens,
+		OutputTokens:      args.OutputTokens,
+		CachedTokenReads:  args.CachedTokenReads,
+		CachedTokenWrites: args.CachedTokenWrites,
+		TotalTokens:       args.TotalTokens,
+	}), nil
+}
+
+func (s *llmSchema) withToolResult(ctx context.Context, llm *core.LLM, args struct {
+	CallID  string `name:"callId"`
+	Content string
+	Errored bool
+	Blocks  []dagql.InputObject[core.LLMContentBlockInput] `default:"[]"`
+}) (*core.LLM, error) {
+	blocks, err := resolveLLMContent(ctx, args.Blocks)
+	if err != nil {
+		return nil, err
+	}
+	result := &core.LLMContentBlock{Kind: core.LLMContentToolResult, CallID: args.CallID, Text: args.Content, Content: blocks, Errored: args.Errored}
+	if err := result.Validate(); err != nil {
+		return nil, err
+	}
+	return llm.WithToolResultBlocks(args.CallID, args.Content, blocks, args.Errored), nil
+}
+
+func (s *llmSchema) withTools(ctx context.Context, llm *core.LLM, args struct {
+	Object  dagql.AnyID
+	Except  []string                     `default:"[]"`
+	Version int                          `default:"0"`
+	Owner   dagql.Optional[dagql.String] `internal:"true"`
+}) (*core.LLM, error) {
+	owner := string(args.Owner.Value)
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, err := args.Object.ID()
+	if err != nil {
+		return nil, err
+	}
+	// Resolve the bound object's type from its ID without evaluating it, so the
+	// toolset can be built lazily. ObjectTypeAndServerForID uses the recipe's
+	// module provenance even when the current schema has an older definition of
+	// the same type. The object itself is loaded only when a tool is actually
+	// invoked on it (see MCP.boundToolObject). This is what lets a
+	// persisted session restore a binding whose object has side effects or is no
+	// longer reproducible without re-running its construction.
+	if id.Type() != nil && !id.IsHandle() {
+		objType, definingServer, ok, err := srv.ObjectTypeAndServerForID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return llm.WithLazyToolsOwner(id, objType, definingServer.Schema(), args.Except, owner, args.Version), nil
+		}
+	}
+	// Fall back to eager loading if the type isn't resolvable structurally. This
+	// includes handle-form IDs such as currentNode: handles deliberately carry no
+	// module provenance. Once loaded, recover the semantic recipe ID and resolve
+	// its defining server so the binding still captures the module schema rather
+	// than the current bootstrap schema.
+	obj, err := srv.Load(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	recipeID, err := obj.RecipeID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve bound object recipe: %w", err)
+	}
+	objType, definingServer, ok, err := srv.ObjectTypeAndServerForID(ctx, recipeID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("resolve defining schema for bound object type %q", obj.Type().Name())
+	}
+	// Loading a handle rewraps it in the caller's schema, which may still have
+	// an older revision of this module. Bind the recipe's class as well as its
+	// schema so dispatch and advertised tools describe the same revision.
+	obj, err = objType.New(obj)
+	if err != nil {
+		return nil, fmt.Errorf("bind object to its defining type: %w", err)
+	}
+	return llm.WithToolsOwner(obj, definingServer.Schema(), args.Except, owner, args.Version), nil
+}
+
+func (s *llmSchema) withoutDefaultSystemPrompt(ctx context.Context, llm *core.LLM, args struct{}) (*core.LLM, error) {
+	return llm.WithoutDefaultSystemPrompt(), nil
+}
+
+func (s *llmSchema) withMCPServer(ctx context.Context, llm *core.LLM, args struct {
+	Name    string
+	Service core.ServiceID
+}) (*core.LLM, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := args.Service.Load(ctx, srv)
+	if err != nil {
+		return nil, err
+	}
+	return llm.WithMCPServer(args.Name, svc), nil
+}
+
+func (s *llmSchema) withSkills(ctx context.Context, llm *core.LLM, args struct {
+	Directory core.DirectoryID
+	Owner     dagql.Optional[dagql.String] `internal:"true"`
+}) (*core.LLM, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := args.Directory.Load(ctx, srv)
+	if err != nil {
+		return nil, err
+	}
+	return llm.WithSkillsOwner(dir, string(args.Owner.Value)), nil
+}
+
+func (s *llmSchema) skills(ctx context.Context, llm *core.LLM, _ struct{}) ([]*core.LLMSkill, error) {
+	return llm.Skills(ctx)
+}
+
+func (s *llmSchema) withPromptFile(ctx context.Context, llm *core.LLM, args struct {
+	File core.FileID
+}) (*core.LLM, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	file, err := args.File.Load(ctx, srv)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := dagql.EngineCache(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := cache.Evaluate(ctx, file); err != nil {
+		return nil, err
+	}
+	prompt, err := file.Self().Contents(ctx, file, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return llm.WithPrompt(string(prompt)), nil
+}
+
+func (s *llmSchema) loop(ctx context.Context, parent dagql.ObjectResult[*core.LLM], args struct {
+	MaxSteps  dagql.Optional[dagql.Int] `name:"maxSteps"`
+	MaxTokens dagql.Optional[dagql.Int] `name:"maxTokens"`
+}) (dagql.ObjectResult[*core.LLM], error) {
+	return parent.Self().Loop(ctx, parent, int(args.MaxSteps.Value), int(args.MaxTokens.Value))
+}
+
+func (s *llmSchema) step(ctx context.Context, parent dagql.ObjectResult[*core.LLM], args struct {
+	MaxTokens dagql.Optional[dagql.Int] `name:"maxTokens"`
+}) (dagql.ObjectResult[*core.LLM], error) {
+	return parent.Self().Step(ctx, parent, int(args.MaxTokens.Value))
+}
+
+// spawn creates a unique agent instance from the conversation. Instance
+// identity is minted here — where instances are born — unless the caller
+// supplies a handle to restore an instance under (resume-from-trace §4.1):
+// either way the resolver pins the handle by re-exec (design §9, the same
+// trick send uses for message identity): a real Select through the pure
+// agent(handle:) lookup on the same receiver yields a handle whose ID is the
+// honest, replayable chain `…llm!agent(handle:"…", name:"…")` —
+// re-addressable from any request in the session, and carrying the unique
+// runtime handle into the value's content digest, so every spawn gets a fresh
+// runtime registry entry (a dismissed name can never resolve to a
+// predecessor's tombstone). spawn is DoNotCache and ID-returning like every
+// imperative verb: lazy clients force the create exactly once and re-hydrate
+// the handle from the ID, which replays the lookup, not the spawn.
+//
+// The registry entry is created HERE, not lazily on first use: spawn is
+// create-pin, whether the handle was minted (a fresh instance) or supplied
+// (a restore, which adopts the receiver as the committed history). Since a
+// registry miss on send is an error rather than a constructor
+// (resume-from-trace §4.2 — a miss used to boot an amnesiac twin from the
+// seed), spawn is the only verb that creates an entry, and every other verb
+// addresses one that exists.
+func (s *llmSchema) spawn(ctx context.Context, parent dagql.ObjectResult[*core.LLM], args struct {
+	Name         dagql.Optional[dagql.String]
+	Handle       dagql.Optional[dagql.String]
+	State        core.AgentState `default:"IDLE"`
+	Error        string          `default:""`
+	ParentHandle dagql.Optional[dagql.String]
+}) (res dagql.Result[core.AgentID], _ error) {
+	name := args.Name.Value.String()
+	if name == "" {
+		// Derive a short display name from the seed conversation's recipe
+		// digest — a readable default label, with no identity role.
+		// (parent.ID().Digest() would panic here: a post-evaluation LLM
+		// carries a handle-form ID with no digest — see core/llm.go's
+		// llmCallDigest derivation for the same dance.)
+		dig, err := parent.RecipeDigest(ctx)
+		if err != nil {
+			return res, fmt.Errorf("llm recipe digest: %w", err)
+		}
+		enc := dig.Encoded()
+		if len(enc) > 8 {
+			enc = enc[:8]
+		}
+		name = "agent-" + enc
+	}
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return res, err
+	}
+	restored := args.Handle.Valid && args.Handle.Value.String() != ""
+	handle := rand.Text()
+	if restored {
+		handle = args.Handle.Value.String()
+	}
+	var pinned dagql.ObjectResult[*core.Agent]
+	if err := srv.Select(ctx, parent, &pinned, dagql.Selector{
+		Field: "agent",
+		Args: []dagql.NamedInput{
+			{
+				Name:  "handle",
+				Value: dagql.NewString(handle),
+			},
+			{
+				Name:  "name",
+				Value: dagql.NewString(name),
+			},
+		},
+	}); err != nil {
+		return res, err
+	}
+	agents, err := agentRuntimes(ctx)
+	if err != nil {
+		return res, err
+	}
+	var parentHandle string
+	if args.ParentHandle.Valid {
+		if !restored {
+			return res, fmt.Errorf("parentHandle is only valid when restoring with a handle")
+		}
+		parentHandle = args.ParentHandle.Value.String()
+	}
+	if _, err := agents.Create(ctx, pinned, args.State, args.Error, restored, parentHandle); err != nil {
+		return res, err
+	}
+	pinnedID, err := pinned.ID()
+	if err != nil {
+		return res, fmt.Errorf("agent ID: %w", err)
+	}
+	return dagql.NewResultForCurrentCall(ctx, dagql.NewID[*core.Agent](pinnedID))
+}
+
+// agent is the pure lookup spawn pins instance identity through: it
+// reconstructs the agent value from the (id, name) literals on the chain,
+// touching no runtime state — a cold re-Select of a spawned agent's ID lands
+// here and projects IDLE-from-absence like any never-started agent.
+func (s *llmSchema) agent(ctx context.Context, parent dagql.ObjectResult[*core.LLM], args struct {
+	Handle string
+	Name   string
+}) (*core.Agent, error) {
+	return &core.Agent{
+		Seed:   parent,
+		Handle: args.Handle,
+		Name:   args.Name,
+	}, nil
+}
+
+func (s *llmSchema) hasPending(ctx context.Context, llm *core.LLM, args struct{}) (bool, error) {
+	return llm.HasPending(), nil
+}
+
+func (s *llmSchema) fork(_ context.Context, llm *core.LLM, _ struct {
+	Label string
+}) (*core.LLM, error) {
+	// The label participates in the returned object's ID, which is what makes
+	// the fork evaluate independently; the state itself is just a clone.
+	return llm.Clone(), nil
+}
+
+// attempt is the pre-v1 spelling of fork.
+func (s *llmSchema) attempt(_ context.Context, llm *core.LLM, _ struct {
+	Number int
+}) (*core.LLM, error) {
+	return llm.Clone(), nil
+}
+
+func (s *llmSchema) llm(ctx context.Context, parent dagql.ObjectResult[*core.Query], args struct {
+	Model    dagql.Optional[dagql.String]
+	Provider dagql.Optional[dagql.String]
+	// Legacy cap on API calls, only exposed to pre-v1 module views; v1+
+	// callers pass maxSteps to loop() instead.
+	MaxAPICalls dagql.Optional[dagql.Int] `name:"maxAPICalls"`
+}) (inst dagql.ObjectResult[*core.LLM], _ error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return inst, err
+	}
+	model := args.Model.Value.String()
+	provider := args.Provider.Value.String()
+	if model == "" {
+		// No model requested: resolve the configured default and re-call this
+		// field with it pinned, the way Container.from re-calls itself with
+		// the digested ref. The recorded ID then names the model the
+		// conversation actually runs against, so a restored one resumes on
+		// its own model rather than whatever default the resuming
+		// environment happens to configure.
+		defModel, defProvider, routeErr := parent.Self().DefaultLLMRoute(ctx, provider)
+		switch {
+		case routeErr != nil:
+			// Routing reads the client's environment; a failure there should
+			// surface at first use, as it did before pinning existed — not
+			// break constructing the object.
+			slog.Warn("could not resolve default LLM route; leaving llm() unpinned", "error", routeErr)
+		case defModel != "":
+			llmArgs := []dagql.NamedInput{
+				{Name: "model", Value: dagql.Opt(dagql.NewString(defModel))},
+			}
+			if defProvider != "" {
+				llmArgs = append(llmArgs, dagql.NamedInput{
+					Name:  "provider",
+					Value: dagql.Opt(dagql.NewString(defProvider)),
+				})
+			}
+			var pinned dagql.ObjectResult[*core.LLM]
+			if err := srv.Select(ctx, parent, &pinned, dagql.Selector{
+				Field: "llm",
+				Args:  llmArgs,
+			}); err != nil {
+				return inst, err
+			}
+			if args.MaxAPICalls.Valid && args.MaxAPICalls.Value.Int() > 0 {
+				// The legacy knob only exists in pre-v1 views while provider
+				// only exists in v1+, so no single view lets the inner call
+				// carry both. Apply it to this outer call's own result; it is
+				// deliberately not part of the durable recipe anyway.
+				llm := pinned.Self().WithMaxAPICalls(args.MaxAPICalls.Value.Int())
+				return dagql.NewObjectResultForCurrentCall(ctx, srv, llm)
+			}
+			return pinned, nil
+		}
+	}
+	llm, err := parent.Self().NewLLM(ctx, model, provider)
+	if err != nil {
+		return inst, err
+	}
+	if args.MaxAPICalls.Valid && args.MaxAPICalls.Value.Int() > 0 {
+		llm = llm.WithMaxAPICalls(args.MaxAPICalls.Value.Int())
+	}
+	return dagql.NewObjectResultForCurrentCall(ctx, srv, llm)
+}
+
+func (s *llmSchema) messages(_ context.Context, llm *core.LLM, _ struct{}) ([]*core.LLMMessage, error) {
+	// tokenUsage is a non-null field, so messages that never had usage
+	// recorded (prompts, tool results) must serve zeros rather than nil.
+	msgs := make([]*core.LLMMessage, len(llm.Messages))
+	for i, msg := range llm.Messages {
+		if msg.TokenUsage == nil {
+			msg = msg.Clone()
+			msg.TokenUsage = &core.LLMTokenUsage{}
+		}
+		msgs[i] = msg
+	}
+	return msgs, nil
+}
+
+func (s *llmSchema) transcript(ctx context.Context, llm *core.LLM, _ struct{}) (string, error) {
+	return llm.Transcript(), nil
+}
+
+func (s *llmSchema) tools(ctx context.Context, llm *core.LLM, _ struct{}) (string, error) {
+	return llm.ToolsDoc(ctx)
+}
+
+func (s *llmSchema) tokenUsage(ctx context.Context, llm *core.LLM, _ struct{}) (*core.LLMTokenUsage, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return llm.TokenUsage(ctx, srv)
+}
+
+func (s *llmSchema) contextTokens(ctx context.Context, llm *core.LLM, _ struct{}) (int, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return llm.ContextTokens(ctx, srv)
+}
+
+func (s *llmSchema) withoutMessageHistory(ctx context.Context, llm *core.LLM, _ struct{}) (*core.LLM, error) {
+	return llm.WithoutMessageHistory(), nil
+}
+
+func (s *llmSchema) withoutSystemPrompts(ctx context.Context, llm *core.LLM, _ struct{}) (*core.LLM, error) {
+	return llm.WithoutSystemPrompts(), nil
+}
+
+type expertiseArgs struct {
+	Expertise []dagql.ID[*core.Expertise]
+}
+
+func (args expertiseArgs) load(ctx context.Context) ([]*core.Expertise, error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	expertise := make([]*core.Expertise, len(args.Expertise))
+	for i, id := range args.Expertise {
+		entry, err := id.Load(ctx, srv)
+		if err != nil {
+			return nil, err
+		}
+		expertise[i] = entry.Self()
+	}
+	return expertise, nil
+}
+
+func (*llmSchema) compose(ctx context.Context, base dagql.ObjectResult[*core.LLM], args expertiseArgs) (dagql.ObjectResult[*core.LLM], error) {
+	expertise, err := args.load(ctx)
+	if err != nil {
+		return base, err
+	}
+	return core.ComposeExpertise(ctx, base, expertise)
+}
+
+func (*llmSchema) recompose(ctx context.Context, base dagql.ObjectResult[*core.LLM], args expertiseArgs) (dagql.ObjectResult[*core.LLM], error) {
+	expertise, err := args.load(ctx)
+	if err != nil {
+		return base, err
+	}
+	return core.RecomposeExpertise(ctx, base, expertise)
+}

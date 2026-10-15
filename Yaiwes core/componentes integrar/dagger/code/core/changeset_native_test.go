@@ -1,0 +1,568 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+)
+
+func TestFallbackMarkerReason(t *testing.T) {
+	require.Equal(t, "directory-metadata", fallbackMarkerReason(nativeCommitUnsupportedReason("directory-metadata")))
+	require.Equal(t, "incoming-parent-ref", fallbackMarkerReason(fmt.Errorf("wrapped: %w", nativeCommitUnsupportedReason("incoming-parent-ref"))))
+	require.Equal(t, "error: git [read-tree abc]", fallbackMarkerReason(errors.New("git [read-tree abc]: exit status 128: fatal")))
+	long := fallbackMarkerReason(errors.New(strings.Repeat("x", 100)))
+	require.Equal(t, "error: "+strings.Repeat("x", 48)+"…", long)
+}
+
+//nolint:gocyclo // one oracle loop over every scenario; the metric counts their setups together
+func TestNativeWorkspaceMergeMatchesCheckout(t *testing.T) {
+	// The engine runs with umask 000. Exercise both it and the usual host
+	// umask: Git's normalization is not a hard-coded 0644/0755 policy.
+	for _, mask := range []int{0022, 0} {
+		t.Run(fmt.Sprintf("umask%03o", mask), func(t *testing.T) {
+			old := syscall.Umask(mask)
+			defer syscall.Umask(old)
+			for _, scenario := range []string{"disjoint", "identical", "identical-metadata", "overlap", "rename-modify", "replacement", "attributes", "normalized-noop", "delete", "conflict", "modify-delete", "packed", "introduced-directory-modes", "empty-directories", "existing-directory-metadata"} {
+				t.Run(scenario, func(t *testing.T) {
+					ctx := t.Context()
+					source := t.TempDir()
+					run := func(dir string, args ...string) string {
+						t.Helper()
+						out, err := runWorkspaceCommitGit(ctx, dir, nil, args...)
+						require.NoError(t, err)
+						return strings.TrimSpace(out)
+					}
+					write := func(dir, p, data string, mode os.FileMode) {
+						t.Helper()
+						name := filepath.Join(dir, p)
+						require.NoError(t, os.MkdirAll(filepath.Dir(name), 0777))
+						require.NoError(t, os.WriteFile(name, []byte(data), mode))
+						require.NoError(t, os.Chmod(name, mode))
+					}
+					run(source, "init", "-b", "main")
+					write(source, "unchanged", "keep filesystem metadata", 0600)
+					write(source, "edit", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n", 0644)
+					write(source, "remove", "remove\n", 0644)
+					write(source, "dir/file", "child\n", 0644)
+					write(source, ".gitattributes", "*.txt text eol=crlf ident\n", 0644)
+					write(source, "same.txt", "same\n", 0644)
+					run(source, "add", ".")
+					run(source, "commit", "-m", "base")
+					parent := run(source, "rev-parse", "HEAD")
+					if scenario == "packed" {
+						run(source, "gc", "--prune=now")
+					}
+					// Both start with precisely the same filesystem, including a
+					// non-Git mode on an untouched file. No shared mutable .git.
+					oracle, native := filepath.Join(t.TempDir(), "oracle"), filepath.Join(t.TempDir(), "native")
+					for _, dir := range []string{oracle, native} {
+						run(source, "clone", "--no-hardlinks", source, dir)
+						require.NoError(t, os.RemoveAll(filepath.Join(dir, ".git")))
+						require.NoError(t, os.Chmod(filepath.Join(dir, "unchanged"), 0600))
+					}
+					paths := []*ChangesetPaths{{}, {}}
+					apply := []func(string) error{
+						func(work string) error {
+							switch scenario {
+							case "disjoint", "packed":
+								paths[0].Added = []string{"ours", "newdir/ours", "link"}
+								write(work, "ours", "ours", 0600)
+								write(work, "newdir/ours", "new directory", 0600)
+								require.NoError(t, os.Symlink("ours", filepath.Join(work, "link")))
+							case "identical", "identical-metadata":
+								paths[0].Added = []string{"new"}
+								write(work, "new", "same", 0600)
+							case "overlap", "conflict", "modify-delete":
+								paths[0].Modified = []string{"edit"}
+								write(work, "edit", "ONE\ntwo\nthree\nfour\nfive\nsix\nseven\n", 0600)
+							case "rename-modify":
+								paths[0].AllRemoved = []string{"edit"}
+								paths[0].Added = []string{"renamed"}
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "edit")))
+								write(work, "renamed", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n", 0600)
+							case "replacement":
+								paths[0].AllRemoved = []string{"dir/file", "remove"}
+								paths[0].Added = []string{"dir", "remove/child"}
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "dir")))
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "remove")))
+								write(work, "dir", "file now", 0600)
+								write(work, "remove/child", "directory now", 0700)
+							case "attributes":
+								paths[0].Added = []string{"same-new.txt"}
+								write(work, "same-new.txt", "$Id: expanded $\nhello\n", 0600)
+							case "normalized-noop":
+								paths[0].Modified = []string{"same.txt"}
+								write(work, "same.txt", "same\n", 0600)
+							case "delete":
+								paths[0].AllRemoved = []string{"dir/file"}
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "dir")))
+							case "introduced-directory-modes":
+								// Directories a delta introduces keep whatever mode
+								// their producer gave them: a patch applied under the
+								// engine's umask 000 creates 0777 ones.
+								paths[0].Added = []string{"fresh/", "fresh/deep/", "fresh/deep/ours", "shared/", "shared/same", "dir/sub/", "dir/sub/ours"}
+								write(work, "fresh/deep/ours", "ours", 0644)
+								write(work, "shared/same", "same", 0644)
+								write(work, "dir/sub/ours", "ours", 0644)
+								for dir, mode := range map[string]os.FileMode{"fresh": 0777, "fresh/deep": 0700, "shared": 0777, "dir/sub": 0777 | os.ModeSetgid} {
+									require.NoError(t, os.Chmod(filepath.Join(work, dir), mode))
+								}
+								if os.Geteuid() == 0 {
+									require.NoError(t, os.Chown(filepath.Join(work, "fresh"), 123, 456))
+								}
+							case "empty-directories":
+								// Git tracks none of these; each side's raw delta
+								// carries them, and the checkout transitions prune
+								// only what they empty themselves.
+								paths[0].Added = []string{"ours-empty/", "deep/", "deep/empty/", "dir/ours-empty/", "remove/"}
+								paths[0].AllRemoved = []string{"remove"}
+								for _, dir := range []string{"ours-empty", "deep/empty", "dir/ours-empty"} {
+									require.NoError(t, os.MkdirAll(filepath.Join(work, dir), 0750))
+								}
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "remove")))
+								require.NoError(t, os.Mkdir(filepath.Join(work, "remove"), 0700))
+							case "existing-directory-metadata":
+								// Deltas change existing directories' metadata,
+								// the root's included: both sides, differently.
+								paths[0].Added = []string{"dir/ours"}
+								write(work, "dir/ours", "ours", 0644)
+								require.NoError(t, os.Chmod(filepath.Join(work, "dir"), 0700))
+								require.NoError(t, os.Chmod(work, 0750))
+								require.NoError(t, unix.Setxattr(filepath.Join(work, "dir"), "user.native-test", []byte("ours"), 0))
+								if os.Geteuid() == 0 {
+									require.NoError(t, os.Chown(filepath.Join(work, "dir"), 123, 456))
+								}
+							}
+							return nil
+						},
+						func(work string) error {
+							switch scenario {
+							case "empty-directories":
+								paths[1].Added = []string{"theirs-empty/"}
+								paths[1].AllRemoved = []string{"dir/file"}
+								require.NoError(t, os.Mkdir(filepath.Join(work, "theirs-empty"), 0777))
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "dir/file")))
+								return nil
+							case "existing-directory-metadata":
+								paths[1].Modified = []string{"dir/file"}
+								write(work, "dir/file", "theirs\n", 0644)
+								require.NoError(t, os.Chmod(filepath.Join(work, "dir"), 0750))
+								require.NoError(t, os.Chmod(work, 0711))
+								return nil
+							}
+							switch scenario {
+							case "introduced-directory-modes":
+								paths[1].Added = []string{"shared/", "shared/same", "theirs-dir/", "theirs-dir/theirs"}
+								write(work, "shared/same", "same", 0644)
+								write(work, "theirs-dir/theirs", "theirs", 0644)
+								for dir, mode := range map[string]os.FileMode{"shared": 0750, "theirs-dir": 0777} {
+									require.NoError(t, os.Chmod(filepath.Join(work, dir), mode))
+								}
+								if os.Geteuid() == 0 {
+									require.NoError(t, os.Chown(filepath.Join(work, "shared"), 123, 456))
+								}
+							case "identical", "identical-metadata":
+								paths[1].Added = []string{"new"}
+								write(work, "new", "same", 0640)
+								if scenario == "identical-metadata" {
+									if os.Geteuid() == 0 {
+										require.NoError(t, os.Chown(filepath.Join(work, "new"), 123, 456))
+									}
+									require.NoError(t, os.Chmod(filepath.Join(work, "new"), 0600|os.ModeSetuid|os.ModeSetgid))
+									require.NoError(t, unix.Setxattr(filepath.Join(work, "new"), "user.native-test", []byte("retained"), 0))
+								}
+							case "overlap", "rename-modify":
+								paths[1].Modified = []string{"edit"}
+								write(work, "edit", "one\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n", 0700)
+							case "conflict":
+								paths[1].Modified = []string{"edit"}
+								write(work, "edit", "conflict\n", 0644)
+							case "modify-delete":
+								paths[1].AllRemoved = []string{"edit"}
+								require.NoError(t, os.RemoveAll(filepath.Join(work, "edit")))
+							case "attributes":
+								paths[1].Added = []string{"same-new.txt", "incoming.txt"}
+								write(work, "same-new.txt", "$Id: different expansion $\r\nhello\r\n", 0640)
+								write(work, "incoming.txt", "$Id: expanded $\nnew\n", 0600)
+							default:
+								paths[1].Added = []string{"theirs"}
+								write(work, "theirs", "theirs", 0700)
+							}
+							return nil
+						},
+					}
+					// This is the actual legacy sequence, including whole-baseline
+					// staging and checkout skips; not a tree-only equality oracle.
+					require.NoError(t, initGitRepo(ctx, oracle))
+					run(oracle, "checkout", "-b", "ours")
+					require.NoError(t, apply[0](oracle))
+					run(oracle, "add", "-A")
+					run(oracle, "commit", "--allow-empty", "-m", "ours")
+					run(oracle, "checkout", "-b", "theirs", "HEAD~1")
+					require.NoError(t, apply[1](oracle))
+					run(oracle, "add", "-A")
+					run(oracle, "commit", "--allow-empty", "-m", "theirs")
+					run(oracle, "checkout", "ours")
+					oracleErr := runGit(ctx, oracle, "merge", "--no-edit", "--no-commit", "theirs")
+					err := nativeWorkspaceMerge(ctx, filepath.Join(source, ".git/objects"), parent, native, paths, apply, nil)
+					if scenario == "conflict" || scenario == "modify-delete" {
+						require.Error(t, oracleErr)
+						require.Error(t, err)
+						require.NotErrorIs(t, err, errNativeCommitUnsupported)
+						var conflict nativeMergeConflict
+						require.ErrorAs(t, err, &conflict)
+						require.Contains(t, err.Error(), "CONFLICT")
+						require.Contains(t, err.Error(), "merge conflict between workspace and incoming changes in edit")
+						require.NotRegexp(t, `[0-9a-f]{40}`, err.Error(), "scratch commit IDs leaked into the conflict")
+						return
+					}
+					require.NoError(t, oracleErr)
+					require.NoError(t, err)
+					require.NoError(t, os.RemoveAll(filepath.Join(oracle, ".git")))
+					require.Equal(t, nativeWorkspaceFilesystem(t, oracle), nativeWorkspaceFilesystem(t, native))
+					oracleRoot, err := os.Stat(oracle)
+					require.NoError(t, err)
+					nativeRoot, err := os.Stat(native)
+					require.NoError(t, err)
+					require.Equal(t, oracleRoot.Mode(), nativeRoot.Mode(), "root directory metadata")
+					switch scenario {
+					case "empty-directories":
+						for _, dir := range []string{"ours-empty", "deep/empty", "dir/ours-empty", "theirs-empty"} {
+							info, err := os.Stat(filepath.Join(native, dir))
+							require.NoError(t, err, dir)
+							require.True(t, info.IsDir(), dir)
+						}
+					case "existing-directory-metadata":
+						require.Equal(t, os.FileMode(0711), nativeRoot.Mode().Perm())
+						value := make([]byte, 16)
+						n, err := unix.Getxattr(filepath.Join(native, "dir"), "user.native-test", value)
+						require.NoError(t, err)
+						require.Equal(t, "ours", string(value[:n]))
+					}
+					if scenario == "introduced-directory-modes" {
+						// Not vacuous: the incoming delta's raw directory
+						// survives where both sides agree, as in the oracle.
+						info, err := os.Stat(filepath.Join(native, "shared"))
+						require.NoError(t, err)
+						require.Equal(t, os.FileMode(0750), info.Mode().Perm())
+					}
+					require.Equal(t, parent, run(source, "rev-parse", "HEAD"))
+				})
+			}
+		})
+	}
+}
+
+func nativeWorkspaceFilesystem(t *testing.T, root string) map[string]string {
+	t.Helper()
+	result := map[string]string{}
+	require.NoError(t, filepath.WalkDir(root, func(name string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if name == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, name)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		var data string
+		if entry.Type()&os.ModeSymlink != 0 {
+			data, err = os.Readlink(name)
+		} else if !entry.IsDir() {
+			var contents []byte
+			contents, err = os.ReadFile(name)
+			data = string(contents)
+		}
+		if err != nil {
+			return err
+		}
+		result[rel] = fmt.Sprintf("%v uid=%d gid=%d %s", info.Mode(), stat.Uid, stat.Gid, data)
+		value := make([]byte, 256)
+		n, err := unix.Lgetxattr(name, "user.native-test", value)
+		if err != nil && !errors.Is(err, unix.ENODATA) && !errors.Is(err, unix.ENOTSUP) {
+			return err
+		}
+		if n > 0 {
+			result[rel] += " xattr=" + string(value[:n])
+		}
+		return nil
+	}))
+	return result
+}
+
+func TestNativeWorkspaceMergeFallbacksAndErrors(t *testing.T) {
+	ctx := t.Context()
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"commit", "--allow-empty", "-m", "base"}} {
+		_, err := runWorkspaceCommitGit(ctx, repo, nil, args...)
+		require.NoError(t, err)
+	}
+	parent, err := runWorkspaceCommitGit(ctx, repo, nil, "rev-parse", "HEAD")
+	require.NoError(t, err)
+	parent = strings.TrimSpace(parent)
+	noop := func(string) error { return nil }
+	for _, paths := range []*ChangesetPaths{{Modified: []string{".gitattributes"}}, {AllRemoved: []string{"nested/.gitignore"}}, {Added: []string{".gitmodules"}}} {
+		err := nativeWorkspaceMerge(ctx, filepath.Join(repo, ".git/objects"), parent, t.TempDir(), []*ChangesetPaths{paths, {}}, []func(string) error{noop, noop}, nil)
+		require.ErrorIs(t, err, errNativeCommitUnsupported)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	err = nativeWorkspaceMerge(cancelled, filepath.Join(repo, ".git/objects"), parent, t.TempDir(), []*ChangesetPaths{{}, {}}, []func(string) error{noop, noop}, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	err = nativeWorkspaceMerge(ctx, filepath.Join(repo, ".git/objects"), strings.Repeat("f", 40), t.TempDir(), []*ChangesetPaths{{}, {}}, []func(string) error{noop, noop}, nil)
+	require.Error(t, err)
+	require.False(t, errors.Is(err, errNativeCommitUnsupported))
+}
+
+func TestNativeWorkspaceMergeBaseEvidence(t *testing.T) {
+	for _, scenario := range []string{"ignored-addition", "ignored-tracked", "noncanonical-blob", "literal-path"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := t.Context()
+			repo := t.TempDir()
+			run := func(args ...string) string {
+				t.Helper()
+				out, err := runWorkspaceCommitGit(ctx, repo, nil, args...)
+				require.NoError(t, err)
+				return strings.TrimSpace(out)
+			}
+			run("init", "-b", "main")
+			require.NoError(t, os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("ignored\n"), 0644))
+			require.NoError(t, os.WriteFile(filepath.Join(repo, "old.txt"), []byte("old\r\n"), 0644))
+			run("add", ".")
+			run("commit", "-m", "base")
+			paths := &ChangesetPaths{}
+			name := "ignored"
+			switch scenario {
+			case "ignored-addition":
+				paths.Added = []string{name}
+			case "ignored-tracked":
+				require.NoError(t, os.WriteFile(filepath.Join(repo, name), []byte("tracked despite ignores"), 0644))
+				run("add", "-f", name)
+				run("commit", "-m", "tracked ignored file")
+				paths.Modified = []string{name}
+			case "noncanonical-blob":
+				// Retain the old CRLF blob, then introduce clean conversion.
+				require.NoError(t, os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("*.txt text eol=lf\n"), 0644))
+				run("add", ".gitattributes")
+				run("commit", "-m", "attributes without renormalizing")
+				name = "old.txt"
+				paths.Modified = []string{name}
+			case "literal-path":
+				name = ":[literal]\nname"
+				paths.Added = []string{name}
+			}
+			parent := run("rev-parse", "HEAD")
+			base := filepath.Join(t.TempDir(), "base")
+			run("clone", "--no-hardlinks", repo, base)
+			require.NoError(t, os.RemoveAll(filepath.Join(base, ".git")))
+			apply := func(work string) error {
+				return os.WriteFile(filepath.Join(work, name), []byte("new\n"), 0644)
+			}
+			err := nativeWorkspaceMerge(ctx, filepath.Join(repo, ".git/objects"), parent, base, []*ChangesetPaths{paths, {}}, []func(string) error{apply, func(string) error { return nil }}, nil)
+			if scenario == "literal-path" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, errNativeCommitUnsupported)
+			}
+		})
+	}
+}
+
+// The merge base is HEAD's real tree. The legacy synthetic base leaves out the
+// tracked ignored file, sees old/ renamed wholesale and reports a file location
+// conflict for old/b.txt; old/ was never renamed, so b.txt stays where added.
+func TestNativeWorkspaceMergeRealBaseDirectoryRename(t *testing.T) {
+	ctx := t.Context()
+	repo := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := runWorkspaceCommitGit(ctx, repo, nil, args...)
+		require.NoError(t, err)
+		return strings.TrimSpace(out)
+	}
+	write := func(dir, p, data string) {
+		t.Helper()
+		name := filepath.Join(dir, p)
+		require.NoError(t, os.MkdirAll(filepath.Dir(name), 0755))
+		require.NoError(t, os.WriteFile(name, []byte(data), 0644))
+	}
+	run("init", "-b", "main")
+	write(repo, ".gitignore", "*.log\n")
+	write(repo, "old/a.txt", "a\n")
+	write(repo, "old/keep.log", "tracked despite ignores\n")
+	run("add", "-f", ".")
+	run("commit", "-m", "base")
+	parent := run("rev-parse", "HEAD")
+	base := filepath.Join(t.TempDir(), "base")
+	run("clone", "--no-hardlinks", repo, base)
+	require.NoError(t, os.RemoveAll(filepath.Join(base, ".git")))
+	paths := []*ChangesetPaths{
+		{AllRemoved: []string{"old/a.txt"}, Added: []string{"new/", "new/a.txt"}},
+		{Added: []string{"old/b.txt"}},
+	}
+	apply := []func(string) error{
+		func(work string) error {
+			if err := os.Remove(filepath.Join(work, "old/a.txt")); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			write(work, "new/a.txt", "a\n")
+			return nil
+		},
+		func(work string) error {
+			write(work, "old/b.txt", "b\n")
+			return nil
+		},
+	}
+	require.NoError(t, nativeWorkspaceMerge(ctx, filepath.Join(repo, ".git/objects"), parent, base, paths, apply, nil))
+	for p, want := range map[string]string{"new/a.txt": "a\n", "old/b.txt": "b\n", "old/keep.log": "tracked despite ignores\n"} {
+		got, err := os.ReadFile(filepath.Join(base, p))
+		require.NoError(t, err, p)
+		require.Equal(t, want, string(got), p)
+	}
+	_, err := os.Lstat(filepath.Join(base, "old/a.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Lstat(filepath.Join(base, "new/b.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// A gitlink beside the merged paths is no submodule change; a path inside it
+// is. A removed submodule directory is reconciled from the raw deltas, as the
+// commit's own change; its content falls back.
+func TestNativeWorkspaceMergeGitlinks(t *testing.T) {
+	for _, scenario := range []string{"sibling", "inside", "remove empty", "remove populated"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := t.Context()
+			repo := t.TempDir()
+			run := func(args ...string) string {
+				t.Helper()
+				out, err := runWorkspaceCommitGit(ctx, repo, nil, args...)
+				require.NoError(t, err)
+				return strings.TrimSpace(out)
+			}
+			write := func(dir, p, data string) {
+				t.Helper()
+				name := filepath.Join(dir, p)
+				require.NoError(t, os.MkdirAll(filepath.Dir(name), 0755))
+				require.NoError(t, os.WriteFile(name, []byte(data), 0644))
+			}
+			run("init", "-b", "main")
+			write(repo, "vendor/x", "x\n")
+			write(repo, "vendor/y", "y\n")
+			run("add", ".")
+			run("commit", "-m", "base")
+			run("update-index", "--add", "--cacheinfo", "160000,"+run("rev-parse", "HEAD")+",vendor/module")
+			run("commit", "-m", "gitlink")
+			parent := run("rev-parse", "HEAD")
+			base := filepath.Join(t.TempDir(), "base")
+			run("clone", "--no-hardlinks", repo, base)
+			require.NoError(t, os.RemoveAll(filepath.Join(base, ".git")))
+			paths := []*ChangesetPaths{{Modified: []string{"vendor/x"}}, {Modified: []string{"vendor/y"}}}
+			switch scenario {
+			case "inside":
+				paths[0] = &ChangesetPaths{Added: []string{"vendor/module/file"}}
+			case "remove empty":
+				paths[0] = &ChangesetPaths{AllRemoved: []string{"vendor/module/"}}
+			case "remove populated":
+				paths[0] = &ChangesetPaths{AllRemoved: []string{"vendor/module/", "vendor/module/file"}}
+			}
+			apply := []func(string) error{
+				func(work string) error {
+					if strings.HasPrefix(scenario, "remove") {
+						return os.RemoveAll(filepath.Join(work, "vendor/module"))
+					}
+					write(work, commitStagePaths(paths[0])[0], "workspace\n")
+					return nil
+				},
+				func(work string) error {
+					write(work, "vendor/y", "incoming\n")
+					return nil
+				},
+			}
+			err := nativeWorkspaceMerge(ctx, filepath.Join(repo, ".git/objects"), parent, base, paths, apply, nil)
+			if scenario == "inside" || scenario == "remove populated" {
+				require.ErrorIs(t, err, errNativeCommitUnsupported)
+				require.Equal(t, "gitlink-change", err.Error())
+				return
+			}
+			require.NoError(t, err)
+			want := map[string]string{"vendor/x": "workspace\n", "vendor/y": "incoming\n"}
+			if scenario == "remove empty" {
+				want["vendor/x"] = "x\n"
+			}
+			for p, want := range want {
+				got, err := os.ReadFile(filepath.Join(base, p))
+				require.NoError(t, err, p)
+				require.Equal(t, want, string(got), p)
+			}
+			info, err := os.Lstat(filepath.Join(base, "vendor/module"))
+			if scenario == "remove empty" {
+				require.ErrorIs(t, err, os.ErrNotExist)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, info.IsDir())
+		})
+	}
+}
+
+func TestNativeWorkspaceDeltaReplacedAncestors(t *testing.T) {
+	for _, beforeKind := range []string{"missing", "regular-file", "external-symlink"} {
+		t.Run(beforeKind, func(t *testing.T) {
+			base, delta, outside := t.TempDir(), t.TempDir(), t.TempDir()
+			// This external directory deliberately has unsupported metadata:
+			// consulting it through the old symlink would reject a valid delta.
+			require.NoError(t, os.Mkdir(filepath.Join(outside, "sub"), 0700))
+			sentinel := filepath.Join(outside, "sub", "sentinel")
+			require.NoError(t, os.WriteFile(sentinel, []byte("untouched"), 0600))
+			switch beforeKind {
+			case "regular-file":
+				require.NoError(t, os.WriteFile(filepath.Join(base, "replaced"), []byte("old file"), 0600))
+			case "external-symlink":
+				require.NoError(t, os.Symlink(outside, filepath.Join(base, "replaced")))
+			}
+			require.NoError(t, os.MkdirAll(filepath.Join(delta, "replaced", "sub", "deep"), 0755))
+			require.NoError(t, os.WriteFile(filepath.Join(delta, "replaced", "sub", "deep", "file"), []byte("new file"), 0644))
+			paths := &ChangesetPaths{Added: []string{"replaced/", "replaced/sub/", "replaced/sub/deep/", "replaced/sub/deep/file"}}
+			require.NoError(t, validateNativeWorkspaceDelta(t.Context(), delta, paths))
+			contents, err := os.ReadFile(sentinel)
+			require.NoError(t, err)
+			require.Equal(t, "untouched", string(contents))
+			info, err := os.Stat(filepath.Join(outside, "sub"))
+			require.NoError(t, err)
+			require.Equal(t, os.FileMode(0700), info.Mode().Perm())
+			_, err = os.Lstat(filepath.Join(outside, "sub", "deep"))
+			require.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
+}
+
+func TestNativeWorkspaceDeltaMetadataFallback(t *testing.T) {
+	delta := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(delta, "unreported"), []byte("same bytes"), 0600))
+	err := validateNativeWorkspaceDelta(t.Context(), delta, &ChangesetPaths{})
+	require.ErrorIs(t, err, errNativeCommitUnsupported)
+	require.NoError(t, os.Remove(filepath.Join(delta, "unreported")))
+	// Directory metadata, the root's included, is the replay's to apply.
+	require.NoError(t, os.Chmod(delta, 0700))
+	require.NoError(t, os.Mkdir(filepath.Join(delta, "empty"), 0777))
+	if err := unix.Setxattr(filepath.Join(delta, "empty"), "user.native-test", []byte("kept"), 0); err != nil && !errors.Is(err, unix.ENOTSUP) {
+		require.NoError(t, err)
+	}
+	require.NoError(t, validateNativeWorkspaceDelta(t.Context(), delta, &ChangesetPaths{Added: []string{"empty/"}}))
+}

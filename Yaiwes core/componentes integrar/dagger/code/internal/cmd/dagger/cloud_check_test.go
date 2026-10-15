@@ -1,0 +1,383 @@
+package daggercmd
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os/exec"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCloudChecksCommandAndHiddenAlias(t *testing.T) {
+	root := testRootCommand()
+	for _, name := range []string{"checks", "check"} {
+		cmd, args, err := root.Find([]string{"cloud", name})
+		require.NoError(t, err)
+		require.Empty(t, args)
+		require.Same(t, cloudCheckCmd, cmd)
+		require.Equal(t, "checks", cmd.Name())
+		require.Empty(t, helpAliases(cmd))
+		for _, subcommand := range []string{"on", "off", "status", "list", "rerun"} {
+			cmd, args, err := root.Find([]string{"cloud", name, subcommand})
+			require.NoError(t, err)
+			require.Empty(t, args)
+			require.Equal(t, "dagger cloud checks "+subcommand, cmd.CommandPath())
+		}
+	}
+	require.NotContains(t, renderHelp(t, cloudCheckCmd), "ALIASES")
+	require.NotContains(t, renderHelp(t, cloudCmd), "checks, check")
+}
+
+func TestCloudChecksCommandPrompt(t *testing.T) {
+	oldOrg := cloudOrgFlag
+	cloudOrgFlag = "team's org"
+	t.Cleanup(func() { cloudOrgFlag = oldOrg })
+	for _, args := range []string{"signup", "integration create github --open"} {
+		command := cloudSetupCommand(args)
+		require.Equal(t, "dagger cloud "+args+" --org 'team'\"'\"'s org'", command)
+	}
+}
+
+func TestCloudChecksOnUnauthenticated(t *testing.T) {
+	for _, name := range []string{"checks", "check"} {
+		t.Run(name, func(t *testing.T) {
+			daggerCloudWithEnv(t, nil, []string{"cloud", name, "on", "github.com/example/project"}, func(t *testing.T, err error, out, stderr *bytes.Buffer) {
+				require.Error(t, err)
+				require.Contains(t, stderr.String(), "dagger cloud signup\ndagger cloud checks on github.com/example/project")
+				require.Empty(t, out.String())
+			})
+		})
+	}
+}
+
+func TestCloudChecksPrerequisiteCommands(t *testing.T) {
+	oldWorkspace, oldOrg := workspaceRef, cloudOrgFlag
+	workspaceRef = "github.com/example/project@main"
+	cloudOrgFlag = "team's org"
+	t.Cleanup(func() { workspaceRef, cloudOrgFlag = oldWorkspace, oldOrg })
+	cmd := &cobra.Command{}
+	err := cloudChecksPrerequisiteError(cmd, []string{"github.com/example/project"}, "Account required", "dagger cloud signup")
+	_, script, found := strings.Cut(err.Error(), "then retry:\n\n")
+	require.True(t, found)
+	shell := exec.Command("sh")
+	shell.Stdin = strings.NewReader("dagger() { printf '<%s>\\n' \"$@\"; }\n" + script)
+	out, shellErr := shell.CombinedOutput()
+	require.NoError(t, shellErr, string(out))
+	require.Equal(t, "<cloud>\n<signup>\n<--org>\n<team's org>\n<-W>\n<github.com/example/project@main>\n<cloud>\n<checks>\n<on>\n<github.com/example/project>\n<--org>\n<team's org>\n", string(out))
+}
+
+func TestCloudChecksOnPrerequisites(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		noSource    bool
+		enabled     bool
+		wantError   string
+		wantQueries []string
+	}{
+		{name: "GitHub App install required", noSource: true, wantError: "installations/select_target", wantQueries: []string{"GetUserRepositories", "GetSources", "GetGithubConnection"}},
+		{name: "already enabled", enabled: true, wantQueries: []string{"GetUserRepositories", "GetSources", "GetOrgDetails"}},
+		{name: "enable mapped repository", wantQueries: []string{"GetUserRepositories", "GetSources", "User", "GetOrgDetails", "GetOrgMappedSources", "ConfigureSource"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					OperationName string         `json:"operationName"`
+					Variables     map[string]any `json:"variables"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					http.Error(w, "invalid request", http.StatusBadRequest)
+					return
+				}
+				operation := request.OperationName
+				if operation == "" {
+					operation = "User"
+				}
+				queries = append(queries, operation)
+				var data string
+				switch operation {
+				case "GetUserRepositories":
+					data = `{"user":{"repositories":[]}}`
+					if tc.enabled {
+						data = `{"user":{"repositories":[{"ref":"github.com/example/project","mappedSource":{"installationId":"installation","mode":"SELECTED","repositories":["github.com/example/project"]}}]}}`
+					}
+				case "GetSources":
+					data = `{"sources":[{"id":"installation","name":"example","orgName":"example"}]}`
+					if tc.noSource {
+						data = `{"sources":[]}`
+					}
+				case "GetOrgDetails":
+					// The feature gate runs even when invoked without the
+					// annotated command (e.g. from dagger init); features are
+					// active here so no trial is offered.
+					data = `{"org":{"id":"org","name":"example","createdAt":"","subscription":{"status":"","subscriptionID":"","planID":"","hasCaching":false},"features":[{"name":"CLOUD_CHECKS","status":"ACTIVE"},{"name":"CLOUD_MODULES","status":"ACTIVE"},{"name":"CLOUD_ENGINES","status":"ACTIVE"}]}}`
+				case "GetGithubConnection":
+					// The identity is connected; only the app install is missing.
+					data = `{"githubConnection":{"githubLogin":"octocat","connectedAt":""}}`
+				case "User":
+					// Membership check before the org-scoped mapped-sources
+					// lookup (clear ownership error instead of "unauthorized").
+					data = `{"user":{"id":"user","orgs":[{"id":"org","name":"example"}]}}`
+				case "GetOrgMappedSources":
+					data = `{"org":{"mappedSources":[{"installationId":"installation","mode":"SELECTED","repositories":["github.com/example/other"]}]}}`
+				case "ConfigureSource":
+					// Enabling this repository must preserve other selections.
+					if got := request.Variables["repositories"]; !sameStrings(got, []string{"github.com/example/other", "github.com/example/project"}) {
+						t.Errorf("configured repositories: %v", got)
+					}
+					data = `{"configureSource":{"installationId":"installation","mode":"SELECTED"}}`
+				default:
+					t.Errorf("unexpected Cloud operation: %s", operation)
+					http.Error(w, "unexpected operation", http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"data":%s}`, data)
+			}))
+			defer server.Close()
+			t.Setenv("DAGGER_CLOUD_URL", server.URL)
+			t.Setenv("DAGGER_CLOUD_TOKEN", "test-token")
+			oldTTY, oldWorkspace, oldOrg := stdinIsTTY, workspaceRef, cloudOrgFlag
+			stdinIsTTY, workspaceRef, cloudOrgFlag = false, "", ""
+			t.Cleanup(func() { stdinIsTTY, workspaceRef, cloudOrgFlag = oldTTY, oldWorkspace, oldOrg })
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			err := runCloudCheckSet(true)(cmd, []string{"github.com/example/project"})
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				require.ErrorContains(t, err, "dagger cloud checks on github.com/example/project")
+				require.Empty(t, out.String())
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "checks for repo github.com/example/project enabled\n", out.String())
+			}
+			require.Equal(t, tc.wantQueries, queries)
+		})
+	}
+}
+
+func sameStrings(value any, expected []string) bool {
+	values, ok := value.([]any)
+	if !ok || len(values) != len(expected) {
+		return false
+	}
+	for i, value := range values {
+		if value != expected[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Enabling checks on a repo that is already selected must still enforce the
+// org's required Cloud features: without this, `checks on` early-returns "on"
+// while checks silently never run for orgs missing CLOUD_CHECKS/CLOUD_MODULES.
+func TestCloudChecksOnEnabledRepoStillEnforcesFeatures(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			OperationName string         `json:"operationName"`
+			Variables     map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		operation := request.OperationName
+		if operation == "" {
+			operation = "User"
+		}
+		queries = append(queries, operation)
+		var data string
+		switch operation {
+		case "GetUserRepositories":
+			// The repo is already tracked AND selected (enabled).
+			data = `{"user":{"repositories":[{"ref":"github.com/example/project","mappedSource":{"installationId":"installation","mode":"SELECTED","repositories":["github.com/example/project"]}}]}}`
+		case "GetSources":
+			// Resolves the org owning the installation for the feature gate.
+			data = `{"sources":[{"id":"installation","name":"example","orgName":"example"}]}`
+		case "GetOrgDetails":
+			// Neither feature enabled -> checks on must fail, not report "on".
+			data = `{"org":{"id":"org-1","name":"example","createdAt":"","subscription":{"status":"","subscriptionID":"","planID":"","hasCaching":false},"features":[{"name":"CLOUD_CHECKS","status":"UNUSED"}]}}`
+		default:
+			t.Errorf("unexpected Cloud operation: %s", operation)
+			http.Error(w, "unexpected operation", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"data":%s}`, data)
+	}))
+	defer server.Close()
+	t.Setenv("DAGGER_CLOUD_URL", server.URL)
+	t.Setenv("DAGGER_CLOUD_TOKEN", "test-token")
+	oldTTY, oldWorkspace, oldOrg, oldApply := stdinIsTTY, workspaceRef, cloudOrgFlag, autoApply
+	stdinIsTTY, workspaceRef, cloudOrgFlag, autoApply = false, "", "", true
+	t.Cleanup(func() { stdinIsTTY, workspaceRef, cloudOrgFlag, autoApply = oldTTY, oldWorkspace, oldOrg, oldApply })
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	requireCloudFeatures(cmd, featureCloudChecks, featureCloudModules)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := runCloudCheckSet(true)(cmd, []string{"github.com/example/project"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `CLOUD_CHECKS + CLOUD_MODULES are not enabled for organization "example"`)
+	require.NotContains(t, out.String(), "enabled\n")
+	require.Equal(t, []string{"GetUserRepositories", "GetSources", "GetOrgDetails"}, queries)
+}
+
+// The org's Cloud features must be checked BEFORE the org-scoped
+// mapped-sources lookup: that query is feature-gated server-side, so an org
+// without the features would otherwise fail with a bare "unauthorized"
+// instead of the actionable feature error.
+func TestCloudChecksOnUntrackedRepoChecksFeaturesBeforeMappedSources(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		features string
+		wantErr  string
+		want     []string
+	}{
+		{
+			name:     "features in trial",
+			features: `{"name":"CLOUD_CHECKS","status":"IN_TRIAL"},{"name":"CLOUD_MODULES","status":"IN_TRIAL"}`,
+			want:     []string{"GetUserRepositories", "GetSources", "User", "GetOrgDetails", "GetOrgMappedSources", "ConfigureSource"},
+		},
+		{
+			name:    "features missing",
+			wantErr: `CLOUD_CHECKS + CLOUD_MODULES are not enabled for organization "example"`,
+			want:    []string{"GetUserRepositories", "GetSources", "User", "GetOrgDetails"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries []string
+			featuresChecked := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					OperationName string `json:"operationName"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					http.Error(w, "invalid request", http.StatusBadRequest)
+					return
+				}
+				operation := request.OperationName
+				if operation == "" {
+					operation = "User"
+				}
+				queries = append(queries, operation)
+				var data string
+				switch operation {
+				case "GetUserRepositories":
+					data = `{"user":{"repositories":[]}}`
+				case "GetSources":
+					data = `{"sources":[{"id":"installation","name":"example","orgName":"example"}]}`
+				case "User":
+					data = `{"user":{"id":"user","orgs":[{"id":"org","name":"example"}]}}`
+				case "GetOrgDetails":
+					featuresChecked = true
+					data = `{"org":{"id":"org","name":"example","createdAt":"","subscription":{"status":"","subscriptionID":"","planID":"","hasCaching":false},"features":[` + tc.features + `]}}`
+				case "GetOrgMappedSources":
+					// Only reachable once the features are ensured (server-side gate).
+					if !featuresChecked {
+						t.Error("mappedSources queried before the features were checked")
+					}
+					data = `{"org":{"mappedSources":[{"installationId":"installation","mode":"SELECTED","repositories":[]}]}}`
+				case "ConfigureSource":
+					data = `{"configureSource":{"installationId":"installation","mode":"SELECTED"}}`
+				default:
+					t.Errorf("unexpected Cloud operation: %s", operation)
+					http.Error(w, "unexpected operation", http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"data":%s}`, data)
+			}))
+			defer server.Close()
+			t.Setenv("DAGGER_CLOUD_URL", server.URL)
+			t.Setenv("DAGGER_CLOUD_TOKEN", "test-token")
+			oldTTY, oldWorkspace, oldOrg, oldApply := stdinIsTTY, workspaceRef, cloudOrgFlag, autoApply
+			stdinIsTTY, workspaceRef, cloudOrgFlag, autoApply = false, "", "", true
+			t.Cleanup(func() { stdinIsTTY, workspaceRef, cloudOrgFlag, autoApply = oldTTY, oldWorkspace, oldOrg, oldApply })
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			requireCloudFeatures(cmd, cloudChecksRequiredFeatures...)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			err := runCloudCheckSet(true)(cmd, []string{"github.com/example/project"})
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+				require.Contains(t, out.String(), "checks for repo github.com/example/project enabled\n")
+			}
+			require.Equal(t, tc.want, queries)
+		})
+	}
+}
+
+// A ConfigureSource rejection for a repo the installation cannot access must
+// surface the installation settings page (and offer it interactively), not the
+// raw backend error.
+func TestCloudChecksOnRepoNotGrantedPointsAtInstallationSettings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			OperationName string `json:"operationName"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		operation := request.OperationName
+		if operation == "" {
+			operation = "User"
+		}
+		var data string
+		switch operation {
+		case "GetUserRepositories":
+			data = `{"user":{"repositories":[]}}`
+		case "GetSources":
+			data = `{"sources":[{"id":"161781848","name":"marcosnils","orgName":"marcosnils","configUrl":"https://github.com/settings/installations/161781848"}]}`
+		case "User":
+			data = `{"user":{"id":"user","orgs":[{"id":"org","name":"marcosnils"}]}}`
+		case "GetOrgDetails":
+			data = `{"org":{"id":"org","name":"marcosnils","createdAt":"","subscription":{"status":"","subscriptionID":"","planID":"","hasCaching":false},"features":[{"name":"CLOUD_CHECKS","status":"ACTIVE"},{"name":"CLOUD_MODULES","status":"ACTIVE"},{"name":"CLOUD_ENGINES","status":"ACTIVE"}]}}`
+		case "GetOrgMappedSources":
+			data = `{"org":{"mappedSources":[{"installationId":"161781848","mode":"SELECTED","repositories":[]}]}}`
+		case "ConfigureSource":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"errors":[{"message":"repository github.com/marcosnils/bin does not belong to installation 161781848. Verify that the GitHub app has been granted access to the repository."}]}`)
+			return
+		default:
+			t.Errorf("unexpected Cloud operation: %s", operation)
+			http.Error(w, "unexpected operation", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"data":%s}`, data)
+	}))
+	defer server.Close()
+	t.Setenv("DAGGER_CLOUD_URL", server.URL)
+	t.Setenv("DAGGER_CLOUD_TOKEN", "test-token")
+	oldTTY, oldWorkspace, oldOrg := stdinIsTTY, workspaceRef, cloudOrgFlag
+	stdinIsTTY, workspaceRef, cloudOrgFlag = false, "", ""
+	t.Cleanup(func() { stdinIsTTY, workspaceRef, cloudOrgFlag = oldTTY, oldWorkspace, oldOrg })
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := runCloudCheckSet(true)(cmd, []string{"github.com/marcosnils/bin"})
+	require.Error(t, err)
+	require.EqualError(t, err,
+		"Cloud checks need GitHub access to this repository. Visit https://github.com/settings/installations/161781848 to enable it and then run the command again")
+	require.NotContains(t, err.Error(), "does not belong to installation")
+}

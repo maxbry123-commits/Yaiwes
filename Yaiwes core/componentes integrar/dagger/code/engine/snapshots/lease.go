@@ -1,0 +1,435 @@
+package snapshots
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	cerrdefs "github.com/containerd/errdefs"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
+)
+
+const snapshotTransferLeaseLabel = "dagger.io/snapshot-transfer"
+
+// operationLeaseLabel marks the lease a lazy operation scope creates for the
+// snapshots its operation produces.
+const operationLeaseLabel = "dagger.io/operation"
+
+// resourcePin owns a transfer's resources until the returned ref or provider
+// is released. It is independent of a caller's ambient lease.
+type resourcePin struct {
+	cm       *snapshotManager
+	id       string
+	mu       sync.Mutex
+	released bool
+}
+
+func (cm *snapshotManager) newResourcePin(ctx context.Context) (*resourcePin, context.Context, error) {
+	l, err := cm.LeaseManager.Create(ctx, leases.WithRandomID(), MakeTemporary, func(l *leases.Lease) error {
+		l.Labels["containerd.io/gc.flat"] = time.Now().UTC().Format(time.RFC3339Nano)
+		l.Labels[snapshotTransferLeaseLabel] = "true"
+		return nil
+	})
+	if err != nil {
+		return nil, ctx, err
+	}
+	return &resourcePin{cm: cm, id: l.ID}, leases.WithLease(ctx, l.ID), nil
+}
+
+// ReleaseTransferLeasesAfterRestart must run only at startup, after durable
+// snapshot owners have been restored and before any transfers can start.
+// Retained typed refs are not released at clean shutdown. Their Go ownership
+// ends with that process, so only durable owners should survive its transfers.
+func ReleaseTransferLeasesAfterRestart(ctx context.Context, lm leases.Manager) error {
+	previous, err := lm.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list snapshot transfer leases: %w", err)
+	}
+	var rerr error
+	for _, lease := range previous {
+		if lease.Labels[snapshotTransferLeaseLabel] != "true" {
+			continue
+		}
+		if err := lm.Delete(ctx, lease); err != nil && !cerrdefs.IsNotFound(err) {
+			rerr = stderrors.Join(rerr, fmt.Errorf("release previous snapshot transfer lease %s: %w", lease.ID, err))
+		}
+	}
+	return rerr
+}
+
+// ReleaseOperationLeasesAfterRestart deletes the operation leases an earlier
+// process left behind. Those leases never expire, so they would otherwise
+// retain their snapshots forever. It must run only at startup, before any
+// operation can start.
+func ReleaseOperationLeasesAfterRestart(ctx context.Context, lm leases.Manager) error {
+	previous, err := lm.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list operation leases: %w", err)
+	}
+	var rerr error
+	for _, lease := range previous {
+		if lease.Labels[operationLeaseLabel] != "true" {
+			continue
+		}
+		if err := lm.Delete(ctx, lease); err != nil && !cerrdefs.IsNotFound(err) {
+			rerr = stderrors.Join(rerr, fmt.Errorf("release previous operation lease %s: %w", lease.ID, err))
+		}
+	}
+	return rerr
+}
+
+func (p *resourcePin) release(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.released {
+		return nil
+	}
+	if err := p.cm.RemoveLease(context.WithoutCancel(ctx), p.id); err != nil {
+		return err
+	}
+	p.released = true
+	return nil
+}
+
+// BuiltinImageLeaseLabel marks the persistent leases that hold the engine's
+// builtin images' blobs; the startup sweeps leave them alone.
+const BuiltinImageLeaseLabel = "dagger.io/builtin-image"
+
+// PinContent holds the given blobs under the persistent lease leaseID,
+// creating it without expiry when it does not exist. The engine ships its
+// builtin images, so their blobs are engine-lifetime resources: with them
+// always present, an export reuses a builtin layer's compressed blob under
+// the digest the builtin store already has, on every engine alike, instead
+// of diffing the snapshot into a fresh tar when the collector has taken
+// the blob between the image's import and the export. A missing blob is
+// still added as a resource; AddResource does not check its target.
+func (cm *snapshotManager) PinContent(ctx context.Context, leaseID string, descs []ocispecs.Descriptor) error {
+	if leaseID == "" {
+		return errors.New("pin content: empty lease ID")
+	}
+	_, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+		l.ID = leaseID
+		l.Labels = map[string]string{BuiltinImageLeaseLabel: "true"}
+		return nil
+	})
+	if err != nil && !cerrdefs.IsAlreadyExists(err) {
+		return errors.Wrapf(err, "create lease %s", leaseID)
+	}
+	for _, desc := range descs {
+		if desc.Digest == "" {
+			continue
+		}
+		err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: leaseID}, leases.Resource{ID: desc.Digest.String(), Type: "content"})
+		if err != nil && !cerrdefs.IsAlreadyExists(err) {
+			return errors.Wrapf(err, "attach content %s to lease %s", desc.Digest, leaseID)
+		}
+	}
+	return nil
+}
+
+// pinContent checks presence after attachment. AddResource itself accepts
+// absent targets; containerd serializes its writes with the GC mark/sweep.
+func (cm *snapshotManager) pinContent(ctx context.Context, desc ocispecs.Descriptor) (bool, error) {
+	if err := cm.linkContentToContextLease(ctx, desc); err != nil {
+		return false, err
+	}
+	_, err := cm.ContentStore.Info(ctx, desc.Digest)
+	if cerrdefs.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+type lazyLeaseScopeKey struct{}
+type withoutLazyLeaseScope struct{}
+
+type lazyLeaseScope struct {
+	mu       sync.Mutex
+	lm       leases.Manager
+	opts     []leases.Opt
+	lease    *LeaseRef
+	released bool
+}
+
+func WithLazyLease(ctx context.Context, lm leases.Manager, opts ...leases.Opt) (context.Context, func(context.Context) error, error) {
+	if leaseID, ok := leases.FromContext(ctx); ok && leaseID != "" {
+		return ctx, func(context.Context) error { return nil }, nil
+	}
+	if lm == nil {
+		return ctx, func(context.Context) error { return nil }, nil
+	}
+	if lazyLeaseFromContext(ctx) != nil {
+		return ctx, func(context.Context) error { return nil }, nil
+	}
+
+	scope := &lazyLeaseScope{
+		lm:   lm,
+		opts: append([]leases.Opt(nil), opts...),
+	}
+	return context.WithValue(ctx, lazyLeaseScopeKey{}, scope), scope.release, nil
+}
+
+func EnsureLease(ctx context.Context) (context.Context, error) {
+	if leaseID, ok := leases.FromContext(ctx); ok && leaseID != "" {
+		return ctx, nil
+	}
+	scope := lazyLeaseFromContext(ctx)
+	if scope == nil {
+		return ctx, nil
+	}
+	return scope.ensure(ctx)
+}
+
+func HasLazyLease(ctx context.Context) bool {
+	return lazyLeaseFromContext(ctx) != nil
+}
+
+func WithoutLazyLease(ctx context.Context) context.Context {
+	if lazyLeaseFromContext(ctx) == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, lazyLeaseScopeKey{}, withoutLazyLeaseScope{})
+}
+
+func lazyLeaseFromContext(ctx context.Context) *lazyLeaseScope {
+	scope, _ := ctx.Value(lazyLeaseScopeKey{}).(*lazyLeaseScope)
+	return scope
+}
+
+func (s *lazyLeaseScope) ensure(ctx context.Context) (context.Context, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.released {
+		return ctx, fmt.Errorf("operation lease scope already released")
+	}
+	if s.lease != nil {
+		return leases.WithLease(ctx, s.lease.l.ID), nil
+	}
+	lease, leaseCtx, err := newOperationLease(ctx, s.lm, s.opts...)
+	if err != nil {
+		return ctx, err
+	}
+	s.lease = lease
+	return leaseCtx, nil
+}
+
+// newOperationLease creates the lease for a live operation. Unlike NewLease's
+// leases it never expires: containerd stops treating an expired lease as a
+// root, so any garbage collection after the deadline would delete snapshots a
+// long-running exec or service is still using. The scope deletes the lease
+// when its operation ends, and ReleaseOperationLeasesAfterRestart deletes any
+// an earlier process left behind.
+func newOperationLease(ctx context.Context, lm leases.Manager, opts ...leases.Opt) (*LeaseRef, context.Context, error) {
+	opts = append([]leases.Opt{leases.WithRandomID()}, opts...)
+	opts = append(opts, func(l *leases.Lease) error {
+		if l.Labels == nil {
+			l.Labels = map[string]string{}
+		}
+		l.Labels[operationLeaseLabel] = "true"
+		return nil
+	})
+	l, err := lm.Create(ctx, opts...)
+	if err != nil {
+		return nil, ctx, err
+	}
+	return &LeaseRef{lm: lm, l: l}, leases.WithLease(ctx, l.ID), nil
+}
+
+func (s *lazyLeaseScope) release(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.released {
+		return nil
+	}
+	s.released = true
+	if s.lease == nil {
+		return nil
+	}
+	return s.lm.Delete(ctx, s.lease.l)
+}
+
+func WithLease(ctx context.Context, ls leases.Manager, opts ...leases.Opt) (context.Context, func(context.Context) error, error) {
+	leaseID, ok := leases.FromContext(ctx)
+	if ok && leaseID != "" {
+		return ctx, func(context.Context) error {
+			return nil
+		}, nil
+	}
+
+	lr, ctx, err := NewLease(ctx, ls, opts...)
+	if err != nil {
+		return ctx, nil, err
+	}
+
+	return ctx, func(ctx context.Context) error {
+		return ls.Delete(ctx, lr.l)
+	}, nil
+}
+
+func NewLease(ctx context.Context, lm leases.Manager, opts ...leases.Opt) (*LeaseRef, context.Context, error) {
+	l, err := lm.Create(ctx, append([]leases.Opt{leases.WithRandomID(), leases.WithExpiration(time.Hour)}, opts...)...)
+	if err != nil {
+		return nil, ctx, err
+	}
+
+	ctx = leases.WithLease(ctx, l.ID)
+	return &LeaseRef{lm: lm, l: l}, ctx, nil
+}
+
+type LeaseRef struct {
+	lm leases.Manager
+	l  leases.Lease
+
+	once      sync.Once
+	resources []leases.Resource
+	err       error
+}
+
+func (l *LeaseRef) Discard() error {
+	return l.lm.Delete(context.Background(), l.l)
+}
+
+func (l *LeaseRef) Adopt(ctx context.Context) error {
+	l.once.Do(func() {
+		resources, err := l.lm.ListResources(ctx, l.l)
+		if err != nil {
+			l.err = err
+			return
+		}
+		l.resources = resources
+	})
+	if l.err != nil {
+		return l.err
+	}
+	currentID, ok := leases.FromContext(ctx)
+	if !ok || currentID == "" {
+		return errors.Errorf("missing lease requirement for adopt")
+	}
+	for _, r := range l.resources {
+		if err := l.lm.AddResource(ctx, leases.Lease{ID: currentID}, r); err != nil {
+			return err
+		}
+	}
+	if len(l.resources) == 0 {
+		l.Discard()
+		return nil
+	}
+	go l.Discard()
+	return nil
+}
+
+func MakeTemporary(l *leases.Lease) error {
+	if l.Labels == nil {
+		l.Labels = map[string]string{}
+	}
+	l.Labels["buildkit/lease.temporary"] = time.Now().UTC().Format(time.RFC3339Nano)
+	return nil
+}
+
+func NewLeaseManager(lm leases.Manager, ns string) *LeaseManager {
+	return &LeaseManager{manager: lm, ns: ns}
+}
+
+type LeaseManager struct {
+	manager leases.Manager
+	ns      string
+}
+
+func (l *LeaseManager) Namespace() string {
+	return l.ns
+}
+
+func (l *LeaseManager) WithNamespace(ns string) *LeaseManager {
+	return NewLeaseManager(l.manager, ns)
+}
+
+func (l *LeaseManager) Create(ctx context.Context, opts ...leases.Opt) (leases.Lease, error) {
+	ctx = namespaces.WithNamespace(ctx, l.ns)
+	return l.manager.Create(ctx, opts...)
+}
+
+func (l *LeaseManager) Delete(ctx context.Context, lease leases.Lease, opts ...leases.DeleteOpt) error {
+	ctx = namespaces.WithNamespace(ctx, l.ns)
+	return l.manager.Delete(ctx, lease, opts...)
+}
+
+func (l *LeaseManager) List(ctx context.Context, filters ...string) ([]leases.Lease, error) {
+	ctx = namespaces.WithNamespace(ctx, l.ns)
+	return l.manager.List(ctx, filters...)
+}
+
+func (l *LeaseManager) AddResource(ctx context.Context, lease leases.Lease, resource leases.Resource) error {
+	ctx = namespaces.WithNamespace(ctx, l.ns)
+	return l.manager.AddResource(ctx, lease, resource)
+}
+
+func (l *LeaseManager) DeleteResource(ctx context.Context, lease leases.Lease, resource leases.Resource) error {
+	ctx = namespaces.WithNamespace(ctx, l.ns)
+	return l.manager.DeleteResource(ctx, lease, resource)
+}
+
+func (l *LeaseManager) ListResources(ctx context.Context, lease leases.Lease) ([]leases.Resource, error) {
+	ctx = namespaces.WithNamespace(ctx, l.ns)
+	return l.manager.ListResources(ctx, lease)
+}
+
+// LeaseExistingSnapshot adds an existing snapshot to the context's operation
+// lease, so the operation owns it as it owns the snapshots it creates, and
+// reopens it. It fails when the context has no lease.
+func (cm *snapshotManager) LeaseExistingSnapshot(ctx context.Context, snapshotID string) (ImmutableRef, error) {
+	ctx, err := EnsureLease(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "ensure lease for existing snapshot")
+	}
+	leaseID, ok := leases.FromContext(ctx)
+	if !ok || leaseID == "" {
+		return nil, errors.Errorf("lease existing snapshot %s: no lease in context", snapshotID)
+	}
+	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: leaseID}, leases.Resource{
+		ID:   snapshotID,
+		Type: "snapshots/" + cm.Snapshotter.Name(),
+	}); err != nil && !cerrdefs.IsAlreadyExists(err) {
+		return nil, errors.Wrapf(err, "attach snapshot %s to lease %s", snapshotID, leaseID)
+	}
+	// AddResource accepts absent targets. GetBySnapshotID checks the snapshot
+	// still exists, now that the lease holds it.
+	return cm.GetBySnapshotID(ctx, snapshotID)
+}
+
+// PinSnapshot protects an existing snapshot and its ancestry independently of
+// any donor or ambient operation lease. It never downloads content.
+func (cm *snapshotManager) PinSnapshot(ctx context.Context, snapshotID string) (_ ImmutableRef, rerr error) {
+	pin, pinnedCtx, err := cm.newResourcePin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var ref ImmutableRef
+	defer func() {
+		if rerr != nil {
+			cleanup := context.WithoutCancel(ctx)
+			if ref != nil {
+				rerr = stderrors.Join(rerr, ref.Release(cleanup))
+			}
+			rerr = stderrors.Join(rerr, pin.release(cleanup))
+		}
+	}()
+	if err := cm.AttachLease(pinnedCtx, pin.id, snapshotID); err != nil {
+		return nil, err
+	}
+	ref, err = cm.GetBySnapshotID(pinnedCtx, snapshotID, NoUpdateLastUsed)
+	if err != nil {
+		return nil, err
+	}
+	ref.(*immutableRef).pin = pin
+	return ref, nil
+}

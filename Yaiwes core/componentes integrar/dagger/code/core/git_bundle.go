@@ -1,0 +1,1318 @@
+package core
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha1" //nolint:gosec // Git object format, not a security primitive
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/dagger/dagger/dagql"
+	"github.com/dagger/dagger/engine/engineutil"
+	bkcache "github.com/dagger/dagger/engine/snapshots"
+	enginetel "github.com/dagger/dagger/engine/telemetry"
+	"github.com/dagger/dagger/engine/wcprof"
+	bkclient "github.com/dagger/dagger/internal/buildkit/client"
+	"github.com/dagger/dagger/util/gitutil"
+	telemetry "github.com/dagger/otel-go"
+	"github.com/vektah/gqlparser/v2/ast"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Git bundle ingestion is intended for ordinary source-history transport, not
+// adversarial archives. These bounds cheaply prevent accidental runaway work
+// before Git is asked to inspect or import the bundle.
+const (
+	MaxGitBundleBytes   = int64(engineutil.MaxFileContentsSize)
+	MaxGitBundleRefs    = 1024
+	MaxGitBundleObjects = 1_000_000
+
+	gitBundleCommandTimeout = 10 * time.Minute
+	maxGitBundleHeaderBytes = 4 << 20
+	maxGitBundleHeaderLine  = 64 << 10
+)
+
+// GitBundle is a standard Git bundle and its lazily parsed header.
+type GitBundle struct {
+	File             dagql.ObjectResult[*File]
+	Version          int             `field:"true" doc:"Bundle format version (2 or 3)."`
+	ObjectFormat     string          `field:"true" name:"objectFormat" doc:"Object format capability: sha1 or sha256."`
+	Refs             []*GitBundleRef `field:"true" doc:"Refs advertised by the bundle and the object IDs they resolve to."`
+	PrerequisiteSHAs []string        `field:"true" name:"prerequisiteSHAs" doc:"Commits that must already exist wherever this bundle is applied."`
+}
+
+// GitBundleRef is a ref advertised by a Git bundle.
+type GitBundleRef struct {
+	Name string `field:"true" doc:"The advertised ref name."`
+	SHA  string `field:"true" name:"sha" doc:"The object ID the advertised ref resolves to."`
+}
+
+var (
+	_ dagql.PersistedObject        = (*GitBundle)(nil)
+	_ dagql.PersistedObjectDecoder = (*GitBundle)(nil)
+	_ dagql.HasDependencyResults   = (*GitBundle)(nil)
+)
+
+func (*GitBundle) Type() *ast.Type {
+	return &ast.Type{NamedType: "GitBundle", NonNull: true}
+}
+
+func (*GitBundle) TypeDescription() string {
+	return "A Git bundle: a self-describing container of refs and the objects needed to reconstruct them, optionally rooted at prerequisite commits."
+}
+
+func (*GitBundleRef) Type() *ast.Type {
+	return &ast.Type{NamedType: "GitBundleRef", NonNull: true}
+}
+
+func (*GitBundleRef) TypeDescription() string {
+	return "A ref advertised by a Git bundle."
+}
+
+func (bundle *GitBundle) Clone() *GitBundle {
+	if bundle == nil {
+		return nil
+	}
+	cp := *bundle
+	cp.Refs = make([]*GitBundleRef, len(bundle.Refs))
+	for i, ref := range bundle.Refs {
+		if ref == nil {
+			continue
+		}
+		refCopy := *ref
+		cp.Refs[i] = &refCopy
+	}
+	cp.PrerequisiteSHAs = slices.Clone(bundle.PrerequisiteSHAs)
+	return &cp
+}
+
+func (bundle *GitBundle) AttachDependencyResults(
+	ctx context.Context,
+	_ dagql.AnyResult,
+	attach func(dagql.AnyResult) (dagql.AnyResult, error),
+) ([]dagql.AnyResult, error) {
+	_ = ctx
+	if bundle == nil || bundle.File.Self() == nil {
+		return nil, nil
+	}
+	attached, err := attach(bundle.File)
+	if err != nil {
+		return nil, fmt.Errorf("attach git bundle file: %w", err)
+	}
+	file, ok := attached.(dagql.ObjectResult[*File])
+	if !ok {
+		return nil, fmt.Errorf("attach git bundle file: unexpected result %T", attached)
+	}
+	bundle.File = file
+	return []dagql.AnyResult{file}, nil
+}
+
+type persistedGitBundlePayload struct {
+	FileResultID     uint64          `json:"fileResultID"`
+	Version          int             `json:"version"`
+	ObjectFormat     string          `json:"objectFormat"`
+	Refs             []*GitBundleRef `json:"refs"`
+	PrerequisiteSHAs []string        `json:"prerequisiteSHAs,omitempty"`
+}
+
+func (bundle *GitBundle) EncodePersistedObject(ctx context.Context, enc *dagql.PersistEncodeContext) (dagql.PersistedObjectEncoding, error) {
+	_ = ctx
+	if bundle == nil || bundle.File.Self() == nil {
+		return dagql.PersistedObjectEncoding{}, fmt.Errorf("encode persisted git bundle: missing bundle file")
+	}
+	fileID, err := encodePersistedObjectRef(enc, bundle.File, "git bundle file")
+	if err != nil {
+		return dagql.PersistedObjectEncoding{}, err
+	}
+	payload, err := json.Marshal(persistedGitBundlePayload{
+		FileResultID:     fileID,
+		Version:          bundle.Version,
+		ObjectFormat:     bundle.ObjectFormat,
+		Refs:             bundle.Clone().Refs,
+		PrerequisiteSHAs: slices.Clone(bundle.PrerequisiteSHAs),
+	})
+	if err != nil {
+		return dagql.PersistedObjectEncoding{}, fmt.Errorf("marshal persisted git bundle: %w", err)
+	}
+	return encodePersistedObjectRawJSON(payload), nil
+}
+
+func (*GitBundle) DecodePersistedObject(ctx context.Context, dec *dagql.PersistDecodeContext, payload json.RawMessage) (dagql.Typed, error) {
+	var persisted persistedGitBundlePayload
+	if err := json.Unmarshal(payload, &persisted); err != nil {
+		return nil, fmt.Errorf("decode persisted git bundle: %w", err)
+	}
+	if persisted.FileResultID == 0 {
+		return nil, fmt.Errorf("decode persisted git bundle: missing bundle file")
+	}
+	file, err := loadPersistedObjectResultByResultID[*File](ctx, dec, persisted.FileResultID, "git bundle file")
+	if err != nil {
+		return nil, err
+	}
+	return &GitBundle{
+		File:             file,
+		Version:          persisted.Version,
+		ObjectFormat:     persisted.ObjectFormat,
+		Refs:             persisted.Refs,
+		PrerequisiteSHAs: slices.Clone(persisted.PrerequisiteSHAs),
+	}, nil
+}
+
+// ParseGitBundle lazily reads and validates only a bundle's textual header. It
+// deliberately does not walk or import the pack; ValidateGitBundle performs
+// that more expensive work.
+func ParseGitBundle(ctx context.Context, file dagql.ObjectResult[*File]) (*GitBundle, error) {
+	if file.Self() == nil {
+		return nil, fmt.Errorf("git bundle file is required")
+	}
+	if err := validateGitBundleFileSize(ctx, file); err != nil {
+		return nil, err
+	}
+	reader, err := file.Self().Open(ctx, file)
+	if err != nil {
+		return nil, fmt.Errorf("open git bundle: %w", err)
+	}
+	defer reader.Close()
+
+	header, _, err := parseGitBundleHeader(reader)
+	if err != nil {
+		return nil, err
+	}
+	header.File = file
+	return header, nil
+}
+
+func validateGitBundleFileSize(ctx context.Context, file dagql.ObjectResult[*File]) error {
+	stat, err := file.Self().Stat(ctx, file)
+	if err != nil {
+		return fmt.Errorf("stat git bundle: %w", err)
+	}
+	if stat.Size <= 0 {
+		return fmt.Errorf("git bundle file is empty")
+	}
+	if int64(stat.Size) > MaxGitBundleBytes {
+		return fmt.Errorf("git bundle size %d exceeds limit %d", stat.Size, MaxGitBundleBytes)
+	}
+	return nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func parseGitBundleHeader(input io.Reader) (*GitBundle, int64, error) {
+	counted := &countingReader{r: input}
+	reader := bufio.NewReaderSize(counted, maxGitBundleHeaderLine)
+	readLine := func() (string, error) {
+		line, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", fmt.Errorf("git bundle header line exceeds limit %d", maxGitBundleHeaderLine)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("git bundle header is truncated")
+			}
+			return "", fmt.Errorf("read git bundle header: %w", err)
+		}
+		if counted.n-int64(reader.Buffered()) > maxGitBundleHeaderBytes {
+			return "", fmt.Errorf("git bundle header exceeds limit %d", maxGitBundleHeaderBytes)
+		}
+		return strings.TrimSuffix(string(line), "\n"), nil
+	}
+
+	signature, err := readLine()
+	if err != nil {
+		return nil, 0, err
+	}
+	bundle := &GitBundle{ObjectFormat: "sha1"}
+	switch signature {
+	case "# v2 git bundle":
+		bundle.Version = 2
+	case "# v3 git bundle":
+		bundle.Version = 3
+	default:
+		return nil, 0, fmt.Errorf("invalid git bundle signature %q", signature)
+	}
+
+	seenEntries := false
+	seenObjectFormat := false
+	seenRefs := map[string]struct{}{}
+	for {
+		line, err := readLine()
+		if err != nil {
+			return nil, 0, err
+		}
+		if line == "" {
+			break
+		}
+		if strings.HasPrefix(line, "@") {
+			if bundle.Version != 3 || seenEntries {
+				return nil, 0, fmt.Errorf("invalid git bundle capability placement")
+			}
+			capability, value, ok := strings.Cut(strings.TrimPrefix(line, "@"), "=")
+			switch capability {
+			case "object-format":
+				if !ok || seenObjectFormat {
+					return nil, 0, fmt.Errorf("invalid git bundle object-format capability")
+				}
+				bundle.ObjectFormat = value
+				seenObjectFormat = true
+			default:
+				return nil, 0, fmt.Errorf("unsupported git bundle capability %q", capability)
+			}
+			continue
+		}
+		seenEntries = true
+
+		prerequisite := strings.HasPrefix(line, "-")
+		entry := strings.TrimPrefix(line, "-")
+		sha, name, ok := strings.Cut(entry, " ")
+		if !ok || sha == "" || name == "" {
+			return nil, 0, fmt.Errorf("invalid git bundle header entry %q", line)
+		}
+		if err := validateGitObjectID(bundle.ObjectFormat, sha); err != nil {
+			return nil, 0, fmt.Errorf("invalid git bundle header entry %q: %w", line, err)
+		}
+		if prerequisite {
+			bundle.PrerequisiteSHAs = append(bundle.PrerequisiteSHAs, sha)
+		} else {
+			if _, exists := seenRefs[name]; exists {
+				return nil, 0, fmt.Errorf("git bundle advertises duplicate ref %q", name)
+			}
+			seenRefs[name] = struct{}{}
+			bundle.Refs = append(bundle.Refs, &GitBundleRef{Name: name, SHA: sha})
+		}
+		if len(bundle.Refs)+len(bundle.PrerequisiteSHAs) > MaxGitBundleRefs {
+			return nil, 0, fmt.Errorf("git bundle header contains more than %d refs and prerequisites", MaxGitBundleRefs)
+		}
+	}
+	if bundle.ObjectFormat != "sha1" && bundle.ObjectFormat != "sha256" {
+		return nil, 0, fmt.Errorf("unsupported git bundle object format %q", bundle.ObjectFormat)
+	}
+	if len(bundle.Refs) == 0 {
+		return nil, 0, fmt.Errorf("git bundle advertises no refs")
+	}
+	return bundle, counted.n - int64(reader.Buffered()), nil
+}
+
+func validateGitObjectID(objectFormat, value string) error {
+	want := sha1.Size
+	if objectFormat == "sha256" {
+		want = sha256.Size
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != want {
+		return fmt.Errorf("%q is not a %s object ID", value, objectFormat)
+	}
+	return nil
+}
+
+// ValidateGitBundle performs bounded structural verification. For bundles
+// without prerequisites it additionally imports the advertised refs into a
+// fresh repository, letting Git verify complete object connectivity. A
+// prerequisite bundle's final connectivity check necessarily happens in
+// ImportGitBundle, after the required objects have been fetched.
+func ValidateGitBundle(ctx context.Context, bundle *GitBundle) error {
+	if bundle == nil || bundle.File.Self() == nil {
+		return fmt.Errorf("git bundle is required")
+	}
+	if err := validateGitBundleFileSize(ctx, bundle.File); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, gitBundleCommandTimeout)
+	defer cancel()
+	return bundle.File.Self().Mount(ctx, bundle.File, func(path string) error {
+		header, err := inspectGitBundleFile(path)
+		if err != nil {
+			return err
+		}
+		if !gitBundleHeadersEqual(bundle, header) {
+			return fmt.Errorf("git bundle header changed after parsing")
+		}
+		if len(header.PrerequisiteSHAs) != 0 {
+			return nil
+		}
+
+		tmp, err := os.MkdirTemp("", "dagger-git-bundle-validate-")
+		if err != nil {
+			return fmt.Errorf("create git bundle validation repository: %w", err)
+		}
+		defer os.RemoveAll(tmp)
+		if _, err := runGitEnv(ctx, tmp, "init", "--bare", "--quiet", "--object-format="+header.ObjectFormat); err != nil {
+			return fmt.Errorf("initialize git bundle validation repository: %w", err)
+		}
+		if err := verifyGitBundleInRepo(ctx, tmp, path); err != nil {
+			return fmt.Errorf("verify git bundle: %w", err)
+		}
+		if err := fetchGitBundleRefs(ctx, tmp, path, header.Refs); err != nil {
+			return fmt.Errorf("verify git bundle connectivity: %w", err)
+		}
+		return nil
+	})
+}
+
+func gitBundleHeadersEqual(a, b *GitBundle) bool {
+	if a == nil || b == nil || a.Version != b.Version || a.ObjectFormat != b.ObjectFormat || !slices.Equal(a.PrerequisiteSHAs, b.PrerequisiteSHAs) || len(a.Refs) != len(b.Refs) {
+		return false
+	}
+	for i := range a.Refs {
+		if a.Refs[i] == nil || b.Refs[i] == nil || *a.Refs[i] != *b.Refs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func inspectGitBundleFile(path string) (*GitBundle, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open git bundle: %w", err)
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat git bundle: %w", err)
+	}
+	if stat.Size() <= 0 {
+		return nil, fmt.Errorf("git bundle file is empty")
+	}
+	if stat.Size() > MaxGitBundleBytes {
+		return nil, fmt.Errorf("git bundle size %d exceeds limit %d", stat.Size(), MaxGitBundleBytes)
+	}
+
+	header, packOffset, err := parseGitBundleHeader(file)
+	if err != nil {
+		return nil, err
+	}
+	hashSize := sha1.Size
+	packHash := sha1.New() //nolint:gosec // Git pack checksum
+	if header.ObjectFormat == "sha256" {
+		hashSize = sha256.Size
+		packHash = sha256.New()
+	}
+	packSize := stat.Size() - packOffset
+	if packSize < int64(12+hashSize) {
+		return nil, fmt.Errorf("git bundle pack is truncated")
+	}
+	if _, err := file.Seek(packOffset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek git bundle pack: %w", err)
+	}
+	var packHeader [12]byte
+	if _, err := io.ReadFull(file, packHeader[:]); err != nil {
+		return nil, fmt.Errorf("read git bundle pack header: %w", err)
+	}
+	if string(packHeader[:4]) != "PACK" {
+		return nil, fmt.Errorf("invalid git bundle pack signature")
+	}
+	packVersion := binary.BigEndian.Uint32(packHeader[4:8])
+	if packVersion != 2 && packVersion != 3 {
+		return nil, fmt.Errorf("unsupported git bundle pack version %d", packVersion)
+	}
+	objectCount := binary.BigEndian.Uint32(packHeader[8:12])
+	if objectCount > MaxGitBundleObjects {
+		return nil, fmt.Errorf("git bundle object count %d exceeds limit %d", objectCount, MaxGitBundleObjects)
+	}
+	if _, err := file.Seek(packOffset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek git bundle pack: %w", err)
+	}
+	if _, err := io.CopyN(packHash, file, packSize-int64(hashSize)); err != nil {
+		return nil, fmt.Errorf("hash git bundle pack: %w", err)
+	}
+	trailer := make([]byte, hashSize)
+	if _, err := io.ReadFull(file, trailer); err != nil {
+		return nil, fmt.Errorf("read git bundle pack checksum: %w", err)
+	}
+	if !bytes.Equal(packHash.Sum(nil), trailer) {
+		return nil, fmt.Errorf("git bundle pack checksum does not match content")
+	}
+	return header, nil
+}
+
+// CreateGitBundleFile creates a version-3 bundle from named refs in the
+// repository's canonical object database. The temporary refs and repository
+// live only in a scratch snapshot; the source repository is never mutated.
+func CreateGitBundleFile(ctx context.Context, repo *GitRepository, refs []string, base *GitRef) (_ *File, rerr error) {
+	if repo == nil || repo.Backend == nil {
+		return nil, fmt.Errorf("git repository is required")
+	}
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("git bundle requires at least one ref")
+	}
+	if len(refs) > MaxGitBundleRefs {
+		return nil, fmt.Errorf("git bundle ref count %d exceeds limit %d", len(refs), MaxGitBundleRefs)
+	}
+
+	targets := make([]*gitBundleTarget, 0, len(refs))
+	backends := make([]GitRefBackend, 0, len(refs)+1)
+	seen := map[string]struct{}{}
+	remote, err := repo.LoadRemote(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range refs {
+		if name == "" || strings.HasPrefix(name, "-") {
+			return nil, fmt.Errorf("invalid git bundle ref %q", name)
+		}
+		ref, err := resolveGitBundleTarget(remote, name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve git bundle ref %q: %w", name, err)
+		}
+		if ref.exact.Name == "" {
+			return nil, fmt.Errorf("git bundle ref %q does not resolve to a named ref", name)
+		}
+		if _, exists := seen[ref.exact.Name]; exists {
+			return nil, fmt.Errorf("git bundle ref %q resolves to duplicate ref %q", name, ref.exact.Name)
+		}
+		seen[ref.exact.Name] = struct{}{}
+		backend, err := repo.Backend.Get(ctx, ref.checkout)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, ref)
+		backends = append(backends, backend)
+	}
+	if base != nil {
+		if base.Ref == nil || base.Ref.SHA == "" {
+			return nil, fmt.Errorf("git bundle base is missing its commit SHA")
+		}
+		backends = append(backends, base.Backend)
+	}
+
+	query, err := CurrentQuery(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bkref, err := query.SnapshotManager().New(ctx, nil,
+		bkcache.WithRecordType(bkclient.UsageRecordTypeRegular),
+		bkcache.WithDescription("git bundle"))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if rerr != nil && bkref != nil {
+			bkref.Release(context.WithoutCancel(ctx))
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, gitBundleCommandTimeout)
+	defer cancel()
+	var baseSHA string
+	if base != nil {
+		baseSHA = base.Ref.SHA
+	}
+	_, local := repo.Backend.(*LocalGitRepository)
+	err = repo.Backend.mount(ctx, 0, false, backends, func(ctx context.Context, source *gitutil.GitCLI) error {
+		return MountRef(ctx, bkref, func(root string, _ *mount.Mount) error {
+			if err := prepareGitBundleSource(ctx, source, repo.Backend, root, targets, baseSHA); err != nil {
+				return err
+			}
+			if !local {
+				return nil
+			}
+			// A local scratch repository borrows the source's objects through
+			// an alternate: it can only be bundled while the source is mounted.
+			return finishGitBundleFile(ctx, root, targets, baseSHA)
+		})
+	})
+	if err == nil && !local {
+		// A remote scratch repository owns copies of everything it bundles.
+		// Pack the bundle with the mirror (and its lock) released.
+		err = MountRef(ctx, bkref, func(root string, _ *mount.Mount) error {
+			ctx, span := Tracer(ctx).Start(ctx, "creating git bundle (mirror released)", telemetry.Internal())
+			err := finishGitBundleFile(ctx, root, targets, baseSHA)
+			telemetry.EndWithCause(span, &err)
+			return err
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot, err := bkref.Commit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bkref = nil
+	file := &File{
+		Platform: query.Platform(),
+		File:     new(LazyAccessor[string, *File]),
+		Snapshot: new(LazyAccessor[bkcache.ImmutableRef, *File]),
+	}
+	file.SetPath("/repository.bundle")
+	file.SetSnapshot(snapshot)
+	return file, nil
+}
+
+// createGitBundleFromSource must finish while source is mounted. Only the bundle
+// survives: the private repository (including its temporary alternates) is removed
+// before the output snapshot is committed.
+func createGitBundleFromSource(ctx context.Context, source *gitutil.GitCLI, backend GitRepositoryBackend, root string, targets []*gitBundleTarget, baseSHA string) error {
+	if err := prepareGitBundleSource(ctx, source, backend, root, targets, baseSHA); err != nil {
+		return err
+	}
+	return finishGitBundleFile(ctx, root, targets, baseSHA)
+}
+
+// gitBundleScratch is the private repository a bundle is packed from.
+func gitBundleScratch(root string) string {
+	return filepath.Join(root, ".git-bundle-source")
+}
+
+// prepareGitBundleSource gives the scratch repository under root every target
+// ref and the base. This is the only phase that reads source. A remote
+// scratch fetches (owns) its objects; a local one borrows them through an
+// alternate, so finishGitBundleFile must then run before source is released.
+// On error, the scratch repository is removed.
+func prepareGitBundleSource(ctx context.Context, source *gitutil.GitCLI, backend GitRepositoryBackend, root string, targets []*gitBundleTarget, baseSHA string) (rerr error) {
+	sourceURL, err := source.URL(ctx)
+	if err != nil {
+		return fmt.Errorf("locate canonical git repository: %w", err)
+	}
+	objectFormatOut, err := source.Run(ctx, "rev-parse", "--show-object-format")
+	if err != nil {
+		return fmt.Errorf("read git repository object format: %w", err)
+	}
+	objectFormat := strings.TrimSpace(string(objectFormatOut))
+	if objectFormat != "sha1" && objectFormat != "sha256" {
+		return fmt.Errorf("unsupported git repository object format %q", objectFormat)
+	}
+
+	scratch := gitBundleScratch(root)
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		return err
+	}
+	defer func() {
+		if rerr != nil {
+			os.RemoveAll(scratch)
+		}
+	}()
+	if _, err := runGitEnv(ctx, scratch, "init", "--bare", "--quiet", "--object-format="+objectFormat); err != nil {
+		return fmt.Errorf("initialize git bundle repository: %w", err)
+	}
+	_, local := backend.(*LocalGitRepository)
+	if local {
+		// Borrow objects, not source refs/configuration. In particular, bundle
+		// packing must not exclude objects merely because an alternate has them:
+		// only the explicitly supplied base is a prerequisite.
+		objectsOut, err := source.Run(ctx, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+		if err != nil {
+			return fmt.Errorf("locate git bundle source objects: %w", err)
+		}
+		objects := strings.TrimSuffix(string(objectsOut), "\n")
+		if !filepath.IsAbs(objects) {
+			return fmt.Errorf("invalid git bundle source object directory %q", objects)
+		}
+		// Alternates are newline-delimited and accept Git's C-style quoting.
+		// Escape path delimiters rather than letting a checkout path add entries.
+		quotedObjects := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`).Replace(objects) + `"`
+		if err := os.WriteFile(filepath.Join(scratch, "objects", "info", "alternates"), []byte(quotedObjects+"\n"), 0o600); err != nil {
+			return fmt.Errorf("borrow git bundle source objects: %w", err)
+		}
+	}
+	fetchGit := source.New(
+		gitutil.WithDir(scratch),
+		gitutil.WithGitDir(""),
+		gitutil.WithWorkTree(""),
+	)
+	if local {
+		for _, target := range targets {
+			// --no-deref keeps a selected HEAD independent of any branch, even
+			// when that branch is also selected. All writes are private to scratch.
+			if _, err := runGitEnv(ctx, scratch, "update-ref", "--no-deref", target.exact.Name, target.exact.SHA); err != nil {
+				return fmt.Errorf("prepare git bundle ref %s: %w", target.exact.Name, err)
+			}
+		}
+		return nil
+	}
+	type originFetch struct {
+		url    string
+		target *gitBundleTarget
+	}
+	var refs []gitBundleMirrorRef
+	var fetches []originFetch
+	var tempRefs []string
+	for _, target := range targets {
+		fetchURL := ""
+		if remoteRepo, ok := backend.(*RemoteGitRepository); ok && target.exact.SHA != target.checkout.SHA {
+			// A canonical mirror fetched by peeled commit need not contain
+			// the annotated tag object. Fetch that exact advertised object
+			// from the configured origin with the backend's auth and network.
+			fetchURL = remoteRepo.URL.Remote()
+			// The peeled commit is in the mirror: copy it first, under a
+			// temporary ref, so the origin fetch advertises its history as
+			// haves and transfers only the tag object, not a full clone.
+			tempRef := fmt.Sprintf("refs/dagger/bundle/peeled/%d", len(tempRefs))
+			tempRefs = append(tempRefs, tempRef)
+			refs = append(refs, gitBundleMirrorRef{tempRef, target.checkout.SHA, target.exact.Name})
+		} else if !strings.HasPrefix(target.exact.Name, "refs/") {
+			// The fetch resolves an unqualified destination (HEAD) its own
+			// way; keep it rather than reproduce that resolution.
+			fetchURL = sourceURL
+		}
+		if fetchURL == "" {
+			refs = append(refs, gitBundleMirrorRef{target.exact.Name, target.exact.SHA, target.exact.Name})
+			continue
+		}
+		fetches = append(fetches, originFetch{fetchURL, target})
+	}
+	if baseSHA != "" {
+		refs = append(refs, gitBundleMirrorRef{"refs/dagger/bundle/base", baseSHA, ""})
+	}
+	if err := copyGitBundleMirrorRefs(ctx, fetchGit, source, sourceURL, refs); err != nil {
+		return err
+	}
+	for _, fetch := range fetches {
+		target := fetch.target
+		if _, err := fetchGit.Run(ctx, "fetch", "--quiet", "--no-tags", fetch.url, target.exact.SHA+":"+target.exact.Name); err != nil {
+			return fmt.Errorf("fetch git bundle ref %s: %w", target.exact.Name, err)
+		}
+	}
+	if len(tempRefs) > 0 {
+		// The bundle names only target refs, but leave nothing behind.
+		var deletes strings.Builder
+		for _, ref := range tempRefs {
+			deletes.WriteString("delete " + ref + "\n")
+		}
+		if _, err := fetchGit.RunWithStdin(ctx, strings.NewReader(deletes.String()), "update-ref", "--stdin"); err != nil {
+			return fmt.Errorf("remove temporary git bundle refs: %w", err)
+		}
+	}
+	return nil
+}
+
+// gitBundleMirrorRef is a scratch ref copied from the mirror; what names it
+// in errors (the target it serves, or "" for the base).
+type gitBundleMirrorRef struct {
+	name, sha, what string
+}
+
+// copyGitBundleMirrorRefs copies refs' histories from the mirror (source)
+// into the scratch repository (dest) and points each ref at its object.
+func copyGitBundleMirrorRefs(ctx context.Context, dest, source *gitutil.GitCLI, sourceURL string, refs []gitBundleMirrorRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	_, err := copyGitObjects(ctx, "bundle", func(ctx context.Context) error {
+		revs := make([]string, len(refs))
+		var updates strings.Builder
+		for i, ref := range refs {
+			revs[i] = ref.sha
+			updates.WriteString("update " + ref.name + " " + ref.sha + "\n")
+		}
+		if err := packGitClosure(ctx, dest, source, revs); err != nil {
+			return err
+		}
+		_, err := dest.RunWithStdin(ctx, strings.NewReader(updates.String()), "update-ref", "--stdin")
+		return err
+	}, nil, func(ctx context.Context) error {
+		for _, ref := range refs {
+			if _, err := dest.Run(ctx, "fetch", "--quiet", "--no-tags", sourceURL, ref.sha+":"+ref.name); err != nil {
+				if ref.what == "" {
+					return fmt.Errorf("fetch git bundle base %s: %w", ref.sha, err)
+				}
+				return fmt.Errorf("fetch git bundle ref %s: %w", ref.what, err)
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// finishGitBundleFile packs the prepared scratch repository into
+// root/repository.bundle, removes the scratch repository, and validates the
+// result. It reads only the scratch repository and whatever it borrows.
+func finishGitBundleFile(ctx context.Context, root string, targets []*gitBundleTarget, baseSHA string) error {
+	scratch := gitBundleScratch(root)
+	defer os.RemoveAll(scratch)
+	bundleArgs := []string{"bundle", "create", "--version=3", filepath.Join(root, "repository.bundle")}
+	for _, target := range targets {
+		bundleArgs = append(bundleArgs, target.exact.Name)
+	}
+	if baseSHA != "" {
+		// Excluding the exact SHA avoids a collision with an advertised ref.
+		bundleArgs = append(bundleArgs, "^"+baseSHA)
+	}
+	if _, err := runGitEnv(ctx, scratch, bundleArgs...); err != nil {
+		return fmt.Errorf("create git bundle: %w", err)
+	}
+	if err := os.RemoveAll(scratch); err != nil {
+		return fmt.Errorf("remove git bundle scratch repository: %w", err)
+	}
+
+	header, err := inspectGitBundleFile(filepath.Join(root, "repository.bundle"))
+	if err != nil {
+		return fmt.Errorf("validate created git bundle: %w", err)
+	}
+	if baseSHA != "" && !slices.Contains(header.PrerequisiteSHAs, baseSHA) {
+		return fmt.Errorf("git bundle base %s is not reachable from the bundled refs", baseSHA)
+	}
+	return nil
+}
+
+type gitBundleTarget struct {
+	checkout *gitutil.Ref
+	exact    *gitutil.Ref
+}
+
+// GitBundleRefPins resolves refs the way CreateGitBundleFile will and returns
+// the exact object each one advertises right now. A bundle's cached result is
+// keyed by these pins as well as the names, so bundling a ref that has moved
+// since an earlier session is a new call rather than a hit on the old bundle.
+func GitBundleRefPins(ctx context.Context, repo *GitRepository, refs []string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	remote, err := repo.LoadRemote(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pins := make([]string, 0, len(refs))
+	for _, name := range refs {
+		if name == "" || strings.HasPrefix(name, "-") {
+			return nil, fmt.Errorf("invalid git bundle ref %q", name)
+		}
+		ref, err := resolveGitBundleTarget(remote, name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve git bundle ref %q: %w", name, err)
+		}
+		pins = append(pins, ref.exact.SHA)
+	}
+	return pins, nil
+}
+
+// resolveGitBundleTarget uses checkout-style lookup to choose the canonical
+// ref name, then preserves the exact advertised object for tags. Checkout
+// callers want an annotated tag peeled to its commit, but a bundle must carry
+// the tag object itself so its annotation and signature survive transport.
+func resolveGitBundleTarget(remote *gitutil.Remote, name string) (*gitBundleTarget, error) {
+	ref, err := remote.Lookup(name)
+	if err != nil {
+		return nil, err
+	}
+	if name == "HEAD" && ref.Name == "" {
+		// Checkout must keep a detached HEAD unnamed, but the bundle still
+		// advertises it as HEAD so its objects can be transported.
+		target := *ref
+		target.Name = "HEAD"
+		return &gitBundleTarget{checkout: ref, exact: &target}, nil
+	}
+	if !strings.HasPrefix(ref.Name, "refs/tags/") {
+		return &gitBundleTarget{checkout: ref, exact: ref}, nil
+	}
+	advertised := remote.Get(ref.Name)
+	if advertised == nil {
+		return nil, fmt.Errorf("resolved tag %q is not advertised", ref.Name)
+	}
+	target := *ref
+	target.SHA = advertised.SHA
+	return &gitBundleTarget{checkout: ref, exact: &target}, nil
+}
+
+// ImportGitBundle materializes a canonical bare repository containing the
+// bundle's refs and every exact prerequisite fetched from repo. The source
+// canonical repository is read-only; all imported refs live in the returned
+// immutable snapshot.
+func ImportGitBundle(ctx context.Context, repo *GitRepository, bundle *GitBundle, prerequisiteRef string) (*Directory, error) {
+	query, err := CurrentQuery(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dir := &Directory{Platform: query.Platform(), Dir: new(LazyAccessor[string, *Directory]), Snapshot: new(LazyAccessor[bkcache.ImmutableRef, *Directory])}
+	if err := importGitBundleInto(ctx, dir, repo, bundle, prerequisiteRef); err != nil {
+		return nil, err
+	}
+	return dir, nil
+}
+
+//nolint:gocyclo // bundle import verifies prerequisites, refs, and connectivity in one pass
+func importGitBundleInto(ctx context.Context, dst *Directory, repo *GitRepository, bundle *GitBundle, prerequisiteRef string) (rerr error) {
+	if err := validateLazyDirectoryReceiver(dst); err != nil {
+		return err
+	}
+
+	if repo == nil || repo.Backend == nil {
+		return fmt.Errorf("git repository is required")
+	}
+	if bundle == nil || bundle.File.Self() == nil {
+		return fmt.Errorf("git bundle is required")
+	}
+	if err := validateGitBundleFileSize(ctx, bundle.File); err != nil {
+		return err
+	}
+	ctx, span := Tracer(ctx).Start(ctx, "git bundle import", telemetry.Internal(), trace.WithAttributes(
+		attribute.Int("dagger.git.bundle.prerequisites.count", len(bundle.PrerequisiteSHAs)),
+	))
+	defer telemetry.EndWithCause(span, &rerr)
+
+	prerequisites := make([]*gitutil.Ref, len(bundle.PrerequisiteSHAs))
+	for i, sha := range bundle.PrerequisiteSHAs {
+		prerequisites[i] = &gitutil.Ref{SHA: sha}
+	}
+	if prerequisiteRef != "" && len(prerequisites) > 0 {
+		remote, err := repo.LoadRemote(ctx)
+		if err != nil {
+			return err
+		}
+		hint, err := remote.Lookup(prerequisiteRef)
+		if err != nil {
+			return fmt.Errorf("resolve git bundle prerequisite ref %q: %w", prerequisiteRef, err)
+		}
+		// The hint identifies a remote ref whose history carried the exact
+		// prerequisite at capture time. Its tip may have advanced since then;
+		// keep the prerequisite SHA from the bundle and use only the resolved
+		// ref name to guide remotes that do not allow fetches by object ID.
+		for i, prerequisite := range prerequisites {
+			prerequisites[i] = &gitutil.Ref{Name: hint.Name, SHA: prerequisite.SHA}
+		}
+	}
+	backends := make([]GitRefBackend, 0, len(prerequisites))
+	for _, prerequisite := range prerequisites {
+		backend, err := repo.Backend.Get(ctx, prerequisite)
+		if err != nil {
+			return err
+		}
+		backends = append(backends, backend)
+	}
+
+	query, err := CurrentQuery(ctx)
+	if err != nil {
+		return err
+	}
+	bkref, err := query.SnapshotManager().New(ctx, nil,
+		bkcache.WithRecordType(bkclient.UsageRecordTypeRegular),
+		bkcache.WithDescription("git bundle repository"))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr != nil && bkref != nil {
+			bkref.Release(context.WithoutCancel(ctx))
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, gitBundleCommandTimeout)
+	defer cancel()
+	remotes, upstream, err := repo.ConfiguredRemotes(ctx)
+	if err != nil {
+		return fmt.Errorf("read git bundle source remotes: %w", err)
+	}
+	err = bundle.File.Self().Mount(ctx, bundle.File, func(bundlePath string) error {
+		header, err := inspectGitBundleFile(bundlePath)
+		if err != nil {
+			return err
+		}
+		if !gitBundleHeadersEqual(bundle, header) {
+			return fmt.Errorf("git bundle header changed after parsing")
+		}
+
+		mountStart := wcprof.NowNS()
+		fetchedPrerequisites := 0
+		importCtx := ctx
+		mountErr := repo.Backend.mount(ctx, 0, false, backends, func(ctx context.Context, source *gitutil.GitCLI) error {
+			// Mounting the source is where the prerequisites' history is
+			// fetched, and where a remote mirror's lock is waited on. The
+			// marker is about the mount, so it stays under the import; the
+			// work below nests under whatever the mount holds (for a remote,
+			// git.mirror.locked).
+			recordGitBundleMarker(importCtx, span, "source", mountStart)
+			formatOut, err := source.Run(ctx, "rev-parse", "--show-object-format")
+			if err != nil {
+				return fmt.Errorf("read git repository object format: %w", err)
+			}
+			if objectFormat := strings.TrimSpace(string(formatOut)); objectFormat != header.ObjectFormat {
+				return fmt.Errorf("git bundle object format is %s, repository object format is %s", header.ObjectFormat, objectFormat)
+			}
+			for _, prerequisite := range prerequisites {
+				out, err := source.Run(ctx, "rev-parse", "--verify", prerequisite.SHA+"^{commit}")
+				if err != nil || strings.TrimSpace(string(out)) != prerequisite.SHA {
+					return fmt.Errorf("git bundle prerequisite %s is not available from the repository", prerequisite.SHA)
+				}
+			}
+			// Only copying the prerequisites' history needs the source (and,
+			// for a remote, its mirror lock). Unbundling happens after.
+			return MountRef(ctx, bkref, func(root string, _ *mount.Mount) error {
+				if _, err := runGitEnv(ctx, root, "init", "--bare", "--quiet", "--object-format="+header.ObjectFormat); err != nil {
+					return fmt.Errorf("initialize git bundle repository: %w", err)
+				}
+				copyStart := wcprof.NowNS()
+				method, err := copyGitBundlePrerequisites(ctx, source, root, prerequisites)
+				if err != nil {
+					return err
+				}
+				if method == "fetch" {
+					fetchedPrerequisites = len(prerequisites)
+				}
+				span.SetAttributes(attribute.String("dagger.git.bundle.prerequisites.method", method))
+				recordGitBundlePhase(ctx, span, "prerequisites", method, copyStart)
+				return nil
+			})
+		})
+		if mountErr != nil {
+			return fmt.Errorf("import git bundle prerequisites %s: %w", strings.Join(bundle.PrerequisiteSHAs, ", "), mountErr)
+		}
+		// The bundle repository owns its prerequisites' history now: verifying,
+		// unbundling and normalizing it must not hold the source.
+		return MountRef(ctx, bkref, func(root string, _ *mount.Mount) (rerr error) {
+			ctx, finishSpan := Tracer(ctx).Start(ctx, "unbundling git bundle (source released)", telemetry.Internal())
+			defer telemetry.EndWithCause(finishSpan, &rerr)
+			return finishGitBundleImport(ctx, span, root, bundlePath, header.Refs, fetchedPrerequisites, remotes, upstream)
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	snapshot, err := bkref.Commit(ctx)
+	if err != nil {
+		return err
+	}
+	bkref = nil
+	dst.SetPath("/")
+	dst.Services = nil
+	dst.SetSnapshot(snapshot)
+	return nil
+}
+func gitBundlePrerequisiteRef(index int) string {
+	return "refs/dagger/bundle/prerequisites/" + strconv.Itoa(index)
+}
+
+// copyGitBundlePrerequisites gives the fresh bundle repository at root the
+// complete history of every prerequisite, owned by it, from the mounted
+// source. It packs that closure directly from the source's objects, as
+// remote commit bases are promoted (packRemoteCommitBaseDepth): a non-thin
+// pack-objects walk, reusing the source's compressed objects and writing its
+// own index. That skips what a fetch adds on top, the protocol negotiation
+// and an index-pack that inflates and hashes every object of the history
+// again. The source is only read, through a transient alternate: nothing of
+// it, nor any object outside the prerequisites' closure, is copied. Any
+// failure (a shallow source, say) discards the partial pack and falls back
+// to fetching each prerequisite into a temporary ref. method reports which
+// ran: "pack", "fetch", or "none" without prerequisites.
+//
+// Either way nothing (no alternates file, no hardlink) refers back to the
+// source once this returns, so the caller may release it, and a remote's
+// mirror lock, before finishGitBundleImport.
+func copyGitBundlePrerequisites(ctx context.Context, source *gitutil.GitCLI, root string, prerequisites []*gitutil.Ref) (method string, _ error) {
+	if len(prerequisites) == 0 {
+		return "none", nil
+	}
+	err := packGitBundlePrerequisites(ctx, source, root, prerequisites)
+	if err == nil {
+		return "pack", nil
+	}
+	if ctx.Err() != nil {
+		return "", err
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("dagger.git.bundle.prerequisites.pack_fallback", err.Error()))
+	packs, globErr := filepath.Glob(filepath.Join(root, "objects", "pack", "*"))
+	if globErr != nil {
+		return "", globErr
+	}
+	for _, p := range packs {
+		if err := os.Remove(p); err != nil {
+			return "", err
+		}
+	}
+	sourceURL, err := source.URL(ctx)
+	if err != nil {
+		return "", fmt.Errorf("locate canonical git repository: %w", err)
+	}
+	for i, prerequisite := range prerequisites {
+		if _, err := runGitEnv(ctx, root, "fetch", "--quiet", "--no-tags", sourceURL, prerequisite.SHA+":"+gitBundlePrerequisiteRef(i)); err != nil {
+			return "", fmt.Errorf("fetch git bundle prerequisite %s: %w", prerequisite.SHA, err)
+		}
+	}
+	return "fetch", nil
+}
+
+// finishGitBundleImport verifies and unbundles bundlePath into the bundle
+// repository at root, whose prerequisites copyGitBundlePrerequisites already
+// copied, and drops the fetchedPrerequisites temporary refs it left. It reads
+// only root and the bundle, so it runs with the source released. The unbundle
+// phase is recorded on importSpan (see recordGitBundlePhase).
+func finishGitBundleImport(ctx context.Context, importSpan trace.Span, root, bundlePath string, refs []*GitBundleRef, fetchedPrerequisites int, remotes []GitRemote, upstream string) error {
+	unbundleStart := wcprof.NowNS()
+	if err := verifyGitBundleInRepo(ctx, root, bundlePath); err != nil {
+		return fmt.Errorf("verify git bundle: %w", err)
+	}
+	if err := fetchGitBundleRefs(ctx, root, bundlePath, refs); err != nil {
+		return fmt.Errorf("import git bundle: %w", err)
+	}
+	recordGitBundlePhase(ctx, importSpan, "unbundle", "", unbundleStart)
+	for i := range fetchedPrerequisites {
+		if _, err := runGitEnv(ctx, root, "update-ref", "-d", gitBundlePrerequisiteRef(i)); err != nil {
+			return fmt.Errorf("remove temporary git bundle prerequisite ref %d: %w", i, err)
+		}
+	}
+	if _, err := runGitEnv(ctx, root, "pack-refs", "--all"); err != nil {
+		return fmt.Errorf("normalize git bundle refs: %w", err)
+	}
+	git := gitutil.NewGitCLI(gitutil.WithDir(root))
+	for _, remote := range remotes {
+		if err := writeGitCheckoutRemote(ctx, git, remote); err != nil {
+			return fmt.Errorf("preserve git bundle source remote: %w", err)
+		}
+	}
+	if err := writeGitRemoteSelection(ctx, git, remotes, upstream); err != nil {
+		return fmt.Errorf("preserve git bundle remote selection: %w", err)
+	}
+	return normalizeCanonicalGitDir(root)
+}
+
+func packGitBundlePrerequisites(ctx context.Context, source *gitutil.GitCLI, root string, prerequisites []*gitutil.Ref) error {
+	objectsOut, err := source.Run(ctx, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	if err != nil {
+		return fmt.Errorf("locate git bundle source objects: %w", err)
+	}
+	objects := strings.TrimSuffix(string(objectsOut), "\n")
+	if !filepath.IsAbs(objects) {
+		return fmt.Errorf("invalid git bundle source object directory %q", objects)
+	}
+	var revs strings.Builder
+	for _, prerequisite := range prerequisites {
+		revs.WriteString(prerequisite.SHA + "\n")
+	}
+	// The walk reads only this repository's (empty) metadata: the source's
+	// shallow boundaries, grafts and replace refs never apply. A boundary
+	// the source does have shows up as a missing parent, failing the pack.
+	// A reachability bitmap in the source (a repacked mirror has one) turns
+	// the object enumeration, the bulk of the work, into a lookup.
+	env := []string{"GIT_NO_REPLACE_OBJECTS=1", "GIT_NO_LAZY_FETCH=1", "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + strconv.Quote(objects)}
+	if _, err := runWorkspaceCommitGitInput(ctx, root, env, strings.NewReader(revs.String()),
+		"pack-objects", "--revs", "--use-bitmap-index", "--delta-base-offset", "--quiet", filepath.Join(root, "objects", "pack", "pack")); err != nil {
+		return fmt.Errorf("pack git bundle prerequisites: %w", err)
+	}
+	for _, prerequisite := range prerequisites {
+		out, err := runGitEnv(ctx, root, "rev-parse", "--verify", "--quiet", prerequisite.SHA+"^{commit}")
+		if err != nil || strings.TrimSpace(out) != prerequisite.SHA {
+			return fmt.Errorf("packed git bundle prerequisite %s is missing", prerequisite.SHA)
+		}
+	}
+	return nil
+}
+
+// recordGitBundlePhase records a phase of a bundle import that ran from start
+// until now: on the import span as dagger.git.bundle.<phase>_ms, and as a
+// wcprof io op "git.bundle.<phase>[<detail>]" under ctx's op: the import's
+// lazy op, or for the prerequisites copy whatever the source mount holds
+// (for a remote, git.mirror.locked). Phases never overlap each other or a
+// recorded wait.
+func recordGitBundlePhase(ctx context.Context, span trace.Span, phase, detail string, start int64) {
+	end := wcprof.NowNS()
+	span.SetAttributes(attribute.Int64("dagger.git.bundle."+phase+"_ms", (end-start)/int64(time.Millisecond)))
+	class := "git.bundle." + phase
+	if detail != "" {
+		class += "[" + detail + "]"
+	}
+	wcprof.RecordOp(ctx, wcprof.OpKindIO, class, wcprof.OpOpts{WorkType: wcprof.WorkTypeEngine}, start, end, wcprof.OutcomeOK)
+}
+
+// recordGitBundleMarker records how long mounting the source took, including
+// any mirror lock wait and fetch: on the import span, and as a zero-length
+// wcprof io marker "git.bundle.source[depth=0]" with the duration in its
+// ident, since the lock wait and fetch inside are recorded by the mirror.
+func recordGitBundleMarker(ctx context.Context, span trace.Span, phase string, start int64) {
+	end := wcprof.NowNS()
+	ms := (end - start) / int64(time.Millisecond)
+	span.SetAttributes(
+		attribute.Int64("dagger.git.bundle."+phase+"_ms", ms),
+		attribute.Int("dagger.git.bundle.prerequisites.depth", 0),
+	)
+	wcprof.RecordOp(ctx, wcprof.OpKindIO, "git.bundle."+phase+"[depth=0]", wcprof.OpOpts{Ident: strconv.FormatInt(ms, 10) + "ms"}, end, end, wcprof.OutcomeOK)
+}
+
+func verifyGitBundleInRepo(ctx context.Context, repoDir, bundlePath string) error {
+	_, err := runGitEnv(ctx, repoDir, "bundle", "verify", bundlePath)
+	return err
+}
+
+func fetchGitBundleRefspecs(ctx context.Context, repoDir, bundlePath string, refspecs []string) error {
+	args := []string{"fetch", "--quiet", "--no-tags", "--update-head-ok", bundlePath}
+	args = append(args, refspecs...)
+	_, err := runGitEnv(ctx, repoDir, args...)
+	return err
+}
+
+func fetchGitBundleRefs(ctx context.Context, repoDir, bundlePath string, refs []*GitBundleRef) error {
+	refspecs := make([]string, 0, len(refs))
+	for i, ref := range refs {
+		if ref == nil || ref.Name == "" {
+			return fmt.Errorf("git bundle contains an unnamed ref")
+		}
+		dst := ref.Name
+		if !strings.HasPrefix(dst, "refs/") {
+			dst = "refs/dagger/bundle/imported/" + strconv.Itoa(i)
+		}
+		refspecs = append(refspecs, "+"+ref.Name+":"+dst)
+	}
+	if err := fetchGitBundleRefspecs(ctx, repoDir, bundlePath, refspecs); err != nil {
+		return err
+	}
+	for i, ref := range refs {
+		dst := ref.Name
+		if !strings.HasPrefix(dst, "refs/") {
+			dst = "refs/dagger/bundle/imported/" + strconv.Itoa(i)
+		}
+		out, err := runGitEnv(ctx, repoDir, "rev-parse", "--verify", dst+"^{object}")
+		if err != nil || strings.TrimSpace(out) != ref.SHA {
+			return fmt.Errorf("imported git bundle ref %q does not resolve to %s", ref.Name, ref.SHA)
+		}
+	}
+	return nil
+}
+
+func normalizeCanonicalGitDir(gitDir string) error {
+	for _, p := range []string{"logs", "hooks", "branches", "description", "FETCH_HEAD", "COMMIT_EDITMSG"} {
+		if err := os.RemoveAll(filepath.Join(gitDir, p)); err != nil {
+			return fmt.Errorf("normalize .git/%s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// runGitEnv runs git in dir under a hermetic environment, returning its
+// standard output. Errors carry the
+// standard error stream, which is where git reports what went wrong.
+func runGitEnv(ctx context.Context, dir string, args ...string) (_ string, rerr error) {
+	// Do not expose paths, ref names, identities, configuration, or Git output
+	// in subprocess telemetry. The caller still receives the original error.
+	commandArgs := args
+	for len(commandArgs) >= 2 && commandArgs[0] == "-c" {
+		commandArgs = commandArgs[2:]
+	}
+	operation := "command"
+	if len(commandArgs) > 0 {
+		operation = commandArgs[0]
+	}
+	ctx, span := Tracer(ctx).Start(ctx, "git "+operation, telemetry.Internal())
+	defer func() {
+		var spanErr error
+		if rerr != nil {
+			spanErr = fmt.Errorf("git %s failed", operation)
+		}
+		telemetry.EndWithCause(span, &spanErr)
+	}()
+	gitArgs := make([]string, 0, len(gitEphemeralConfig)+len(args))
+	gitArgs = append(gitArgs, gitEphemeralConfig...)
+	gitArgs = append(gitArgs, args...)
+
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd.Dir = dir
+	cmd.Env = []string{
+		"GIT_CONFIG_NOSYSTEM=1",
+		"HOME=/dev/null",
+		"GIT_AUTHOR_NAME=Dagger",
+		"GIT_AUTHOR_EMAIL=dagger@localhost",
+		"GIT_COMMITTER_NAME=Dagger",
+		"GIT_COMMITTER_EMAIL=dagger@localhost",
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	finish := enginetel.PrepareCommandNetwork(ctx, cmd)
+	defer finish()
+	if err := cmd.Run(); err != nil {
+		return stdout.String(), fmt.Errorf("git %v: %w: %s", args, err, strings.TrimSpace(stderr.String()+stdout.String()))
+	}
+	return stdout.String(), nil
+}
+
+const persistedDirectoryLazyKindGitBundleImport = "gitBundleImport"
+
+type DirectoryGitBundleImportLazy struct {
+	LazyState
+	Repo            dagql.ObjectResult[*GitRepository]
+	Bundle          dagql.ObjectResult[*GitBundle]
+	PrerequisiteRef string
+}
+
+type persistedDirectoryGitBundleImportLazy struct {
+	RepoResultID    uint64 `json:"repoResultID"`
+	BundleResultID  uint64 `json:"bundleResultID"`
+	PrerequisiteRef string `json:"prerequisiteRef"`
+}
+
+func (p *persistedDirectoryGitBundleImportLazy) validate() error {
+	if p.RepoResultID == 0 {
+		return fmt.Errorf("DirectoryGitBundleImportLazy: missing repoResultID")
+	}
+	if p.BundleResultID == 0 {
+		return fmt.Errorf("DirectoryGitBundleImportLazy: missing bundleResultID")
+	}
+	return nil
+}
+func (lazy *DirectoryGitBundleImportLazy) Evaluate(ctx context.Context, dir *Directory) error {
+	return dir.evaluateLazy(ctx, &lazy.LazyState, "GitRepository.__withBundleDirectory", func(ctx context.Context) error {
+		if err := validateLazyDirectoryReceiver(dir); err != nil {
+			return err
+		}
+		if lazy.Repo.Self() == nil || lazy.Bundle.Self() == nil {
+			return fmt.Errorf("git bundle lazy: missing Repo or Bundle")
+		}
+		return importGitBundleInto(ctx, dir, lazy.Repo.Self(), lazy.Bundle.Self(), lazy.PrerequisiteRef)
+	})
+}
+func (lazy *DirectoryGitBundleImportLazy) AttachDependencies(ctx context.Context, attach func(dagql.AnyResult) (dagql.AnyResult, error)) ([]dagql.AnyResult, error) {
+	repo, err := attachLazyInput(attach, lazy.Repo, "DirectoryGitBundleImportLazy.Repo")
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := attachLazyInput(attach, lazy.Bundle, "DirectoryGitBundleImportLazy.Bundle")
+	if err != nil {
+		return nil, err
+	}
+	lazy.Repo = repo
+	lazy.Bundle = bundle
+	return []dagql.AnyResult{repo, bundle}, nil
+}
+func (lazy *DirectoryGitBundleImportLazy) EncodePersisted(ctx context.Context, enc *dagql.PersistEncodeContext) (json.RawMessage, error) {
+	repoID, err := encodePersistedObjectRef(enc, lazy.Repo, "DirectoryGitBundleImportLazy.Repo")
+	if err != nil {
+		return nil, err
+	}
+	bundleID, err := encodePersistedObjectRef(enc, lazy.Bundle, "DirectoryGitBundleImportLazy.Bundle")
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(persistedDirectoryGitBundleImportLazy{RepoResultID: repoID, BundleResultID: bundleID, PrerequisiteRef: lazy.PrerequisiteRef})
+}
+func decodeDirectoryGitBundleImportLazy(ctx context.Context, dec *dagql.PersistDecodeContext, payload json.RawMessage) (Lazy[*Directory], error) {
+	var p persistedDirectoryGitBundleImportLazy
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("decode DirectoryGitBundleImportLazy: %w", err)
+	}
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	repo, err := loadPersistedObjectResultByResultID[*GitRepository](ctx, dec, p.RepoResultID, "DirectoryGitBundleImportLazy.Repo")
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := loadPersistedObjectResultByResultID[*GitBundle](ctx, dec, p.BundleResultID, "DirectoryGitBundleImportLazy.Bundle")
+	if err != nil {
+		return nil, err
+	}
+	return &DirectoryGitBundleImportLazy{LazyState: NewLazyState(), Repo: repo, Bundle: bundle, PrerequisiteRef: p.PrerequisiteRef}, nil
+}

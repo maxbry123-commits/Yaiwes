@@ -1,0 +1,492 @@
+// Creates a complete end-to-end build environment with CLI and engine for interactive testing
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/dagger/dagger/engine/distconsts"
+	"github.com/dagger/dagger/util/parallel"
+	"golang.org/x/mod/semver"
+
+	"dagger/engine-dev/build"
+	"dagger/engine-dev/internal/dagger"
+)
+
+func New(
+	ctx context.Context,
+	ws *dagger.Workspace,
+	// A configurable part of the IP subnet managed by the engine
+	// Change this to allow nested dagger engines
+	// +default=89
+	subnetNumber int,
+	// A docker config file with credentials to install on clients,
+	// to ensure they can access private registries
+	// +optional
+	clientDockerConfig *dagger.Secret,
+) *EngineDev {
+	commit, dirty := vcsInfo(ctx, ws)
+	return &EngineDev{
+		Ws: ws,
+		Source: ws.Directory("/", dagger.WorkspaceDirectoryOpts{
+			Exclude: []string{
+				"*",
+				"!.git",
+				"!dagger.json",
+				"!**/dagger.json",
+				"!dagger.toml",
+				"!**/dagger.toml",
+				"!**/go.*",
+				"!**/*.dang",
+				"!core",
+				"!engine",
+				"!util",
+				"!network",
+				"!dagql",
+				"!analytics",
+				"!auth",
+				"!cmd",
+				"!internal",
+				"!sdk",
+				"sdk/**/examples",
+				"!cmd",
+				"!modules",
+				"!.dagger",
+				"!.changes",
+			},
+		}),
+		VCSCommit:          commit,
+		VCSDirty:           dirty,
+		SubnetNumber:       subnetNumber,
+		ClientDockerConfig: clientDockerConfig,
+	}
+}
+
+// vcsInfo resolves the git HEAD commit and dirty state from the workspace for
+// stamping into built binaries. Errors are swallowed — a build proceeds with
+// whatever we collected (possibly nothing). Only the resolved scalars are
+// threaded onward; the Workspace itself is never stored or passed into a
+// build, which would make every affected cache key session-specific.
+func vcsInfo(ctx context.Context, ws *dagger.Workspace) (commit string, dirty bool) {
+	if ws == nil {
+		return "", false
+	}
+	git := ws.Git()
+	commit, err := git.Head().Commit(ctx)
+	if err != nil {
+		return "", false
+	}
+	if clean, err := git.Uncommitted().IsEmpty(ctx); err == nil {
+		dirty = !clean
+	}
+	return commit, dirty
+}
+
+type EngineDev struct {
+	Source *dagger.Directory
+
+	// Resolved VCS info stamped into built engine/CLI binaries. Stored as
+	// scalars (not the source Workspace) so EngineDev's methods stay
+	// content-addressed and their build results survive an engine restart.
+	VCSCommit string // +private
+	VCSDirty  bool   // +private
+
+	EngineConfig []string // +private
+	LogLevel     string   // +private
+	SubnetNumber int      // +private
+	EBPFProgs    []string // +private
+
+	Race               bool // +private
+	ClientDockerConfig *dagger.Secret
+
+	Ws *dagger.Workspace // +private
+}
+
+func (dev *EngineDev) NetworkCidr() string {
+	return fmt.Sprintf("10.%d.0.0/16", dev.SubnetNumber)
+}
+
+func (dev *EngineDev) IncrementSubnet() *EngineDev {
+	dev.SubnetNumber++
+	return dev
+}
+
+func (dev *EngineDev) WithEBPFProgs(names []string) *EngineDev {
+	dev.EBPFProgs = append(dev.EBPFProgs, names...)
+	return dev
+}
+
+func (dev *EngineDev) WithEngineConfig(key, value string) *EngineDev {
+	dev.EngineConfig = append(dev.EngineConfig, key+"="+value)
+	return dev
+}
+
+func (dev *EngineDev) WithRace() *EngineDev {
+	dev.Race = true
+	return dev
+}
+
+func (dev *EngineDev) WithLogLevel(level string) *EngineDev {
+	dev.LogLevel = level
+	return dev
+}
+
+// Build the engine container
+func (dev *EngineDev) Container(
+	ctx context.Context,
+
+	// +optional
+	platform dagger.Platform,
+	// +optional
+	gpuSupport bool,
+	// +optional
+	version string,
+) (*dagger.Container, error) {
+	cfg, err := generateConfig(dev.LogLevel)
+	if err != nil {
+		return nil, err
+	}
+	engineTOML, err := generateEngineTOML(dev.EngineConfig)
+	if err != nil {
+		return nil, err
+	}
+	entrypoint, err := generateEntrypoint()
+	if err != nil {
+		return nil, err
+	}
+
+	builder, err := build.NewBuilder(ctx, dev.Source, version, dev.VCSCommit, dev.VCSDirty, dev.Ws)
+	if err != nil {
+		return nil, err
+	}
+	builder = builder.WithRace(dev.Race)
+	if platform != "" {
+		builder = builder.WithPlatform(platform)
+	}
+
+	if gpuSupport {
+		builder = builder.WithGPUSupport()
+	}
+
+	ctr, err := builder.Engine(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, prog := range dev.EBPFProgs {
+		ctr = ctr.WithEnvVariable("DAGGER_EBPF_PROG_"+strings.ToUpper(prog), "y")
+	}
+
+	ctr = ctr.
+		WithFile(engineJSONPath, cfg).
+		WithFile(engineTOMLPath, engineTOML).
+		WithFile(engineEntrypointPath, entrypoint).
+		WithEntrypoint([]string{filepath.Base(engineEntrypointPath)})
+
+	cli := dag.DaggerCli(dagger.DaggerCliOpts{Version: version, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).Binary(dagger.DaggerCliBinaryOpts{
+		Platform: platform,
+	})
+	ctr = ctr.
+		WithFile(cliPath, cli).
+		WithEnvVariable("_EXPERIMENTAL_DAGGER_RUNNER_HOST", distconsts.DefaultEngineSockAddr)
+
+	// ctr = ctr.WithEnvVariable("BUILDKIT_SCHEDULER_DEBUG", "1")
+
+	return ctr, nil
+}
+
+// Create a test engine service
+func (dev *EngineDev) Service(
+	ctx context.Context,
+	name string,
+	// +optional
+	gpuSupport bool,
+	// +optional
+	sharedCache bool,
+	// +optional
+	metrics bool,
+) (*dagger.Service, error) {
+	// Support 256 layers of nested dagger engines :-P
+	dev = dev.IncrementSubnet()
+	cacheVolumeName := "dagger-dev-engine-state"
+	if !sharedCache {
+		cacheVolumeName = "dagger-dev-engine-state-" + rand.Text()
+		if name != "" {
+			cacheVolumeName += "-" + name
+		}
+	}
+
+	devEngine, err := dev.Container(ctx, "", gpuSupport, "")
+	if err != nil {
+		return nil, err
+	}
+
+	devEngine = devEngine.
+		WithExposedPort(1234, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
+		WithMountedCache(distconsts.EngineDefaultStateDir, dag.CacheVolume(cacheVolumeName), dagger.ContainerWithMountedCacheOpts{
+			// Only one engine can safely use a state dir at a time. LOCKED keeps the
+			// cache identity stable while serializing concurrent users.
+			Sharing: dagger.CacheSharingModeLocked,
+		})
+
+	if metrics {
+		devEngine = devEngine.
+			WithEnvVariable("_EXPERIMENTAL_DAGGER_METRICS_ADDR", "0.0.0.0:9090").
+			WithEnvVariable("_EXPERIMENTAL_DAGGER_METRICS_CACHE_UPDATE_INTERVAL", "10s")
+	}
+
+	return devEngine.AsService(dagger.ContainerAsServiceOpts{
+		Args: []string{
+			"--addr", "tcp://0.0.0.0:1234",
+			"--network-name", "dagger-dev",
+			"--network-cidr", dev.NetworkCidr(),
+		},
+		UseEntrypoint:            true,
+		InsecureRootCapabilities: true,
+	}), nil
+}
+
+// Configure the given client container so that it can connect to the given engine service
+func (dev *EngineDev) InstallClient(
+	ctx context.Context,
+	// The client container to configure
+	// +optional
+	client *dagger.Container,
+	// The engine service to bind
+	// +optional
+	service *dagger.Service,
+) (*dagger.Container, error) {
+	if client == nil {
+		// By default, start from a simple base container
+		client = dag.Wolfi().Container()
+	}
+	if service == nil {
+		var err error
+		service, err = dev.Service(
+			ctx,
+			"",    // name
+			false, // gpuSupport
+			false, // sharedCache
+			false, // metrics
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cliPath := "/.dagger-cli"
+	endpoint, err := service.Endpoint(ctx, dagger.ServiceEndpointOpts{Port: 1234, Scheme: "tcp"})
+	if err != nil {
+		return nil, err
+	}
+	client = client.
+		WithServiceBinding("dagger-engine", service).
+		// FIXME: retrieve endpoint dynamically?
+		WithEnvVariable("_EXPERIMENTAL_DAGGER_RUNNER_HOST", endpoint).
+		WithMountedFile(cliPath, dag.DaggerCli(dagger.DaggerCliOpts{Source: dev.Source, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).Binary()).
+		WithEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", cliPath).
+		WithSymlink(cliPath, "/usr/local/bin/dagger")
+	if cfg := dev.ClientDockerConfig; cfg != nil {
+		client = client.WithMountedSecret(
+			"${HOME}/.docker/config.json",
+			cfg,
+			dagger.ContainerWithMountedSecretOpts{Expand: true},
+		)
+	}
+	return client, nil
+}
+
+// withoutOuterSession wraps a command whose Dagger client must reach the dev
+// engine that InstallClient configures. On the v1.0 API, execs get a session
+// to the engine running them (DAGGER_SESSION_PORT/TOKEN), and Dagger clients
+// prefer that session over _EXPERIMENTAL_DAGGER_RUNNER_HOST. The engine sets
+// those variables when the process starts, so WithoutEnvVariable cannot
+// remove them; unset them at the process boundary instead. This works
+// whether or not the outer engine nests by default.
+func withoutOuterSession(args ...string) []string {
+	return append([]string{"env", "-u", "DAGGER_SESSION_PORT", "-u", "DAGGER_SESSION_TOKEN"}, args...)
+}
+
+// Introspect the engine API schema, and return it as a json-encoded file.
+// This file is used by SDKs to generate clients.
+func (dev *EngineDev) IntrospectionJSON(ctx context.Context) (*dagger.File, error) {
+	ctr, err := dev.InstallClient(ctx, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	introspectionJSON := ctr.
+		WithFile("/usr/local/bin/codegen", dag.Codegen(dev.Ws).Binary()).
+		WithExec(withoutOuterSession("codegen", "introspect", "-o", "/schema.json")).
+		File("/schema.json")
+	return introspectionJSON, nil
+}
+
+// Introspect the engine API schema, and return it as a graphql schema
+func (dev *EngineDev) GraphqlSchema(
+	ctx context.Context,
+	// +optional
+	version string,
+) (*dagger.File, error) {
+	ctr, err := dev.InstallClient(ctx, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	schemaPath := "schema.graphqls"
+	schema := ctr.
+		WithFile("/usr/local/bin/introspect", dev.IntrospectionTool()).
+		WithExec(
+			[]string{"introspect", "--version=" + version, "schema"},
+			dagger.ContainerWithExecOpts{RedirectStdout: schemaPath},
+		).
+		File(schemaPath)
+	return schema, nil
+}
+
+// Build the `introspect` tool which introspects the engine API
+func (dev *EngineDev) IntrospectionTool() *dagger.File {
+	return dag.
+		Go(dagger.GoOpts{Source: dev.Source, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).
+		Binary("./cmd/introspect")
+}
+
+var targets = []struct {
+	Name       string
+	Tag        string
+	Platforms  []dagger.Platform
+	GPUSupport bool
+}{
+	{
+		Name:      "wolfi (default)",
+		Tag:       "%s",
+		Platforms: []dagger.Platform{"linux/amd64", "linux/arm64"},
+	},
+	{
+		Name:       "wolfi with nvidia variant",
+		Tag:        "%s-gpu",
+		Platforms:  []dagger.Platform{"linux/amd64"},
+		GPUSupport: true,
+	},
+}
+
+type targetResult struct {
+	Platforms []*dagger.Container
+	Tags      []string
+}
+
+// +check
+func (dev *EngineDev) ReleaseDryRun(ctx context.Context) error {
+	return dev.Publish(
+		ctx,
+		"dagger-engine.dev", // image
+		// FIXME: why not from HEAD like the SDKs?
+		[]string{"main"}, // tag
+		true,             // dryRun
+		nil,              // registryUsername
+		nil,              // registryPassword
+	)
+}
+
+// Publish all engine images to a registry
+// +cache="session"
+func (dev *EngineDev) Publish(
+	ctx context.Context,
+
+	// Image target to push to
+	// +default="ghcr.io/dagger/engine"
+	image string,
+	// List of tags to use
+	tag []string,
+
+	// +optional
+	dryRun bool,
+
+	// +optional
+	registryUsername *string,
+	// +optional
+	registryPassword *dagger.Secret,
+) error {
+	targetResults, err := dev.buildTargets(ctx, tag)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		return nil
+	}
+	return dev.pushTargets(ctx, targetResults, image, registryUsername, registryPassword)
+}
+
+func (dev *EngineDev) buildTargets(ctx context.Context, tags []string) ([]targetResult, error) {
+	releaseVersion := releaseVersionFromTags(tags)
+	targetResults := make([]targetResult, len(targets))
+	jobs := parallel.New()
+	for i, target := range targets {
+		// determine the target tags
+		for _, tag := range tags {
+			targetResults[i].Tags = append(targetResults[i].Tags, fmt.Sprintf(target.Tag, tag))
+		}
+		// build all the target platforms
+		targetResults[i].Platforms = make([]*dagger.Container, len(target.Platforms))
+		for j, platform := range target.Platforms {
+			jobs = jobs.WithJob(fmt.Sprintf("build %s for %s", target.Name, platform),
+				func(ctx context.Context) error {
+					ctr, err := dev.Container(ctx, platform, target.GPUSupport, releaseVersion)
+					if err != nil {
+						return err
+					}
+					ctr, err = ctr.Sync(ctx)
+					if err != nil {
+						return err
+					}
+					targetResults[i].Platforms[j] = ctr
+					return nil
+				},
+			)
+		}
+	}
+	if err := jobs.Run(ctx); err != nil {
+		return nil, err
+	}
+	return targetResults, nil
+}
+
+func releaseVersionFromTags(tags []string) string {
+	for _, tag := range tags {
+		if semver.IsValid(tag) {
+			return tag
+		}
+	}
+	return ""
+}
+
+func (dev *EngineDev) pushTargets(
+	ctx context.Context,
+	targetResults []targetResult,
+	image string,
+	registryUsername *string,
+	registryPassword *dagger.Secret,
+) error {
+	ctr := dag.Container()
+	if registryUsername != nil && registryPassword != nil {
+		registry, _, _ := strings.Cut(image, "/")
+		ctr = ctr.WithRegistryAuth(registry, *registryUsername, registryPassword)
+	}
+	jobs := parallel.New()
+	for i, target := range targets {
+		result := targetResults[i]
+		jobs = jobs.WithJob(fmt.Sprintf("push target %s", target.Name),
+			func(ctx context.Context) error {
+				for _, tag := range result.Tags {
+					if _, err := ctr.Publish(ctx, image+":"+tag, dagger.ContainerPublishOpts{
+						PlatformVariants: result.Platforms,
+						// use gzip to avoid incompatibility w/ older docker versions
+						ForcedCompression: dagger.ImageLayerCompressionGzip,
+					}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+	}
+	return jobs.Run(ctx)
+}

@@ -1,0 +1,3480 @@
+---
+title: "CLI reference"
+description: "Learn how to use the Dagger CLI to run composable workflows in containers."
+slug: /reference/cli
+---
+
+## dagger
+
+A tool to run composable workflows in containers
+
+```
+dagger [options] [subcommand | file...]
+```
+
+### Options
+
+```
+  -c, --command string   Execute a Dagger script
+  -v, --verbose count    Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger agent](#dagger-agent)	 - Compose your installed agent modules and drop into an interactive prompt.
+* [dagger api](#dagger-api)	 - Interact with the Dagger API (advanced)
+* [dagger check](#dagger-check)	 - Verify your project — tests, linters, type checks, security scans, etc.
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+* [dagger generate](#dagger-generate)	 - Generate derived files for your project — code, SDKs, types, docs, etc.
+* [dagger init](#dagger-init)	 - Initialize a workspace and show the next commands
+* [dagger install](#dagger-install)	 - Install a module into your workspace
+* [dagger list](#dagger-list)	 - List artifacts or collection items
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+* [dagger lock](#dagger-lock)	 - Manage Dagger lockfiles
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+* [dagger sdk](#dagger-sdk)	 - Inspect and configure SDKs
+* [dagger settings](#dagger-settings)	 - Get, set, or unset module settings (use --env for an env overlay)
+* [dagger shell](#dagger-shell)	 - Open a terminal for a container or directory in your project
+* [dagger start](#dagger-start)	 - Run your project's services for local development — databases, APIs, dev servers, etc.
+* [dagger uninstall](#dagger-uninstall)	 - Uninstall a module from your workspace
+* [dagger version](#dagger-version)	 - Print dagger version
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger agent
+
+Compose your installed agent modules and drop into an interactive prompt.
+
+```
+dagger agent [FILTERS] [OPTIONS]
+```
+
+### Options
+
+```
+      --absolute              Show absolute links (alias: --abs)
+      --agent string          With -r, focus this restored agent (runtime handle or name) instead of the top-level one
+  -a, --all                   Expand collections and list each item
+  -f, --format FORMAT         Output FORMAT: table, link, or cli (requires --list) (default "table")
+  -l, --list                  List available agents
+      --module NAME           Select artifacts from module NAME
+  -r, --resume trace[=list]   Restore agents from a past session's trace: a retained engine archive, falling back to Dagger Cloud. With no trace ID, pick a retained session to resume (or list them when not interactive)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger api
+
+Interact with the Dagger API (advanced)
+
+### Synopsis
+
+Every Dagger command — check, up, generate, even install — ultimately
+runs against a GraphQL API served by the Dagger engine, combining
+Dagger's core types with schema extensions loaded from modules. The
+"api" group surfaces direct access for scripting and advanced
+automation. Most users will never type these commands.
+
+See https://docs.dagger.io/api for the full overview.
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger api call](#dagger-api-call)	 - Call one or more functions, interconnected into a pipeline
+* [dagger api functions](#dagger-api-functions)	 - List available functions
+* [dagger api query](#dagger-api-query)	 - Send API queries to a dagger engine
+* [dagger api with-session](#dagger-api-with-session)	 - Run a command with a connected Dagger API session (DAGGER_SESSION_PORT/TOKEN injected)
+
+## dagger api call
+
+Call one or more functions, interconnected into a pipeline
+
+```
+dagger api call [options] [function]...
+```
+
+### Options
+
+```
+      --allow-llm strings    List of URLs of remote modules allowed to access LLM APIs, or 'all' to allow every loaded module for the entire session
+  -j, --json                 Present result as JSON
+  -m, --load-module string   Use a one-off module (local path or git ref)
+  -M, --no-load-module       Don't load any module for this command
+  -o, --output string        Save the result to a local file or directory
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger api](#dagger-api)	 - Interact with the Dagger API (advanced)
+
+## dagger api functions
+
+List available functions
+
+### Synopsis
+
+List available functions in a module.
+
+This is similar to `dagger api call --help`, but only focused on showing the
+available functions.
+
+Examples:
+  dagger api functions                           # List top-level functions in current workspace
+  dagger api functions container                 # List functions on container
+  dagger -m core api functions                   # List core functions
+  dagger -W github.com/acme/ws api functions     # List top-level functions in explicit workspace
+  dagger -W github.com/acme/ws api functions container from
+
+
+```
+dagger api functions [options] [function]...
+```
+
+### Options
+
+```
+      --allow-llm strings    List of URLs of remote modules allowed to access LLM APIs, or 'all' to allow every loaded module for the entire session
+  -m, --load-module string   Use a one-off module (local path or git ref)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger api](#dagger-api)	 - Interact with the Dagger API (advanced)
+
+## dagger api query
+
+Send API queries to a dagger engine
+
+### Synopsis
+
+Send API queries to a dagger engine.
+
+When no document file is provided, reads query from standard input.
+
+Can optionally provide the GraphQL operation name if there are multiple
+queries in the document.
+
+
+```
+dagger api query [options] [operation]
+```
+
+### Examples
+
+```
+dagger api query <<EOF
+{
+  container {
+    from(address:"hello-world") {
+      withExec(args:["/hello"]) {
+        stdout
+      }
+    }
+  }
+}
+EOF
+
+```
+
+### Options
+
+```
+      --allow-llm strings    List of URLs of remote modules allowed to access LLM APIs, or 'all' to allow every loaded module for the entire session
+      --doc string           Read query from file (defaults to reading from stdin)
+  -m, --load-module string   Use a one-off module (local path or git ref)
+  -M, --no-load-module       Don't load any module for this command
+      --var strings          List of query variables, in key=value format
+      --var-json string      Query variables in JSON format (overrides --var)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger api](#dagger-api)	 - Interact with the Dagger API (advanced)
+
+## dagger api with-session
+
+Run a command with a connected Dagger API session (DAGGER_SESSION_PORT/TOKEN injected)
+
+### Synopsis
+
+Run an external command with a live Dagger API session attached.
+
+`DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN` are injected into the
+command's environment so the command can talk to the engine directly.
+Progress is rendered live in the TUI.
+
+For example:
+```shell
+jq -n '{query:"{container{id}}"}' | \
+  dagger api with-session sh -c 'curl -s \
+    -u $DAGGER_SESSION_TOKEN: \
+    -H "content-type:application/json" \
+    -d @- \
+    http://127.0.0.1:$DAGGER_SESSION_PORT/query'
+```
+
+```
+dagger api with-session [options] <command>...
+```
+
+### Examples
+
+```
+dagger api with-session go run main.go
+dagger api with-session node index.mjs
+dagger api with-session python main.py
+```
+
+### Options
+
+```
+      --cleanup-timeout duration   max duration to wait between SIGTERM and SIGKILL on interrupt (default 10s)
+      --focus                      Only show output for focused commands.
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger api](#dagger-api)	 - Interact with the Dagger API (advanced)
+
+## dagger check
+
+Verify your project — tests, linters, type checks, security scans, etc.
+
+```
+dagger check [--fail-fast] [FILTERS] [OPTIONS]
+```
+
+### Options
+
+```
+      --absolute             Show absolute links (alias: --abs)
+  -a, --all                  Expand collections and list each item
+      --allow-llm strings    List of URLs of remote modules allowed to access LLM APIs, or 'all' to allow every loaded module for the entire session
+      --fail-fast            Cancel remaining checks on first failure
+  -f, --format FORMAT        Output FORMAT: table, link, or cli (requires --list) (default "table")
+      --generated            Include staleness checks for 'dagger generate' (default true)
+  -l, --list                 List available checks
+  -m, --load-module string   Use a one-off module (local path or git ref)
+      --module NAME          Select artifacts from module NAME
+  -j, --parallel int         Run at most this many checks at once; 0 means no limit. Defaults to $DAGGER_CHECK_PARALLEL
+      --skip link            Exclude checks selected by this link
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger cloud
+
+Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger cloud billing](#dagger-cloud-billing)	 - Manage your Dagger Cloud subscription, payment method, and billing information
+* [dagger cloud checks](#dagger-cloud-checks)	 - Manage Cloud-side automated checks for this workspace
+* [dagger cloud engines](#dagger-cloud-engines)	 - Manage Dagger Cloud engines
+* [dagger cloud integration](#dagger-cloud-integration)	 - Manage Dagger Cloud integration providers
+* [dagger cloud login](#dagger-cloud-login)	 - Log in to Dagger Cloud
+* [dagger cloud logout](#dagger-cloud-logout)	 - Log out from Dagger Cloud
+* [dagger cloud org](#dagger-cloud-org)	 - Manage Dagger Cloud organizations
+* [dagger cloud signup](#dagger-cloud-signup)	 - Create or select a Dagger Cloud account and organization
+* [dagger cloud traces](#dagger-cloud-traces)	 - View Dagger Cloud traces
+* [dagger cloud usage](#dagger-cloud-usage)	 - Show Dagger Cloud usage
+* [dagger cloud workspaces](#dagger-cloud-workspaces)	 - Manage Dagger Cloud workspaces
+
+## dagger cloud billing
+
+Manage your Dagger Cloud subscription, payment method, and billing information
+
+### Synopsis
+
+Manage your Dagger Cloud subscription, payment method, and billing information.
+
+Opens the billing portal of the org (the argument, or the current org) in a
+browser when running in an interactive terminal, and prints its URL.
+
+```
+dagger cloud billing [org]
+```
+
+### Options
+
+```
+      --json   Print JSON output
+      --open   Open the billing portal in a browser (default: in an interactive terminal)
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger cloud checks
+
+Manage Cloud-side automated checks for this workspace
+
+```
+dagger cloud checks
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+* [dagger cloud checks list](#dagger-cloud-checks-list)	 - List Cloud-side checks for this workspace
+* [dagger cloud checks off](#dagger-cloud-checks-off)	 - Disable a Cloud-side check (by name; defaults to the workspace remote's default check)
+* [dagger cloud checks on](#dagger-cloud-checks-on)	 - Enable a Cloud-side check (by name; defaults to the workspace remote's default check)
+* [dagger cloud checks rerun](#dagger-cloud-checks-rerun)	 - Re-run checks on Dagger Cloud for the current commit
+* [dagger cloud checks status](#dagger-cloud-checks-status)	 - Show the status of a Cloud-side check (by name; defaults to the workspace remote's default check)
+
+## dagger cloud checks list
+
+List Cloud-side checks for this workspace
+
+```
+dagger cloud checks list [version]
+```
+
+### Options
+
+```
+      --fail-fast           When watching, stop as soon as a check is not successful
+      --failed              Only list failed checks
+      --interval duration   Polling interval used while watching (default 5s)
+      --watch               Wait until all checks have finished; exit non-zero if any check did not succeed
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger cloud checks](#dagger-cloud-checks)	 - Manage Cloud-side automated checks for this workspace
+
+## dagger cloud checks off
+
+Disable a Cloud-side check (by name; defaults to the workspace remote's default check)
+
+```
+dagger cloud checks off [name]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger cloud checks](#dagger-cloud-checks)	 - Manage Cloud-side automated checks for this workspace
+
+## dagger cloud checks on
+
+Enable a Cloud-side check (by name; defaults to the workspace remote's default check)
+
+```
+dagger cloud checks on [name]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger cloud checks](#dagger-cloud-checks)	 - Manage Cloud-side automated checks for this workspace
+
+## dagger cloud checks rerun
+
+Re-run checks on Dagger Cloud for the current commit
+
+### Synopsis
+
+Re-run checks on Dagger Cloud, against the commit CI already ran on.
+
+By default this targets the commit at the current HEAD (matched by SHA, falling
+back to the branch or PR it belongs to) and re-runs the checks that failed. Pass
+--check to pick specific checks by name, --all to re-run everything, or
+--commit/--pr to target a different commit.
+
+Only outermost checks can be re-run; sub-checks run as part of their parent
+check, so name the parent (e.g. "ci:bootstrap", not "ci:bootstrap:lint").
+
+This re-runs a check that already exists in Cloud for the commit. If CI hasn't
+run on the commit yet there's nothing to re-run -- use 'dagger check' to run
+checks locally against your working tree.
+
+```
+dagger cloud checks rerun [--check NAME ...] [--failed | --all]
+```
+
+### Options
+
+```
+      --all                 Re-run every check, including ones that passed
+      --check stringArray   Re-run a specific check by name (repeatable; outermost checks only)
+      --clean-slate         Re-run without reusing cache (experimental; requires an org feature)
+      --commit string       Target a specific commit SHA instead of the current HEAD
+      --dry-run             Show which checks would be re-run without triggering anything
+      --failed              Re-run the failed checks (the default when no --check is given)
+      --json                Print JSON output
+      --pr string           Target a specific pull request number
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger cloud checks](#dagger-cloud-checks)	 - Manage Cloud-side automated checks for this workspace
+
+## dagger cloud checks status
+
+Show the status of a Cloud-side check (by name; defaults to the workspace remote's default check)
+
+```
+dagger cloud checks status [name]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger cloud checks](#dagger-cloud-checks)	 - Manage Cloud-side automated checks for this workspace
+
+## dagger cloud engines
+
+Manage Dagger Cloud engines
+
+```
+dagger cloud engines
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger cloud integration
+
+Manage Dagger Cloud integration providers
+
+```
+dagger cloud integration
+```
+
+### Options
+
+```
+      --json   Print JSON output
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+* [dagger cloud integration create](#dagger-cloud-integration-create)	 - Create a new integration of the given provider type
+* [dagger cloud integration list](#dagger-cloud-integration-list)	 - List configured integrations (optionally filtered by provider type)
+* [dagger cloud integration rm](#dagger-cloud-integration-rm)	 - Remove a configured integration
+
+## dagger cloud integration create
+
+Create a new integration of the given provider type
+
+```
+dagger cloud integration create <provider>
+```
+
+### Examples
+
+```
+dagger cloud integration create github
+```
+
+### Options
+
+```
+      --open   Open the setup URL in a browser
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Print JSON output
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud integration](#dagger-cloud-integration)	 - Manage Dagger Cloud integration providers
+
+## dagger cloud integration list
+
+List configured integrations (optionally filtered by provider type)
+
+```
+dagger cloud integration list [type]
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Print JSON output
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud integration](#dagger-cloud-integration)	 - Manage Dagger Cloud integration providers
+
+## dagger cloud integration rm
+
+Remove a configured integration
+
+```
+dagger cloud integration rm <id>
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Print JSON output
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud integration](#dagger-cloud-integration)	 - Manage Dagger Cloud integration providers
+
+## dagger cloud login
+
+Log in to Dagger Cloud
+
+```
+dagger cloud login [options] [org]
+```
+
+### Options
+
+```
+      --switch-account   Choose a different Dagger Cloud account
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger cloud logout
+
+Log out from Dagger Cloud
+
+```
+dagger cloud logout
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger cloud org
+
+Manage Dagger Cloud organizations
+
+```
+dagger cloud org [flags]
+```
+
+### Options
+
+```
+      --json   Print JSON output
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+* [dagger cloud org info](#dagger-cloud-org-info)	 - Show Dagger Cloud organization status
+* [dagger cloud org list](#dagger-cloud-org-list)	 - List Dagger Cloud organizations
+* [dagger cloud org use](#dagger-cloud-org-use)	 - Select the current Dagger Cloud organization
+
+## dagger cloud org info
+
+Show Dagger Cloud organization status
+
+```
+dagger cloud org info [org] [flags]
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Print JSON output
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud org](#dagger-cloud-org)	 - Manage Dagger Cloud organizations
+
+## dagger cloud org list
+
+List Dagger Cloud organizations
+
+```
+dagger cloud org list [flags]
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Print JSON output
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud org](#dagger-cloud-org)	 - Manage Dagger Cloud organizations
+
+## dagger cloud org use
+
+Select the current Dagger Cloud organization
+
+```
+dagger cloud org use <org> [flags]
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Print JSON output
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud org](#dagger-cloud-org)	 - Manage Dagger Cloud organizations
+
+## dagger cloud signup
+
+Create or select a Dagger Cloud account and organization
+
+### Synopsis
+
+Create or select a Dagger Cloud account and organization.
+
+Use the same account and organization flow as dagger cloud login.
+If human action is required, non-interactive mode returns instructions
+without opening a browser or waiting for input.
+
+```
+dagger cloud signup [options] [org]
+```
+
+### Options
+
+```
+      --switch-account   Choose a different Dagger Cloud account
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger cloud traces
+
+View Dagger Cloud traces
+
+```
+dagger cloud traces
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+* [dagger cloud traces list](#dagger-cloud-traces-list)	 - List Dagger Cloud traces
+* [dagger cloud traces status](#dagger-cloud-traces-status)	 - Show if this installation sends traces to Dagger Cloud
+* [dagger cloud traces view](#dagger-cloud-traces-view)	 - View a Dagger Cloud trace
+
+## dagger cloud traces list
+
+List Dagger Cloud traces
+
+### Synopsis
+
+List the traces of a Dagger Cloud org, local and CI, newest first.
+
+Use the flags to filter the traces. All filters must match.
+
+```
+dagger cloud traces list
+```
+
+### Examples
+
+```
+dagger cloud traces list --status failed --branch main --since 7d
+dagger cloud traces list --mine --local --limit 5
+dagger cloud traces list --pr 123 --json
+```
+
+### Options
+
+```
+      --author string           Only traces whose commit author or committer matches this text
+      --branch string           Only traces of this branch
+      --ci                      Only traces of CI runs
+      --command string          Only traces whose command matches this glob, e.g. 'dagger check*'
+      --commit string           Only traces of this commit (full or short SHA)
+      --json                    Print JSON output
+  -L, --limit int               Maximum number of traces to list (at most 1000) (default 20)
+      --local                   Only traces of local runs
+      --max-duration duration   Only traces that ran for at most this time
+      --min-duration duration   Only traces that ran for at least this time, e.g. 5m
+      --mine                    Only traces that you sent
+      --pr string               Only traces of this pull request number
+      --provider string         Only traces of this CI provider, e.g. github
+      --repo strings            Only traces of this repository, e.g. github.com/org/repo (repeatable)
+      --since string            Only traces that started after this time: a duration (30m, 2d, 1w) or a date (2006-01-02, RFC 3339). Defaults to 1h with --sort duration
+      --sort string             Sort order: start (newest first) or duration (longest first). Duration sorts within --since, which defaults to 1h (default "start")
+      --status string           Only traces with this status: passed, failed or running
+      --tag string              Only traces of this git tag
+      --token string            Only traces that this token sent (token ID or name)
+      --until string            Only traces that started before this time: a duration or a date, as for --since
+      --user string             Only traces that this user sent (user ID or email)
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud traces](#dagger-cloud-traces)	 - View Dagger Cloud traces
+
+## dagger cloud traces status
+
+Show if this installation sends traces to Dagger Cloud
+
+### Synopsis
+
+Show if the dagger CLI on this machine sends traces to Dagger Cloud, with
+the current environment.
+
+This command shows the state of this installation, not the state of Dagger
+Cloud. It does not ask Dagger Cloud if the credential is valid, but it can
+refresh an expired login token.
+
+The exit code is 0 when the CLI sends traces, and 1 when it does not.
+
+```
+dagger cloud traces status
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud traces](#dagger-cloud-traces)	 - View Dagger Cloud traces
+
+## dagger cloud traces view
+
+View a Dagger Cloud trace
+
+### Synopsis
+
+View a Dagger Cloud trace: the overall result, the commands that caused a
+failure, check results and failed tests, each with the end of its logs, and the
+full call tree with arguments and timing.
+
+The trace is a trace ID or a https://dagger.cloud/&lt;org&gt;/traces/&lt;id&gt; URL. Use
+--last for your most recent trace.
+
+Use --span, --check or --test to show one span, check or test.
+
+Use --log to show the full logs instead of the tree. In a terminal, the logs
+open in a pager: press esc to go to the tree, and L to go back to the logs.
+When the output is not a terminal, or with --output, the command writes the
+raw logs.
+
+Use --web (-w) to open the trace in the Dagger Cloud web UI.
+
+```
+dagger cloud traces view [trace]
+```
+
+### Examples
+
+```
+dagger cloud traces view 2f123ba77bf7bd2d4db2f70ed20613e8
+dagger cloud traces view --last --check build:lint
+dagger cloud traces view --last --log --test TestFoo
+dagger cloud traces view https://dagger.cloud/acme/traces/2f123ba77bf7bd2d4db2f70ed20613e8 -w
+dagger cloud traces view --last --log --check build:lint -o lint.log
+```
+
+### Options
+
+```
+      --check string       Show only this check, by name
+      --descendants        With --log and --span, include the logs of the span's descendants
+      --last               View your most recent trace
+      --log                Show the full logs instead of the tree
+  -o, --output string      With --log, write the logs to this file
+      --span string        Show only this span, by span ID
+      --test string        Show only this test, by name
+      --timeout duration   With --log, the maximum time to write logs, when the command does not open a pager (default 2m0s)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug             Enable engine and trace diagnostics
+  -E, --no-exit           Leave the TUI running after completion
+      --progress string   Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count       Reduce verbosity (show progress, but clean up at the end)
+  -s, --silent            Do not show progress at all
+  -v, --verbose count     Increase verbosity (use -vv or -vvv for more)
+  -w, --web               Open trace URL in a web browser
+```
+
+### SEE ALSO
+
+* [dagger cloud traces](#dagger-cloud-traces)	 - View Dagger Cloud traces
+
+## dagger cloud usage
+
+Show Dagger Cloud usage
+
+### Synopsis
+
+Show Dagger Cloud usage for a UTC calendar month.
+
+Reports Cloud Engine compute usage (core minutes and cost) and telemetry usage
+(spans and log lines ingested) for the current month by default, or the month
+given with --month.
+
+```
+dagger cloud usage [options] [org] [flags]
+```
+
+### Options
+
+```
+      --json           Print JSON output
+      --month string   UTC month to report, as YYYY-MM (defaults to the current month)
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger cloud workspaces
+
+Manage Dagger Cloud workspaces
+
+```
+dagger cloud workspaces [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger cloud](#dagger-cloud)	 - Manage Dagger Cloud (checks, engines, traces, billing, etc.)
+
+## dagger engine
+
+How to select the engine that runs your workflows
+
+### Synopsis
+
+Dagger runs your workflows on an engine. Use --engine to select one.
+
+VALUES
+
+  Dagger Cloud:
+    cloud
+
+  Start from an OCI image:
+    image://IMAGE
+    image+docker://IMAGE
+    image+apple://IMAGE
+    image+podman://IMAGE
+    image+finch://IMAGE
+    image+nerdctl://IMAGE
+
+  Use a running engine container:
+    container://NAME
+    container+docker://NAME
+    container+apple://NAME
+    container+podman://NAME
+    container+finch://NAME
+    container+nerdctl://NAME
+
+  Connect directly:
+    tcp://HOST:PORT (no authentication)
+    tls://HOST[:PORT]
+    ssh://[USER@]HOST[:PORT]
+    kube-pod://POD
+    unix://PATH
+
+  Legacy Docker schemes:
+    docker-image://IMAGE
+    docker-container://NAME
+
+PRIORITY
+
+  The CLI uses the first of these that is set:
+
+    1. --engine
+    2. --cloud (deprecated; the same as --engine=cloud)
+    3. DAGGER_ENGINE (takes the same values as --engine)
+    4. DAGGER_CLOUD_ENGINE (deprecated; any value selects Dagger Cloud)
+    5. _EXPERIMENTAL_DAGGER_RUNNER_HOST (deprecated)
+    6. The engine that this CLI version ships with
+
+  The two deprecated variables still work as a fallback, in the same way as
+  the deprecated --cloud flag. --engine and DAGGER_ENGINE replace them:
+
+    --engine=cloud  instead of DAGGER_CLOUD_ENGINE
+    --engine=URI    instead of _EXPERIMENTAL_DAGGER_RUNNER_HOST
+
+EXAMPLES
+
+  Run on Dagger Cloud:
+    dagger call --engine=cloud build
+
+  Run on an engine container that is already running:
+    dagger call --engine=container://dagger-engine build
+
+  Run on a remote host over SSH:
+    dagger call --engine=ssh://user@host build
+
+  Select an engine for every command in a shell session:
+    export DAGGER_ENGINE=cloud
+
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger generate
+
+Generate derived files for your project — code, SDKs, types, docs, etc.
+
+```
+dagger generate [FILTERS] [OPTIONS]
+```
+
+### Options
+
+```
+      --absolute        Show absolute links (alias: --abs)
+  -a, --all             Expand collections and list each item
+  -f, --format FORMAT   Output FORMAT: table, link, or cli (requires --list) (default "table")
+  -l, --list            List available generators
+      --module NAME     Select artifacts from module NAME
+      --no-apply        Compute and show a summary of generated changes without applying them
+  -j, --parallel int    Run at most this many generators at once; 0 means no limit
+      --require-load    Fail if any workspace module cannot be loaded (default: report as a warning and generate the rest)
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger init
+
+Initialize a workspace and show the next commands
+
+### Synopsis
+
+Initialize a workspace and show the next commands.
+
+Use an existing dagger.toml when present. If a legacy dagger.json has
+workspace settings, stop and direct the user to dagger workspace migrate.
+Otherwise, create an empty dagger.toml. Existing module files remain unchanged.
+
+Run this command in a local Git repository.
+Run this command again to inspect the current initialization state.
+
+```
+dagger init
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger install
+
+Install a module into your workspace
+
+### Synopsis
+
+Install a module from a local path or Git source into the current workspace.
+
+To change an installed version, use dagger mod update.
+
+If no workspace config is selected, this creates one at the workspace root first.
+Use --here to create the workspace config at the workspace cwd instead.
+
+With --env the module is recorded in that env's overlay (env.&lt;name&gt;.modules.*)
+and the env is created if missing.
+
+```
+dagger install [options] SOURCE
+```
+
+### Examples
+
+```
+dagger module install github.com/shykes/daggerverse/hello@v0.3.0
+```
+
+### Options
+
+```
+      --here          Write workspace config at the selected workspace cwd
+  -n, --name string   Name to use for the module in the workspace. Defaults to the name of the module being installed.
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger links
+
+How to select artifacts with DAG links
+
+### Synopsis
+
+A DAG link selects artifacts. A relative link uses the current workspace.
+An absolute link specifies a workspace and revision.
+
+FORMS
+  dag://go/test                              Relative link
+  dag://github.com/acme/project@main:go/test  Absolute link
+  dag+check://go/test                        Filter by artifact type
+
+SELECTION
+  A path selects that artifact and its children. Several links select their
+  combined results. With no link, commands use their default selection.
+
+  The dag:// prefix is optional for short paths: go/test is a relative link.
+  The legacy form go:test is also accepted.
+
+  Path patterns accept wildcards: * matches within a path segment, and **
+  matches across segments. Quote links with wildcards or query parameters.
+
+  --skip accepts the same link filters and excludes their matches from the
+  selected checks. Its workspace prefix does not change the selected workspace.
+
+DIMENSIONS
+  Query parameters select dimension keys:
+    'dag://go/modules/test?go-module=./app&go-module=./lib'
+
+  Select a module with --module=go, or --go when available.
+  If --go conflicts with another flag, use --by-go.
+  The equivalent link is 'dag://?module=go'. Module names come from the
+  workspace configuration. A module filter does not load collection keys.
+
+  Type flags match path suffixes. For example, --check=stale selects all
+  matching checks. Use --check=/go/generate/stale to match a complete path.
+  Use 'dagger check --help' to see available filters.
+
+  Repeated keys in one dimension select alternatives. Different dimensions
+  must all match. Named flags, such as --go-module=./app, apply to all links.
+  Use 'dagger list --help' to find collection commands that list available keys.
+
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger list
+
+List artifacts or collection items
+
+### Synopsis
+
+List artifacts by type or collection. Use -a to expand collections.
+
+```
+dagger list [TYPE | COLLECTION]
+```
+
+### Options
+
+```
+      --absolute        Show absolute links (alias: --abs)
+  -a, --all             Expand collections and list each item
+  -f, --format FORMAT   Output FORMAT: table, link, or cli (default "table")
+      --module NAME     Select artifacts from module NAME
+  -t, --type TYPE       Select artifacts of this TYPE (repeat to select more)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger llm
+
+Manage LLM configuration
+
+### Synopsis
+
+Manage LLM provider configuration, API keys, and default models.
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger llm add-key](#dagger-llm-add-key)	 - Add or update API key for a provider
+* [dagger llm config](#dagger-llm-config)	 - Display current LLM configuration
+* [dagger llm remove-key](#dagger-llm-remove-key)	 - Remove API key for a provider
+* [dagger llm reset](#dagger-llm-reset)	 - Reset LLM configuration (removes all stored credentials)
+* [dagger llm set-default](#dagger-llm-set-default)	 - Set default provider and optionally model
+* [dagger llm setup](#dagger-llm-setup)	 - Configure LLM authentication interactively
+* [dagger llm show-config](#dagger-llm-show-config)	 - Show raw LLM configuration (JSON)
+
+## dagger llm add-key
+
+Add or update API key for a provider
+
+### Synopsis
+
+Add or update API key for a provider.
+
+Supported providers:
+  - openrouter: Unified access to 100+ models (https://openrouter.ai/keys)
+  - anthropic: Claude models (https://console.anthropic.com/settings/keys)
+  - openai: GPT models (https://platform.openai.com/api-keys)
+  - google: Gemini models (https://aistudio.google.com/app/apikey)
+
+
+```
+dagger llm add-key <provider>
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger llm config
+
+Display current LLM configuration
+
+```
+dagger llm config
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger llm remove-key
+
+Remove API key for a provider
+
+```
+dagger llm remove-key <provider>
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger llm reset
+
+Reset LLM configuration (removes all stored credentials)
+
+```
+dagger llm reset
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger llm set-default
+
+Set default provider and optionally model
+
+```
+dagger llm set-default <provider> [model]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger llm setup
+
+Configure LLM authentication interactively
+
+```
+dagger llm setup
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger llm show-config
+
+Show raw LLM configuration (JSON)
+
+```
+dagger llm show-config
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger llm](#dagger-llm)	 - Manage LLM configuration
+
+## dagger lock
+
+Manage Dagger lockfiles
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger lock list](#dagger-lock-list)	 - List matching lockfile entries
+* [dagger lock update](#dagger-lock-update)	 - Refresh selected lockfile entries
+
+## dagger lock list
+
+List matching lockfile entries
+
+### Synopsis
+
+List entries already recorded in the selected dagger.lock.
+
+Selectors use the same matching rules as dagger lock update. With no selectors,
+every supported entry is listed. The command prints canonical resource
+identities without resolving or writing them.
+
+```
+dagger lock list [SELECTOR...]
+```
+
+### Examples
+
+```
+  dagger lock list
+  dagger lock list 'node:lts*' 'dagger@m*'
+  dagger lock list 'github.com/dagger/dagger@refs/heads/main'
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger lock](#dagger-lock)	 - Manage Dagger lockfiles
+
+## dagger lock update
+
+Refresh selected lockfile entries
+
+### Synopsis
+
+Refresh entries already recorded in the selected dagger.lock.
+
+Selectors match user-facing resource identities instead of lockfile entry
+types. OCI entries match their full image reference, repository name, or short
+reference with a tag. For example, both "node" and "node:lts*" match
+"docker.io/library/node:lts-alpine". Git entries match a scheme-free repository
+identity or repository name, optionally followed by a ref. "dagger@main" and
+"dagger@m*" match both "refs/heads/main" and "refs/tags/main" in repositories
+named dagger. Use a qualified ref such as
+"github.com/dagger/dagger@refs/heads/main" to select only that branch. Vanity
+URL entries match their full URL or final path component.
+
+Selectors support shell-style patterns, with "*" matching across "/". Multiple
+selectors are ORed together, but every selector must match at least one entry.
+With no selectors, every supported entry is refreshed.
+
+SDK client scopes are regenerated unless --no-generate is set. Use --list to
+print the matching canonical identities without resolving or writing them. This
+is equivalent to dagger lock list with the same selectors.
+
+```
+dagger lock update [SELECTOR...]
+```
+
+### Examples
+
+```
+  dagger lock update
+  dagger lock update 'node:lts*' 'dagger@m*'
+  dagger lock update 'github.com/dagger/dagger@refs/heads/main'
+  dagger lock update '*node*' '*python*'
+  dagger lock update --list dagger
+```
+
+### Options
+
+```
+  -l, --list          List matching lock entries without resolving or updating them
+      --no-generate   Update the lockfile without regenerating SDK client scopes
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger lock](#dagger-lock)	 - Manage Dagger lockfiles
+
+## dagger module
+
+Install, use, and develop Dagger modules
+
+```
+dagger module
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger module client](#dagger-module-client)	 - Manage generated clients for modules
+* [dagger module init](#dagger-module-init)	 - Initialize a new module for development with an SDK
+* [dagger module install](#dagger-module-install)	 - Install a module into your workspace
+* [dagger module list](#dagger-module-list)	 - List installed modules
+* [dagger module migrate](#dagger-module-migrate)	 - Migrate one local module in place
+* [dagger module recommend](#dagger-module-recommend)	 - Find recommended modules and select which modules to install
+* [dagger module search](#dagger-module-search)	 - Search for modules you can install
+* [dagger module settings](#dagger-module-settings)	 - Get, set, or unset module settings (use --env for an env overlay)
+* [dagger module uninstall](#dagger-module-uninstall)	 - Uninstall a module from your workspace
+* [dagger module update](#dagger-module-update)	 - Update installed module sources, versions and lockfile state
+* [dagger module version](#dagger-module-version)	 - Print the version request for an installed module
+
+## dagger module client
+
+Manage generated clients for modules
+
+```
+dagger module client [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+* [dagger module client add](#dagger-module-client-add)	 - Add and generate a module client
+* [dagger module client list](#dagger-module-client-list)	 - List generated module clients
+* [dagger module client rm](#dagger-module-client-rm)	 - Remove a module client
+* [dagger module client scope](#dagger-module-client-scope)	 - Print the current client-generation scope
+* [dagger module client update](#dagger-module-client-update)	 - Update module clients
+
+## dagger module client add
+
+Add and generate a module client
+
+### Synopsis
+
+Add a module client to one SDK scope and generate that scope.
+
+Use an explicit local path such as ./api or ../api, or a module address.
+Installed module names are not supported.
+
+With no --sdk, select the deepest scope found across installed SDKs.
+If several SDKs have that scope, use --sdk to select one.
+
+```
+dagger module client add <module> [--sdk=SDK]
+```
+
+### Options
+
+```
+      --sdk SDK   Select an installed SDK (default: deepest scope)
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module client](#dagger-module-client)	 - Manage generated clients for modules
+
+## dagger module client list
+
+List generated module clients
+
+### Synopsis
+
+List recorded clients in scopes that contain the current directory.
+
+Use --all to list clients in every scope. SCOPE is relative to the workspace
+root. To remove a row, run 'dagger module client rm TARGET --sdk=SDK' from SCOPE.
+
+```
+dagger module client list [flags]
+```
+
+### Options
+
+```
+      --all          List clients in all scopes
+      --sdk string   Filter by SDK module
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module client](#dagger-module-client)	 - Manage generated clients for modules
+
+## dagger module client rm
+
+Remove a module client
+
+### Synopsis
+
+Remove a recorded module client and regenerate its SDK scope.
+
+Use the exact TARGET from 'dagger module client list'. Select the deepest
+matching scope. If several SDKs have that scope, use --sdk to select one.
+If invalid targets remain, save the removal and skip generation until they
+are corrected or removed.
+
+```
+dagger module client rm <module> [--sdk=SDK]
+```
+
+### Options
+
+```
+      --sdk SDK   Select an installed SDK (default: deepest matching scope)
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module client](#dagger-module-client)	 - Manage generated clients for modules
+
+## dagger module client scope
+
+Print the current client-generation scope
+
+```
+dagger module client scope [flags]
+```
+
+### Options
+
+```
+      --sdk string   SDK module to query
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module client](#dagger-module-client)	 - Manage generated clients for modules
+
+## dagger module client update
+
+Update module clients
+
+### Synopsis
+
+Update the recorded module clients and regenerate their SDK scopes.
+
+With no argument, updates every client target in the current scope. Only the
+lock entries that the selected targets reach are rewritten.
+
+```
+dagger module client update [module...] [flags]
+```
+
+### Examples
+
+```
+dagger module client update
+```
+
+### Options
+
+```
+      --all          Update clients in all scopes
+      --sdk string   Filter by SDK module
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module client](#dagger-module-client)	 - Manage generated clients for modules
+
+## dagger module init
+
+Initialize a new module for development with an SDK
+
+### Synopsis
+
+Initialize a new module for development with an SDK
+
+```
+dagger module init SDK [flags]
+```
+
+### Options
+
+```
+      --entrypoint    Install and select the module as entrypoint (default: select when --path and --name are omitted)
+      --install       Install the module (default: install when --path is omitted)
+  -n, --name string   Module name (inferred when omitted)
+      --no-apply      Show generated changes without applying them
+      --path string   Module path (default: .dagger/modules/<name> beside dagger.toml)
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module install
+
+Install a module into your workspace
+
+### Synopsis
+
+Install a module from a local path or Git source into the current workspace.
+
+To change an installed version, use dagger mod update.
+
+If no workspace config is selected, this creates one at the workspace root first.
+Use --here to create the workspace config at the workspace cwd instead.
+
+With --env the module is recorded in that env's overlay (env.&lt;name&gt;.modules.*)
+and the env is created if missing.
+
+```
+dagger module install [options] SOURCE [flags]
+```
+
+### Examples
+
+```
+dagger module install github.com/shykes/daggerverse/hello@v0.3.0
+```
+
+### Options
+
+```
+      --here          Write workspace config at the selected workspace cwd
+  -n, --name string   Name to use for the module in the workspace. Defaults to the name of the module being installed.
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module list
+
+List installed modules
+
+```
+dagger module list [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module migrate
+
+Migrate one local module in place
+
+### Synopsis
+
+Migrate one local dagger.json to dagger-module.toml in place.
+
+PATH defaults to the workspace current directory. Relative paths start there;
+absolute paths start at the workspace root. A dagger.toml is not required.
+If one exists, migration also registers the module's SDK scope. Otherwise,
+only the requested module is converted; no workspace config is created.
+Configurations with workspace fields require workspace migration.
+
+Review module and SDK configuration changes together. Use --auto-apply to apply
+without a prompt, or --no-apply to preview without changing files.
+
+```
+dagger module migrate [PATH] [flags]
+```
+
+### Options
+
+```
+      --no-apply   Preview migration without changing files
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module recommend
+
+Find recommended modules and select which modules to install
+
+### Synopsis
+
+Find modules for the current workspace and select which modules to install.
+Already installed modules are skipped.
+
+Use --auto-apply to install all recommended modules without a prompt.
+Without --auto-apply, print recommendations and install commands in
+non-interactive mode.
+
+```
+dagger module recommend [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module search
+
+Search for modules you can install
+
+### Synopsis
+
+Search the module registry by name or description.
+
+With no query, lists all known modules and SDK modules.
+
+```
+dagger module search [query] [flags]
+```
+
+### Examples
+
+```
+dagger module search wolfi
+```
+
+### Options
+
+```
+      --sdk   Only show modules that provide SDK capabilities
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module settings
+
+Get, set, or unset module settings (use --env for an env overlay)
+
+```
+dagger module settings [module] [key] [value...] [flags]
+```
+
+### Options
+
+```
+  -g, --global   Store the setting in user-level config instead of the repository, keyed by the workspace's git remote
+      --here     Write workspace config at the selected workspace cwd
+  -u, --unset    Remove the setting from workspace config
+      --wide     List settings with full values and descriptions, wrapped to the terminal width instead of truncated
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module uninstall
+
+Uninstall a module from your workspace
+
+### Synopsis
+
+Uninstall a module from the current workspace, removing it from dagger.toml.
+
+Match an installed name first, then a source without a version.
+The source must match exactly one installation. Version selectors are not accepted.
+
+With --env only the env's overlay entry is removed, never the base module.
+
+```
+dagger module uninstall [options] NAME|SOURCE [flags]
+```
+
+### Examples
+
+```
+dagger module uninstall hello
+```
+
+### Options
+
+```
+      --here   Write workspace config at the selected workspace cwd
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module update
+
+Update installed module sources, versions and lockfile state
+
+### Synopsis
+
+Update an installed module by name or source.
+
+Use --version VERSION or append @VERSION to set a new version request.
+Use --source SOURCE to change the source address. The new source can include
+a version. A local path is relative to the current directory, as with install.
+The module keeps its name and settings.
+Match an installed name first.
+Source matching ignores the version and must select exactly one installation.
+Without a new version or source, refresh the existing request.
+
+With no arguments, this refreshes all installed modules. It does not refresh
+client targets or runtime targets. If a client scope targets an updated module,
+the command regenerates that scope. Use dagger lock update to refresh all
+entries in dagger.lock.
+
+```
+dagger module update [NAME|SOURCE...] [flags]
+```
+
+### Options
+
+```
+      --source string    New source address for one installed module
+      --version string   New version request for one installed module
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger module version
+
+Print the version request for an installed module
+
+### Synopsis
+
+Print the version request from dagger.toml, such as v1 or main.
+
+Match an installed name first, then a source without a version. The source must
+match exactly one installation. Source-match details go to stderr.
+Local modules and sources without an explicit version request return an error.
+
+```
+dagger module version NAME|SOURCE [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger module](#dagger-module)	 - Install, use, and develop Dagger modules
+
+## dagger sdk
+
+Inspect and configure SDKs
+
+```
+dagger sdk
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger sdk list](#dagger-sdk-list)	 - List known SDKs
+* [dagger sdk scope](#dagger-sdk-scope)	 - Inspect and configure SDK scopes
+
+## dagger sdk list
+
+List known SDKs
+
+```
+dagger sdk list [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger sdk](#dagger-sdk)	 - Inspect and configure SDKs
+
+## dagger sdk scope
+
+Inspect and configure SDK scopes
+
+### Synopsis
+
+Inspect and configure SDK scopes. Field edits update dagger.toml only. They do not generate files.
+
+```
+dagger sdk scope [flags]
+```
+
+### Options
+
+```
+      --path string   Select a scope by path instead of the workspace CWD
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger sdk](#dagger-sdk)	 - Inspect and configure SDKs
+* [dagger sdk scope is-module](#dagger-sdk-scope-is-module)	 - Get or set whether an SDK scope contains a module
+* [dagger sdk scope list](#dagger-sdk-scope-list)	 - List SDK scopes
+* [dagger sdk scope name](#dagger-sdk-scope-name)	 - Get or set an SDK scope name
+* [dagger sdk scope sdk](#dagger-sdk-scope-sdk)	 - Get or set the SDK that owns a scope
+
+## dagger sdk scope is-module
+
+Get or set whether an SDK scope contains a module
+
+```
+dagger sdk scope is-module [BOOL] [flags]
+```
+
+### Options
+
+```
+  -u, --unset   Remove the value
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+      --path string        Select a scope by path instead of the workspace CWD
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger sdk scope](#dagger-sdk-scope)	 - Inspect and configure SDK scopes
+
+## dagger sdk scope list
+
+List SDK scopes
+
+```
+dagger sdk scope list [flags]
+```
+
+### Options
+
+```
+      --is-module     Filter by whether the scope contains a module
+      --name string   Filter by scope name
+      --sdk string    Filter by SDK name
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+      --path string        Select a scope by path instead of the workspace CWD
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger sdk scope](#dagger-sdk-scope)	 - Inspect and configure SDK scopes
+
+## dagger sdk scope name
+
+Get or set an SDK scope name
+
+```
+dagger sdk scope name [NAME] [flags]
+```
+
+### Options
+
+```
+  -u, --unset   Remove the value
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+      --path string        Select a scope by path instead of the workspace CWD
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger sdk scope](#dagger-sdk-scope)	 - Inspect and configure SDK scopes
+
+## dagger sdk scope sdk
+
+Get or set the SDK that owns a scope
+
+```
+dagger sdk scope sdk [SDK] [flags]
+```
+
+### Options
+
+```
+  -u, --unset   Remove the value
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+      --path string        Select a scope by path instead of the workspace CWD
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger sdk scope](#dagger-sdk-scope)	 - Inspect and configure SDK scopes
+
+## dagger settings
+
+Get, set, or unset module settings (use --env for an env overlay)
+
+```
+dagger settings [module] [key] [value...]
+```
+
+### Options
+
+```
+  -g, --global   Store the setting in user-level config instead of the repository, keyed by the workspace's git remote
+      --here     Write workspace config at the selected workspace cwd
+  -u, --unset    Remove the setting from workspace config
+      --wide     List settings with full values and descriptions, wrapped to the terminal width instead of truncated
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger shell
+
+Open a terminal for a container or directory in your project
+
+```
+dagger shell [FILTERS] [OPTIONS]
+```
+
+### Options
+
+```
+      --absolute             Show absolute links (alias: --abs)
+  -a, --all                  Expand collections and list each item
+  -c, --command command      Run a shell command and return its exit code
+      --copy [PATH=]SOURCE   Copy a directory into the container: [PATH=]SOURCE (repeatable)
+  -f, --format FORMAT        Output FORMAT: table, link, or cli (requires --list) (default "table")
+      --init command         Run a shell command before opening the shell (repeatable)
+  -l, --list                 List available shells
+      --module NAME          Select artifacts from module NAME
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger start
+
+Run your project's services for local development — databases, APIs, dev servers, etc.
+
+```
+dagger start [FILTERS] [OPTIONS]
+```
+
+### Options
+
+```
+      --absolute        Show absolute links (alias: --abs)
+  -a, --all             Expand collections and list each item
+  -f, --format FORMAT   Output FORMAT: table, link, or cli (requires --list) (default "table")
+  -l, --list            List available services
+      --module NAME     Select artifacts from module NAME
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger uninstall
+
+Uninstall a module from your workspace
+
+### Synopsis
+
+Uninstall a module from the current workspace, removing it from dagger.toml.
+
+Match an installed name first, then a source without a version.
+The source must match exactly one installation. Version selectors are not accepted.
+
+With --env only the env's overlay entry is removed, never the base module.
+
+```
+dagger uninstall [options] NAME|SOURCE
+```
+
+### Examples
+
+```
+dagger module uninstall hello
+```
+
+### Options
+
+```
+      --here   Write workspace config at the selected workspace cwd
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger version
+
+Print dagger version
+
+```
+dagger version
+```
+
+### Options
+
+```
+      --check   Check for updates
+  -q, --quiet   Print only the canonical build identifier
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count   Increase verbosity (use -vv or -vvv for more)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+
+## dagger workspace
+
+Inspect workspace files and config
+
+### Synopsis
+
+Inspect or configure your workspace.
+
+A workspace is a project configured to use Dagger — a directory holding
+a dagger.toml that records installed modules, environment overlays, and
+settings. Most commands (install, check, generate, up, settings, ...)
+operate on the workspace reachable from the current directory. The -W
+flag selects a different workspace (local path or git ref); --env
+applies a named overlay; dagger.toml is the source of truth.
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger](#dagger)	 - A tool to run composable workflows in containers
+* [dagger workspace activity](#dagger-workspace-activity)	 - Show recent activity (runs, traces, etc.) for this workspace
+* [dagger workspace cat](#dagger-workspace-cat)	 - Print files from the selected workspace
+* [dagger workspace config](#dagger-workspace-config)	 - Get or set workspace configuration
+* [dagger workspace config-file](#dagger-workspace-config-file)	 - Print the selected workspace config file
+* [dagger workspace cwd](#dagger-workspace-cwd)	 - Print the workspace cwd
+* [dagger workspace doctor](#dagger-workspace-doctor)	 - Check whether your workspace is ready to run Dagger
+* [dagger workspace entrypoint](#dagger-workspace-entrypoint)	 - Get or set the workspace entrypoint
+* [dagger workspace exec](#dagger-workspace-exec)	 - Execute a command in a container with the selected workspace mounted
+* [dagger workspace export](#dagger-workspace-export)	 - Export a file or directory from the selected workspace
+* [dagger workspace find](#dagger-workspace-find)	 - Find paths in the selected workspace
+* [dagger workspace git](#dagger-workspace-git)	 - Inspect Git metadata for the selected workspace
+* [dagger workspace grep](#dagger-workspace-grep)	 - Search file contents in the selected workspace
+* [dagger workspace ls](#dagger-workspace-ls)	 - List directories or files in the selected workspace
+* [dagger workspace migrate](#dagger-workspace-migrate)	 - Migrate the workspace and its installed local modules
+* [dagger workspace remote](#dagger-workspace-remote)	 - Print the selectable remote address for the current workspace
+* [dagger workspace remotes](#dagger-workspace-remotes)	 - List selectable remote workspace addresses
+* [dagger workspace root](#dagger-workspace-root)	 - Print the workspace root
+
+## dagger workspace activity
+
+Show recent activity (runs, traces, etc.) for this workspace
+
+```
+dagger workspace activity [flags]
+```
+
+### Options
+
+```
+  -a, --all   Show activity from all remotes in the current workspace
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace cat
+
+Print files from the selected workspace
+
+### Synopsis
+
+Print file contents from the selected workspace in argument order.
+
+Relative paths start at the workspace's current directory.
+Absolute paths start at the workspace root.
+
+The output preserves line endings and does not add a final newline.
+
+```
+dagger workspace cat PATH [PATH...] [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace config
+
+Get or set workspace configuration
+
+### Synopsis
+
+Get or set workspace configuration values in dagger.toml.
+
+With no arguments, prints the full configuration.
+With one argument, prints the value at the given key.
+With two arguments, sets the value at the given key.
+With one argument and --unset, removes the value at the given key.
+
+With --env, reads show the effective env-applied view while writes target that
+environment's overlay. Explicit env.* keys always address raw overlay storage.
+
+Local module source values are stored relative to dagger.toml.
+
+```
+dagger workspace config [key] [value] [flags]
+```
+
+### Options
+
+```
+  -g, --global   Write to user-level config instead of the repository, keyed by the workspace's git remote
+      --here     Write workspace config at the selected workspace cwd
+  -u, --unset    Remove the value at the given key
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace config-file
+
+Print the selected workspace config file
+
+```
+dagger workspace config-file [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace cwd
+
+Print the workspace cwd
+
+```
+dagger workspace cwd [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace doctor
+
+Check whether your workspace is ready to run Dagger
+
+### Synopsis
+
+Check workspace configuration, lockfile, engine connectivity, Cloud authentication,
+module loading, and module settings.
+
+Missing configuration or lockfiles, legacy configuration fields, and Cloud
+authentication problems are warnings.
+Invalid files, unavailable engines, module loading failures, and invalid settings
+cause a nonzero exit status. Object settings are resolved using their configured
+addresses, which may invoke module functions. Loading modules can populate dagger.lock.
+
+```
+dagger workspace doctor [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace entrypoint
+
+Get or set the workspace entrypoint
+
+### Synopsis
+
+Print the installed name of the current entrypoint.
+Print nothing if no entrypoint is set.
+
+With NAME, select that installed module and clear the previous entrypoint.
+Use --unset to clear the selection. NAME must be an exact installed name.
+Changes are written to the selected dagger.toml.
+
+```
+dagger workspace entrypoint [NAME] [flags]
+```
+
+### Options
+
+```
+      --unset   Clear the entrypoint
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace exec
+
+Execute a command in a container with the selected workspace mounted
+
+### Synopsis
+
+Execute a command in a container with the selected workspace mounted at /ws.
+
+Run the command in /ws/&lt;workspace cwd&gt;. The command and its arguments are
+executed directly. Use an explicit shell, such as sh -c, for shell syntax.
+The command's output is shown in Dagger's normal progress output.
+
+By default, show a prompt before applying workspace changes. Use --auto-apply
+to apply without a prompt, or --no-apply to preview changes without applying them.
+
+```
+dagger workspace exec [OPTIONS] [--] COMMAND [ARGS...] [flags]
+```
+
+### Examples
+
+```
+  dagger ws exec -- go test ./...
+  dagger ws exec --from=golang:1.26 -- gofmt -w .
+  dagger ws exec --no-apply -- sh -c 'printf "hello\n" > hello.txt'
+```
+
+### Options
+
+```
+      --exclude stringArray   Exclude workspace paths that match the glob pattern (repeatable)
+      --from string           Base container address (default "alpine:3.22.1")
+      --include stringArray   Include workspace paths that match the glob pattern (repeatable)
+      --no-apply              Compute and show workspace changes without applying them
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace export
+
+Export a file or directory from the selected workspace
+
+### Synopsis
+
+Export a file or directory from the selected workspace to the local client.
+
+PATH defaults to the workspace's current directory. Relative paths start
+at that directory. Absolute paths start at the workspace root.
+
+For a directory, merge its contents into DEST. Use --include and --exclude
+to filter directory contents. These options can be repeated and use patterns
+relative to PATH. They cannot be used with a file.
+
+```
+dagger workspace export [PATH] -o DEST [flags]
+```
+
+### Examples
+
+```
+  dagger ws export -o ./workspace
+  dagger ws export ./dist -o ./download
+  dagger -W github.com/dagger/dagger ws export /README.md -o ./README.md
+```
+
+### Options
+
+```
+      --exclude stringArray   Exclude directory paths that match the glob pattern (repeatable)
+      --include stringArray   Include directory paths that match the glob pattern (repeatable)
+  -o, --output string         Local destination path
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace find
+
+Find paths in the selected workspace
+
+### Synopsis
+
+Find files and directories in the selected workspace.
+
+PATH defaults to the workspace's current directory. Relative paths start
+at that directory. Absolute paths start at the workspace root.
+
+Without --name, print each target followed by its contents, one path per line.
+Directory entries end with /. Hidden entries are included.
+
+Use --name to print paths with a base name that matches a glob pattern.
+Use --name more than once to match any of the patterns.
+
+```
+dagger workspace find [PATH...] [flags]
+```
+
+### Options
+
+```
+      --name stringArray   Print paths with a base name that matches the glob pattern
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace git
+
+Inspect Git metadata for the selected workspace
+
+### Synopsis
+
+Inspect Git metadata for the selected local or remote workspace.
+
+These commands use the workspace's selected Git ref and repository.
+They do not load installed modules.
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+* [dagger workspace git dirty](#dagger-workspace-git-dirty)	 - Print whether the workspace has uncommitted changes
+* [dagger workspace git log](#dagger-workspace-git-log)	 - Print the workspace commit history
+* [dagger workspace git ref](#dagger-workspace-git-ref)	 - Print the resolved ref name, or commit hash if unnamed
+* [dagger workspace git sha](#dagger-workspace-git-sha)	 - Print the full commit hash
+* [dagger workspace git url](#dagger-workspace-git-url)	 - Print the resolved Git URL, including the selected subdirectory
+
+## dagger workspace git dirty
+
+Print whether the workspace has uncommitted changes
+
+### Synopsis
+
+Print true if the workspace has uncommitted changes, or false if it is clean.
+
+Changes include staged files, unstaged files, and untracked files.
+Git ignore rules apply to untracked files.
+Both true and false return exit status 0.
+
+```
+dagger workspace git dirty [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace git](#dagger-workspace-git)	 - Inspect Git metadata for the selected workspace
+
+## dagger workspace git log
+
+Print the workspace commit history
+
+### Synopsis
+
+Print commit history from the workspace's selected Git ref.
+
+Each line contains a short commit hash and the first line of its message.
+The default limit is 10 commits. The history covers the whole repository.
+
+Use --json to print an array with full commit hashes, short hashes, author
+and committer names, email addresses, dates, messages, and parent hashes.
+Dates use RFC3339 format.
+
+```
+dagger workspace git log [flags]
+```
+
+### Options
+
+```
+      --json        Print commit metadata as JSON
+      --limit int   Maximum number of commits (must be greater than zero) (default 10)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace git](#dagger-workspace-git)	 - Inspect Git metadata for the selected workspace
+
+## dagger workspace git ref
+
+Print the resolved ref name, or commit hash if unnamed
+
+```
+dagger workspace git ref [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace git](#dagger-workspace-git)	 - Inspect Git metadata for the selected workspace
+
+## dagger workspace git sha
+
+Print the full commit hash
+
+```
+dagger workspace git sha [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace git](#dagger-workspace-git)	 - Inspect Git metadata for the selected workspace
+
+## dagger workspace git url
+
+Print the resolved Git URL, including the selected subdirectory
+
+### Synopsis
+
+Print the resolved Git URL, including the selected subdirectory.
+
+Use the repository and ref loaded for the selected workspace.
+The output has the form protocol://repository#ref:subdirectory.
+Omit the subdirectory when the workspace is at the repository root.
+
+For local workspaces, use the origin remote and the loaded ref.
+A local workspace must have an origin remote.
+
+Use the output with dagger -W to select the same remote location.
+
+```
+dagger workspace git url [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace git](#dagger-workspace-git)	 - Inspect Git metadata for the selected workspace
+
+## dagger workspace grep
+
+Search file contents in the selected workspace
+
+### Synopsis
+
+Search file contents in the selected workspace, including subdirectories.
+
+PATTERN is a case-sensitive regular expression. Use -F for a literal string.
+PATH defaults to the workspace's current directory. Relative paths start
+at that directory. Absolute paths start at the workspace root.
+
+Honor .gitignore, .ignore, and .rgignore files by default. Include hidden files.
+Use --all to include ignored files. Use -g to filter paths with glob patterns.
+
+Print each full matching line as path:line:text, with no surrounding lines.
+Output paths are relative to the workspace's current directory.
+Highlight matches when stdout is a terminal, unless NO_COLOR is set.
+Use -l for paths only, or --json for a JSON array of structured matches.
+The -l and --json options cannot be combined.
+
+Exit status is 0 if a match is found, 1 if no matches are found, and 2 on error.
+
+```
+dagger workspace grep PATTERN [PATH...] [flags]
+```
+
+### Examples
+
+```
+  dagger ws grep 'CurrentWorkspace' sdk/go core
+  dagger -W github.com/dagger/dagger ws grep -i -g '*.md' 'workspace'
+  dagger ws grep -l -F 'TODO'
+```
+
+### Options
+
+```
+      --all                  Include ignored files
+  -l, --files-with-matches   Print only paths of matching files
+  -F, --fixed-strings        Treat PATTERN as a literal string
+  -g, --glob stringArray     Include or exclude paths with a glob pattern (repeatable; prefix ! to exclude)
+  -i, --ignore-case          Ignore case when matching
+      --json                 Print a JSON array of structured matches
+      --multiline            Allow matches to span multiple lines
+      --shell-on-error       Open a shell when a container exec fails (needs an interactive terminal)
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace ls
+
+List directories or files in the selected workspace
+
+### Synopsis
+
+List directories or files in the selected workspace, one entry per line.
+
+PATH defaults to the workspace's current directory. Relative paths start
+at that directory. Absolute paths start at the workspace root.
+
+Directory listings include hidden entries and end directory names with /.
+For a file, print the supplied path.
+With multiple paths, list targets in argument order and label directories.
+
+```
+dagger workspace ls [PATH...] [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace migrate
+
+Migrate the workspace and its installed local modules
+
+### Synopsis
+
+Plan migration of the workspace and its installed local modules.
+
+Other legacy module configurations are optional candidates. They start
+unselected and are skipped in non-interactive mode, including with --auto-apply.
+Use dagger module migrate PATH to select one explicitly.
+
+Review all selected changes together. Use --auto-apply to apply without a
+prompt, or --no-apply to preview without changing files.
+
+```
+dagger workspace migrate [flags]
+```
+
+### Options
+
+```
+      --module stringArray   Also migrate this module explicitly (repeatable)
+      --no-apply             Preview migration without changing files
+```
+
+### Options inherited from parent commands
+
+```
+  -y, --auto-apply         Automatically apply changes when an output is returned
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+      --env string         Apply a named env overlay; writes target it, creating it if missing
+  -E, --no-exit            Leave the TUI running after completion
+      --progress string    Progress output format (auto, plain, tty, dots, logs, report) (default "auto")
+  -q, --quiet count        Reduce verbosity (show progress, but clean up at the end)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -s, --silent             Do not show progress at all
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -w, --web                Open trace URL in a web browser
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace remote
+
+Print the selectable remote address for the current workspace
+
+```
+dagger workspace remote [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace remotes
+
+List selectable remote workspace addresses
+
+```
+dagger workspace remotes [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+
+## dagger workspace root
+
+Print the workspace root
+
+```
+dagger workspace root [flags]
+```
+
+### Options inherited from parent commands
+
+```
+  -d, --debug              Enable engine and trace diagnostics
+      --engine string      Select the engine: cloud, image://, container://, tcp://, tls://, ssh://, kube-pod://, unix:// (or set DAGGER_ENGINE; run 'dagger help engine' for details)
+  -i, --shell-on-error     Open a shell when a container exec fails (needs an interactive terminal)
+  -v, --verbose count      Increase verbosity (use -vv or -vvv for more)
+  -W, --workspace string   Select the workspace location to load from (local path or git ref)
+```
+
+### SEE ALSO
+
+* [dagger workspace](#dagger-workspace)	 - Inspect workspace files and config
+

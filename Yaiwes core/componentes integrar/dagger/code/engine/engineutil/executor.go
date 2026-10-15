@@ -1,0 +1,995 @@
+package engineutil
+
+/*
+The original implementation of this is derived from:
+https://github.com/dagger/dagger/internal/buildkit/blob/08180a774253a8199ebdb629d21cd9f378a14419/executor/runcexecutor/executor.go
+*/
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/containerd/console"
+	runc "github.com/containerd/go-runc"
+	"github.com/dagger/dagger/dagql"
+	"github.com/dagger/dagger/engine"
+	enginetel "github.com/dagger/dagger/engine/telemetry"
+	"github.com/dagger/dagger/engine/telemetryattrs"
+	"github.com/dagger/dagger/engine/wcprof"
+	"github.com/dagger/dagger/internal/buildkit/executor"
+	"github.com/dagger/dagger/internal/buildkit/executor/oci"
+	gatewayapi "github.com/dagger/dagger/internal/buildkit/frontend/gateway/pb"
+	"github.com/dagger/dagger/internal/buildkit/solver/pb"
+	"github.com/dagger/dagger/internal/buildkit/util/bklog"
+	"github.com/dagger/dagger/internal/buildkit/util/entitlements"
+	"github.com/dagger/dagger/internal/buildkit/util/stack"
+	"github.com/dagger/dagger/util/cleanups"
+	"github.com/moby/sys/signal"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
+)
+
+type ExecutionMetadata struct {
+	// Internal execution initiated by dagger and not the user.
+	// Used when executing the module runtime itself.
+	Internal bool
+
+	// UseRecipeIDsByDefault configures nested clients started by this exec to
+	// resolve id() as recipe-form IDs unless explicitly requested otherwise.
+	UseRecipeIDsByDefault bool
+
+	CallDigest digest.Digest
+
+	// hostname -> list of aliases
+	HostAliases map[string][]string
+	// search domains to install prior to the session's domain
+	ExtraSearchDomains []string
+
+	RedirectStdinPath  string
+	RedirectStdoutPath string
+	RedirectStderrPath string
+	// LogRedirectedOutput keeps redirected stdout/stderr in the exec's logs
+	// too, for API views before v1.0.0. By default a redirected stream goes
+	// only to its file.
+	//
+	// json:"-" like ProfArgs below: core derives it from the exec's opts on
+	// every run, so it must not perturb an exec cache key.
+	LogRedirectedOutput bool `json:"-"`
+
+	SecretEnvNames  []string
+	SecretFilePaths []string
+
+	SystemEnvNames []string
+
+	EnabledGPUs []string
+
+	// If true, skip injecting dagger-init into the container.
+	NoInit bool
+
+	// If true, Dagger clients started in the container connect to the engine
+	// as new sessions instead of as nested clients of the caller's session.
+	//
+	// omitempty keeps the serialized form, and therefore the cache keys, of
+	// every other exec unchanged.
+	DaggerInDaggerNewSession bool `json:",omitempty"`
+
+	// ProfArgs is the fully-resolved user command (entrypoint + args), captured
+	// in core at exec-run time BEFORE any engine shim (the QEMU emulator, the
+	// executor's /.init) wraps it, so wall-clock profiling can headline the user's
+	// real program (e.g. "go build") instead of a shim. It is read at the executor
+	// emit site (executor_spec.go) by both the native recorder and the OTel source.
+	//
+	// json:"-" is load-bearing: ExecutionMetadata is JSON-serialized into exec
+	// cache keys (dagql.SerializedString/DigestedSerializedString), and ProfArgs
+	// must never perturb a cache key. It is excluded structurally here; it is also
+	// set only at run time (after every execMD digest is computed), and the
+	// core->executor hand-off is an in-process pointer (never re-serialized), so
+	// excluding it from JSON cannot drop it before the emit.
+	ProfArgs []string `json:"-"`
+
+	// UserFacingSpanCtx is the last user-facing (non-profiling) span of the API
+	// call this exec runs under, captured in core at exec-setup time (see
+	// dagql.UserFacingSpanContext). The executor injects IT as the container's
+	// traceparent — not its own current span: the exec runs on a detached
+	// execution context (shared/deduped, possibly lazily resumed) whose current
+	// span is a profiling span (the call_exec twin / a resume span) and which
+	// does not carry the caller's context mark, so only core still knows the
+	// user-facing span. Everything the container emits (nested SDK client
+	// spans, user process logs, returned Error origin extensions) parents to
+	// the injected id, and telemetry parented to an unrendered passthrough span
+	// vanishes from the row that should show it.
+	//
+	// json:"-" is load-bearing for the same reason as ProfArgs above: this
+	// run-time-only value must never perturb an exec cache key, and the
+	// core->executor hand-off is an in-process pointer, so excluding it from
+	// JSON cannot drop it before use.
+	UserFacingSpanCtx trace.SpanContext `json:"-"`
+
+	// HostAliasFQDNs maps a HostAliases key (a bound service's advertised
+	// hostname) to the fully qualified name the running service actually
+	// registered in DNS under. A service with a custom hostname is namespaced
+	// into the domain of whichever module started it (core.Service.startContainer),
+	// and that FQDN is the only name the dnsname CNI plugin registers. The
+	// consuming exec only searches its own module domain plus the session
+	// domain, so re-deriving the name from the bare hostname fails outright
+	// whenever the service was first started by a different module. Recording
+	// the FQDN keeps an explicit WithServiceBinding working across that
+	// boundary without installing the producer's domain as a search domain,
+	// which would expose every other service scoped to it.
+	//
+	// Only entries for names in the engine's DNS domain are set; tunnel
+	// services report a host-side dial address instead and must keep resolving
+	// through the search-domain sweep in setupNetwork.
+	//
+	// json:"-" is load-bearing for the same reason as ProfArgs above: this
+	// run-time-only value must never perturb an exec cache key, and the
+	// core->executor hand-off is an in-process pointer, so excluding it from
+	// JSON cannot drop it before use.
+	HostAliasFQDNs map[string]string `json:"-"`
+
+	// ContentPreferredDigest returns the content-preferred digest of the call
+	// that owns this execution. The executor reads it when the execution ends,
+	// when the inputs are evaluated, and records it on exec.run.
+	//
+	// json:"-" is load-bearing for the same reason as ProfArgs above: this
+	// run-time-only value must never perturb an exec cache key.
+	ContentPreferredDigest func() digest.Digest `json:"-"`
+}
+
+func (c *Client) Run(
+	ctx context.Context,
+	id string,
+	rootMount executor.Mount,
+	mounts []executor.Mount,
+	procInfo executor.ProcessInfo,
+	started chan<- struct{},
+	causeCtx trace.SpanContext,
+	execMD *ExecutionMetadata,
+	sessionID string,
+	callerClientID string,
+	nestedClientMetadata *engine.ClientMetadata,
+	nestedClientModule dagql.AnyObjectResult,
+	nestedClientFunctionCall dagql.Typed,
+) (rerr error) {
+	if id == "" {
+		id = rand.Text()
+	}
+
+	if err := c.validateEntitlements(procInfo.Meta); err != nil {
+		return err
+	}
+
+	state := newExecState(
+		id,
+		&procInfo,
+		rootMount,
+		mounts,
+		started,
+		causeCtx,
+		execMD,
+		sessionID,
+		callerClientID,
+		nestedClientMetadata,
+		nestedClientModule,
+		nestedClientFunctionCall,
+	)
+
+	execIdent := state.id
+	if execMD != nil && execMD.CallDigest != "" {
+		execIdent = execMD.CallDigest.String()
+	}
+
+	var execOp *wcprof.Op
+	if wcprof.Enabled(ctx) {
+		ctx, execOp = wcprof.BeginOp(ctx, wcprof.OpKindExec, "exec.run", wcprof.OpOpts{
+			Ident:    execIdent,
+			ClientID: callerClientID,
+		})
+		state.profExecOpID = execOp.ID()
+	}
+	// OTel analog of execOp: exec.run nests the container run under
+	// the withExec call_exec span (or the service exec span) via the propagated
+	// ctx, so the offline loader reconstructs the same exec shape from a Cloud
+	// trace. Gated only on telemetry being active, independent of wcprof. OTel
+	// gets nested-client parentage for free via traceparent, so unlike native it
+	// needs no nested-client link.
+	var execRunSpan trace.Span
+	if dagql.OTelProfActive(ctx) {
+		var attrs []attribute.KeyValue
+		if enginetel.HasWorkloadReadings(ctx) {
+			attrs = append(attrs,
+				attribute.String(enginetel.ExecutionIDAttr, state.id),
+				attribute.Bool(enginetel.ExecutionInternalAttr, execMD != nil && execMD.Internal),
+			)
+		}
+		ctx, execRunSpan = beginOTelExecRun(ctx, execIdent, attrs...)
+	}
+	err := c.run(ctx, state,
+		namedSetupFunc{"setupNetwork", c.setupNetwork},
+		namedSetupFunc{"injectInit", c.injectInit},
+		namedSetupFunc{"injectDaggerCLI", c.injectDaggerCLI},
+		namedSetupFunc{"generateBaseSpec", c.generateBaseSpec},
+		namedSetupFunc{"filterEnvs", c.filterEnvs},
+		namedSetupFunc{"setupRootfs", c.setupRootfs},
+		namedSetupFunc{"setUserGroup", c.setUserGroup},
+		namedSetupFunc{"setExitCodePath", c.setExitCodePath},
+		namedSetupFunc{"setupStdio", c.setupStdio},
+		namedSetupFunc{"setupOTel", c.setupOTel},
+		namedSetupFunc{"setupSecretScrubbing", c.setupSecretScrubbing},
+		namedSetupFunc{"setProxyEnvs", c.setProxyEnvs},
+		namedSetupFunc{"enableGPU", c.enableGPU},
+		namedSetupFunc{"createCWD", c.createCWD},
+		namedSetupFunc{"setupNestedClient", c.setupNestedClient},
+		namedSetupFunc{"setupNewSessionEndpoint", c.setupNewSessionEndpoint},
+		namedSetupFunc{"installCACerts", c.installCACerts},
+		namedSetupFunc{"runContainer", c.runContainer},
+	)
+	execOp.EndErr(err)
+	if execRunSpan != nil {
+		recordExecContentPreferredDigest(execRunSpan, execMD)
+		endOTelExecRun(execRunSpan, &err)
+	}
+	return err
+}
+
+// recordExecContentPreferredDigest stamps the owning call's final
+// content-preferred digest on exec.run. The execution has
+// ended, so every input it mounted is evaluated and has any content identity
+// it will learn; a digest read at call completion can predate that.
+func recordExecContentPreferredDigest(span trace.Span, execMD *ExecutionMetadata) {
+	if execMD == nil || execMD.ContentPreferredDigest == nil {
+		return
+	}
+	if dig := execMD.ContentPreferredDigest(); dig != "" {
+		span.SetAttributes(attribute.String(telemetryattrs.ExecutionContentPreferredDigestAttr, dig.String()))
+	}
+}
+
+// namedSetupFunc pairs an executor setup phase with a stable name used for
+// profiling and logging.
+type namedSetupFunc struct {
+	name string
+	fn   executorSetupFunc
+}
+
+func (c *Client) run(
+	ctx context.Context,
+	state *execState,
+	setupFuncs ...namedSetupFunc,
+) (rerr error) {
+	c.runningMu.Lock()
+	c.running[state.id] = state
+	c.runningMu.Unlock()
+	defer func() {
+		c.runningMu.Lock()
+		delete(c.running, state.id)
+		c.runningMu.Unlock()
+
+		close(state.done)
+		if err := state.cleanups.Run(); err != nil {
+			bklog.G(ctx).Errorf("executor run failed to cleanup: %v", err)
+			rerr = errors.Join(rerr, &ExecCleanupError{Err: err})
+		}
+		state.doneErr = rerr
+
+		if state.startedCh != nil {
+			state.startedOnce.Do(func() {
+				close(state.startedCh)
+			})
+		}
+	}()
+
+	profiling := wcprof.Enabled(ctx)
+	for _, f := range setupFuncs {
+		phaseCtx := ctx
+		var phaseOp *wcprof.Op
+		if profiling {
+			phaseCtx, phaseOp = wcprof.BeginOp(ctx, wcprof.OpKindExecPhase, "exec."+f.name, wcprof.OpOpts{
+				Ident: state.id,
+			})
+		}
+		err := f.fn(phaseCtx, state)
+		phaseOp.EndErr(err)
+		if err != nil {
+			bklog.G(ctx).WithError(err).Error("executor run")
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Namespaced is something that has Linux namespaces set up.
+// Currently this is either a full-blown container or just a raw
+// network namespace that's setns'd into to support service tunneling
+// and similar.
+type Namespaced interface {
+	NamespaceID() string
+	Release(context.Context) error
+}
+
+// NewDirectNS creates a namespace, that's externally managed.
+func NewDirectNS(id string) Namespaced {
+	return &networkNamespace{
+		id:      id,
+		cleanup: &cleanups.Cleanups{},
+	}
+}
+
+type networkNamespace struct {
+	id      string
+	cleanup *cleanups.Cleanups
+}
+
+var _ Namespaced = (*networkNamespace)(nil)
+
+func (n *networkNamespace) NamespaceID() string {
+	return n.id
+}
+
+func (n *networkNamespace) Release(_ context.Context) error {
+	return n.cleanup.Run()
+}
+
+func (c *Client) newNetNS(ctx context.Context, hostname string) (_ *networkNamespace, rerr error) {
+	provider, ok := c.NetworkProviders[pb.NetMode_UNSET] // get default CNI provider
+	if !ok {
+		return nil, fmt.Errorf("no default network provider found")
+	}
+
+	cleanup := &cleanups.Cleanups{}
+	defer func() {
+		if rerr != nil {
+			rerr = errors.Join(rerr, cleanup.Run())
+		}
+	}()
+
+	netNS, err := provider.New(ctx, hostname)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create network namespace: %w", err)
+	}
+	cleanup.Add("close netns", netNS.Close)
+
+	state := &execState{
+		done:             make(chan struct{}),
+		networkNamespace: netNS,
+		cleanups:         cleanup,
+	}
+	cleanup.Add("mark run state done", cleanups.Infallible(func() {
+		close(state.done)
+	}))
+
+	id := rand.Text()
+	c.runningMu.Lock()
+	c.running[id] = state
+	c.runningMu.Unlock()
+	cleanup.Add("delete run state", cleanups.Infallible(func() {
+		c.runningMu.Lock()
+		delete(c.running, id)
+		c.runningMu.Unlock()
+	}))
+
+	return &networkNamespace{
+		id:      id,
+		cleanup: cleanup,
+	}, nil
+}
+
+func (c *Client) Exec(ctx context.Context, id string, process executor.ProcessInfo) (err error) {
+	if err := c.validateEntitlements(process.Meta); err != nil {
+		return err
+	}
+
+	// first verify the container is running, if we get an error assume the container
+	// is in the process of being created and check again every 100ms or until
+	// context is canceled.
+	var runcState *runc.Container
+	var execState *execState
+	for {
+		c.runningMu.RLock()
+		var ok bool
+		execState, ok = c.running[id]
+		c.runningMu.RUnlock()
+		if !ok {
+			return fmt.Errorf("container %s not found", id)
+		}
+
+		runcState, _ = c.Runc.State(ctx, id)
+		if runcState != nil && runcState.Status == "running" {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-execState.done:
+			if execState.doneErr == nil {
+				return fmt.Errorf("container %s has stopped", id)
+			}
+			return fmt.Errorf("container %s has exited with error: %w", id, execState.doneErr)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// load default process spec (for Env, Cwd etc) from bundle
+	spec, err := readBundleSpec(runcState.Bundle)
+	if err != nil {
+		return err
+	}
+
+	spec.Process.Terminal = process.Meta.Tty
+	spec.Process.Args = process.Meta.Args
+	if process.Meta.Cwd != "" {
+		spec.Process.Cwd = process.Meta.Cwd
+	}
+
+	if len(process.Meta.Env) > 0 {
+		spec.Process.Env = process.Meta.Env
+		if execState.hasDaggerCLI() {
+			spec.Process.Env = appendDaggerCLIToPath(spec.Process.Env)
+		}
+	}
+
+	if process.Meta.User != "" {
+		uid, gid, sgids, err := oci.GetUser(runcState.Rootfs, process.Meta.User)
+		if err != nil {
+			return err
+		}
+		spec.Process.User = specs.User{
+			UID:            uid,
+			GID:            gid,
+			AdditionalGids: sgids,
+		}
+	}
+
+	err = c.exec(ctx, id, spec.Process, process, nil)
+	return exitError(ctx, "", err, process.Meta.ValidExitCodes)
+}
+
+func (c *Client) exec(ctx context.Context, id string, specsProcess *specs.Process, process executor.ProcessInfo, started func()) error {
+	killer, err := newExecProcKiller(c.Runc, id)
+	if err != nil {
+		return fmt.Errorf("failed to initialize process killer: %w", err)
+	}
+	defer killer.Cleanup()
+
+	return c.callWithIO(ctx, &process, started, killer, func(ctx context.Context, started chan<- int, io runc.IO, pidfile string) error {
+		return c.Runc.Exec(ctx, id, *specsProcess, &runc.ExecOpts{
+			Started: started,
+			IO:      io,
+			PidFile: pidfile,
+		})
+	})
+}
+
+func (c *Client) validateEntitlements(meta executor.Meta) error {
+	return c.Entitlements.Check(entitlements.Values{
+		NetworkHost:      meta.NetMode == pb.NetMode_HOST,
+		SecurityInsecure: meta.SecurityMode == pb.SecurityMode_INSECURE,
+	})
+}
+
+func exitError(ctx context.Context, exitCodePath string, err error, validExitCodes []int) error {
+	exitErr := &gatewayapi.ExitError{ExitCode: uint32(gatewayapi.UnknownExitStatus), Err: err}
+
+	if err == nil {
+		exitErr.ExitCode = 0
+	} else {
+		var runcExitError *runc.ExitError
+		if errors.As(err, &runcExitError) {
+			exitErr = &gatewayapi.ExitError{ExitCode: uint32(runcExitError.Status)}
+		}
+	}
+
+	if exitCodePath != "" {
+		if err := os.WriteFile(exitCodePath, fmt.Appendf(nil, "%d", exitErr.ExitCode), 0o600); err != nil {
+			bklog.G(ctx).Errorf("failed to write exit code %d to %s: %v", exitErr.ExitCode, exitCodePath, err)
+		}
+	}
+
+	trace.SpanFromContext(ctx).AddEvent(
+		"Container exited",
+		trace.WithAttributes(attribute.Int("exit.code", int(exitErr.ExitCode))),
+	)
+
+	if validExitCodes == nil {
+		// no exit codes specified, so only 0 is allowed
+		if exitErr.ExitCode == 0 {
+			return nil
+		}
+	} else {
+		// exit code in allowed list, so exit cleanly
+		if slices.Contains(validExitCodes, int(exitErr.ExitCode)) {
+			return nil
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		exitErr.Err = fmt.Errorf("%s: %w", exitErr.Error(), context.Cause(ctx))
+		return exitErr
+	default:
+		return stack.Enable(exitErr)
+	}
+}
+
+type forwardIO struct {
+	stdin          io.ReadCloser
+	stdout, stderr io.WriteCloser
+}
+
+func (s *forwardIO) Close() error {
+	return nil
+}
+
+func (s *forwardIO) Set(cmd *exec.Cmd) {
+	cmd.Stdin = s.stdin
+	cmd.Stdout = s.stdout
+	cmd.Stderr = s.stderr
+}
+
+func (s *forwardIO) Stdin() io.WriteCloser {
+	return nil
+}
+
+func (s *forwardIO) Stdout() io.ReadCloser {
+	return nil
+}
+
+func (s *forwardIO) Stderr() io.ReadCloser {
+	return nil
+}
+
+// newRunProcKiller returns an abstraction for sending SIGKILL to the
+// process inside the container initiated from `runc run`.
+func newRunProcKiller(runC *runc.Runc, id string) procKiller {
+	return procKiller{runC: runC, id: id}
+}
+
+// newExecProcKiller returns an abstraction for sending SIGKILL to the
+// process inside the container initiated from `runc exec`.
+func newExecProcKiller(runC *runc.Runc, id string) (procKiller, error) {
+	// for `runc exec` we need to create a pidfile and read it later to kill
+	// the process
+	tdir, err := os.MkdirTemp("", "runc")
+	if err != nil {
+		return procKiller{}, fmt.Errorf("failed to create directory for runc pidfile: %w", err)
+	}
+
+	return procKiller{
+		runC:    runC,
+		id:      id,
+		pidfile: filepath.Join(tdir, "pidfile"),
+		cleanup: func() {
+			os.RemoveAll(tdir)
+		},
+	}, nil
+}
+
+type procKiller struct {
+	runC    *runc.Runc
+	id      string
+	pidfile string
+	cleanup func()
+}
+
+// Cleanup will delete any tmp files created for the pidfile allocation
+// if this killer was for a `runc exec` process.
+func (k procKiller) Cleanup() {
+	if k.cleanup != nil {
+		k.cleanup()
+	}
+}
+
+// Kill will send SIGKILL to the process running inside the container.
+// If the process was created by `runc run` then we will use `runc kill`,
+// otherwise for `runc exec` we will read the pid from a pidfile and then
+// send the signal directly that process.
+func (k procKiller) Kill(ctx context.Context) (err error) {
+	bklog.G(ctx).Tracef("sending sigkill to process in container %s", k.id)
+	defer func() {
+		if err != nil {
+			bklog.G(ctx).Errorf("failed to kill process in container id %s: %+v", k.id, err)
+		}
+	}()
+
+	// this timeout is generally a no-op, the Kill ctx should already have a
+	// shorter timeout but here as a fail-safe for future refactoring.
+	ctx, cancel := context.WithCancelCause(ctx)
+	ctx, _ = context.WithTimeoutCause(ctx, 10*time.Second, context.DeadlineExceeded)
+	defer cancel(nil)
+
+	if k.pidfile == "" {
+		// for `runc run` process we use `runc kill` to terminate the process
+		return k.runC.Kill(ctx, k.id, int(syscall.SIGKILL), nil)
+	}
+
+	// `runc exec` will write the pidfile a few milliseconds after we
+	// get the runc pid via the startedCh, so we might need to retry until
+	// it appears in the edge case where we want to kill a process
+	// immediately after it was created.
+	// crun creates the file before writing the pid into it, so an empty file
+	// is retried like a missing one.
+	var pidData []byte
+	for {
+		pidData, err = os.ReadFile(k.pidfile)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read pidfile from the runtime: %w", err)
+		}
+		if err == nil && len(strings.TrimSpace(string(pidData))) > 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return errors.New("context cancelled before the runtime wrote the pidfile")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil {
+		return fmt.Errorf("read invalid pid from pidfile: %w", err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		// error only possible on non-unix hosts
+		return fmt.Errorf("failed to find process for pid %d from pidfile: %w", pid, err)
+	}
+	defer process.Release()
+	return process.Signal(syscall.SIGKILL)
+}
+
+// procHandle is to track the process so we can send signals to it
+// and handle graceful shutdown.
+type procHandle struct {
+	// this is for the runc process (not the process in-container)
+	monitorProcess *os.Process
+	ready          chan struct{}
+	ended          chan struct{}
+	shutdown       func(error)
+	// this this only used when the request context is canceled and we need
+	// to kill the in-container process.
+	killer procKiller
+}
+
+// runcProcessHandle will create a procHandle that will be monitored, where
+// on ctx.Done the in-container process will receive a SIGKILL.  The returned
+// context should be used for the go-runc.(Run|Exec) invocations.  The returned
+// context will only be canceled in the case where the request context is
+// canceled and we are unable to send the SIGKILL to the in-container process.
+// The goal is to allow for runc to gracefully shutdown when the request context
+// is cancelled.
+func runcProcessHandle(ctx context.Context, killer procKiller) (*procHandle, context.Context) {
+	runcCtx, cancel := context.WithCancelCause(context.Background())
+	p := &procHandle{
+		ready:    make(chan struct{}),
+		ended:    make(chan struct{}),
+		shutdown: cancel,
+		killer:   killer,
+	}
+	// preserve the logger on the context used for the runc process handling
+	runcCtx = bklog.WithLogger(runcCtx, bklog.G(ctx))
+
+	go func() {
+		// Wait for pid
+		select {
+		case <-ctx.Done():
+			return // nothing to kill
+		case <-p.ready:
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				killCtx, timeout := context.WithCancelCause(context.Background())
+				killCtx, _ = context.WithTimeoutCause(killCtx, 7*time.Second, context.DeadlineExceeded)
+				if err := p.killer.Kill(killCtx); err != nil {
+					// If kill fails with "container not running", the container is already dead
+					// Short-circuit to prevent infinite loop
+					if strings.Contains(err.Error(), "container not running") {
+						bklog.G(ctx).Debug("container already dead, stopping kill loop")
+						cancel(context.Cause(ctx))
+						timeout(context.Canceled)
+						return
+					}
+					select {
+					case <-killCtx.Done():
+						cancel(context.Cause(ctx))
+						timeout(context.Canceled)
+						return
+					default:
+					}
+				}
+				timeout(context.Canceled)
+				select {
+				case <-time.After(50 * time.Millisecond):
+				case <-p.ended:
+					return
+				}
+			case <-p.ended:
+				return
+			}
+		}
+	}()
+
+	return p, runcCtx
+}
+
+// Release will free resources with a procHandle.
+func (p *procHandle) Release() {
+	close(p.ended)
+	if p.monitorProcess != nil {
+		p.monitorProcess.Release()
+	}
+}
+
+// Shutdown should be called after the runc process has exited. This will allow
+// the signal handling and tty resize loops to exit, terminating the
+// goroutines.
+func (p *procHandle) Shutdown() {
+	if p.shutdown != nil {
+		p.shutdown(context.Canceled)
+	}
+}
+
+// WaitForReady will wait until we have received the runc pid via the go-runc
+// Started channel, or until the request context is canceled.  This should
+// return without errors before attempting to send signals to the runc process.
+func (p *procHandle) WaitForReady(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-p.ready:
+		return nil
+	}
+}
+
+// WaitForStart will record the runc pid reported by go-runc via the channel.
+// We wait for up to 10s for the runc pid to be reported.  If the started
+// callback is non-nil it will be called after receiving the pid.
+func (p *procHandle) WaitForStart(ctx context.Context, startedCh <-chan int, started func()) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	ctx, _ = context.WithTimeoutCause(ctx, 10*time.Second, context.DeadlineExceeded)
+	defer cancel(context.Canceled)
+	select {
+	case <-ctx.Done():
+		return errors.New("go-runc started message never received")
+	case runcPid, ok := <-startedCh:
+		if !ok {
+			return errors.New("go-runc failed to send pid")
+		}
+		if started != nil {
+			started()
+		}
+		var err error
+		p.monitorProcess, err = os.FindProcess(runcPid)
+		if err != nil {
+			// error only possible on non-unix hosts
+			return fmt.Errorf("failed to find runc process %d: %w", runcPid, err)
+		}
+		close(p.ready)
+	}
+	return nil
+}
+
+// handleSignals will wait until the procHandle is ready then will
+// send each signal received on the channel to the runc process (not directly
+// to the in-container process)
+func handleSignals(ctx context.Context, runcProcess *procHandle, signals <-chan syscall.Signal) error {
+	if signals == nil {
+		return nil
+	}
+	err := runcProcess.WaitForReady(ctx)
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case sig := <-signals:
+			if sig == syscall.SIGKILL {
+				// never send SIGKILL directly to runc, it needs to go to the
+				// process in-container
+				if err := runcProcess.killer.Kill(ctx); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := runcProcess.monitorProcess.Signal(sig); err != nil {
+				bklog.G(ctx).Errorf("failed to signal %s to process: %s", sig, err)
+				return err
+			}
+		}
+	}
+}
+
+type runcCall func(ctx context.Context, started chan<- int, io runc.IO, pidfile string) error
+
+func (c *Client) callWithIO(ctx context.Context, process *executor.ProcessInfo, started func(), killer procKiller, call runcCall) error {
+	runcProcess, ctx := runcProcessHandle(ctx, killer)
+	defer runcProcess.Release()
+
+	eg, ctx := errgroup.WithContext(ctx)
+	defer func() {
+		if err := eg.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+			bklog.G(ctx).Errorf("runc process monitoring error: %s", err)
+		}
+	}()
+	defer runcProcess.Shutdown()
+
+	startedCh := make(chan int, 1)
+	eg.Go(func() error {
+		return runcProcess.WaitForStart(ctx, startedCh, started)
+	})
+
+	eg.Go(func() error {
+		return handleSignals(ctx, runcProcess, process.Signal)
+	})
+
+	if !process.Meta.Tty {
+		return call(ctx, startedCh, &forwardIO{stdin: process.Stdin, stdout: process.Stdout, stderr: process.Stderr}, killer.pidfile)
+	}
+
+	ptm, ptsName, err := console.NewPty()
+	if err != nil {
+		return err
+	}
+
+	pts, err := os.OpenFile(ptsName, os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		ptm.Close()
+		return err
+	}
+
+	defer func() {
+		if process.Stdin != nil {
+			process.Stdin.Close()
+		}
+		pts.Close()
+		ptm.Close()
+		runcProcess.Shutdown()
+		err := eg.Wait()
+		if err != nil {
+			bklog.G(ctx).Warningf("error while shutting down tty io: %s", err)
+		}
+	}()
+
+	if process.Stdin != nil {
+		eg.Go(func() error {
+			_, err := io.Copy(ptm, process.Stdin)
+			// stdin might be a pipe, so this is like EOF
+			if errors.Is(err, io.ErrClosedPipe) {
+				return nil
+			}
+			return err
+		})
+	}
+
+	if process.Stdout != nil {
+		eg.Go(func() error {
+			_, err := io.Copy(process.Stdout, ptm)
+			// ignore `read /dev/ptmx: input/output error` when ptm is closed
+			var ptmClosedError *os.PathError
+			if errors.As(err, &ptmClosedError) {
+				if ptmClosedError.Op == "read" &&
+					ptmClosedError.Path == "/dev/ptmx" &&
+					ptmClosedError.Err == syscall.EIO {
+					return nil
+				}
+			}
+			return err
+		})
+	}
+
+	eg.Go(func() error {
+		err := runcProcess.WaitForReady(ctx)
+		if err != nil {
+			return err
+		}
+		// crun ignores SIGWINCH until it starts proxying the container's
+		// terminal, where it blocks every signal and reads them from a
+		// signalfd, and it copies the size only on SIGWINCH. A resize sent
+		// before then, such as the initial one, is lost, so resend the latest
+		// once crun blocks SIGWINCH.
+		takesResize := waitForBlockedSignal(ctx, runcProcess.monitorProcess.Pid, syscall.SIGWINCH)
+		resized := false
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-takesResize:
+				takesResize = nil
+				if !resized {
+					continue
+				}
+			case resize := <-process.Resize:
+				resized = true
+				err = ptm.Resize(console.WinSize{
+					Height: uint16(resize.Rows),
+					Width:  uint16(resize.Cols),
+				})
+				if err != nil {
+					bklog.G(ctx).Errorf("failed to resize ptm: %s", err)
+				}
+			}
+			// SIGWINCH must be sent to the runtime's monitor process, as
+			// terminal resizing is done in the runtime: it copies the ptm's size
+			// to the container's terminal.
+			err = runcProcess.monitorProcess.Signal(signal.SIGWINCH)
+			if err != nil {
+				bklog.G(ctx).Errorf("failed to send SIGWINCH to process: %s", err)
+			}
+		}
+	})
+
+	runcIO := &forwardIO{}
+	if process.Stdin != nil {
+		runcIO.stdin = pts
+	}
+	if process.Stdout != nil {
+		runcIO.stdout = pts
+	}
+	if process.Stderr != nil {
+		runcIO.stderr = pts
+	}
+
+	return call(ctx, startedCh, runcIO, killer.pidfile)
+}
+
+type nopCloser struct {
+	io.Writer
+}
+
+func (nopCloser) Close() error { return nil }
+
+// waitForBlockedSignal returns a channel that is closed once process pid
+// blocks sig, polling its /proc status. It is never closed if the process
+// exits first or ctx is done.
+func waitForBlockedSignal(ctx context.Context, pid int, sig syscall.Signal) <-chan struct{} {
+	blocked := make(chan struct{})
+	go func() {
+		for {
+			status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+			if err != nil {
+				return
+			}
+			if signalBlocked(status, sig) {
+				close(blocked)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	return blocked
+}
+
+// signalBlocked reports whether a /proc/<pid>/status shows sig in its
+// blocked mask (SigBlk).
+func signalBlocked(status []byte, sig syscall.Signal) bool {
+	for _, line := range strings.Split(string(status), "\n") {
+		mask, ok := strings.CutPrefix(line, "SigBlk:")
+		if !ok {
+			continue
+		}
+		bits, err := strconv.ParseUint(strings.TrimSpace(mask), 16, 64)
+		return err == nil && bits&(1<<(uint(sig)-1)) != 0
+	}
+	return false
+}

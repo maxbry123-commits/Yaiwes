@@ -1,0 +1,230 @@
+package h2c
+
+import (
+	context "context"
+	"errors"
+	fmt "fmt"
+	"io"
+	"net"
+	"strconv"
+	"sync"
+
+	"github.com/dagger/dagger/engine/slog"
+	"github.com/dagger/dagger/util/grpcutil"
+	"google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
+)
+
+type TunnelListenerAttachable struct {
+	rootCtx context.Context
+
+	UnimplementedTunnelListenerServer
+}
+
+func NewTunnelListenerAttachable(rootCtx context.Context) TunnelListenerAttachable {
+	return TunnelListenerAttachable{
+		rootCtx: rootCtx,
+	}
+}
+
+func (s TunnelListenerAttachable) Register(srv *grpc.Server) {
+	RegisterTunnelListenerServer(srv, &s)
+}
+
+const InstrumentationLibrary = "dagger.io/engine.session"
+
+func (s TunnelListenerAttachable) Listen(srv TunnelListener_ListenServer) error {
+	req, err := srv.Recv()
+	if err != nil {
+		return err
+	}
+
+	l, err := net.Listen(req.GetProtocol(), req.GetAddr())
+	if err != nil {
+		return err
+	}
+	return s.serveListener(srv, l)
+}
+
+func (s TunnelListenerAttachable) serveListener(srv TunnelListener_ListenServer, l net.Listener) error {
+	slog := slog.SpanLogger(s.rootCtx, InstrumentationLibrary)
+	defer l.Close()
+	err := srv.Send(&ListenResponse{
+		Addr: l.Addr().String(),
+	})
+	if err != nil {
+		return err
+	}
+
+	conns := map[string]net.Conn{}
+	connsL := &sync.Mutex{}
+	sendL := &sync.Mutex{}
+	closed := false
+
+	defer func() {
+		l.Close()
+		connsL.Lock()
+		closed = true
+		for _, conn := range conns {
+			conn.Close()
+		}
+		connsL.Unlock()
+	}()
+
+	go func() {
+		var nextConnID uint64
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					slog.Warn("accept error", "error", err)
+				}
+				return
+			}
+
+			// TCP source addresses can be reused while messages for the previous
+			// connection are still in flight. IDs identify one accepted socket
+			// for the entire lifetime of this listener.
+			nextConnID++
+			connID := strconv.FormatUint(nextConnID, 10)
+
+			connsL.Lock()
+			if closed {
+				connsL.Unlock()
+				conn.Close()
+				return
+			}
+			conns[connID] = conn
+			connsL.Unlock()
+
+			sendL.Lock()
+			err = srv.Send(&ListenResponse{
+				ConnId: connID,
+			})
+			sendL.Unlock()
+			if err != nil {
+				slog.Warn("send connID error", "error", err)
+				return
+			}
+
+			go func() {
+				for {
+					// Read data from the connection
+					data := make([]byte, 1024)
+					n, err := conn.Read(data)
+					if err != nil {
+						if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+							// conn closed
+							return
+						}
+
+						slog.Warn("conn read error", "error", err)
+						return
+					}
+
+					sendL.Lock()
+					err = srv.Send(&ListenResponse{
+						ConnId: connID,
+						Data:   data[:n],
+					})
+					sendL.Unlock()
+					if err != nil {
+						slog.Warn("listener send response error", "error", err)
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	for {
+		req, err := srv.Recv()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+				// canceled
+				return nil
+			}
+
+			if errors.Is(err, io.EOF) {
+				// stopped
+				return nil
+			}
+
+			if status.Code(err) == codes.Unavailable {
+				// client disconnected (i.e. quitting Dagger out)
+				return nil
+			}
+
+			slog.Error("listener receive request error", "error", err)
+			return err
+		}
+
+		connID := req.GetConnId()
+		if req.GetConnId() == "" {
+			slog.Warn("listener request with no connID")
+			continue
+		}
+
+		connsL.Lock()
+		conn, ok := conns[connID]
+		connsL.Unlock()
+		if !ok {
+			slog.Warn("listener request for unknown connID", "connID", connID)
+			continue
+		}
+
+		switch {
+		case req.GetClose():
+			connsL.Lock()
+			delete(conns, connID)
+			connsL.Unlock()
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				slog.Warn("conn close error", "error", err)
+			}
+		case req.Data != nil:
+			_, err = conn.Write(req.GetData())
+			if err != nil {
+				slog.Warn("conn write error", "error", err)
+				conn.Close()
+				connsL.Lock()
+				delete(conns, connID)
+				connsL.Unlock()
+				sendL.Lock()
+				err = srv.Send(&ListenResponse{ConnId: connID, Close: true})
+				sendL.Unlock()
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		}
+	}
+}
+
+type TunnelListenerProxy struct {
+	client TunnelListenerClient
+}
+
+func NewTunnelListenerProxy(client TunnelListenerClient) *TunnelListenerProxy {
+	return &TunnelListenerProxy{
+		client: client,
+	}
+}
+
+func (p *TunnelListenerProxy) Register(server *grpc.Server) {
+	RegisterTunnelListenerServer(server, p)
+}
+
+func (p *TunnelListenerProxy) Listen(stream TunnelListener_ListenServer) error {
+	ctx, cancel := context.WithCancelCause(stream.Context())
+	defer cancel(errors.New("proxy stream closed"))
+
+	clientStream, err := p.client.Listen(grpcutil.IncomingToOutgoingContext(ctx))
+	if err != nil {
+		return fmt.Errorf("create client stream: %w", err)
+	}
+
+	return grpcutil.ProxyStream[anypb.Any](ctx, clientStream, stream)
+}

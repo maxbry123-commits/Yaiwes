@@ -1,0 +1,1242 @@
+package core
+
+// These tests cover module functions that call Dagger's LLM API. They verify
+// direct calls, `dagger script` argument handling, API limit errors, and the
+// `--allow-llm` permission check.
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"dagger.io/dagger"
+	"dagger.io/dagger/core"
+	"dagger.io/dagger/engineconn"
+	"github.com/creack/pty"
+	"github.com/dagger/dagger/dagql/call"
+	"github.com/dagger/dagger/internal/testutil"
+	"github.com/dagger/testctx"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+)
+
+/* NOTE: These tests use canned conversations rather than live providers: each
+test constructs the exact message history it needs through the LLM API itself
+(withPrompt/withResponse/withToolResult), exports it with the same messages
+selection a real recording would use, and runs it via a recording/ model (see
+cannedRecordingModel). Deriving the recording from the engine on every run keeps
+it in lockstep with the export/decode format by construction — there are no
+stored recordings to go stale, and no API keys are needed. */
+
+type LLMSuite struct{}
+
+func TestLLM(t *testing.T) {
+	testctx.New(t, Middleware()...).RunTests(LLMSuite{})
+}
+
+type LLMTestCase struct {
+	Ref   string
+	Name  string
+	Flags []LLMTestCaseFlag
+	// Conversation constructs the canned message history this case consumes,
+	// through the LLM API itself (no live provider).
+	Conversation func(*dagger.Client) *core.LLM
+}
+
+type LLMTestCaseFlag struct {
+	Key      string
+	Value    string
+	Optional bool
+}
+
+const (
+	// testModulesVersion pins github.com/dagger/dagger-test-modules, so that
+	// changes to that repo take effect only when the pin is bumped instead of
+	// immediately affecting every branch's CI. Currently the head of the
+	// dang-llm-modules branch.
+	testModulesVersion = "4232918aa11c5347758ce657659e92f43610f0ff"
+
+	// llm-direct prompts the LLM in the most minimal way, forked per call
+	// (via its cacheBuster argument) to bust caches
+	directModuleSymbolic = "github.com/dagger/dagger-test-modules/llm/direct"
+	// llm-indirect only reaches the LLM through its dependency on llm-direct
+	indirectModuleSymbolic = "github.com/dagger/dagger-test-modules/llm/indirect"
+
+	// pinned refs for loading the modules; the allow-llm policy matches
+	// against the unpinned symbolic form
+	directModuleRef   = directModuleSymbolic + "@" + testModulesVersion
+	indirectModuleRef = indirectModuleSymbolic + "@" + testModulesVersion
+)
+
+// llmMessagesSelection selects everything a conversation recording needs from a
+// conversation: the same JSON shape core.decodeRecordedMessages consumes.
+const llmMessagesSelection = `role content{kind text callId toolName arguments errored signature} tokenUsage{inputTokens outputTokens cachedTokenReads cachedTokenWrites totalTokens}`
+
+type recordedTokenUsage struct {
+	InputTokens       int64 `json:"inputTokens,omitempty"`
+	OutputTokens      int64 `json:"outputTokens,omitempty"`
+	CachedTokenReads  int64 `json:"cachedTokenReads,omitempty"`
+	CachedTokenWrites int64 `json:"cachedTokenWrites,omitempty"`
+	TotalTokens       int64 `json:"totalTokens,omitempty"`
+}
+
+type recordedBlock struct {
+	Kind      string `json:"kind"`
+	Text      string `json:"text,omitempty"`
+	CallID    string `json:"callId,omitempty"`
+	ToolName  string `json:"toolName,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Errored   bool   `json:"errored,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+type recordedMessage struct {
+	Role       string              `json:"role"`
+	Content    []recordedBlock     `json:"content"`
+	TokenUsage *recordedTokenUsage `json:"tokenUsage,omitempty"`
+}
+
+// messagesGolden extracts the messages array at the given gjson path in a
+// `dagger query` result and renders it as a conversation recording.
+func messagesGolden(t *testctx.T, queryOutput string, path string) []byte {
+	t.Helper()
+	raw := gjson.Get(queryOutput, path)
+	require.True(t, raw.Exists(), "path %q missing in query output:\n%s", path, queryOutput)
+	var msgs []recordedMessage
+	require.NoError(t, json.Unmarshal([]byte(raw.Raw), &msgs))
+	for i := range msgs {
+		// drop all-zero usage (prompts, tool results) for readability
+		if msgs[i].TokenUsage != nil && *msgs[i].TokenUsage == (recordedTokenUsage{}) {
+			msgs[i].TokenUsage = nil
+		}
+	}
+	data, err := json.MarshalIndent(msgs, "", "  ")
+	require.NoError(t, err)
+	return data
+}
+
+// recordMessages runs a raw GraphQL query that drives a conversation and
+// renders the messages export at the given gjson path as a conversation recording.
+// The query should select messages{llmMessagesSelection}.
+func recordMessages(t *testctx.T, c *dagger.Client, query string, vars map[string]any, path string) []byte {
+	t.Helper()
+	var opts *testutil.QueryOptions
+	if vars != nil {
+		opts = &testutil.QueryOptions{Variables: vars}
+	}
+	res, err := testutil.QueryWithClient[map[string]any](c, t, query, opts)
+	require.NoError(t, err)
+	raw, err := json.Marshal(res)
+	require.NoError(t, err)
+	return messagesGolden(t, string(raw), path)
+}
+
+// cannedRecordingModel derives a recording/ model from a conversation constructed
+// through the LLM API itself (withPrompt/withResponse/withToolResult) — no
+// live provider involved. The recording round-trips through the same messages
+// export a real conversation would use, so its shape cannot drift from what
+// the recording decoder expects: both come from the engine under test.
+func cannedRecordingModel(ctx context.Context, t *testctx.T, c *dagger.Client, llm *core.LLM) string {
+	t.Helper()
+	llmID, err := llm.ID(ctx)
+	require.NoError(t, err)
+	recording := recordMessages(t, c,
+		fmt.Sprintf(`query($llm: ID!){node(id:$llm){... on LLM{messages{%s}}}}`, llmMessagesSelection),
+		map[string]any{"llm": llmID},
+		"node.messages")
+	return "recording/" + base64.StdEncoding.EncodeToString(recording)
+}
+
+func (flag LLMTestCaseFlag) ToCall() []string {
+	return []string{"--" + flag.Key, flag.Value}
+}
+
+func (flag LLMTestCaseFlag) ToShell() []string {
+	if flag.Optional {
+		return []string{"--" + flag.Key, strconv.Quote(flag.Value)}
+	}
+	return []string{strconv.Quote(flag.Value)}
+}
+
+func (LLMSuite) TestCase(ctx context.Context, t *testctx.T) {
+	tcs := []LLMTestCase{
+		{
+			Name: "hello-world",
+			Ref:  "./llmtest/go-programmer/",
+			Flags: []LLMTestCaseFlag{
+				{
+					Key:   "assignment",
+					Value: "write a hello world program",
+				},
+			},
+			// Mirrors the conversation GoProgrammer.drive starts: the first
+			// user message must match the module's withPrompt text byte for
+			// byte (the recorded-response provider diffs TEXT blocks), while tool
+			// results are placeholders — the real read/write/build tools run while
+			// consuming the recording and their live results flow through.
+			Conversation: func(c *dagger.Client) *core.LLM {
+				return core.NewQuery(c).LLM().
+					WithPrompt("You are an expert go programmer. You have access to a workspace.\n"+
+						"Use the read, write, build tools to complete the following assignment.\n"+
+						"Do not try to access the container directly.\n"+
+						"Don't stop until your code builds.\n"+
+						"\n"+
+						"Assignment: write a hello world program\n").
+					WithResponse([]core.LLMContentBlockInput{
+						{Kind: core.LLMContentBlockKindText, Text: "Let me check the current main.go first."},
+						{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "read"},
+					}).
+					WithToolResult("call_1", `workspace file "main.go": stat main.go: no such file or directory`, true).
+					WithResponse([]core.LLMContentBlockInput{
+						{Kind: core.LLMContentBlockKindText, Text: "No main.go yet, so I'll write a hello world program."},
+						{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "write",
+							Arguments: core.JSON(`{"content":"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Hello, World!\")\n}\n"}`)},
+					}).
+					WithToolResult("call_2", "", false).
+					WithResponse([]core.LLMContentBlockInput{
+						{Kind: core.LLMContentBlockKindText, Text: "Now let me build it to make sure it compiles."},
+						{Kind: core.LLMContentBlockKindToolCall, CallID: "call_3", ToolName: "build"},
+					}).
+					WithToolResult("call_3", "", false).
+					WithResponse([]core.LLMContentBlockInput{
+						{Kind: core.LLMContentBlockKindText, Text: "Done: main.go builds and prints Hello, World!"},
+					})
+			},
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.Name, func(ctx context.Context, t *testctx.T) {
+			c := connect(ctx, t)
+
+			srcPath, err := filepath.Abs(tc.Ref)
+			require.NoError(t, err)
+			ctr := goGitBase(t, c).
+				WithWorkdir("/work").
+				WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+			var flags []string
+			for _, flag := range tc.Flags {
+				flags = append(flags, flag.ToCall()...)
+			}
+
+			model := cannedRecordingModel(ctx, t, c, tc.Conversation(c))
+
+			t.Run("call", func(ctx context.Context, t *testctx.T) {
+				// run drives the recorded conversation and returns the final
+				// main.go contents from the LLM's workspace.
+				cmd := []string{"--model=" + model, "run"}
+				cmd = append(cmd, flags...)
+				out, err := ctr.With(daggerCallAt(".", cmd...)).Stdout(ctx)
+				require.NoError(t, err)
+				testGoProgram(ctx, t, c, core.NewQuery(c).Directory().WithNewFile("main.go", out).File("main.go"), regexp.MustCompile("(?i)hello(.*)world"))
+			})
+
+			t.Run("shell", func(ctx context.Context, t *testctx.T) {
+				var flags []string
+				for _, flag := range tc.Flags {
+					flags = append(flags, flag.ToShell()...)
+				}
+				out, err := ctr.
+					With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | run %s`, model, strings.Join(flags, " ")))).
+					Stdout(ctx)
+				require.NoError(t, err)
+				testGoProgram(ctx, t, c, core.NewQuery(c).Directory().WithNewFile("main.go", out).File("main.go"), regexp.MustCompile("(?i)hello(.*)world"))
+			})
+		})
+	}
+}
+
+// TestGeneratorSeesOverlayEdits locks in that the LLM's bound (overlaid)
+// Workspace propagates through a module's `generate` tool into the generator
+// leaves it rolls up and runs. An auto-injected Workspace! on a generator leaf
+// resolves to the seeded bound workspace even though it is resolved while
+// running inside the module runtime, so the generator reads the agent's
+// overlaid source rather than the frozen source (see
+// hack/designs/workspace-agents.md §4).
+//
+// The gen-agent fixture's generator reads input.txt and writes
+// output.txt = "generated from: <input>". The canned conversation edits
+// input.txt to "B-OVERLAY" via the write tool (overlaying the bound
+// workspace), then calls the generate tool. run returns output.txt, so if the
+// overlay reached the generator it reads "generated from: B-OVERLAY" rather
+// than the frozen "generated from: A".
+func (LLMSuite) TestGeneratorSeesOverlayEdits(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/gen-agent/")
+	require.NoError(t, err)
+	// The generator is discovered via Workspace.artifacts, so the fixture
+	// must be a detected workspace: a git root with the dagger.toml the
+	// fixture ships. goGitBase already `git init`s /work; copy the fixture in
+	// (WithDirectory, so the repo's .git survives) and commit it so detection
+	// succeeds.
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithDirectory(".", core.NewQuery(c).Host().Directory(srcPath)).
+		WithExec([]string{"git", "add", "."}).
+		WithExec([]string{"git", "commit", "-m", "initial"})
+
+	// The write tool overlays input.txt=B-OVERLAY onto the bound workspace,
+	// then the generate tool runs the workspace generators against that
+	// overlay. The tool results are placeholders — the real write/generate
+	// tools run while the recording is consumed and their live results flow
+	// through.
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an agent operating on a workspace.\n"+
+			"Use the write tool to edit input.txt, then the generate tool to run the workspace generators.\n"+
+			"\n"+
+			"Assignment: set input.txt to B-OVERLAY and regenerate\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Editing input.txt."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "write",
+				Arguments: core.JSON(`{"content":"B-OVERLAY"}`)},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Now running the generators."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "generate"},
+		}).
+		WithToolResult("call_2", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done: regenerated output.txt from the edited input.txt."},
+		}))
+
+	out, err := ctr.
+		With(daggerCall("gen-agent", "--model="+model, "run", "--assignment", "set input.txt to B-OVERLAY and regenerate")).
+		Stdout(ctx)
+	require.NoError(t, err)
+	// The generator observed the overlay edit, not the frozen "A".
+	require.Contains(t, out, "generated from: B-OVERLAY")
+}
+
+// TestToolLogsExcludeInternal locks in captureLogs' internal-span filtering:
+// a tool result surfaces the print output of the tool's real work, but not
+// logs from beneath spans marked dagger.io/ui.internal — e.g. ComputePaths'
+// "computing paths" task prints (added:/removed:/...), so they don't appear
+// in Workspace-returning tool results ahead of the patch summary.
+func (LLMSuite) TestToolLogsExcludeInternal(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/go-programmer/")
+	require.NoError(t, err)
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+	// Mirrors GoProgrammer.drive's conversation (the first user message must
+	// match its withPrompt byte for byte): write main.go, then build it. Tool
+	// results are placeholders — the real tools run while consuming the recording.
+	// Give the workspace a fresh digest so the nested execs actually run. If
+	// they hit the shared cache, there is no live stdout for captureLogs to
+	// surface and the build result correctly collapses to "(done)".
+	source := fmt.Sprintf("package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Hello, World!\")\n}\n\n// cache-buster: %s\n", rand.Text())
+	writeArgs, err := json.Marshal(map[string]string{"content": source})
+	require.NoError(t, err)
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an expert go programmer. You have access to a workspace.\n"+
+			"Use the read, write, build tools to complete the following assignment.\n"+
+			"Do not try to access the container directly.\n"+
+			"Don't stop until your code builds.\n"+
+			"\n"+
+			"Assignment: write a hello world program\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Writing main.go."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "write",
+				Arguments: core.JSON(writeArgs)},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Building."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "build"},
+		}).
+		WithToolResult("call_2", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done."},
+		}))
+
+	out, err := ctr.
+		With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | drive "write a hello world program" | loop | transcript`, model))).
+		Stdout(ctx)
+	require.NoError(t, err)
+
+	// The write tool (Workspace-returning) reports the patch summary...
+	require.Contains(t, out, "diff --git")
+	// ...without the internal "computing paths" span's prints leaking in.
+	require.NotContains(t, out, "added: [")
+	// The build tool's real work still surfaces: its exec output sits beneath
+	// non-internal spans, so logsOrDone returns it rather than "(done)".
+	require.Contains(t, out, "creating new go.mod")
+}
+
+// TestToolLogsExcludeService locks in captureLogs' service-span filtering:
+// a tool result surfaces the tool's deliberate print output, but not logs
+// from long-lived service exec spans (dagger.io/service) — those enter the
+// tool-call subtree via cause links (gaining new links per session, e.g.
+// when a later tool call reloads the started service) and would otherwise
+// drown out the print signal in the 8-line tail. ReadLogs remains the
+// deliberate discovery path for service logs.
+func (LLMSuite) TestToolLogsExcludeService(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/svc-agent/")
+	require.NoError(t, err)
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+	// Mirrors SvcAgent.drive's conversation (the first user message must
+	// match its withPrompt byte for byte): start the noisy service, then
+	// stop it. Tool results are placeholders — the real tools run during
+	// the recording-driven run.
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an agent that manages a service.\n"+
+			"Use the start tool to start the service, then the stop tool to stop it.\n"+
+			"\n"+
+			"Assignment: start and stop the service\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Starting the service."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "start"},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Now stopping the service."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "stop"},
+		}).
+		WithToolResult("call_2", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done: service started and stopped."},
+		}))
+
+	out, err := ctr.
+		With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | drive "start and stop the service" | loop | transcript`, model))).
+		Stdout(ctx)
+	require.NoError(t, err)
+
+	// The start tool's deliberate print survives into its tool result: the
+	// service's 200 noise lines all land before the healthcheck passes, so
+	// without service filtering they'd swamp the 8-line tail.
+	require.Contains(t, out, "SERVICE-READY")
+	// The service exec span's emitted logs stay out of tool results entirely.
+	// The surfaced SERVICES row includes the service command itself, so assert
+	// against a concrete expanded loop line rather than the marker in that
+	// command ("echo SVC-NOISE-$i").
+	require.NotContains(t, out, "SVC-NOISE-200")
+	// stop's print also surfaces — this exercises the late-cause-link route:
+	// stop reloads the started service, re-linking the exec span (and its
+	// full log history) beneath the stop tool call.
+	require.Contains(t, out, "SERVICE-STOPPED")
+}
+
+// TestToolLogsKeepReport locks in that a module function's own print output
+// reaches the tool result in full, even after noisy nested work. The Dang
+// runtime routes stdio to the user-facing span (the function call the user
+// sees) rather than the passthrough call_exec profiling span it currently runs
+// under — as containerized SDKs do via the injected traceparent — and the tool
+// result classifies that output as the tool's own and keeps it verbatim.
+//
+// A successful tool result contains its own output and surfaced sections,
+// falling back to abridged flat logs when nothing was surfaced. The raw span
+// tree itself remains available through ReadTrace instead of being transcribed
+// into every result.
+func (LLMSuite) TestToolLogsKeepReport(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/report-agent/")
+	require.NoError(t, err)
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+	// Mirrors ReportAgent.drive's conversation (the first user message must
+	// match its withPrompt text byte for byte). Tool results are placeholders —
+	// the real tool runs while consuming the recording. Give its nested exec a
+	// fresh cache key: a shared-cache hit has no live stdout for the tool result
+	// to abridge.
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an agent that writes a report.\n"+
+			"Use the report tool to do the work and write the report.\n"+
+			"\n"+
+			"Assignment: do the work and write the report\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Doing the work."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "report",
+				Arguments: core.JSON(fmt.Sprintf(`{"cacheBuster":%q}`, rand.Text()))},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done: the report is written."},
+		}))
+
+	out, err := ctr.
+		With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | drive "do the work and write the report" | loop | transcript`, model))).
+		Stdout(ctx)
+	require.NoError(t, err)
+
+	// Every line of the tool's own report survives into the tool result.
+	for i := 1; i <= 14; i++ {
+		require.Contains(t, out, fmt.Sprintf("LINE-%02d", i))
+	}
+	// With no surfaced sections, useful nested output is still abridged into
+	// the flat result, while the raw span-tree rows stay out.
+	require.NotContains(t, out, "NESTED-NOISE-01")
+	require.Contains(t, out, "NESTED-NOISE-20")
+	require.NotContains(t, out, "ReportAgent.report")
+	require.Contains(t, out, "ReadLogs(span:")
+}
+
+// TestToolReadTrace exercises the ReadTrace builtin end to end: it is
+// registered alongside ReadLogs, it is dispatchable by the model, and it
+// resolves its target against the session's real trace -- an unknown span
+// comes back as an actionable error rather than an empty result.
+//
+// The happy path (a span that exists) can't be canned: the span IDs
+// of a recording-driven run aren't known when the conversation is recorded.
+// The rendering half is covered by the unit tests in core (resolution) and
+// dagql/idtui (report shape).
+func (LLMSuite) TestToolReadTrace(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/report-agent/")
+	require.NoError(t, err)
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an agent that writes a report.\n"+
+			"Use the report tool to do the work and write the report.\n"+
+			"\n"+
+			"Assignment: do the work and write the report\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Doing the work."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "report"},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Looking at the trace."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "ReadTrace",
+				Arguments: core.JSON(`{"span":"ffffffffffffffff"}`)},
+		}).
+		WithToolResult("call_2", "", true).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done: the report is written."},
+		}))
+
+	out, err := ctr.
+		With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | drive "do the work and write the report" | loop | transcript`, model))).
+		Stdout(ctx)
+	require.NoError(t, err)
+
+	// The builtin was dispatched and resolved against the real trace, which
+	// does not contain this span -- and points the caller at discovery.
+	require.Contains(t, out, `no span "ffffffffffffffff"`)
+	require.Contains(t, out, "FindSpans")
+}
+
+// TestToolFindSpans exercises the FindSpans builtin end to end: it is
+// registered, dispatchable, and searches the session's real trace -- a query
+// nothing matches comes back as a counted "no match" rather than an empty
+// result, and a query that does match lists the span with its ID.
+func (LLMSuite) TestToolFindSpans(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/report-agent/")
+	require.NoError(t, err)
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an agent that writes a report.\n"+
+			"Use the report tool to do the work and write the report.\n"+
+			"\n"+
+			"Assignment: do the work and write the report\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Doing the work."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "report",
+				Arguments: core.JSON(fmt.Sprintf(`{"cacheBuster":%q}`, rand.Text()))},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Looking for spans."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "FindSpans",
+				Arguments: core.JSON(`{"query":"no such span anywhere"}`)},
+		}).
+		WithToolResult("call_2", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_3", ToolName: "FindSpans",
+				Arguments: core.JSON(`{"query":"ReportAgent.report"}`)},
+		}).
+		WithToolResult("call_3", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done: the report is written."},
+		}))
+
+	out, err := ctr.
+		With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | drive "do the work and write the report" | loop | transcript`, model))).
+		Stdout(ctx)
+	require.NoError(t, err)
+
+	require.Contains(t, out, `(no spans matching "no such span anywhere" among the`)
+	// The module function the first tool call ran is a span in the session's
+	// trace, listed with its ID and status.
+	require.Regexp(t, `[0-9a-f]{16}  ok     [^\n]*ReportAgent\.report`, out)
+}
+
+// TestToolInspectCall exercises the FindCalls and InspectCall builtins end
+// to end against the session's real trace: a call is found by a literal
+// deep in its arguments, listed with its digest; a digest nothing delivered
+// is refused with the gap named rather than a truncated chain.
+//
+// The happy path of InspectCall (a real digest) can't be canned: digests
+// depend on the module's own source digest and aren't known when the
+// conversation is recorded. The rebuild and every view are covered by the
+// unit tests in core against a real store.
+func (LLMSuite) TestToolInspectCall(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	srcPath, err := filepath.Abs("./llmtest/report-agent/")
+	require.NoError(t, err)
+	ctr := goGitBase(t, c).
+		WithWorkdir("/work").
+		WithMountedDirectory(".", core.NewQuery(c).Host().Directory(srcPath))
+
+	buster := rand.Text()
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("You are an agent that writes a report.\n"+
+			"Use the report tool to do the work and write the report.\n"+
+			"\n"+
+			"Assignment: do the work and write the report\n").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Doing the work."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "report",
+				Arguments: core.JSON(fmt.Sprintf(`{"cacheBuster":%q}`, buster))},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Looking for the call."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_2", ToolName: "FindCalls",
+				Arguments: core.JSON(fmt.Sprintf(`{"query":%q}`, buster))},
+		}).
+		WithToolResult("call_2", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_3", ToolName: "InspectCall",
+				Arguments: core.JSON(`{"digest":"xxh3:0000000000000000"}`)},
+		}).
+		WithToolResult("call_3", "", true).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Done: the report is written."},
+		}))
+
+	out, err := ctr.
+		With(daggerShellAt(".", fmt.Sprintf(`. --model="%s" | drive "do the work and write the report" | loop | transcript`, model))).
+		Stdout(ctx)
+	require.NoError(t, err)
+
+	// The module function call the first tool call made, found by its
+	// argument literal and listed with its digest.
+	require.Regexp(t, `xxh3:[0-9a-f]+  report\(cacheBuster: "`+regexp.QuoteMeta(buster)+`"\)`, out)
+	require.Contains(t, out, "call xxh3:0000000000000000 never reached this client")
+}
+
+func (LLMSuite) TestStepLimit(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	// maxSteps is a loop() argument: the limit caps the loop invocation
+	// rather than the LLM as a whole. Binding a container's methods as tools
+	// gives the recorded conversation a tool call, so the loop needs a second
+	// API call and trips the limit.
+	ctrFn := func(llmFlags, loopFlags string) core.WithContainerFunc {
+		return daggerShell(fmt.Sprintf(`llm %s | with-tools $(container | from alpine) | with-prompt "tell me the value of PATH" | loop %s | with-prompt "now tell me the value of TERM" | transcript`, llmFlags, loopFlags))
+	}
+
+	// One tool-call turn: step 1 answers with the envVariable call (which
+	// really dispatches against the bound alpine container), leaving its
+	// result pending, so a --max-steps=1 loop trips the limit before the
+	// closing text turn.
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("tell me the value of PATH").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindThinking, Text: "Retrieving the PATH environment variable."},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "envVariable",
+				Arguments: core.JSON(`{"name":"PATH"}`)},
+		}).
+		WithToolResult("call_1", "", false).
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "The value of PATH is /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin."},
+		}))
+	llmFlags := fmt.Sprintf("--model=%q", model)
+
+	_, err := daggerCliBase(t, c).
+		With(ctrFn(llmFlags, "--max-steps=1")).
+		Stdout(ctx)
+	requireErrOut(t, err, "reached step limit: 1")
+}
+
+func (LLMSuite) TestAllowLLM(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	// A canned conversation shared amongst subtests: they all drive the same
+	// "greet me" prompt through the llm/direct module.
+	model := cannedRecordingModel(ctx, t, c, core.NewQuery(c).LLM().
+		WithPrompt("greet me").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "Hello! How can I help you today?"},
+		}))
+	modelFlag := "--model=" + model
+
+	t.Run("allowed calls", func(ctx context.Context, t *testctx.T) {
+		tcs := []struct {
+			name     string
+			module   string
+			allowLLM string
+		}{
+			{
+				name:     "direct allow all",
+				module:   directModuleRef,
+				allowLLM: "all",
+			},
+			{
+				name:     "direct allow specific module",
+				module:   directModuleRef,
+				allowLLM: directModuleSymbolic,
+			},
+			{
+				name:     "indirect allow all",
+				module:   indirectModuleRef,
+				allowLLM: "all",
+			},
+			{
+				name:     "indirect allow specific module",
+				module:   indirectModuleRef,
+				allowLLM: directModuleSymbolic,
+			},
+			// we only test various permutations of remote module LLM use, local modules don't require the flag and that's covered by the toy-programmer case
+		}
+
+		for _, tc := range tcs {
+			t.Run(tc.name, func(ctx context.Context, t *testctx.T) {
+				args := []string{"--allow-llm", tc.allowLLM, modelFlag, "prompt", "--string-arg", "greet me", "--cache-buster", rand.Text()}
+
+				_, err := daggerCliBase(t, c).
+					With(daggerCallAt(tc.module, args...)).
+					Stdout(ctx)
+				require.NoError(t, err)
+			})
+		}
+	})
+
+	t.Run("noninteractive prompt fail", func(ctx context.Context, t *testctx.T) {
+		args := []string{modelFlag, "prompt", "--string-arg", t.Name(), "--cache-buster", rand.Text()}
+
+		_, err := daggerCliBase(t, c).
+			With(daggerCallAt(directModuleRef, args...)).
+			Stdout(ctx)
+		require.Error(t, err)
+	})
+
+	t.Run("environment variable", func(ctx context.Context, t *testctx.T) {
+		_, err := daggerCliBase(t, c).
+			WithEnvVariable("DAGGER_ALLOW_LLM", "all").
+			With(daggerCallAt(indirectModuleRef, modelFlag, "prompt", "--string-arg", "greet me", "--cache-buster", rand.Text())).
+			Stdout(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("shell allow all", func(ctx context.Context, t *testctx.T) {
+		_, err := daggerCliBase(t, c).
+			WithExec([]string{"dagger", "script", "-m", indirectModuleRef, "--allow-llm=all"}, core.ContainerWithExecOpts{
+				Stdin: fmt.Sprintf(`. %s | prompt "greet me" %q`, modelFlag, rand.Text()),
+			}).
+			Stdout(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("shell interactive module loads", func(ctx context.Context, t *testctx.T) {
+		_, err := daggerCliBase(t, c).
+			WithExec([]string{"dagger", "script", "--allow-llm", directModuleSymbolic}, core.ContainerWithExecOpts{
+				Stdin: fmt.Sprintf(`%s %s | prompt "greet me" %q`, indirectModuleRef, modelFlag, rand.Text()),
+			}).
+			Stdout(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("prompt calls", func(ctx context.Context, t *testctx.T) {
+		consoleDagger := func(ctx context.Context, t *testctx.T, args ...string) (*exec.Cmd, *tuiConsole) {
+			t.Helper()
+			console, err := newTUIConsole(t, 60*time.Second)
+			require.NoError(t, err)
+
+			tty := console.Tty()
+			err = pty.Setsize(tty, &pty.Winsize{Rows: 10, Cols: 80}) // for plain, we should make this wider, like 150
+			require.NoError(t, err)
+
+			cmd := hostDaggerCommand(
+				ctx,
+				t,
+				t.TempDir(),
+				args...,
+			)
+			cmd.Stdin = tty
+			cmd.Stdout = tty
+			cmd.Stderr = tty
+
+			return cmd, console
+		}
+
+		tcs := []struct {
+			name     string
+			allowLLM string
+			module   string
+			plain    bool
+		}{
+			{
+				name:     "direct remote module call",
+				allowLLM: "",
+				module:   directModuleRef,
+			},
+			// TODO: find a way to test plain tui.
+			// under test, it doesn't acknowledge input, but works fine irl
+			// {
+			// 	name:     "plain tui direct remote module call",
+			// 	allowLLM: "",
+			// 	module:   directModuleRef,
+			// 	plain:    true,
+			// },
+			{
+				name:     "allowed unrelated, calling direct",
+				allowLLM: "github.com/dagger/dagger",
+				module:   directModuleRef,
+			},
+			{
+				name:     "allowed indirect, calling direct",
+				allowLLM: indirectModuleSymbolic,
+				module:   directModuleRef,
+			},
+			{
+				// this should prompt for the dependency
+				name:     "allowed indirect, calling indirect",
+				allowLLM: indirectModuleSymbolic,
+				module:   indirectModuleRef,
+			},
+		}
+
+		for i, tc := range tcs {
+			t.Run(tc.name, func(ctx context.Context, t *testctx.T) {
+				progressFlag := "--progress=auto"
+				if tc.plain {
+					progressFlag = "--progress=plain"
+				}
+				cmd, console := consoleDagger(
+					ctx, t,
+					progressFlag, "call", "-m", tc.module, "--allow-llm", tc.allowLLM, modelFlag, "prompt", "--string-arg", fmt.Sprintf("greet me %d", i), "--cache-buster", rand.Text(),
+				)
+				defer console.Close()
+
+				err := cmd.Start()
+				require.NoError(t, err)
+
+				_, err = console.ExpectString("Allow LLM access?")
+				require.NoError(t, err)
+
+				// only test the  "no" case- the yes case persists history and requires special handling
+				_, err = console.SendLine("n")
+				require.NoError(t, err)
+
+				_, err = console.ExpectString("was denied LLM access")
+				require.NoError(t, err)
+
+				go console.ExpectEOF()
+
+				err = cmd.Wait()
+				require.Error(t, err)
+			})
+		}
+	})
+}
+
+func testGoProgram(ctx context.Context, t *testctx.T, c *dagger.Client, program *core.File, re any) {
+	name, err := program.Name(ctx)
+	require.NoError(t, err)
+	out, err := goGitBase(t, c).
+		WithWorkdir("/src").
+		WithMountedFile(name, program).
+		WithExec([]string{"go", "run", name}).
+		Stdout(ctx)
+	require.NoError(t, err)
+	require.Regexp(t, re, out)
+}
+
+// TestTraceRecipe reconstructs a committed conversation from the control record's
+// digest and complete call-payload closure after its source session has closed.
+func (LLMSuite) TestTraceRecipe(ctx context.Context, t *testctx.T) {
+	c, sink := connectWithTrace(ctx, t)
+	llm := core.NewQuery(c).LLM().
+		WithModel("openai/gpt-4o").
+		WithSystemPrompt("you are a helpful assistant").
+		WithPrompt("hello")
+	origHist, err := llm.Transcript(ctx)
+	require.NoError(t, err)
+	origModel, err := llm.Model(ctx)
+	require.NoError(t, err)
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, llm)
+	require.NoError(t, err)
+	gid := new(call.ID)
+	require.NoError(t, gid.Decode(string(recipe)))
+	require.False(t, gid.IsHandle(), "the traced anchor must reconstruct without a source-session handle")
+	require.NoError(t, c.Close())
+
+	dst, _ := connectWithTrace(ctx, t)
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	model, err := reloaded.Model(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origModel, model)
+	history, err := reloaded.Transcript(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origHist, history)
+}
+
+// Empty arguments on non-tool-call content decode to nil and may be omitted
+// from recipe literals. This once prevented conversations with replies from
+// being reconstructed, with a missing required input field "arguments" error.
+func (LLMSuite) TestTraceRecipeWithResponse(ctx context.Context, t *testctx.T) {
+	c, sink := connectWithTrace(ctx, t)
+	llm := core.NewQuery(c).LLM().
+		WithModel("openai/gpt-4o").
+		WithPrompt("hello").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "hello world"},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "read", Arguments: core.JSON(`{"path":"/x"}`)},
+		})
+	origHist, err := llm.Transcript(ctx)
+	require.NoError(t, err)
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, llm)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	dst, _ := connectWithTrace(ctx, t)
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	reply, err := reloaded.LastReply(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "hello world", reply)
+	history, err := reloaded.Transcript(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origHist, history)
+}
+
+// An unknown model name cannot recover its explicit provider by inference.
+func (LLMSuite) TestTraceRecipeCarriesProvider(ctx context.Context, t *testctx.T) {
+	c, sink := connectWithTrace(ctx, t)
+	llm := core.NewQuery(c).LLM(core.LLMOpts{
+		Model:    "my-custom-finetune",
+		Provider: "openai",
+	}).
+		WithPrompt("hello").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "hello world"},
+		})
+	origProvider, err := llm.Provider(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "openai", origProvider)
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, llm)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	dst, _ := connectWithTrace(ctx, t)
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	provider, err := reloaded.Provider(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "openai", provider, "the trace must retain the explicit provider")
+	model, err := reloaded.Model(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "my-custom-finetune", model)
+}
+
+// Resolve routing in the source CLI's controlled environment, then reconstruct
+// in a session with different defaults. The traced conversation, not the new
+// client's configuration or a semantic small-model selector, owns the route.
+func (LLMSuite) TestDefaultModelPinnedInTrace(ctx context.Context, t *testctx.T) {
+	c, sink := connectWithTrace(ctx, t, engineconn.Config{
+		ExtraEnv: []string{"OPENAI_MODEL=gpt-4o-test"},
+	})
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, core.NewQuery(c).LLM())
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	dst, _ := connectWithTrace(ctx, t, engineconn.Config{
+		ExtraEnv: []string{"OPENAI_MODEL=different-default"},
+	})
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	model, err := reloaded.Model(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "gpt-4o-test", model)
+	provider, err := reloaded.Provider(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "openai", provider)
+}
+
+func (LLMSuite) TestSmallModelPinnedInTrace(ctx context.Context, t *testctx.T) {
+	c, sink := connectWithTrace(ctx, t, engineconn.Config{
+		ExtraEnv: []string{"OPENAI_MODEL=gpt-main-model-test", "OPENAI_SMALL_MODEL=small-model-test"},
+	})
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, core.NewQuery(c).LLM().WithSmallModel())
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	dst, _ := connectWithTrace(ctx, t, engineconn.Config{
+		ExtraEnv: []string{"OPENAI_MODEL=different-main", "OPENAI_SMALL_MODEL=different-small"},
+	})
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	model, err := reloaded.Model(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "small-model-test", model)
+	provider, err := reloaded.Provider(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "openai", provider)
+}
+
+// Exporting and rebinding to a new snapshot must not resurrect superseded
+// withChanges overlays when the traced conversation is reconstructed.
+func (LLMSuite) TestTraceRecipeAfterChangesExport(ctx context.Context, t *testctx.T) {
+	workdir, git := workspaceExportCheckout(ctx, t)
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "a.txt"), []byte("before"), 0o644))
+	git("add", "a.txt")
+	git("commit", "-m", "initial editable file")
+	publishCheckpointRemote(ctx, t, workdir)
+	c, sink := connectWithTrace(ctx, t, engineconn.Config{Workdir: workdir})
+	current := snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace())
+	llm := core.NewQuery(c).LLM().
+		WithWorkspace(current).
+		WithModel("openai/gpt-4o").
+		WithSystemPrompt("be helpful").
+		WithPrompt("hello").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "hello world"},
+			{Kind: core.LLMContentBlockKindToolCall, CallID: "call_1", ToolName: "read", Arguments: core.JSON(`{"path":"/x"}`)},
+		}).
+		WithToolResult("call_1", "file contents", false)
+
+	base := core.NewQuery(c).Directory().WithNewFile("a.txt", "before")
+	edited := base.WithNewFile("a.txt", "after")
+	llmEdited := llm.WithWorkspace(llm.Workspace().WithChanges(edited.Changes(base)))
+	require.NoError(t, llmEdited.Workspace().Export(ctx, core.WorkspaceExportOpts{Path: workdir}))
+	rebound := llmEdited.WithWorkspace(snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace()))
+	origHist, err := llmEdited.Transcript(ctx)
+	require.NoError(t, err)
+	reboundHist, err := rebound.Transcript(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origHist, reboundHist)
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, rebound)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	// A new session must reconstruct the current binding, irrespective of
+	// whether the producer prunes superseded immutable recipe dependencies.
+	dst, _ := connectWithTrace(ctx, t, engineconn.Config{Workdir: workdir})
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	reloadedEmpty, err := reloaded.Workspace().Changes(core.WorkspaceChangesOpts{From: snapshotWorkspace(ctx, t, dst, core.NewQuery(dst).CurrentWorkspace())}).IsEmpty(ctx)
+	require.NoError(t, err)
+	require.True(t, reloadedEmpty, "resume must not reapply already-exported workspace edits")
+	contents, err := reloaded.Workspace().File("a.txt").Contents(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "after", contents)
+	reply, err := reloaded.LastReply(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "hello world", reply)
+	reloadedHist, err := reloaded.Transcript(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origHist, reloadedHist)
+}
+
+// Exercise overlays made by filesystem tools, not only withChanges. After the
+// overlay is exported and the exported snapshot rebound, the captured recipe
+// carries no stale pending edits from the exported overlay.
+func (LLMSuite) TestTraceRecipeAfterFileExport(ctx context.Context, t *testctx.T) {
+	workdir, git := workspaceExportCheckout(ctx, t)
+	publishCheckpointRemote(ctx, t, workdir)
+	c, sink := connectWithTrace(ctx, t, engineconn.Config{Workdir: workdir})
+	current := snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace())
+	llm := core.NewQuery(c).LLM().
+		WithWorkspace(current).
+		WithModel("openai/gpt-4o").
+		WithSystemPrompt("be helpful").
+		WithPrompt("hello").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "hello world"},
+		})
+	edited := llm.WithWorkspace(
+		llm.Workspace().
+			WithNewFile("added.txt", "one").
+			WithNewFile("another.txt", "two"),
+	)
+	editedEmpty, err := edited.Workspace().Changes(core.WorkspaceChangesOpts{From: current}).IsEmpty(ctx)
+	require.NoError(t, err)
+	require.False(t, editedEmpty, "overlaid workspace should report pending changes")
+	require.NoError(t, edited.Workspace().Export(ctx, core.WorkspaceExportOpts{Path: workdir}))
+	git("add", "added.txt", "another.txt")
+	fresh := snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace())
+	rebound := edited.WithWorkspace(fresh)
+	reboundEmpty, err := rebound.Workspace().Changes(core.WorkspaceChangesOpts{From: fresh}).IsEmpty(ctx)
+	require.NoError(t, err)
+	require.True(t, reboundEmpty, "rebinding the exported snapshot must drop the overlay edits")
+	origHist, err := edited.Transcript(ctx)
+	require.NoError(t, err)
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, rebound)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	dst, _ := connectWithTrace(ctx, t, engineconn.Config{Workdir: workdir})
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	reloadedEmpty, err := reloaded.Workspace().Changes(core.WorkspaceChangesOpts{From: snapshotWorkspace(ctx, t, dst, core.NewQuery(dst).CurrentWorkspace())}).IsEmpty(ctx)
+	require.NoError(t, err)
+	require.True(t, reloadedEmpty, "resume must not reapply already-exported workspace edits")
+	for path, expected := range map[string]string{"added.txt": "one", "another.txt": "two"} {
+		contents, err := reloaded.Workspace().File(path).Contents(ctx)
+		require.NoError(t, err)
+		require.Equal(t, expected, contents)
+	}
+	reloadedHist, err := reloaded.Transcript(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origHist, reloadedHist)
+}
+
+// Capturing before export must preserve the agent's pending edits and its
+// frozen base, even if the client checkout changes after the source closes.
+func (LLMSuite) TestTraceRecipePreservesPendingEdits(ctx context.Context, t *testctx.T) {
+	workdir, _ := workspaceExportCheckout(ctx, t)
+	publishCheckpointRemote(ctx, t, workdir)
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "base.txt"), []byte("SOURCE"), 0o644))
+	c, sink := connectWithTrace(ctx, t, engineconn.Config{Workdir: workdir})
+	current := snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace())
+	llm := core.NewQuery(c).LLM().
+		WithWorkspace(current).
+		WithModel("openai/gpt-4o").
+		WithPrompt("hello").
+		WithResponse([]core.LLMContentBlockInput{
+			{Kind: core.LLMContentBlockKindText, Text: "hello world"},
+		})
+	edited := llm.WithWorkspace(llm.Workspace().WithNewFile("pending.txt", "PENDING"))
+	origHist, err := edited.Transcript(ctx)
+	require.NoError(t, err)
+	recipe, err := sink.captureLLMRecipe(ctx, t, c, edited)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "base.txt"), []byte("DESTINATION"), 0o644))
+
+	dst, _ := connectWithTrace(ctx, t, engineconn.Config{Workdir: workdir})
+	reloaded := core.Ref[*core.LLM](core.NewQuery(dst), recipe)
+	contents, err := reloaded.Workspace().File("pending.txt").Contents(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "PENDING", contents)
+	base, err := reloaded.Workspace().File("base.txt").Contents(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "SOURCE", base, "the trace, not the client checkout, owns the workspace")
+	reloadedEmpty, err := reloaded.Workspace().Changes(core.WorkspaceChangesOpts{From: snapshotWorkspace(ctx, t, dst, core.NewQuery(dst).CurrentWorkspace())}).IsEmpty(ctx)
+	require.NoError(t, err)
+	require.False(t, reloadedEmpty, "un-exported edits must survive trace reconstruction")
+	reloadedHist, err := reloaded.Transcript(ctx)
+	require.NoError(t, err)
+	require.Equal(t, origHist, reloadedHist)
+}
+
+// Snapshotting after saving or external edits supplies a new baseline without changing
+// workspaces already bound to an LLM or invalidating ambient read caches.
+func (LLMSuite) TestWorkspaceSnapshotRefreshesBinding(ctx context.Context, t *testctx.T) {
+	for _, export := range []bool{false, true} {
+		t.Run(fmt.Sprintf("export=%t", export), func(ctx context.Context, t *testctx.T) {
+			workdir := t.TempDir()
+			initGitRepo(ctx, t, workdir)
+			filename := filepath.Join(workdir, "x.txt")
+			require.NoError(t, os.WriteFile(filename, []byte("OLD"), 0o644))
+			cmd := exec.CommandContext(ctx, "git", "add", "x.txt")
+			cmd.Dir = workdir
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			cmd = exec.CommandContext(ctx, "git", "commit", "-m", "initial")
+			cmd.Dir = workdir
+			out, err = cmd.CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			c := connect(ctx, t, dagger.WithWorkdir(workdir))
+			before, err := core.NewQuery(c).CurrentWorkspace().File("x.txt").Contents(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "OLD", before)
+			original := core.NewQuery(c).LLM().WithWorkspace(snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace()))
+			if export {
+				require.NoError(t, core.NewQuery(c).CurrentWorkspace().WithNewFile("x.txt", "NEW").Export(ctx))
+			} else {
+				require.NoError(t, os.WriteFile(filename, []byte("NEW"), 0o644))
+			}
+			fresh := snapshotWorkspace(ctx, t, c, core.NewQuery(c).CurrentWorkspace())
+			after, err := original.WithWorkspace(fresh).Workspace().File("x.txt").Contents(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "NEW", after)
+			unchanged, err := original.Workspace().File("x.txt").Contents(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "OLD", unchanged)
+		})
+	}
+}
+
+// TestNestedClientInheritsSessionConfig verifies that LLM configuration is
+// session-wide: a nested client (an experimentalPrivilegedNesting exec, e.g.
+// `dagger agent` running inside a container) with no LLM configuration of its
+// own inherits the session main client's config; its own config still wins
+// where set; and the underlying credentials never become readable from inside
+// the nested container — the credential references resolve through the
+// *main* client's session, so nesting grants use of the LLM, not the keys.
+func (LLMSuite) TestNestedClientInheritsSessionConfig(ctx context.Context, t *testctx.T) {
+	// Config on the session's main client (this test process): the CLI the
+	// SDK spawns assembles its LLMConfig from its environment, so a plain
+	// os.Setenv is all it takes (same pattern as AddressSuite/TestSecret).
+	// The values are inert for other tests: recording models ignore
+	// credentials, and an anthropic model only routes when nothing
+	// higher-priority is configured.
+	sessionModel := "claude-session-wide-model"
+	apiKey := "secret" + rand.Text()
+	os.Setenv("ANTHROPIC_MODEL", sessionModel)
+	os.Setenv("ANTHROPIC_API_KEY", apiKey)
+
+	// Each subtest connects on its own: LLM settings resolve once per session
+	// (see TestCrossSessionLLM), so a shared session would serve the first
+	// subtest's model to the others from the session cache.
+
+	t.Run("inherits main client config", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+		out, err := goGitBase(t, c).
+			With(daggerExecRaw("core", "llm", "model")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, sessionModel, out)
+	})
+
+	t.Run("nested config wins where set", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+		out, err := goGitBase(t, c).
+			WithEnvVariable("ANTHROPIC_MODEL", "claude-nested-override").
+			With(daggerExecRaw("core", "llm", "model")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "claude-nested-override", out)
+	})
+
+	t.Run("credentials stay with the main client", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+		// Inheritance must not hand out the keys: resolving the credential
+		// env var directly still happens inside the nested container, which
+		// doesn't have it.
+		_, err := goGitBase(t, c).
+			With(daggerExecRaw("core", "secret", "--uri", "env://ANTHROPIC_API_KEY", "plaintext")).
+			Sync(ctx)
+		requireErrOut(t, err, `secret env var not found: "ANT..."`)
+	})
+}

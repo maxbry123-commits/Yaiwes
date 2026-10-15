@@ -1,0 +1,203 @@
+package dagql
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"slices"
+
+	"github.com/dagger/dagger/engine"
+)
+
+type perClientCacheScopeKey struct{}
+
+// WithPerClientCacheScope gives PerClientInput calls made with ctx a fresh
+// cache namespace while preserving the real client metadata used by resolvers.
+// Use it when a resolution must be re-evaluated against request-scoped state.
+func WithPerClientCacheScope(ctx context.Context) context.Context {
+	return WithNamedPerClientCacheScope(ctx, rand.Text())
+}
+
+// WithNamedPerClientCacheScope is like WithPerClientCacheScope but pins the
+// cache namespace to a caller-provided value instead of a random one. Calls
+// made under the same scope value share a cache namespace, while a changed
+// value invalidates it — use it to bust a client's cached reads at a
+// controlled boundary (e.g. a bumped generation counter) rather than on every
+// call. An empty scope leaves the client's default namespace untouched.
+func WithNamedPerClientCacheScope(ctx context.Context, scope string) context.Context {
+	if scope == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, perClientCacheScopeKey{}, scope)
+}
+
+// PerClientInput scopes a call ID per client by mixing in the client ID as
+// an implicit call input.
+var PerClientInput = ImplicitInput{
+	Name: "cachePerClient",
+	Resolver: func(ctx context.Context, _ map[string]Input) (Input, error) {
+		clientMD, err := engine.ClientMetadataFromContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get client metadata: %w", err)
+		}
+		if clientMD.ClientID == "" {
+			return nil, fmt.Errorf("client ID not found in context")
+		}
+		cacheKey := clientMD.ClientID
+		if scope, ok := ctx.Value(perClientCacheScopeKey{}).(string); ok && scope != "" {
+			cacheKey += ":" + scope
+		}
+		return NewString(cacheKey), nil
+	},
+}
+
+// CacheScopeInput scopes a call ID to the named per-client cache scope on ctx
+// (see WithPerClientCacheScope) without also mixing in the client ID. Use it on
+// fields whose results are safe to share across clients but must still be
+// re-resolved when a caller deliberately busts its per-client cache, such as a
+// lock refresh that needs fresh remote metadata. Without a scope it resolves
+// to "", so ordinary calls from every client share one result.
+var CacheScopeInput = ImplicitInput{
+	Name: "cacheScope",
+	Resolver: func(ctx context.Context, _ map[string]Input) (Input, error) {
+		scope, _ := ctx.Value(perClientCacheScopeKey{}).(string)
+		return NewString(scope), nil
+	},
+}
+
+// PerSessionInput scopes a call ID per session by mixing in the session ID as
+// an implicit call input.
+var PerSessionInput = ImplicitInput{
+	Name: "cachePerSession",
+	Resolver: func(ctx context.Context, _ map[string]Input) (Input, error) {
+		clientMD, err := engine.ClientMetadataFromContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get client metadata: %w", err)
+		}
+		if clientMD.SessionID == "" {
+			return nil, fmt.Errorf("session ID not found in context")
+		}
+		return NewString(clientMD.SessionID), nil
+	},
+}
+
+// PerCallInput scopes a call ID per invocation by mixing in a random value as
+// an implicit call input.
+var PerCallInput = ImplicitInput{
+	Name: "cachePerCall",
+	Resolver: func(context.Context, map[string]Input) (Input, error) {
+		return NewString(rand.Text()), nil
+	},
+}
+
+// PerSchemaInput scopes a call ID to the server schema digest.
+func PerSchemaInput(srv *Server) ImplicitInput {
+	return ImplicitInput{
+		Name: "cachePerSchema",
+		Resolver: func(context.Context, map[string]Input) (Input, error) {
+			return NewString(srv.SchemaDigest().String()), nil
+		},
+	}
+}
+
+// CurrentSchemaInput scopes a call ID to the schema digest of the dagql server
+// currently executing the call.
+var CurrentSchemaInput = ImplicitInput{
+	Name: "cachePerSchema",
+	Resolver: func(ctx context.Context, _ map[string]Input) (Input, error) {
+		srv := CurrentDagqlServer(ctx)
+		if srv == nil {
+			return nil, fmt.Errorf("current dagql server not found")
+		}
+		return NewString(srv.SchemaDigest().String()), nil
+	},
+}
+
+// RequestedCacheInput scopes a call ID according to a boolean argument:
+// false => PerClientInput, true => PerCallInput.
+func RequestedCacheInput(argName string) ImplicitInput {
+	return ImplicitInput{
+		Name:        "cacheAsRequested:" + argName,
+		PerCallWhen: []string{argName},
+		Resolver: func(ctx context.Context, args map[string]Input) (Input, error) {
+			noCache, err := inputBoolArg(args, argName)
+			if err != nil {
+				return nil, err
+			}
+			if noCache {
+				return PerCallInput.Resolver(ctx, args)
+			}
+			return PerClientInput.Resolver(ctx, args)
+		},
+	}
+}
+
+// PerCallWhen wraps input so that a call passing argName: true gets a fresh
+// per-call key, like PerCallInput. The input keeps its name, and its value
+// when argName is false or absent, so ordinary calls keep their digests. Use
+// it for an argument that asks a lookup to resolve live (e.g. noLock): the
+// call itself must not be answered from an earlier one.
+func PerCallWhen(argName string, input ImplicitInput) ImplicitInput {
+	return ImplicitInput{
+		Name:        input.Name,
+		PerCallWhen: append(slices.Clone(input.PerCallWhen), argName),
+		Resolver: func(ctx context.Context, args map[string]Input) (Input, error) {
+			perCall, err := inputBoolArg(args, argName)
+			if err != nil {
+				return nil, err
+			}
+			if perCall {
+				return PerCallInput.Resolver(ctx, args)
+			}
+			return input.Resolver(ctx, args)
+		},
+	}
+}
+
+func inputBoolArg(args map[string]Input, argName string) (bool, error) {
+	raw, ok := args[argName]
+	if !ok || raw == nil {
+		return false, nil
+	}
+	switch val := raw.(type) {
+	case Boolean:
+		return val.Bool(), nil
+	case Optional[Boolean]:
+		if !val.Valid {
+			return false, nil
+		}
+		return val.Value.Bool(), nil
+	case DynamicOptional:
+		if !val.Valid {
+			return false, nil
+		}
+		booleanVal, ok := val.Value.(Boolean)
+		if !ok {
+			return false, fmt.Errorf("cache input argument %q must wrap Boolean, got %T", argName, val.Value)
+		}
+		return booleanVal.Bool(), nil
+	default:
+		return false, fmt.Errorf("cache input argument %q must be Boolean, got %T", argName, raw)
+	}
+}
+
+// PerEngineCacheInput scopes a call ID to the engine's cache, so a result is
+// reused only by the cache that computed it, including after a clean restart.
+// Another engine's copy never matches. It is the cache's identity ID, or,
+// for a cache without a persistence database, the engine instance's ID.
+var PerEngineCacheInput = ImplicitInput{
+	Name: "cachePerEngineCache",
+	Resolver: func(ctx context.Context, _ map[string]Input) (Input, error) {
+		cache, err := EngineCache(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if id := cache.Identity().ID; id != "" {
+			return NewString(id), nil
+		}
+		if cache.engineInstanceID != "" {
+			return NewString(cache.engineInstanceID), nil
+		}
+		return nil, fmt.Errorf("engine cache has no identity")
+	},
+}

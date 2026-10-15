@@ -1,0 +1,326 @@
+syntax = "proto3";
+
+package dagger.git;
+
+option go_package = "git";
+
+service Git {
+  // Engine-internal: call only after push authorization, never for Git reads.
+  rpc PreparePushSSHAuth(PreparePushSSHAuthRequest) returns (PreparePushSSHAuthResponse);
+  rpc GetCredential(GitCredentialRequest) returns (GitCredentialResponse);
+  rpc GetConfig(GitConfigRequest) returns (GitConfigResponse);
+  rpc CheckoutState(CheckoutStateRequest) returns (CheckoutStateResponse);
+  rpc PackCheckout(PackCheckoutRequest) returns (stream PackCheckoutResponse);
+  // Exact local object closure only; never fetches or exports checkout refs.
+  rpc PackCommit(PackCommitRequest) returns (stream PackCheckoutResponse);
+  rpc PackUncommitted(PackUncommittedRequest) returns (stream PackUncommittedResponse);
+  rpc CaptureGit(CaptureGitRequest) returns (stream CaptureGitResponse);
+  rpc ApplyBundle(stream ApplyBundleRequest) returns (ApplyBundleResponse);
+}
+
+// Import a workspace's committed HEAD and fast-forward the destination under
+// a lease. A failed fast-forward leaves the commits on a hand-off ref; it never
+// rebases, resets, or writes the workspace's uncommitted overlay.
+message ApplyBundleRequest {
+  oneof msg {
+    ApplyBundleMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message ApplyBundleMetadata {
+  string checkout_path = 1;
+  string target_sha = 2;
+  string expected_state_digest = 3;
+  string bundle_ref = 4;
+  // Prepared integration: bundle_ref advertises this transport commit, whose
+  // parents are target_sha and a before-worktree snapshot (parented by the
+  // expected checkout HEAD). Its tree is the desired final worktree.
+  string integration_worktree_sha = 5;
+  // Empty bundles are allowed when the checkout already contains target_sha.
+  // Nonempty bundles must advertise target_sha under bundle_ref.
+}
+
+message ApplyBundleResponse {
+  string head_sha = 1;
+  string parked_ref = 2;
+  ErrorInfo error = 3;
+}
+
+message GitCredentialRequest {
+  string protocol = 1;
+  string host = 2;
+  string path = 3; // optional
+}
+
+message GitCredentialResponse {
+  oneof result {
+    CredentialInfo credential = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+message CredentialInfo {
+  string protocol = 1;
+  string host = 2;
+  string username = 3;
+  string password = 4;
+}
+
+message GitConfigRequest {
+  // Optional checkout for effective repository-local config (including worktrees).
+  // Empty retains the system/global-only config query.
+  string checkout_path = 1;
+}
+
+message GitConfigResponse {
+  oneof result {
+    GitConfig config = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+message GitConfig {
+  repeated GitConfigEntry entries = 1;
+}
+
+message GitConfigEntry {
+  string key = 1;
+  string value = 2;
+}
+
+// CheckoutStateRequest asks the client for a digest identifying the current
+// git state of a local checkout: HEAD, the symbolic HEAD, and all branch and
+// tag refs. The engine uses it as a cache key so a checkout is only re-packed
+// (PackCheckout) when its refs actually move.
+message CheckoutStateRequest {
+  string checkout_path = 1;
+}
+
+message CheckoutStateResponse {
+  oneof result {
+    string state_digest = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+// PackCheckoutRequest asks the client to pack a local checkout's repository
+// with its own git (a bundle of HEAD plus all branches and tags). Host git
+// natively understands every checkout layout - worktrees, submodules,
+// separate git dirs, alternates, partial clones - so the engine never has to
+// interpret raw .git state; it reconstructs a canonical repository from the
+// returned pack.
+message PackCheckoutRequest {
+  string checkout_path = 1;
+  // expected_state_digest, when set, requires the packed checkout to match a
+  // preceding CheckoutState response. A mismatch asks the engine to retry
+  // under the checkout's new cache key.
+  string expected_state_digest = 2;
+}
+
+// A captured checkout is an optional donor for precisely this commit. The
+// payload is a non-thin raw pack, not a bundle, of the commit's complete
+// closure. The checkout's refs may have moved since capture: the closure of a
+// fixed SHA does not depend on them, and the engine verifies what it imports.
+// The response metadata carries no state_digest.
+message PackCommitRequest {
+  // expected_state_digest pinned the checkout's refs to their captured state.
+  // depth was the closure depth; only the complete closure is ever requested.
+  reserved 2, 4;
+  reserved "expected_state_digest", "depth";
+  string checkout_path = 1;
+  string commit_sha = 3;
+}
+
+// PackCheckoutResponse streams one metadata message first, then the bundle
+// bytes in chunks.
+message PackCheckoutResponse {
+  oneof msg {
+    PackCheckoutMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message PackCheckoutMetadata {
+  // head_sha is the commit HEAD resolves to. Empty for a repository with no
+  // commits yet (unborn HEAD), in which case no bundle chunks follow.
+  string head_sha = 1;
+  // head_ref is the symbolic ref HEAD points at (e.g. "refs/heads/main"),
+  // empty when HEAD is detached.
+  string head_ref = 2;
+  // object_format is the repository's object hash algorithm ("sha1" or
+  // "sha256"), so the engine reconstructs with the same format.
+  string object_format = 3;
+  // error reports a failure instead of a pack: NOT_A_REPO when the checkout
+  // has no .git entry at its root, NOT_FOUND when git is not installed.
+  ErrorInfo error = 4;
+  // state_digest identifies the exact checkout state represented by the
+  // bundle. The client verifies that it remains stable while packing.
+  string state_digest = 5;
+  repeated CheckoutRemote remotes = 6;
+  string upstream_remote = 7;
+  // Distinguishes a complete empty list from an older client's absent metadata.
+  bool has_remote_metadata = 8;
+}
+
+// Remote routing only; never a credential grant or arbitrary host Git config.
+message CheckoutRemote {
+  string name = 1;
+  string url = 2;
+  string push_url = 3;
+}
+
+// PackUncommittedRequest asks the client for the git-visible working-tree delta
+// relative to HEAD. The payload is a binary git patch containing tracked,
+// staged, and ordinary untracked nonignored files. Ignored files and contents
+// inside untracked nested repositories are deliberately omitted, matching
+// `git clean -fd` and GitRepository.uncommitted semantics.
+message PackUncommittedRequest {
+  string checkout_path = 1;
+  // expected_head_sha pins the patch to the canonical checkout already packed
+  // by the engine. A moved checkout reports HEAD_MISMATCH instead of producing
+  // a delta against a different commit.
+  string expected_head_sha = 2;
+}
+
+// PackUncommittedResponse streams one metadata message first, then binary patch
+// bytes in chunks.
+message PackUncommittedResponse {
+  oneof msg {
+    PackUncommittedMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message PackUncommittedMetadata {
+  // head_sha anchors the patch and must match the canonical checkout to which
+  // the engine applies it.
+  string head_sha = 1;
+  // nested_repositories are untracked repository roots omitted from the patch.
+  // The engine recreates lightweight repository markers at these boundaries so
+  // later workspace overlays beneath them remain invisible to the outer repo.
+  repeated string nested_repositories = 2;
+  ErrorInfo error = 3;
+}
+
+message ErrorInfo {
+  enum ErrorType {
+    UNKNOWN = 0;
+    INVALID_REQUEST = 1;
+    NOT_FOUND = 2;
+    TIMEOUT = 3;
+    CREDENTIAL_RETRIEVAL_FAILED = 4;
+    CONFIG_RETRIEVAL_FAILED = 5;
+    HEAD_MISMATCH = 6;
+    NOT_A_REPO = 7;
+    PACK_FAILED = 8;
+    UNCOMMITTED_UNSUPPORTED = 9;
+    CHECKOUT_STATE_MISMATCH = 10;
+    CAPTURE_REJECTED = 11;
+    CAPTURE_FAILED = 12;
+    // The checkout is usable, but capture has no committed baseline.
+    CAPTURE_UNSUPPORTED = 13;
+    // Optional local donor lacks the requested complete object closure.
+    HISTORY_UNAVAILABLE = 14;
+  }
+  ErrorType type = 1;
+  string message = 2;
+}
+
+// CaptureGit performs the security-sensitive host half of a portable Git
+// workspace checkpoint. It discovers a currently advertised remote ancestor,
+// scans the selected dirty set, and then emits a version-3 two-ref bundle.
+// Without a usable remote ancestor, HEAD is the prerequisite and the engine
+// must reconstruct the repository from this client's checkout.
+message CaptureGitRequest {
+  string checkout_path = 1;
+  CaptureGitPolicy policy = 2;
+}
+
+// Tracked changes are included automatically. Untracked changes need explicit
+// approval. approval_tokens are opaque fingerprints returned
+// with an aggregate prompt and bind its retry to the exact reviewed state;
+// include patterns approve matching ordinary nonignored untracked
+// paths for noninteractive use. Patterns use Git path separators and path.Match.
+message CaptureGitPolicy {
+  repeated string include = 1;
+  repeated string exclude = 2;
+  repeated string approval_tokens = 3;
+  int64 max_untracked_file_bytes = 4;
+  int64 max_untracked_total_bytes = 5;
+  int32 max_untracked_files = 6;
+  int64 max_tracked_file_bytes = 7;
+  int64 max_total_bytes = 8;
+  // Omit all untracked paths before inspecting their contents. Host files are
+  // never deleted. Tracked changes remain subject to the usual capture policy.
+  bool drop_untracked = 9;
+}
+
+message CaptureGitResponse {
+  oneof msg {
+    CaptureGitMetadata metadata = 1;
+    CaptureGitChunk chunk = 2;
+  }
+}
+
+message CaptureGitChunk {
+  enum Kind {
+    CAPTURE_CHUNK_UNKNOWN = 0;
+    CAPTURE_CHUNK_BUNDLE = 1;
+    reserved 2;
+  }
+  Kind kind = 1;
+  bytes data = 2;
+}
+
+message CaptureGitMetadata {
+  uint32 format_version = 1;
+  string object_format = 2;
+  string remote_url = 3;
+  string remote_ref = 4;
+  string base_sha = 5;
+  string head_sha = 6;
+  reserved 7;
+  string bundle_sha256 = 8;
+  int64 bundle_bytes = 9;
+  // worktree_sha is the optional synthetic snapshot commit S. Its parent is
+  // head_sha and its tree is the complete approved dirty state.
+  string worktree_sha = 10;
+  reserved 11;
+  reserved "worktree_bytes";
+  int32 tracked_files = 12;
+  int32 untracked_files = 13;
+  int64 selected_bytes = 14;
+  ErrorInfo error = 15;
+  // approval_candidates is populated only on a fail-closed preflight. It
+  // lists the complete selected dirty set for one local aggregate prompt,
+  // retaining suspicious classifications but never candidate bytes.
+  repeated CaptureGitCandidate approval_candidates = 16;
+  // Pins a session-only host reconstruction to the captured checkout state.
+  string checkout_state_digest = 17;
+  // Effective push destinations computed by the owner's Git configuration.
+  // Routing metadata only, never authorization. Empty means remote_url.
+  string remote_push_url = 18;
+  repeated CheckoutRemote remotes = 19;
+  string upstream_remote = 20;
+  bool has_remote_metadata = 21;
+  string remote_name = 22;
+}
+
+message CaptureGitCandidate {
+  string path = 1;
+  string classification = 2;
+  bool tracked = 3;
+  int64 bytes = 4;
+  // approval_token binds approval to the path's reviewed type, mode, and bytes.
+  string approval_token = 5;
+}
+
+message PreparePushSSHAuthRequest {
+  string remote = 1;
+}
+
+message PreparePushSSHAuthResponse {
+  // Operation-local socket; never publish it as a module capability.
+  string socket_path = 1;
+}

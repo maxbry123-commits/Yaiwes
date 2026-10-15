@@ -1,0 +1,158 @@
+---
+title: "Module wiring"
+slug: /config/module-wiring
+description: "Connect installed modules by wiring one module's output into another's settings"
+---
+
+# Module wiring
+
+Modules in a workspace connect to each other through settings. A setting whose
+value is a `"dag://<module>/<function>"` DAG address is a module reference. It
+injects the value returned by a function on another installed module. This is
+how generic modules compose without knowing about each other, and without you
+writing a glue module.
+
+## Wire a service into a module
+
+A test-runner module accepts an optional `Service`; your app module has a
+function that returns one. Connect them in `dagger.toml`:
+
+```toml
+[modules.myapp]
+source = "./ci/myapp"
+
+[modules.playwright]
+source = "dagger.io/js/playwright"
+
+[modules.playwright.settings]
+service = "dag://myapp/serve"
+```
+
+Now `dagger check --playwright` runs the browser tests against your app.
+Dagger resolves the reference when it constructs the playwright module and
+passes the running service in.
+
+To find functions you can wire, run `dagger list services`. It lists every
+service in the workspace with the module that provides it. Any function
+returning the right type works.
+
+## Wire a container
+
+References aren't limited to services. A `Container` argument wires the same
+way:
+
+```toml
+[modules.playwright.settings]
+baseCtr = "dag://base-images/chromium"
+```
+
+## Wire a file, directory, or workspace
+
+Build artifacts and workspaces can be passed between modules in the same way.
+A function returning a `File`, `Directory`, or `Workspace` can be referenced by
+a matching constructor argument:
+
+```toml
+[modules.packager.settings]
+binary = "dag://builder/binary"
+assets = "dag://frontend/assets"
+source = "dag://source-prep/workspace"
+```
+
+## Reference the workspace entrypoint
+
+The entrypoint module's functions are hoisted onto the workspace root, so a
+reference to one can drop the module name:
+
+```shell
+dagger module settings playwright service serve
+```
+
+The config always stores the full address:
+
+```toml
+[modules.myapp]
+source = "./ci/myapp"
+entrypoint = true
+
+[modules.playwright.settings]
+service = "dag://myapp/serve"
+```
+
+The `dagger settings` command only rewrites a bare name when the entrypoint
+has a function of that name. In `dagger.toml`, the entrypoint's functions are
+also addressed without the module name: `dag://serve`.
+
+## Use a reference on the command line
+
+A module reference is an ordinary address string, so it also works as a CLI
+flag for any object-typed constructor argument:
+
+```shell
+dagger api call playwright --service=dag://myapp/serve project --path=. test
+```
+
+## How references resolve
+
+- The `dag://` scheme marks a workspace artifact address. The path's leading
+  segment is a module's install name, the `[modules.X]` key in this
+  `dagger.toml`, and the rest names a zero-arg function on it whose return type
+  matches the argument. The workspace entrypoint module's functions drop the
+  module segment: `dag://serve`.
+- An address with `dag://` *is* a module reference. A missing function or a
+  mismatched type is then a hard error, never a silent fallback to an image or
+  URL. `dagger list` lists the artifacts the workspace has, by type.
+- A value without `dag://` keeps its ordinary address meaning: an OCI ref for
+  a `Container`, a `tcp://` URL for a `Service`. So `git:2.40` and
+  `alpine:3.20` stay image refs.
+
+## Migrate existing references
+
+Older workspace configurations used `module:function` or a bare entrypoint
+function name. Replace those values in object-typed settings and CLI flags
+with DAG addresses:
+
+| Previous value | DAG address |
+| --- | --- |
+| `base-images:chromium` | `dag://base-images/chromium` |
+| `myapp:serve` | `dag://myapp/serve` |
+| `go-base` (on entrypoint `project-dev`) | `dag://project-dev/go-base` |
+
+This rule applies to object-typed settings for modules written in any SDK.
+For a `Container` setting, a bare name such as `go-base` is now an image
+reference. For `File` and `Directory` settings, it is a path. Keep ordinary
+image references, paths, URLs, and string-valued settings as they are.
+
+The settings command accepts a bare entrypoint function name and writes its
+full DAG address. Hand-edited `dagger.toml` values and CLI object flags need
+the `dag://` scheme explicitly.
+
+SDK code that resolves workspace artifacts uses `Workspace.resolve` with a
+DAG address, then the matching typed loader such as `Address.container` or
+`Address.service`. In the 1.0 API, `Query.address` resolves external references
+only. Pass the resulting typed object to other module functions as usual.
+Clients using a pre-1.0 schema view retain the legacy `Query.address` behavior.
+
+## Design your module for wiring
+
+If you author modules, wiring changes how you shape a constructor:
+
+- **Accept collaborators as optional constructor arguments.** An optional
+  `Service`, `Container`, `File`, `Directory`, or `Workspace` argument is a
+  wiring point. Without one, users need a glue module to connect yours to
+  anything.
+- **Consume workspaces in the constructor.** A module object cannot retain a
+  `Workspace` as a field. Derive and store the `File`, `Directory`, or other
+  value your module needs from the wired workspace instead.
+- **Put workspace-level configuration on the constructor, not on function
+  arguments.** Settings map to constructor arguments. A shard count, a
+  service, or a base image belongs there if the workspace should configure it
+  once.
+- **Degrade gracefully.** When nothing is wired, do something sensible rather
+  than failing: skip the service binding, or fall back to a default image. The
+  workspace may have nothing to wire yet.
+
+The [Playwright module](../reference/modules/js/playwright.mdx) is a worked example of
+optional collaborators, constructor-level configuration, and graceful
+degradation. [Daggerize a Go Project](../getting-started/platform-guides/go/index.mdx) wires a project's own
+module into the Go module's `base` setting, from the consumer's side.

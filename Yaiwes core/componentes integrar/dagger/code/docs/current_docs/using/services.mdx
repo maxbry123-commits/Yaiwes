@@ -1,0 +1,87 @@
+---
+title: "Running services"
+slug: /using/services
+description: "Start dev services and expose them locally"
+---
+
+# Running services
+
+Start all services defined in your workspace:
+
+```shell
+dagger start
+```
+
+Services run in ephemeral containers. Dagger tunnels their ports to your local machine. Stop with Ctrl+C.
+
+## Listing and filtering services
+
+```shell
+dagger start -l                    # list available services
+dagger start web                   # start only the 'web' service
+dagger start web api redis         # start multiple services
+```
+
+## Use cases
+
+- Running a database for local development or testing
+- Running end-to-end integration tests against a service
+- Running sidecars (proxies, caches, queues)
+
+## How services work
+
+Service containers have three key properties:
+
+- **Content-addressed hostnames.** Each service gets a canonical hostname derived from its definition. Same definition, same hostname, so no port conflicts.
+- **Just-in-time lifecycle.** Services start when first needed. If several clients request the same service, they share one instance. Services stop when nothing references them anymore.
+- **Health checks.** Dagger health-checks a service before any client can connect, so there is no race between service startup and test execution.
+
+## Wiring a service into another module
+
+Generic modules can compose through workspace settings. If a module's constructor accepts an optional `Service`, you can wire another module's service into it with a DAG address. No glue module required.
+
+For example, a `docusaurus` module knows how to serve a documentation site, and a `playwright` module knows how to run browser tests against any web app it's given. Connect them in `dagger.toml`:
+
+```toml
+[modules.docusaurus]
+source = "github.com/example/docusaurus@v1.0"
+
+[modules.playwright]
+source = "github.com/example/playwright@v1.0"
+
+[modules.playwright.settings]
+app = "dag://docusaurus/serve"
+```
+
+The setting selects a `Service` artifact by its `dag://` address. In this example, `docusaurus` is the module's install name, the `[modules.docusaurus]` key in `dagger.toml`. The selected function must return a non-null `Service` and be reachable without required user input. Use `dagger list services` to find the services available to wire. When Dagger constructs `playwright`, it evaluates that artifact and passes the service as the `app` argument.
+
+This also works for `Container` constructor arguments. Select a `Container` artifact to share a common base image across modules.
+
+Because a module reference is an ordinary address string, the same value works as a CLI flag with no `dagger.toml` entry:
+
+```shell
+dagger api call playwright --app=dag://docusaurus/serve test
+```
+
+## Container-to-host networking
+
+A service defined in a module can be exposed to your local machine:
+
+```shell
+# Start an HTTP service and access it locally
+dagger start web
+curl http://localhost:80
+```
+
+## Host-to-container networking
+
+Containers running in Dagger can also connect to services on your host machine. This is useful for testing against a locally running database or API.
+
+A function exposes a host service by accepting it as an argument, using the `tcp://` or `udp://` provider to point at a host port:
+
+```shell
+# Make a database running on the host reachable from the function
+dagger api call integration-test --db=tcp://localhost:5432
+```
+
+Inside the function the argument is an ordinary `Service`, so the same code works whether the upstream runs on your host or in another container.

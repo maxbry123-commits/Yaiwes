@@ -1,0 +1,1084 @@
+# engine-lab: give a Dagger coding agent a from-source engine to debug against.
+#
+# A bash-less agent investigating engine bugs needs the loop a human gets from
+# `./hack/dev` + `./hack/with-dev` (see the `engine-debugging` skill): build
+# the engine and CLI from the workspace source, run commands against the live
+# engine, poke its debug endpoints, and re-run after edits. This module
+# reimplements that loop as @agent tools, following the same session-state
+# pattern as `modules/tui-qa/main.dang`:
+#
+#   - `start`/`restart`: build engine + CLI from the workspace and run the
+#     engine as a Service held as session state, with the `:6060/debug/...`
+#     endpoints enabled — the equivalent of `./hack/dev`.
+#   - `exec`: run a command in a client container bound to that engine, with
+#     the from-source `dagger` CLI on PATH — the equivalent of
+#     `./hack/with-dev ...`. It takes the (auto-injected) `Workspace!` itself,
+#     so the *current* tree — including edits made since `start` — is mounted
+#     fresh on every call. Freshness is structural, not procedural: the engine
+#     *binary* still only changes on `restart` (rebuilding is expensive and
+#     deliberate), but the files a command sees always match the workspace.
+#   - `query`: send raw GraphQL straight to the engine.
+#   - `debugGet`/`debugJq`: curl the engine's debug HTTP server (routes are
+#     defined in cmd/engine/debug.go).
+#   - `engineTest`: run engine tests via the engine-dev toolchain (spins its
+#     own ephemeral engine; independent of `start`), optionally recording a
+#     wcprof capture of that engine.
+#   - `dumpId`: build and run the repo's own `cmd/dump-id` against a file in
+#     the workspace — recipe forensics on a base64 call ID, with no engine
+#     needed.
+#   - `wcprofEnable`/`wcprofCapture`/`wcprofReport`: record the engine's
+#     wall-clock profile (engine/wcprof), fetch named dumps once into module
+#     state, and slice or compare them with the wcprof-report helper shipped
+#     in this module.
+#
+# Engine log access deliberately has no tool here: the engine service's spans
+# are discoverable via ListServices, and ReadLogs(span: ..., grep: ...) reads
+# them — the sandbox equivalent of `docker logs dagger-engine.dev | grep`.
+
+let defaultWorkdir = "/src"
+let debugPort = 6060
+# Where the wcprof-report helper is grafted into its build tree: Go import
+# paths can't have a leading-dot element, so it can't build in place under
+# .dagger/ (see wcprofReportBin).
+let wcprofReportPkg = "internal/enginelab/wcprofreport"
+
+# Where forwarded Dagger Cloud credentials are mounted. The CLI reads its
+# credentials from $XDG_CONFIG_HOME/dagger/credentials.json (see configRoot in
+# internal/cloud/auth/auth.go), so pointing XDG_CONFIG_HOME at a directory we
+# control is all it takes for a forwarded token to be found.
+let configHome = "/config"
+
+# Forward Dagger Cloud credentials and user config into a container. A no-op
+# when neither is configured.
+#
+# Mounted as secrets: credentials never land in a filesystem layer, and the
+# plaintext is only resolved (from the host, via the secret URI) when an exec
+# actually runs. The mounts are read-only; host-side updates are picked up by
+# the next tool call.
+let withCredentials(
+  ctr: Container!,
+  credentials: Secret,
+  daggerConfig: Secret,
+): Container! {
+  let configured = if (credentials == null and daggerConfig == null) {
+    ctr
+  } else {
+    ctr.withEnvVariable("XDG_CONFIG_HOME", configHome)
+  }
+  let withCloud = if (credentials == null) {
+    configured
+  } else {
+    configured.withMountedSecret(
+      configHome + "/dagger/credentials.json",
+      credentials,
+    )
+  }
+  if (daggerConfig == null) {
+    withCloud
+  } else {
+    withCloud.withMountedSecret(
+      configHome + "/dagger/config.toml",
+      daggerConfig,
+    )
+  }
+}
+
+type EngineLab {
+  # ---- session state (private so it isn't exposed as tools; persists across
+  # tool calls the same way tui-qa's `client`/`service` do) ------------------
+
+  # client container bound to the running engine service: from-source `dagger`
+  # CLI on PATH, curl + jq + git installed. Deliberately does NOT carry a
+  # workspace mount: the tree is mounted per-call from the caller's current
+  # Workspace, so no tool can ever run against a stale snapshot.
+  let client: Container! = container
+  # the started from-source engine service (null until `start`)
+  let engine: Service = null
+  # tcp://<host>:1234 address of the running engine, resolvable session-wide
+  # (digest hostname + session DNS domain) — the handoff other tools (e.g.
+  # tui-qa's `start`) use to attach to THIS engine ("" until `start`)
+  let engineEndpoint: String! = ""
+  # wcprof dumps fetched by `wcprofCapture`, named: wcprofDumps[i] is the
+  # capture named wcprofCaptureNames[i] (parallel lists, oldest first). Kept
+  # as module state rather than written to the workspace: a dump is tens of
+  # MB and only `wcprofReport` should ever read it. Module state outlives an
+  # engine `restart`, which is what makes before/after comparisons work.
+  # Re-capturing a name appends it again; lookups take the last match.
+  let wcprofCaptureNames: [String!]! = []
+  let wcprofDumps: [File!]! = []
+
+  # The skills shipped alongside this module (skills/<name>/SKILL.md), installed
+  # onto the agent's LLM instead of a static system prompt: the model discovers
+  # them with ListSkills and reads them with ReadSkill only when relevant, so
+  # the engine-lab workflow never pollutes context until it's actually needed.
+  let skills: Directory! = currentModule.source.directory("skills")
+
+  # Dagger Cloud credentials and user-level config forwarded into the `dagger`
+  # commands this module runs. Private so secrets are never exposed as fields
+  # or tool arguments: they are configuration, not something the model steers
+  # per call.
+  let cloudCredentials: Secret = null
+  let daggerConfig: Secret = null
+
+  new(
+    """
+    Dagger Cloud credentials for the from-source CLI — the contents of the
+    host's ~/.config/dagger/credentials.json — so debugging commands that talk
+    to Cloud (`dagger cloud ...`, Cloud-backed traces) runs authenticated
+    instead of logged out.
+
+    Wire it up in dagger.toml settings rather than passing it around:
+
+        [env.dev.modules.engine-lab.settings]
+        cloudCredentials = "file://~/.config/dagger/credentials.json"
+
+    Without it, the CLI runs logged out.
+    """
+    cloudCredentials: Secret = null,
+    """
+    User-level Dagger config for the from-source CLI — the contents of the
+    host's ~/.config/dagger/config.toml. This forwards LLM provider settings
+    into clients connected to a nested engine.
+    """
+    daggerConfig: Secret = null,
+  ) {
+    self.cloudCredentials = cloudCredentials
+    self.daggerConfig = daggerConfig
+    self
+  }
+
+  """
+  Compose the engine-lab tools onto a base LLM.
+  """
+  agent(base: LLM!): LLM! @agent {
+    base
+      .withTools(currentNode)
+      .withSkills(skills)
+  }
+
+  """
+  Build the dagger engine + CLI from the workspace source and run the engine
+  as a persistent service — the sandbox equivalent of `./hack/dev`.
+
+  The engine runs with its debug endpoints enabled (see `debugGet`/`debugJq`),
+  and a client container is prepared for `exec`/`query`: the from-source
+  `dagger` CLI on PATH, connected to the engine, with the workspace source
+  mounted at /src. After editing engine code, call `restart` to rebuild.
+  The engine's own logs are readable via ListServices + ReadLogs.
+  """
+  start(
+    source: Workspace!,
+  ): EngineLab! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): starting a service is a side effect that must actually run
+    # every invocation, not be served stale from the dagql session cache.
+    if (engine != null) {
+      engine.stop
+      print("Stopped previous engine service")
+    }
+
+    let srcDir = source.directory("/")
+    let dev = engineDev(ws: source)
+
+    # The from-source engine service. This replicates engine-dev's Service()
+    # (fresh state volume, engine entrypoint, incremented subnet for nesting)
+    # and adds --debugaddr, which the stock Playground service doesn't enable.
+    let svcDev = dev.incrementSubnet
+    let engineCtr = svcDev
+      .container
+      .withExposedPort(1234)
+      .withMountedCache(
+        "/var/lib/dagger",
+        cacheVolume("engine-lab-state-" + Random.string),
+      )
+    let engineArgs = [
+      "--addr", "tcp://0.0.0.0:1234",
+      "--network-name", "dagger-lab",
+      "--network-cidr", svcDev.networkCidr,
+      "--debugaddr", "0.0.0.0:" + toString(debugPort),
+    ]
+
+    let svc = engineCtr
+      .asService(args: engineArgs, useEntrypoint: true, insecureRootCapabilities: true)
+      .start
+
+    let host = svc.hostname
+
+    # The client container: installClient binds the engine service under the
+    # `dagger-engine` hostname and points _EXPERIMENTAL_DAGGER_RUNNER_HOST at
+    # it; we overwrite the CLI with our from-source build (same
+    # belt-and-suspenders as tui-qa). The workspace is NOT mounted here — the
+    # CLI and the engine binding are what's expensive and deliberate to pin,
+    # while the tree is re-mounted per call (see `withSource`).
+    let base = container
+      .from("alpine:3.20")
+      .withExec(["apk", "add", "--no-cache", "curl", "jq", "git"])
+    let cli = cliDev(ws: source, source: srcDir).binary
+
+    self.client = dev
+      .installClient(client: base, service: svc)
+      .withFile("/usr/local/bin/dagger", cli)
+    self.engine = svc
+    self.engineEndpoint = "tcp://" + host + ":1234"
+    print(
+      "Engine listening at " + self.engineEndpoint + " — pass this to the tui-qa start tool's `engineAddress` arg to QA the TUI" + " against THIS engine (debugGet/debugJq/ReadLogs then introspect the" + " same engine the TUI is driving).",
+    )
+    self
+  }
+
+  """
+  Rebuild the engine + CLI from the current workspace source and replace the
+  running engine service. Call after editing engine code, then re-run your
+  repro with `exec`. Breaks any TUI session attached to the old engine —
+  restart those after (the tui-qa start tool with the freshly printed
+  endpoint).
+  """
+  restart(
+    source: Workspace!,
+  ): EngineLab! @cache(policy: FunctionCachePolicy.Never) {
+    start(source: source)
+  }
+
+  """
+  The tcp://<host>:1234 address of the running engine, resolvable from any
+  container in this session. Pass it to the tui-qa start tool's `engineAddress` arg
+  to point a TUI session at this engine. Empty until the engine-lab start
+  tool runs.
+  """
+  endpoint: String! {
+    if (engineEndpoint == "") {
+      "No engine session. Call the engine-lab start tool first."
+    } else {
+      engineEndpoint
+    }
+  }
+
+  # NOTE: every tool that talks to the live engine MUST be
+  # @cache(policy: FunctionCachePolicy.Never). Without it, dagql memoizes the
+  # function result by (object id + field + args) across tool-call queries in
+  # the session, so a repeated call would reuse the first call's output
+  # instead of re-running. The nonce env var busts the exec cache underneath
+  # for the same reason (same trick as tui-qa).
+  """
+  Run a `dagger` command against the live from-source engine - the equivalent
+  of `./hack/with-dev ./bin/dagger ...`.
+  """
+  dagger(
+    source: Workspace!,
+    args: [String!]!,
+  ): Void @cache(policy: FunctionCachePolicy.Never) {
+    if (engine == null) {
+      print("No engine session. Call the engine-lab start tool first.")
+      return null
+    }
+    # Unset the session this exec gets to the engine running it, so the CLI
+    # uses the lab engine (see engine-dev's withoutOuterSession).
+    withSource(source)
+      .withExec(["env", "-u", "DAGGER_SESSION_PORT", "-u", "DAGGER_SESSION_TOKEN", "dagger"] + args)
+      .sync
+    null
+  }
+
+  """
+  Send a raw GraphQL query to the live from-source engine, via `dagger api
+  query` with no module loaded. Use for core API repros without CLI plumbing,
+  e.g. querying `version` or driving `container { ... }` chains directly.
+  """
+  query(
+    source: Workspace!,
+    graphql: String!,
+  ): Void @cache(policy: FunctionCachePolicy.Never) {
+    if (engine == null) {
+      print("No engine session. Call the engine-lab start tool first.")
+      return null
+    }
+    withSource(source)
+      .withExec(
+        ["env", "-u", "DAGGER_SESSION_PORT", "-u", "DAGGER_SESSION_TOKEN", "dagger", "api", "query", "--no-load-module"],
+        stdin: graphql,
+        expect: ReturnType.ANY,
+      )
+      .sync
+    null
+  }
+
+  """
+  GET a path from the live engine's debug HTTP server (routes are defined in
+  cmd/engine/debug.go), e.g. /debug/pprof/goroutine?debug=2 for hang triage or
+  /debug/dagql/cache for a cache snapshot. Returns the raw (tail-truncated)
+  response; prefer `debugJq` for large JSON.
+  """
+  debugGet(
+    path: String! = "/debug/pprof/",
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    if (engine == null) {
+      return "No engine session. Call the engine-lab start tool first."
+    }
+    client
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withExec([
+        "curl", "-s",
+        "--retry", "5", "--retry-delay", "2", "--retry-connrefused",
+        "--max-time", "120",
+        debugURL(path),
+      ])
+      .stdout
+  }
+
+  """
+  GET a JSON endpoint from the live engine's debug HTTP server and filter it
+  through jq, e.g. path /debug/dagql/cache with a filter selecting just the
+  fields under investigation. Keeps huge debug payloads out of context.
+  """
+  debugJq(
+    path: String!,
+    """
+    jq filter expression to apply to the response
+    """
+    filter: String! = ".",
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    if (engine == null) {
+      return "No engine session. Call the engine-lab start tool first."
+    }
+    # The URL and filter travel as env vars so no shell-quoting of user input
+    # is needed inside the sh -c script.
+    client
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withEnvVariable("ENGINE_LAB_DEBUG_URL", debugURL(path))
+      .withEnvVariable("ENGINE_LAB_JQ_FILTER", filter)
+      .withExec([
+        "sh", "-c",
+        "curl -s --retry 5 --retry-delay 2 --retry-connrefused --max-time 120 \"$ENGINE_LAB_DEBUG_URL\" | jq \"$ENGINE_LAB_JQ_FILTER\"",
+      ])
+      .stdout
+  }
+
+  """
+  Run engine tests via the engine-dev toolchain — the equivalent of `dagger
+  api call engine-dev test`. Rebuilds an ephemeral dev engine from the
+  workspace source and runs the tests against it (independent of `start`).
+  Keep runs tight: pkg ./core/integration with run TestSuite/TestSub. On
+  failure the error tail is returned; full test output lives in telemetry,
+  readable with ReadLogs on the failing span.
+
+  With `wcprofCapture` set, the test engine records wcprof from startup
+  (engine-dev's testProfile) and its dump is kept as a capture under that
+  name, exactly like `wcprofCapture` keeps one from the `start` engine: slice
+  it with `wcprofReport`, or `compare` it with another capture. Benchmark
+  tests gated on _DAGGER_BENCH run in this mode (select them with `run`). A
+  failing run still yields its capture; the result reports the exit code,
+  the output tail and the capture summary.
+  """
+  engineTest(
+    source: Workspace!,
+    """
+    Go package to test, e.g. ./core/integration
+    """
+    pkg: String! = "./...",
+    """
+    Regex selecting tests to run, e.g. TestSuite/TestSub
+    """
+    run: String! = "",
+    """
+    Enable verbose test output
+    """
+    testVerbose: Boolean! = false,
+    """
+    Profile the test engine with wcprof and keep the recording as a capture
+    under this name, e.g. "before" or "after" ("" = don't profile).
+    """
+    wcprofCapture: String! = "",
+  ): EngineLab! @cache(policy: FunctionCachePolicy.Never) {
+    # NOTE: engine-dev's test() and testProfile() are +cache="session" on its
+    # side, so an identical re-run in one session may be served from the
+    # session cache; any workspace edit changes the engine source and forces
+    # a real re-run.
+    let dev = engineDev(ws: source)
+    if (wcprofCapture == "") {
+      dev.test(pkg: pkg, run: run, testVerbose: testVerbose)
+      print("tests passed")
+      return self
+    }
+    let profiled = dev.testProfile(pkg: pkg, run: run, testVerbose: testVerbose)
+    let status = profiled.{{exitCode, output}}
+    # The dump is the same session-cached testProfile result, so reading it
+    # does not re-run the tests.
+    let dump = profiled.dump
+    let summary = wcprofRun(source, dump, ["-view", "summary", "-top", "8"])
+    let names = wcprofCaptureNames + [wcprofCapture]
+    self.wcprofCaptureNames = names
+    self.wcprofDumps = wcprofDumps + [dump]
+    let verdict = if (status.exitCode == 0) {
+      "tests passed"
+    } else {
+      "TESTS FAILED (exit " + toString(status.exitCode) + ")"
+    }
+    print(
+      verdict + "; output tail:\n" + tail(status.output, 80) + "\n\ncapture \"" + wcprofCapture + "\" (captures: " + names.uniq.join(", ") + ")\n" + summary,
+    )
+    self
+  }
+
+  """
+  Compile and run `./cmd/dump-id` from the workspace source: decode a dagql
+  call ID (a "recipe") and report on it.
+
+  `file` is a workspace-relative path to a file holding a base64 call ID. Modes
+  match the command's own flags; with none, the human-readable idtui dump is
+  printed.
+
+  The binary is compiled from the CURRENT workspace on every call, so edits to
+  cmd/dump-id take effect immediately. No engine session is needed.
+  """
+  dumpId(
+    source: Workspace!,
+    """
+    Workspace-relative path to a file containing a base64 call ID.
+    """
+    file: String!,
+    """
+    Emit per-field counts, chain depth and expansion (re-execution) counts —
+    the mode for "how many times does this recipe run that call?".
+    """
+    stats: Boolean! = false,
+    """
+    Emit the receiver spine, with ID-valued arguments expanded inline.
+    """
+    tree: Boolean! = false,
+    """
+    Emit the decoded callpbv1.DAG as structured JSON (lossless, and large).
+    """
+    jsonOutput: Boolean! = false,
+    """
+    Emit every call whose Type.field name matches this regexp, e.g. "spawn".
+    """
+    find: String! = "",
+    """
+    Structurally diff the input recipe against the recipe in this file.
+    """
+    diff: String! = "",
+    """
+    Truncate literal values to this many characters (0 = no truncation).
+    """
+    lit: Int! = 72,
+    """
+    Show at most this many trailing receiver selectors in a path (0 = all).
+    """
+    spine: Int! = 12,
+    """
+    In `tree`, only recurse this many levels into ID arguments (0 = unlimited).
+    """
+    depth: Int! = 0,
+    """
+    Keep at most this many lines of output (0 = unlimited).
+    """
+    limit: Int! = 300,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    let args: [String!]! = []
+    if (stats) { args += ["-stats"] }
+    if (tree) { args += ["-tree"] }
+    if (jsonOutput) { args += ["-json"] }
+    if (find != "") { args += ["-find", find] }
+    if (diff != "") { args += ["-diff", diff] }
+    args += [
+      "-lit", toString(lit),
+      "-spine", toString(spine),
+      "-depth", toString(depth),
+      file,
+    ]
+
+    let out = goEnv(source)
+      # The build is deliberately NOT nonce-busted: it is a pure function of
+      # the mounted source, so an unchanged tree replays from the exec cache
+      # and only the run below actually re-executes.
+      .withExec(["go", "build", "-o", "/usr/local/bin/dump-id", "./cmd/dump-id"])
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withExec(["dump-id"] + args)
+      .stdout
+    clip(out, limit)
+  }
+
+  """
+  Turn the live engine's engine-wide wcprof wall-clock recording on or off.
+  Engine-wide means every session is recorded, including a TUI or agent
+  session driving this engine — no `--profile` flag needed. Turning it off
+  keeps buffered events dumpable. Returns the recorder state.
+  """
+  wcprofEnable(
+    on: Boolean! = true,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    if (engine == null) {
+      return "No engine session. Call the engine-lab start tool first."
+    }
+    let v = if (on) { "on" } else { "off" }
+    client
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withExec([
+        "curl", "-sS", "--max-time", "30",
+        "-X", "POST", "-d", v,
+        debugURL("/debug/wcprof/enabled"),
+      ])
+      .stdout
+  }
+
+  """
+  Fetch the live engine's wcprof recording ONCE and keep it as private module
+  state for `wcprofReport`, under `name` (it is never written to the
+  workspace: dumps hold 100k+ ops). Returns a short summary: op count, span,
+  dropped events, call outcomes, top clients and top classes.
+
+  The loop: `wcprofEnable`, `wcprofCapture` (flush) to clear what was already
+  recorded, reproduce the workload, `wcprofCapture` again, then slice that
+  capture with `wcprofReport`. Captures are kept by name (re-using a name
+  replaces it) and survive `restart`, so capture "before", edit the engine,
+  `restart`, re-enable, reproduce, capture "after", then
+  `wcprofReport(view: "compare", capture: "after", against: "before")`.
+  """
+  wcprofCapture(
+    source: Workspace!,
+    """
+    Clear the engine's event buffer after dumping, so the next capture only
+    sees new work. Pass false to leave the buffer intact.
+    """
+    flush: Boolean! = true,
+    """
+    Name to keep the capture under, e.g. "before" or "after".
+    """
+    name: String! = "default",
+  ): EngineLab! @cache(policy: FunctionCachePolicy.Never) {
+    if (engine == null) {
+      print("No engine session. Call the engine-lab start tool first.")
+      return self
+    }
+    let flushArg = if (flush) { "1" } else { "0" }
+    # The endpoint answers 503 with a hint when recording was never enabled;
+    # surface that body instead of a bare curl failure.
+    let dump = client
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withEnvVariable("ENGINE_LAB_DEBUG_URL", debugURL("/debug/wcprof/dump?flush=" + flushArg))
+      .withExec([
+        "sh", "-c",
+        "code=$(curl -sS --max-time 300 -o /tmp/wcprof.dump -w '%{http_code}' \"$ENGINE_LAB_DEBUG_URL\") || exit 1; if [ \"$code\" != 200 ]; then cat /tmp/wcprof.dump >&2; exit 1; fi",
+      ])
+      .file("/tmp/wcprof.dump")
+    # Summarizing reads the dump, so the fetch (and flush) happens here and
+    # now, not lazily at the first report.
+    let summary = wcprofRun(source, dump, ["-view", "summary", "-top", "8"])
+    let names = wcprofCaptureNames + [name]
+    self.wcprofCaptureNames = names
+    self.wcprofDumps = wcprofDumps + [dump]
+    print("capture \"" + name + "\" (captures: " + names.uniq.join(", ") + ")\n" + summary)
+    self
+  }
+
+  """
+  Profile one `dagger` command and keep its wcprof recording as a capture:
+  the one-shot form of `start`, `wcprofEnable`, `wcprofCapture`, `dagger`,
+  `wcprofCapture`, for scripts.
+
+  Builds the engine and CLI from the workspace, runs a fresh engine that
+  records wcprof from startup, and runs `dagger <args>` against it with the
+  from-source CLI, in `workdir` (mounted at /work; default: the workspace
+  source). `warmup`, when given, runs first the same way and is left out of
+  the capture: use it to load the module so the capture holds only the
+  command. The capture is kept under `name`, like `wcprofCapture` keeps one:
+  slice it with `wcprofReport`, `compare` it, or get the file with
+  `wcprofDump`. A failing command still yields its capture; the result
+  reports the exit code and the output tail, so check them before trusting
+  the numbers. A failing warm-up fails the call.
+
+  Independent of `start`: the engine lives only for this call. Use the
+  result in the same pipeline (e.g. `| wcprofDump | export ...`): a later
+  statement of a `dagger -c` script that refers to a stored result can run
+  the profile again. To report on one profile from several statements,
+  export its dump once and load it back with `wcprofLoad`.
+  """
+  wcprofProfile(
+    source: Workspace!,
+    """
+    Arguments to `dagger`, e.g. ["call", "my-mod", "build"].
+    """
+    args: [String!]!,
+    """
+    Directory the command runs in (default: the workspace source).
+    """
+    workdir: Directory = null,
+    """
+    Arguments to a `dagger` command run before recording starts.
+    """
+    warmup: [String!]! = [],
+    """
+    Name to keep the capture under, e.g. "before" or "after".
+    """
+    name: String! = "default",
+    """
+    Cache volume for the engine's state, reused across calls that pass the
+    same name ("" = a fresh volume, so the engine starts cold). Each volume
+    keeps its engine's pulled images and builds until pruned; never share
+    one between engines running at once.
+    """
+    stateVolume: String! = "",
+  ): EngineLab! @cache(policy: FunctionCachePolicy.PerSession) {
+    let volume = if (stateVolume == "") {
+      "engine-lab-profile-state-" + Random.string
+    } else {
+      stateVolume
+    }
+    let dev = engineDev(ws: source)
+    let svcDev = dev.incrementSubnet
+    let svc = svcDev
+      .container
+      .withExposedPort(1234)
+      .withEnvVariable("_DAGGER_WCPROF", "1")
+      .withMountedCache(
+        "/var/lib/dagger",
+        cacheVolume(volume),
+      )
+      .asService(
+        args: [
+          "--addr", "tcp://0.0.0.0:1234",
+          "--network-name", "dagger-lab",
+          "--network-cidr", svcDev.networkCidr,
+          "--debugaddr", "0.0.0.0:" + toString(debugPort),
+        ],
+        useEntrypoint: true,
+        insecureRootCapabilities: true,
+      )
+      .start
+    let base = container
+      .from("alpine:3.20")
+      .withExec(["apk", "add", "--no-cache", "curl"])
+    let dir = workdir ?? source.directory("/")
+    let run = ["env", "-u", "DAGGER_SESSION_PORT", "-u", "DAGGER_SESSION_TOKEN", "dagger"]
+    let client = withCredentials(
+      dev.installClient(client: base, service: svc).withFile("/usr/local/bin/dagger", cliDev(ws: source, source: source.directory("/")).binary),
+      cloudCredentials,
+      daggerConfig,
+    )
+      # bust Dagger's exec cache so each session's profile actually runs
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withMountedDirectory("/work", dir)
+      .withWorkdir("/work")
+    let warmed = if (warmup.isEmpty) {
+      client
+    } else {
+      client.withExec(run + warmup)
+    }
+    let ran = warmed
+      # drop what the engine recorded before the command
+      .withExec(["curl", "-sSf", "--max-time", "300", "-o", "/dev/null", debugURL("/debug/wcprof/dump?flush=1")])
+      # a failing command still yields its profile, like engineTest's
+      .withExec(run + args, expect: ReturnType.ANY)
+    let status = ran.{{exitCode, combinedOutput}}
+    let dump = ran
+      .withExec(["curl", "-sSf", "--max-time", "300", "-o", "/tmp/wcprof.dump", debugURL("/debug/wcprof/dump?flush=0")])
+      .file("/tmp/wcprof.dump")
+      .sync
+    svc.stop
+    let summary = wcprofRun(source, dump, ["-view", "summary", "-top", "8"])
+    let names = wcprofCaptureNames + [name]
+    self.wcprofCaptureNames = names
+    self.wcprofDumps = wcprofDumps + [dump]
+    let verdict = if (status.exitCode == 0) {
+      "command succeeded"
+    } else {
+      "COMMAND FAILED (exit " + toString(status.exitCode) + ")"
+    }
+    print(
+      verdict + "; output tail:\n" + tail(status.combinedOutput, 40) + "\n\ncapture \"" + name + "\" (captures: " + names.uniq.join(", ") + ")\n" + summary,
+    )
+    self
+  }
+
+  """
+  The dump of a wcprof capture (`capture`, default the latest), to export
+  and analyze elsewhere.
+  """
+  wcprofDump(
+    """
+    Name of the capture ("" = the latest).
+    """
+    capture: String! = "",
+  ): File {
+    let idx = wcprofIndex(capture)
+    if (idx < 0) {
+      return null
+    }
+    wcprofDumps[idx]
+  }
+
+  """
+  Keep a wcprof dump file (e.g. one exported from `wcprofDump`, or fetched
+  from an engine's /debug/wcprof/dump) as a capture under `name`, to slice
+  with `wcprofReport` or `compare`. Needs no engine.
+  """
+  wcprofLoad(
+    source: Workspace!,
+    """
+    The dump file.
+    """
+    dump: File!,
+    """
+    Name to keep the capture under, e.g. "before" or "after".
+    """
+    name: String! = "default",
+  ): EngineLab! {
+    let summary = wcprofRun(source, dump, ["-view", "summary", "-top", "8"])
+    let names = wcprofCaptureNames + [name]
+    self.wcprofCaptureNames = names
+    self.wcprofDumps = wcprofDumps + [dump]
+    print("capture \"" + name + "\" (captures: " + names.uniq.join(", ") + ")\n" + summary)
+    self
+  }
+
+  # The index in wcprofDumps of the capture named `name` ("" = the latest),
+  # or -1. A re-captured name was appended again, so the last match wins.
+  let wcprofIndex(name: String!): Int! {
+    if (name == "") {
+      return wcprofDumps.length - 1
+    }
+    wcprofCaptureNames
+      .map { n, i => if (n == name) { i } else { -1 } }
+      .reduce(-1) { acc, i => if (i > acc) { i } else { acc } }
+  }
+
+  """
+  Report on a `wcprofCapture` (`capture`, default the latest) with the
+  wcprof-report helper, built from this module against the workspace's
+  engine/wcprof package. Views:
+
+  - `classes`: per op class (kind + class), count, self-time total/p50/max,
+    duration total/p50/max, duplicate executions and outcome counts
+    (hit/executed/joined/do_not_cache/...). `sortBy` self, count or dur.
+  - `breakdown`: for ops whose class matches `class` (required), their direct
+    children aggregated by class, and "shapes": groups of parent ops with an
+    identical child multiset, with count and p50 duration per shape — the
+    view for "what does each Query.node actually do?".
+  - `clients`: ops started per client over `buckets` time buckets, plus each
+    client's top classes.
+  - `tree`: one op's subtree (`op`, default the slowest matching op) with
+    durations and waits, `depth` levels below the root (1 = the direct
+    children). Children and waits print in start order, offset from their
+    parent (`+31.2ms`); a class with at least 4 siblings collapses runs of
+    them into one aggregate line. A call whose only content is its
+    call_exec shows as one node, "(exec N)", with the exec's children
+    directly under it. "▸ N" marks N unexpanded children (internal-kind
+    ops such as dagql.publishResult not counted).
+  - `children`: a flat table of one op's (`op`, default the slowest
+    matching op) direct children and waits — id, start offset from the
+    parent, duration, self, outcome, class — the view for "where did this
+    op's time go?". `sortBy` start (default), dur or self.
+  - `critpath`: the critical path — the chain of work an op's end actually
+    waited on. Walking back from its end, each step takes the child or wait
+    that ran latest, and recurses into it; waits into shared work (a
+    singleflight join, a lazy result, an exec) follow that work. Time no
+    blocker covers is the op's own. Roots are `op`, or every outermost op
+    matching the filters; per class, their on-path own time (which sums to
+    the roots' duration, unlike summed self time), then the longest root's
+    path, `depth` levels deep. Runs of segments under 1% of the path are
+    hidden when their total is too; otherwise their largest members print
+    and the rest fold into one line.
+  - `waits`: recorded waits (waiters matching the filters) by reason, by
+    target (op class or resource, e.g. a lock) and by waiter → target, with
+    count, total, p50 and max — lock contention, singleflight joins, lazy
+    results everyone blocks on. A call waiting on its own call_exec is left
+    out.
+  - `jq`: one JSON object per event with names resolved, piped through the
+    jq `filter` (with `slurp`, over the whole array). Ops look like
+    {"type":"op","id","kind","class","client","parent","parent_class",
+    "outcome","start_ms","dur_ms","self_ms","children",...}; waits are
+    {"type":"wait","waiter_class","target_class","reason","dur_ms",...} and
+    links {"type":"link","link",...}. jq runs with -c -r: objects and arrays
+    print as compact JSON, strings print raw, so end a filter in `@tsv` or a
+    string for plain-text rows. Output is capped at `limit` lines.
+  - `summary`: the capture summary again.
+  - `compare`: the capture against another (`against`, required): per
+    class, count, duration total, duration p50 and self total on each side,
+    with the delta or ratio, sorted by the largest absolute change in
+    duration total. The filters apply to both sides.
+
+  `class`, `excludeClass`, `client` and `kind` filter ops in every view (in
+  tree and children, they pick the root). Self time is an op's duration
+  minus its child ops and its waits; self_tot sums it across ops, concurrent
+  ones included, so it can exceed wall time. The summary and classes
+  rankings leave out internal-kind ops (engine bookkeeping such as
+  dagql.publishResult, whose summed self time would top every ranking)
+  unless `kind` is "internal". Times are relative to the capture's first
+  recorded op.
+  """
+  wcprofReport(
+    source: Workspace!,
+    """
+    classes, breakdown, clients, tree, children, critpath, waits, compare,
+    jq or summary.
+    """
+    view: String! = "classes",
+    """
+    Name of the capture to report on ("" = the latest).
+    """
+    capture: String! = "",
+    """
+    compare: name of the baseline capture, e.g. "before".
+    """
+    against: String! = "",
+    """
+    Regexp over op classes, e.g. "^Query.node$" or "withExec".
+    """
+    class: String! = "",
+    """
+    Regexp over op classes to leave out, e.g. "^Query[.]node$" (RE2 has no
+    lookahead, so this is how to say "everything except X").
+    """
+    excludeClass: String! = "",
+    """
+    Substring of the client ID (see the summary or the clients view).
+    """
+    client: String! = "",
+    """
+    Exact op kind: call, call_exec, lazy, exec, exec_phase, session_phase, ...
+    """
+    kind: String! = "",
+    """
+    tree/children/critpath: root op ID (0 = the slowest op matching the
+    filters; critpath: every outermost matching op).
+    """
+    op: Int! = 0,
+    """
+    tree/critpath: levels to print below the root (1 = its direct children).
+    """
+    depth: Int! = 6,
+    """
+    Rows per ranking (classes, clients, shapes, child classes).
+    """
+    top: Int! = 30,
+    """
+    classes: sort by self (default), count or dur. children: sort by start
+    (default), dur or self.
+    """
+    sortBy: String! = "",
+    """
+    clients: number of time buckets.
+    """
+    buckets: Int! = 10,
+    """
+    jq: the jq filter applied to each event (jq -c -r), e.g.
+    'select(.class == "Query.node") | [.id, .start_ms, .dur_ms] | @tsv'.
+    """
+    filter: String! = ".",
+    """
+    jq: slurp all events into one array first (jq -s), for aggregations.
+    """
+    slurp: Boolean! = false,
+    """
+    Keep at most this many lines of output (0 = unlimited).
+    """
+    limit: Int! = 200,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    if (wcprofDumps.isEmpty) {
+      return "No wcprof capture yet. Call wcprofEnable, reproduce the workload, then wcprofCapture."
+    }
+    let known = "captures: " + wcprofCaptureNames.uniq.join(", ")
+    let missing = "No wcprof capture named \"" + capture + "\" (" + known + ")."
+    let idx = wcprofIndex(capture)
+    if (idx < 0) {
+      return missing
+    }
+    let dump = wcprofDumps[idx]
+    if (dump == null) {
+      return missing
+    }
+    let name = wcprofCaptureNames[idx] ?? capture
+    let args = [
+      "-class", class,
+      "-exclude-class", excludeClass,
+      "-client", client,
+      "-kind", kind,
+      "-op", toString(op),
+      "-depth", toString(depth),
+      "-top", toString(top),
+      "-sort", sortBy,
+      "-buckets", toString(buckets),
+    ]
+    if (view == "compare") {
+      if (against == "") {
+        return "compare needs `against`: the name of the baseline capture (" + known + ")."
+      }
+      let baseMissing = "No wcprof capture named \"" + against + "\" (" + known + ")."
+      let baseIdx = wcprofIndex(against)
+      if (baseIdx < 0) {
+        return baseMissing
+      }
+      let base = wcprofDumps[baseIdx]
+      if (base == null) {
+        return baseMissing
+      }
+      return wcprofExec(
+        wcprofRunner(source, dump).withMountedFile("/tmp/against.dump", base),
+        [
+          "-view", "compare", "-limit", toString(limit),
+          "-name", name, "-against-name", against, "-against", "/tmp/against.dump",
+        ] + args,
+      )
+    }
+    if (view != "jq") {
+      return wcprofRun(source, dump, ["-view", view, "-limit", toString(limit)] + args)
+    }
+    # -r prints string results raw, so filters ending in a string or @tsv
+    # read as plain text; with -c, objects and arrays stay compact JSON.
+    let jqFlags = if (slurp) { "-c -r -s" } else { "-c -r" }
+    # The filter travels as an env var and the helper args as "$@", so no
+    # user input is shell-quoted. Clipping happens in the container, so a
+    # broad filter never ships the whole dump back as a string.
+    wcprofRunner(source, dump)
+      .withEnvVariable("WCPROF_JQ_FILTER", filter)
+      .withEnvVariable("WCPROF_JQ_FLAGS", jqFlags)
+      .withEnvVariable("WCPROF_LIMIT", toString(limit))
+      .withExec(
+        [
+          "sh", "-c",
+          "set -o pipefail; wcprof-report -view events \"$@\" /tmp/wcprof.dump | jq $WCPROF_JQ_FLAGS \"$WCPROF_JQ_FILTER\" > /tmp/out || exit 1; n=$(wc -l < /tmp/out); if [ \"$WCPROF_LIMIT\" -gt 0 ] && [ \"$n\" -gt \"$WCPROF_LIMIT\" ]; then head -n \"$WCPROF_LIMIT\" /tmp/out; echo \"… ($((n - WCPROF_LIMIT)) more lines truncated; raise limit, or narrow with class/client/kind or the filter) …\"; else cat /tmp/out; fi",
+          "sh",
+        ] + args,
+      )
+      .stdout
+  }
+
+  """
+  Test the wcprof-report helper, in the same tree it is built in.
+  """
+  wcprofReportTest(source: Workspace!): Void @check {
+    goEnvAt(wcprofReportTree(source))
+      .withExec(["go", "test", "-race", "-v", "./" + wcprofReportPkg])
+      .sync
+    null
+  }
+
+  # A self-call (`engineLab`) yields the module's own type as it lives in the
+  # runtime schema — a Dagger.EngineLab, which carries a GraphQL id and
+  # implements Node. Declaring the return as Dagger.EngineLab! (rather than
+  # the bare local EngineLab!) makes the annotation match what the self-call
+  # actually produces.
+  """
+  Stop the engine session and release the underlying service.
+  """
+  stop: Dagger.EngineLab! @cache(policy: FunctionCachePolicy.Never) {
+    if (engine != null) {
+      engine.stop
+      print("Stopped engine service")
+    }
+    engineLab
+  }
+
+  # ---- helpers ------------------------------------------------------------
+
+  # The pinned client with the CALLER'S CURRENT workspace mounted at /src.
+  #
+  # This is the fix for a nasty class of bug: when the client container was
+  # built once (at `start`) with the workspace snapshot of that moment, every
+  # later `exec` silently ran a stale tree — three successive edits to a
+  # fixture "failing" with the byte-identical error, and even `cp -r /src/...`
+  # inside the container propagating the staleness. Taking `source:
+  # Workspace!` on each tool means the current tree (including edits made
+  # since `start`) is re-injected on every call, structurally.
+  let withSource(source: Workspace!): Container! {
+    withCredentials(client, cloudCredentials, daggerConfig)
+      # bust Dagger's exec cache so each call actually re-runs
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withMountedDirectory(defaultWorkdir, source.directory("/"))
+      .withWorkdir(defaultWorkdir)
+  }
+
+  let debugURL(path: String!): String! {
+    "http://dagger-engine:" + toString(debugPort) + path
+  }
+
+  # A Go toolchain with the caller's CURRENT workspace mounted at /src, for
+  # building the repo's own commands (cmd/dump-id today).
+  #
+  # Share go-cli's Go toolchain and module/build caches with the other dev
+  # tools, so repeated builds can reuse their downloaded modules and objects.
+  let goEnv(source: Workspace!): Container! {
+    goEnvAt(source.directory("/"))
+  }
+
+  let goEnvAt(dir: Directory!): Container! {
+    goCli
+      .base
+      .withMountedDirectory(defaultWorkdir, dir)
+      .withWorkdir(defaultWorkdir)
+  }
+
+  # The wcprof-report helper (wcprof-report/ in this module), built against
+  # the CURRENT workspace's engine/wcprof so it always reads the dump format
+  # of the engine being profiled. The offline analyzer moved out of the repo
+  # in #13588, so the helper ships with this module and is grafted into a
+  # minimal build tree (go.mod/go.sum + engine/wcprof, both stdlib-only): the
+  # build only re-runs when those or the helper change. Static, so it runs
+  # in the alpine+jq runner.
+  let wcprofReportBin(source: Workspace!): File! {
+    goEnvAt(wcprofReportTree(source))
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withExec(["go", "build", "-o", "/out/wcprof-report", "./" + wcprofReportPkg])
+      .file("/out/wcprof-report")
+  }
+
+  let wcprofReportTree(source: Workspace!): Directory! {
+    let ws = source.directory("/")
+    directory
+      .withFile("go.mod", ws.file("go.mod"))
+      .withFile("go.sum", ws.file("go.sum"))
+      .withDirectory("engine/wcprof", ws.directory("engine/wcprof"))
+      .withDirectory(wcprofReportPkg, currentModule.source.directory("wcprof-report"))
+  }
+
+  # A container with the helper, jq, and a dump at /tmp/wcprof.dump. Not
+  # nonce-busted: a report is a pure function of the binary, dump and args.
+  let wcprofRunner(source: Workspace!, dump: File!): Container! {
+    container
+      .from("alpine:3.20")
+      .withExec(["apk", "add", "--no-cache", "--quiet", "jq"])
+      .withFile("/usr/local/bin/wcprof-report", wcprofReportBin(source))
+      .withMountedFile("/tmp/wcprof.dump", dump)
+  }
+
+  # The report goes to a file rather than stdout so the exec's own log stays
+  # empty: wcprofCapture prints the summary, and a stdout copy would show up
+  # in the tool output a second time.
+  let wcprofRun(source: Workspace!, dump: File!, args: [String!]!): String! {
+    wcprofExec(wcprofRunner(source, dump), args)
+  }
+
+  # Run the helper on /tmp/wcprof.dump in a runner (which may mount more,
+  # e.g. a compare baseline).
+  let wcprofExec(runner: Container!, args: [String!]!): String! {
+    runner
+      .withExec(
+        ["sh", "-c", "wcprof-report \"$@\" /tmp/wcprof.dump > /tmp/wcprof.out", "sh"] + args,
+      )
+      .file("/tmp/wcprof.out")
+      .contents
+  }
+
+  # Head-truncate a report to keep tool results context-friendly. Head, not
+  # tail: dump-id's modes lead with what a caller came for (the stats totals,
+  # the tree's root spine, the first matches), unlike the exec output the rest
+  # of this module returns, where the error is at the end.
+  let clip(s: String!, lines: Int!): String! {
+    let all = s.split("\n")
+    if (lines <= 0 or all.length <= lines) {
+      s
+    } else {
+      let dropped = toString(all.length - lines)
+      all.takeFirst(lines).join("\n") + "\n… (" + dropped + " more lines truncated; raise `limit`, or narrow" + " the report with `find`/`spine`/`depth`) …"
+    }
+  }
+
+  # Tail-truncate test output: unlike a report, its verdict is at the end.
+  let tail(s: String!, lines: Int!): String! {
+    let all = s.split("\n")
+    if (all.length <= lines) {
+      s
+    } else {
+      "… (" + toString(all.length - lines) + " earlier lines omitted) …\n" + all.takeLast(lines).join("\n")
+    }
+  }
+}

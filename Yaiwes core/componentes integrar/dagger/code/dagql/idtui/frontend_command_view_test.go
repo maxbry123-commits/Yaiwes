@@ -1,0 +1,650 @@
+package idtui
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/dagger/dagger/dagql/dagui"
+	sessionprompt "github.com/dagger/dagger/engine/session/prompt"
+	"github.com/muesli/termenv"
+	"github.com/vito/tuist"
+)
+
+func TestPushConfirmationAboveInput(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	t.Setenv("NO_COLOR", "1")
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(120, 40))
+	fe.setupTUI()
+	fe.startShell(t.Context(), stubShellHandler{})
+	defer fe.stopShell()
+	fe.textInput.SetValue("unfinished draft")
+	allowed := false
+	question := "Allow push to ssh://root@172.17.0.9/qa/remote.git @ refs/heads/approval-qa?"
+	field := NewExplicitConfirm("Yes", "No", &allowed).Title(question).Inline(true)
+	form := huh.NewForm(huh.NewGroup(field))
+	fe.handlePromptForm(form, func(*huh.Form) {})
+	active := fe.activeForm
+	for range 5 {
+		fe.tui.Step()
+		time.Sleep(10 * time.Millisecond)
+	}
+	frame := ansi.Strip(strings.Join(fe.tui.Step(), "\n"))
+	questionAt, inputAt := strings.Index(frame, question), strings.Index(frame, "unfinished draft")
+	if questionAt < 0 || inputAt < questionAt {
+		t.Fatalf("question must precede input:\n%s", frame)
+	}
+	if !strings.Contains(frame, "▶ No") || allowed {
+		t.Fatalf("permission must default to No:\n%s\nfield=%q form=%q", frame, field.View(), form.View())
+	}
+	// Long targets must wrap rather than hiding choices or the end of a ref.
+	field.WithWidth(40)
+	wrapped := ansi.Strip(field.View())
+	if !strings.Contains(wrapped, "▶ No") || !strings.Contains(strings.ReplaceAll(wrapped, "\n", ""), "refs/heads/approval-qa?") {
+		t.Fatalf("narrow confirmation clipped the target or choices: %q", wrapped)
+	}
+	fe.cancelPromptForm(active.request)
+	if fe.textInput.Value() != "unfinished draft" || fe.activeForm != nil {
+		t.Fatal("dismissal must preserve the input and remove the question")
+	}
+}
+
+func TestPushConfirmationReportMode(t *testing.T) {
+	fe := NewWithDB(io.Discard, dagui.NewDB())
+	fe.reportOnly = true
+	allowed := false
+	if err := fe.HandlePrompt(context.Background(), "Allow push?", "", &allowed); !errors.Is(err, ErrNonInteractive) {
+		t.Fatalf("report mode approval = %v", err)
+	}
+	if allowed {
+		t.Fatal("report mode granted permission")
+	}
+}
+
+func TestCheckpointSelectAboveInput(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(120, 40))
+	fe.setupTUI()
+	fe.startShell(t.Context(), stubShellHandler{})
+	defer fe.stopShell()
+	fe.textInput.SetValue("unfinished draft")
+	form, selected, err := sessionprompt.SelectForm(&sessionprompt.SelectRequest{
+		Title: "Checkpoint selection", Prompt: "Local files stay untouched.",
+		Choices: []*sessionprompt.SelectChoice{{Id: "include", Label: "Include"}, {Id: "drop", Label: "Drop"}, {Id: "cancel", Label: "Cancel"}}, DefaultChoice: "cancel",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fe.handlePromptForm(form, func(*huh.Form) {})
+	active := fe.activeForm
+	for range 5 {
+		fe.tui.Step()
+		time.Sleep(10 * time.Millisecond)
+	}
+	frame := ansi.Strip(strings.Join(fe.tui.Step(), "\n"))
+	for _, label := range []string{"Include", "Drop", "Cancel"} {
+		if !strings.Contains(frame, label) {
+			t.Fatalf("missing %s: %s", label, frame)
+		}
+	}
+	if *selected != "cancel" {
+		t.Fatal("must default to Cancel")
+	}
+	if strings.Index(frame, "Checkpoint selection") > strings.Index(frame, "unfinished draft") {
+		t.Fatal("choice must appear above input")
+	}
+	form.GetFocusedField().Update(tea.KeyMsg{Type: tea.KeyUp})
+	if *selected != "drop" {
+		t.Fatal("up should select Drop")
+	}
+	fe.cancelPromptForm(active.request)
+	if fe.textInput.Value() != "unfinished draft" {
+		t.Fatal("must preserve draft")
+	}
+}
+
+func TestPushPassphraseMaskedAboveInput(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(120, 40))
+	fe.setupTUI()
+	fe.startShell(t.Context(), stubShellHandler{})
+	defer fe.stopShell()
+	fe.textInput.SetValue("unfinished draft")
+	var passphrase string
+	field := huh.NewInput().Title("SSH key passphrase").EchoMode(huh.EchoModePassword).Value(&passphrase)
+	form := huh.NewForm(huh.NewGroup(field))
+	fe.handlePromptForm(form, func(*huh.Form) {})
+	active := fe.activeForm
+	for range 5 {
+		fe.tui.Step()
+		time.Sleep(10 * time.Millisecond)
+	}
+	field.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("fixture-secret")})
+	frame := ansi.Strip(strings.Join(fe.tui.Step(), "\n"))
+	if passphrase != "fixture-secret" || strings.Contains(frame, passphrase) {
+		t.Fatal("passphrase input must accept text without displaying it")
+	}
+	questionAt, inputAt := strings.Index(frame, "SSH key passphrase"), strings.Index(frame, "unfinished draft")
+	if questionAt < 0 || inputAt < questionAt {
+		t.Fatal("passphrase form must appear above the input")
+	}
+	fe.cancelPromptForm(active.request)
+	if fe.textInput.Value() != "unfinished draft" || fe.activeForm != nil {
+		t.Fatal("dismissal must preserve the draft and remove the secret form")
+	}
+}
+
+func TestPushConfirmationCancellation(t *testing.T) {
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(120, 40))
+	fe.setupTUI()
+	fe.startShell(t.Context(), stubShellHandler{})
+	defer fe.stopShell()
+	fe.textInput.SetValue("keep this draft")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		allowed := false
+		done <- fe.HandlePrompt(ctx, "", "Allow push?", &allowed)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for fe.activeForm == nil && time.Now().Before(deadline) {
+		fe.tui.Step()
+		time.Sleep(time.Millisecond)
+	}
+	if fe.activeForm == nil {
+		t.Fatal("confirmation was not mounted")
+	}
+	cancel()
+	for time.Now().Before(deadline) {
+		fe.tui.Step()
+		select {
+		case err := <-done:
+			fe.tui.Step() // drain dismissal queued before the handler returned
+			if !errors.Is(err, context.Canceled) || fe.activeForm != nil || fe.textInput.Value() != "keep this draft" {
+				t.Fatalf("canceled prompt: err=%v form=%v draft=%q", err, fe.activeForm, fe.textInput.Value())
+			}
+			return
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Fatal("canceled confirmation did not return")
+}
+
+// mountBoolPrompt shows a bool prompt through HandlePrompt and waits until the
+// form is mounted. The returned cancel dismisses it.
+func mountBoolPrompt(t *testing.T, fe *frontendPretty, title, message string) context.CancelFunc {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		allowed := false
+		_ = fe.HandlePrompt(ctx, title, message, &allowed)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for fe.activeForm == nil && time.Now().Before(deadline) {
+		fe.tui.Step()
+		time.Sleep(time.Millisecond)
+	}
+	if fe.activeForm == nil {
+		cancel()
+		t.Fatal("confirmation was not mounted")
+	}
+	return cancel
+}
+
+func TestPushConfirmationSpacing(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	t.Setenv("NO_COLOR", "1")
+	for _, tc := range []struct {
+		name       string
+		promptMode bool
+		// Rows between the question and the draft: the prompt frame opens with
+		// its separator line carrying the key hint, and the shaded frame adds
+		// its padding row.
+		blanksBelow int
+	}{
+		{name: "framed", promptMode: true, blanksBelow: 2},
+		{name: "plain", promptMode: false, blanksBelow: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(120, 40))
+			fe.setupTUI()
+			fe.startShell(t.Context(), &imagePromptHandler{mode: tc.promptMode})
+			defer fe.stopShell()
+			fe.textInput.SetValue("unfinished draft")
+			question := "Allow push to git@example.com:repo @ refs/heads/main?"
+			cancel := mountBoolPrompt(t, fe, "", question)
+			defer cancel()
+			for range 5 {
+				fe.tui.Step()
+				time.Sleep(10 * time.Millisecond)
+			}
+			lines := strings.Split(ansi.Strip(strings.Join(fe.tui.Step(), "\n")), "\n")
+			questionAt, draftAt := -1, -1
+			for i, line := range lines {
+				if questionAt < 0 && strings.Contains(line, question) {
+					questionAt = i
+				}
+				if strings.Contains(line, "unfinished draft") {
+					draftAt = i
+				}
+			}
+			frame := strings.Join(lines, "\n")
+			if questionAt < 1 || draftAt < questionAt {
+				t.Fatalf("question must follow a line and precede the draft:\n%s", frame)
+			}
+			if strings.TrimSpace(lines[questionAt-1]) != "" {
+				t.Fatalf("question must have a blank line above it:\n%s", frame)
+			}
+			if questionAt >= 2 && strings.TrimSpace(lines[questionAt-2]) == "" {
+				t.Fatalf("question must have exactly one blank line above it:\n%s", frame)
+			}
+			if got := draftAt - questionAt - 1; got != tc.blanksBelow {
+				t.Fatalf("rows between question and draft = %d, want %d:\n%s", got, tc.blanksBelow, frame)
+			}
+			for i, line := range lines[questionAt+1 : draftAt] {
+				want := ""
+				if i == 0 {
+					want = ansi.Strip(fe.keymapHint())
+				}
+				if strings.TrimSpace(line) != want {
+					t.Fatalf("unexpected content between question and draft:\n%s", frame)
+				}
+			}
+		})
+	}
+}
+
+// TestShellAnchorsStatusLineAtBottom: the shell hides the keymap bar, so the
+// status line (and its agent tabs) sits on the bottom row -- even while a form
+// is up, whose keys the keymap bubble lists instead.
+func TestShellAnchorsStatusLineAtBottom(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	t.Setenv("NO_COLOR", "1")
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(100, 30))
+	fe.setupTUI()
+	fe.startShell(t.Context(), &imagePromptHandler{mode: true})
+	defer fe.stopShell()
+	const model = "test-model"
+	fe.statusLine.SetData(StatusLineData{Model: model})
+	cancel := mountBoolPrompt(t, fe, "", "Allow push?")
+	defer cancel()
+	for range 5 {
+		fe.tui.Step()
+		time.Sleep(10 * time.Millisecond)
+	}
+	lines := strings.Split(ansi.Strip(strings.Join(fe.tui.Step(), "\n")), "\n")
+	frame := strings.Join(lines, "\n")
+	if !strings.Contains(lines[len(lines)-1], model) {
+		t.Fatalf("status line must be the bottom row:\n%s", frame)
+	}
+	if strings.Contains(frame, "enter submit") {
+		t.Fatalf("form keys must not render outside the keymap bubble:\n%s", frame)
+	}
+	fe.toggleKeymap()
+	if frame := ansi.Strip(strings.Join(fe.tui.Step(), "\n")); !strings.Contains(frame, "enter") || !strings.Contains(frame, "submit") {
+		t.Fatalf("keymap bubble must list the form's keys:\n%s", frame)
+	}
+}
+
+func TestPushConfirmationHighlightsForcePush(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+	theme := frontendFormTheme()
+	question := explicitConfirmQuestionStyle(&theme.Focused)
+	if got := question.GetForeground(); got != lipgloss.Color("3") || question.GetItalic() {
+		t.Fatalf("approval question style: fg=%v italic=%v, want yellow upright", got, question.GetItalic())
+	}
+	danger := explicitConfirmDangerStyle(question)
+
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), tuist.NewHeadlessTerminal(120, 40))
+	fe.setupTUI()
+	fe.startShell(t.Context(), stubShellHandler{})
+	defer fe.stopShell()
+
+	// A ref named after the phrase must not be flagged on a regular push.
+	cancel := mountBoolPrompt(t, fe, "", "Allow push to git@example.com:repo @ refs/heads/force-push?")
+	view := fe.activeForm.model.View()
+	if !strings.Contains(view, question.Render("Allow push to git@example.com:repo @ refs/heads/force-push?")) {
+		t.Fatalf("regular push question is not uniformly yellow: %q", view)
+	}
+	if strings.Contains(view, danger.Render(forcePushPhrase)) {
+		t.Fatalf("regular push flagged as a force-push: %q", view)
+	}
+	fe.cancelPromptForm(fe.activeForm.request)
+	cancel()
+
+	cancel = mountBoolPrompt(t, fe, "", "Allow force-push to git@example.com:repo @ refs/heads/main?")
+	defer cancel()
+	view = fe.activeForm.model.View()
+	want := question.Render("Allow ") + danger.Render("force-push") + question.Render(" to git@example.com:repo @ refs/heads/main?")
+	if !strings.Contains(view, want) {
+		t.Fatalf("force-push is not red within a yellow question:\ngot  %q\nwant %q", view, want)
+	}
+}
+
+func TestFrontendFormThemeUsesStructuralFocusMarkers(t *testing.T) {
+	theme := frontendFormTheme()
+	if _, ok := theme.Focused.FocusedButton.GetBackground().(lipgloss.NoColor); !ok {
+		t.Fatal("focused button still has a background")
+	}
+	if _, ok := theme.Focused.BlurredButton.GetBackground().(lipgloss.NoColor); !ok {
+		t.Fatal("inactive button still has a background")
+	}
+	if _, ok := theme.Blurred.FocusedButton.GetBackground().(lipgloss.NoColor); !ok {
+		t.Fatal("button in an unfocused confirmation still has a background")
+	}
+	if theme.Focused.Base.GetBorderLeft() {
+		t.Fatal("focused form field still has a left border")
+	}
+	if theme.Blurred.Base.GetBorderLeft() {
+		t.Fatal("blurred form field still reserves a left border")
+	}
+	if theme.Focused.Base.GetPaddingLeft() != 0 || theme.Blurred.Base.GetPaddingLeft() != 0 {
+		t.Fatal("form fields still reserve a leading padding column")
+	}
+	if !theme.Focused.FocusedButton.GetBold() || theme.Focused.BlurredButton.GetBold() {
+		t.Fatal("only the focused confirmation choice should be bold")
+	}
+	if strings.Contains(theme.Blurred.MultiSelectSelector.String(), ">") {
+		t.Fatal("blurred multi-select still has a selection caret")
+	}
+	if got := theme.Focused.MultiSelectSelector.String(); got != "▶ " {
+		t.Fatalf("focused multi-select selector = %q, want %q", got, "▶ ")
+	}
+}
+
+func TestFrontendFormKeymapNamesSpaceToggle(t *testing.T) {
+	keymap := frontendFormKeyMap()
+	if got := keymap.MultiSelect.Toggle.Help().Key; got != "space" {
+		t.Fatalf("multi-select toggle key = %q, want space", got)
+	}
+}
+
+func TestAbortedFormInterrupts(t *testing.T) {
+	form := huh.NewForm(huh.NewGroup(huh.NewConfirm()))
+	form.State = huh.StateAborted
+	err := formCompletionError(form)
+	if !errors.Is(err, ErrInterrupted) || !errors.Is(err, huh.ErrUserAborted) {
+		t.Fatalf("aborted form returned %v", err)
+	}
+}
+
+func TestExplicitConfirmHasTextualSelectionAndAccessibleLabels(t *testing.T) {
+	selected := true
+	field := NewExplicitConfirm("Install selected", "Skip", &selected)
+	field.WithTheme(frontendFormTheme())
+	if got := field.View(); strings.Contains(got, "▶") {
+		t.Fatalf("unfocused confirmation has a selection caret:\n%s", got)
+	}
+
+	field.Focus()
+	if got := field.View(); !strings.Contains(got, "▶ Install selected") || strings.Contains(got, "▶ Skip") || strings.Contains(got, "[") {
+		t.Fatalf("affirmative selection is not explicit:\n%s", got)
+	}
+
+	selected = false
+	if got := field.View(); !strings.Contains(got, "▶ Skip") || strings.Contains(got, "▶ Install selected") || strings.Contains(got, "[") {
+		t.Fatalf("negative selection is not explicit:\n%s", got)
+	}
+	field.Blur()
+	if got := field.View(); strings.Contains(got, "▶") {
+		t.Fatalf("blurred confirmation retained its selection caret:\n%s", got)
+	}
+	var help strings.Builder
+	for _, binding := range field.KeyBinds() {
+		help.WriteString(binding.Help().Key)
+		help.WriteString(binding.Help().Desc)
+	}
+	if got := help.String(); strings.ContainsAny(got, "[]▶") || !strings.Contains(got, "Install selected") || !strings.Contains(got, "Skip") {
+		t.Fatalf("confirmation keymap labels are not semantic: %q", got)
+	}
+	if strings.Contains(help.String(), "back") || strings.Contains(help.String(), "next") {
+		t.Fatalf("confirmation keymap includes redundant field navigation: %q", help.String())
+	}
+
+	var output bytes.Buffer
+	if err := field.RunAccessible(&output, strings.NewReader("n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "Install selected") || !strings.Contains(got, "Skip") {
+		t.Fatalf("accessible prompt does not name both actions:\n%s", got)
+	}
+}
+
+func TestExplicitConfirmTitleIsSubtleHeader(t *testing.T) {
+	theme := frontendFormTheme()
+	style := explicitConfirmTitleStyle(&theme.Focused)
+	if !style.GetBold() || !style.GetItalic() {
+		t.Fatal("confirmation title is not bold and italic")
+	}
+	if got := style.GetForeground(); got != lipgloss.Color("8") {
+		t.Fatalf("confirmation title foreground = %v, want ANSI bright black", got)
+	}
+}
+
+func TestExplicitConfirmTitleLink(t *testing.T) {
+	selected := true
+	field := NewExplicitConfirm("Yes", "No", &selected).
+		Title("Log in to Dagger Cloud?").
+		TitleLink("https://dagger.io/cloud")
+	if got := field.View(); !strings.Contains(got, ansi.SetHyperlink("https://dagger.io/cloud")) {
+		t.Fatalf("confirmation title is not linked: %q", got)
+	}
+}
+
+func TestExplicitChoiceHasOneTextualSelection(t *testing.T) {
+	choice := "login"
+	field := NewExplicitChoice(&choice,
+		huh.NewOption("Log in", "login"),
+		huh.NewOption("Not now", "not-now"),
+		huh.NewOption("Never ask again", "never"),
+	)
+	field.WithTheme(frontendFormTheme())
+	field.WithKeyMap(huh.NewDefaultKeyMap())
+	field.Focus()
+	if got := field.View(); strings.Count(got, "▶") != 1 || !strings.Contains(got, "▶ Log in") {
+		t.Fatalf("choice does not identify exactly one selection:\n%s", got)
+	}
+
+	field.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if got := field.View(); strings.Count(got, "▶") != 1 || !strings.Contains(got, "▶ Not now") {
+		t.Fatalf("right did not move the explicit selection:\n%s", got)
+	}
+	field.Blur()
+	if got := field.View(); strings.Contains(got, "▶") {
+		t.Fatalf("blurred choice retained its selection caret:\n%s", got)
+	}
+}
+
+func TestFormFieldsFlowWithVerticalKeys(t *testing.T) {
+	downKeys := map[string]tea.KeyMsg{
+		"down":   {Type: tea.KeyDown},
+		"j":      {Type: tea.KeyRunes, Runes: []rune{'j'}},
+		"ctrl+n": {Type: tea.KeyCtrlN},
+	}
+	for name, keyMsg := range downKeys {
+		t.Run(name, func(t *testing.T) {
+			var selected []string
+			multi := NewFlowMultiSelect(
+				huh.NewMultiSelect[string]().
+					Options(
+						huh.NewOption("one", "one"),
+						huh.NewOption("two", "two"),
+					).
+					Value(&selected),
+				"two",
+			)
+			multi.WithKeyMap(huh.NewDefaultKeyMap())
+			multi.Focus()
+			if _, cmd := multi.Update(keyMsg); cmd != nil {
+				t.Fatalf("%s before the final option advanced to the next field", name)
+			}
+			if hovered, ok := multi.Hovered(); !ok || hovered != "two" {
+				t.Fatalf("%s did not reach final option: %q, %v", name, hovered, ok)
+			}
+			if _, cmd := multi.Update(keyMsg); cmd == nil {
+				t.Fatalf("%s on the final option did not advance to the next field", name)
+			}
+		})
+	}
+
+	upKeys := map[string]tea.KeyMsg{
+		"up":     {Type: tea.KeyUp},
+		"k":      {Type: tea.KeyRunes, Runes: []rune{'k'}},
+		"ctrl+p": {Type: tea.KeyCtrlP},
+	}
+	for name, keyMsg := range upKeys {
+		t.Run(name, func(t *testing.T) {
+			install := true
+			confirm := NewExplicitConfirm("Install selected", "Skip", &install)
+			confirm.Focus()
+			if _, cmd := confirm.Update(keyMsg); cmd == nil {
+				t.Fatalf("%s from the confirmation did not return to the previous field", name)
+			}
+		})
+	}
+}
+
+func TestMountedFormUpdatesKeymapAndUsesNaturalHeight(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	fe := NewWithDB(io.Discard, dagui.NewDB())
+	fe.setupTUI()
+	if before := strings.Join(fe.tui.RenderLines(), "\n"); !strings.Contains(before, "verbosity") {
+		t.Fatalf("initial keymap did not render navigation keys:\n%s", before)
+	}
+
+	apply := true
+	form := NewForm(huh.NewGroup(
+		NewExplicitConfirm("Apply", "Discard", &apply).Title("Apply changes?"),
+	))
+	fe.window.Height = 40
+	fe.handlePromptForm(form, func(*huh.Form) {})
+	after := strings.Join(fe.tui.RenderLines(), "\n")
+	if !strings.Contains(after, "toggle") || strings.Contains(after, "verbosity") {
+		t.Fatalf("form keymap did not replace navigation keys:\n%s", after)
+	}
+	plainAfter := ansi.Strip(after)
+	flushTitle := strings.HasPrefix(plainAfter, "Apply changes?") || strings.Contains(plainAfter, "\nApply changes?")
+	if !flushTitle || strings.HasPrefix(plainAfter, " Apply changes?") || strings.Contains(plainAfter, "\n Apply changes?") {
+		t.Fatalf("form retained a leading padding column:\n%s", plainAfter)
+	}
+	if height := strings.Count(fe.activeForm.model.View(), "\n") + 1; height > 8 {
+		t.Fatalf("compact confirmation reserved %d lines", height)
+	}
+}
+
+type commandViewFixture struct {
+	tuist.Compo
+	final bool
+	label string
+	child tuist.Component
+}
+
+func (view *commandViewFixture) SetFinal(final bool) {
+	view.final = final
+	view.Update()
+}
+
+func (view *commandViewFixture) Render(ctx tuist.Context) {
+	if view.final {
+		ctx.Line("final " + view.label)
+	} else {
+		ctx.Line("live " + view.label)
+	}
+	if view.child != nil {
+		view.RenderChild(ctx, view.child)
+	}
+}
+
+func TestCommandViewOwnsLiveAndFinalRendering(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	fe := NewWithDB(io.Discard, dagui.NewDB())
+	fe.reportOnly = true
+	view := &commandViewFixture{label: "setup"}
+	handle := fe.SetView(func(ViewContext) CommandView { return view })
+
+	live := strings.Join(fe.tui.RenderLines(), "\n")
+	if !strings.Contains(live, "live setup") {
+		t.Fatalf("live render did not use command view:\n%s", live)
+	}
+
+	handle.Update(func() { view.label = "workspace" })
+	var final bytes.Buffer
+	if err := fe.FinalRender(&final); err != nil {
+		t.Fatal(err)
+	}
+	if got := final.String(); !strings.Contains(got, "final workspace") {
+		t.Fatalf("final render did not use updated command view:\n%s", got)
+	}
+}
+
+func TestCommandViewInitializesPerRenderState(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	term := tuist.NewHeadlessTerminal(73, 19)
+	fe := newWithTerminal(io.Discard, dagui.NewDB(), term)
+	fe.reportOnly = true
+	view := &commandViewFixture{label: "setup"}
+	fe.SetView(func(ViewContext) CommandView { return view })
+
+	claimed := prettyTestSpanID(1)
+	fe.claims.claimErrorID(claimed)
+	_ = fe.tui.Frame()
+
+	if fe.claims.hasError(claimed) {
+		t.Fatal("command view retained claims from a previous render")
+	}
+	if got, want := fe.window, (windowSize{Width: 73, Height: 19}); got != want {
+		t.Fatalf("command view window = %+v, want %+v", got, want)
+	}
+}
+
+func TestSpanListSelectsCommandOwnedRoots(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	db := dagui.NewDB()
+	rootID := prettyTestSpanID(1)
+	keepID := prettyTestSpanID(2)
+	dropID := prettyTestSpanID(3)
+	start := time.Unix(100, 0)
+	db.ImportSnapshots([]dagui.SpanSnapshot{
+		{ID: rootID, TraceID: prettyTestTraceID(), Name: "setup", StartTime: start, EndTime: start.Add(time.Second), Final: true},
+		{ID: keepID, TraceID: prettyTestTraceID(), Name: "keep install", ParentID: rootID, StartTime: start, EndTime: start.Add(time.Second), Final: true, Reveal: true},
+		{ID: dropID, TraceID: prettyTestTraceID(), Name: "drop install", ParentID: rootID, StartTime: start, EndTime: start.Add(time.Second), Final: true, Reveal: true},
+	})
+	db.SetPrimarySpan(rootID)
+
+	fe := NewWithDB(io.Discard, db)
+	fe.reportOnly = true
+	fe.FrontendOpts.Verbosity = dagui.ShowCompletedVerbosity
+	view := &commandViewFixture{label: "setup"}
+	var list *SpanListView
+	fe.SetView(func(ctx ViewContext) CommandView {
+		list = ctx.SpanList(
+			func() dagui.SpanID { return rootID },
+			func() []dagui.SpanID { return []dagui.SpanID{keepID} },
+		)
+		view.child = list
+		return view
+	})
+
+	rendered := strings.Join(fe.tui.RenderLines(), "\n")
+	if !strings.Contains(rendered, "keep install") {
+		t.Fatalf("selected span was not rendered:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "drop install") {
+		t.Fatalf("unselected span was rendered:\n%s", rendered)
+	}
+	if !list.FocusFirst() || fe.FocusedSpan != keepID {
+		t.Fatalf("span list did not focus selected root: got %s, want %s", fe.FocusedSpan, keepID)
+	}
+}

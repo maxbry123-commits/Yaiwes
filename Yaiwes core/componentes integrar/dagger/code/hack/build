@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+set -e -u -o pipefail
+
+cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.."
+
+# The host CLI has to be built for the host, which need not match the engine's
+# platform (e.g. macOS). Module arguments don't get the CLI's own
+# `--platform=current` handling, so resolve it here.
+host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$(uname -m)" in
+    x86_64 | amd64) host_arch=amd64 ;;
+    aarch64 | arm64) host_arch=arm64 ;;
+    *) host_arch=$(uname -m) ;;
+esac
+
+# --docker configures the Dev object itself, so it goes on the module
+# selector, ahead of the function name; everything else is a deploy argument.
+mod_args=()
+if [[ -n "${DOCKER_HOST:-}" ]]; then
+    mod_args+=(--docker="$DOCKER_HOST")
+fi
+
+args=(
+    --name="${_EXPERIMENTAL_DAGGER_DEV_CONTAINER:-dagger-engine.dev}"
+    --image="${_EXPERIMENTAL_DAGGER_DEV_IMAGE:-localhost/dagger-engine.dev}"
+    --platform="$host_os/$host_arch"
+)
+
+if [[ -n "${_EXPERIMENTAL_DAGGER_GPU_SUPPORT:-}" ]]; then
+    args+=(--gpu-support)
+fi
+if [[ -n "${DAGGER_EXTRA_HOSTS:-}" ]]; then
+    args+=(--extra-hosts="$DAGGER_EXTRA_HOSTS")
+fi
+if [[ -n "${DAGGER_CLOUD_TOKEN:-}" ]]; then
+    args+=(--cloud-token=env://DAGGER_CLOUD_TOKEN)
+fi
+if [[ -n "${DAGGER_CLOUD_URL:-}" ]]; then
+    args+=(--cloud-url="$DAGGER_CLOUD_URL")
+fi
+
+exec dagger api call dev "${mod_args[@]+"${mod_args[@]}"}" deploy "${args[@]}" --output ./bin
