@@ -1,0 +1,24 @@
+*.bak
+*.class
+*.dist-info/
+*.egg-info
+*.eggs/
+*.py[co]
+*.swp
+*~
+.DS_Store
+.cache
+.coverage
+.idea
+.ipynb_checkpoints/
+.pytest_cache/
+.vscode
+_build
+bones-scripts/
+build
+dist
+docs/.doctrees
+docs/examples/**/*.py  # For .ipynb examples converted to .py
+htmlcov
+log.txt
+plots/
