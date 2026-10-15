@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 474505,
+  "bundle_sha256": "3f6730d253b13bd695cf45dec341cc3a5959a35c64c63e15f0a11547c5b1958c",
+  "extracted_tree": {
+    "bytes": 1278998,
+    "files": 419,
+    "sha256": "b1cfeb66ae456edb49f7f8bd91c90abc2678fa02d68019decfb91a4a78a3b510"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 474505,
+      "name": "opennars.bundle.zip.part-0001",
+      "sha256": "3f6730d253b13bd695cf45dec341cc3a5959a35c64c63e15f0a11547c5b1958c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "opennars",
+  "source_bytes": 1278998,
+  "source_commit": "4d1bdb0f599ccf6ed44edfc398f02f930713d30f",
+  "source_files": 419,
+  "source_ref": "master",
+  "source_repo": "opennars/opennars",
+  "source_tree": {
+    "bytes": 1278998,
+    "files": 419,
+    "sha256": "b1cfeb66ae456edb49f7f8bd91c90abc2678fa02d68019decfb91a4a78a3b510"
+  }
+}
