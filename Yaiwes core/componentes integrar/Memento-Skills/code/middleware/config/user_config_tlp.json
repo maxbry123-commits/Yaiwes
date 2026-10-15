@@ -1,0 +1,86 @@
+{
+  "$schema": "./user_config_schema.json",
+  "app": {
+    "theme": "system",
+    "language": "zh-CN"
+  },
+  "llm": {
+    "active_profile": "default",
+    "profiles": {
+      "default": {
+        "model": "anthropic/claude-3.5-sonnet",
+        "api_key": "",
+        "base_url": "https://api.openrouter.ai/v1",
+        "extra_headers": {},
+        "extra_body": {
+          "chat_template_kwargs": {
+            "thinking": false
+          }
+        },
+        "max_tokens": 81920,
+        "temperature": 0.5,
+        "timeout": 120
+      }
+    }
+  },
+  "env": {
+    "GITHUB_TOKEN": null,
+    "UV_PYTHON_INSTALL_MIRROR": "https://gh-proxy.com/https://github.com/indygreg/python-build-standalone/releases/download",
+    "PIP_INDEX_URL": "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
+    "PIP_EXTRA_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/ https://mirrors.huaweicloud.com/repository/pypi/simple/",
+    "PIP_TRUSTED_HOST": "mirrors.tuna.tsinghua.edu.cn mirrors.aliyun.com mirrors.huaweicloud.com",
+    "UV_PIP_INDEX_URL": "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
+    "UV_PIP_EXTRA_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/ https://mirrors.huaweicloud.com/repository/pypi/simple/",
+    "UV_PIP_TRUSTED_HOST": "mirrors.tuna.tsinghua.edu.cn mirrors.aliyun.com mirrors.huaweicloud.com",
+    "TAVILY_API_KEY": ""
+  },
+  "im": {
+    "platform": "feishu",
+    "feishu": {
+      "enabled": false,
+      "app_id": "",
+      "app_secret": "",
+      "encrypt_key": "",
+      "verification_token": "",
+      "base_url": "https://open.feishu.cn"
+    },
+    "dingtalk": {
+      "enabled": false,
+      "app_key": "",
+      "app_secret": "",
+      "webhook_url": "",
+      "webhook_secret": "",
+      "base_url": "https://api.dingtalk.com"
+    },
+    "wecom": {
+      "enabled": false,
+      "corp_id": "",
+      "agent_id": "",
+      "secret": "",
+      "token": "",
+      "encoding_aes_key": "",
+      "bot_id": "",
+      "bot_secret": "",
+      "webhook_url": ""
+    },
+    "wechat": {
+      "enabled": false,
+      "base_url": "https://ilinkai.weixin.qq.com",
+      "token": ""
+    }
+  },
+  "gateway": {
+    "enabled": true,
+    "mode": "gateway",
+    "websocket_host": "127.0.0.1",
+    "websocket_port": 8765,
+    "webhook_host": "127.0.0.1",
+    "webhook_port": 18080
+  },
+  "ota": {
+    "auto_check": true,
+    "auto_download": true,
+    "check_interval_hours": 24,
+    "install_confirmation": true
+  }
+}

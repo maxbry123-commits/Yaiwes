@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 2928720,
+  "bundle_sha256": "6a177568d34c930ee9ed045c363cf7d0739ab7f1bfcdb2fcb595e7d3db2acd26",
+  "extracted_tree": {
+    "bytes": 6330815,
+    "files": 641,
+    "sha256": "8b91c0ff9cbe1a91f1968594dbcdbb3145497f6f0bbb5fb3ae2051751d0b7fe2"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2928720,
+      "name": "Memento-Skills.bundle.zip.part-0001",
+      "sha256": "6a177568d34c930ee9ed045c363cf7d0739ab7f1bfcdb2fcb595e7d3db2acd26"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "Memento-Skills",
+  "source_bytes": 6330815,
+  "source_commit": "ee9b9a45efd093d669c06fe318b4b1dceb246d19",
+  "source_files": 641,
+  "source_ref": "main",
+  "source_repo": "Memento-Teams/Memento-Skills",
+  "source_tree": {
+    "bytes": 6330815,
+    "files": 641,
+    "sha256": "8b91c0ff9cbe1a91f1968594dbcdbb3145497f6f0bbb5fb3ae2051751d0b7fe2"
+  }
+}
