@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 1620325,
+  "bundle_sha256": "783e35b78ab8ce0cc6e5270ccdb993194585dc9b313474c713c520e05db2cefa",
+  "extracted_tree": {
+    "bytes": 4037163,
+    "files": 544,
+    "sha256": "33fcd136f7703aa9f62be3328cfe2b0e44a6c62f998b75eaba94c4d468df1dab"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1620325,
+      "name": "pyodide.bundle.zip.part-0001",
+      "sha256": "783e35b78ab8ce0cc6e5270ccdb993194585dc9b313474c713c520e05db2cefa"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".cursorrules"
+  ],
+  "skipped_special_count": 1,
+  "slug": "pyodide",
+  "source_bytes": 4037163,
+  "source_commit": "adc5b63f8b7c3f55c7ece10e88345cb3fd89956e",
+  "source_files": 544,
+  "source_ref": "main",
+  "source_repo": "pyodide/pyodide",
+  "source_tree": {
+    "bytes": 4037163,
+    "files": 544,
+    "sha256": "33fcd136f7703aa9f62be3328cfe2b0e44a6c62f998b75eaba94c4d468df1dab"
+  }
+}
