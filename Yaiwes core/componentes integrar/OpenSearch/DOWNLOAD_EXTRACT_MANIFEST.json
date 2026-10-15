@@ -1,0 +1,50 @@
+{
+  "bundle_bytes": 48889784,
+  "bundle_sha256": "21a7375f52365c39b81c5efd865a337741a280218b86fd2310117bf3e2160ebb",
+  "extracted_tree": {
+    "bytes": 160702286,
+    "files": 19334,
+    "sha256": "85ed9fd16666c8ab551539e245ca9b8efb76ef9f19c92677938c56ad37eaa3b5"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "OpenSearch.bundle.zip.part-0001",
+      "sha256": "ec9f24dec99acc76441013de165c1956431ce1e013ad977a4dea26344a67c9de"
+    },
+    {
+      "bytes": 12582912,
+      "name": "OpenSearch.bundle.zip.part-0002",
+      "sha256": "2573c4ac4ee6d21618af1fab6d441f2a1bdd98495c0dac1076a089488e2860e5"
+    },
+    {
+      "bytes": 12582912,
+      "name": "OpenSearch.bundle.zip.part-0003",
+      "sha256": "7d1c15d87f57ab94584261f50a749485bcc12abbbd96ef2884468fc9e0c0281b"
+    },
+    {
+      "bytes": 11141048,
+      "name": "OpenSearch.bundle.zip.part-0004",
+      "sha256": "e25d60f3563f221c2810206ff3c1e5fd7c7ec267f3fe74c85b947ab7d317a733"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "OpenSearch",
+  "source_bytes": 160702286,
+  "source_commit": "9d8263dcf7fe62a34d57ae1c9595c4c2b210baca",
+  "source_files": 19334,
+  "source_ref": "main",
+  "source_repo": "opensearch-project/OpenSearch",
+  "source_tree": {
+    "bytes": 160702286,
+    "files": 19334,
+    "sha256": "85ed9fd16666c8ab551539e245ca9b8efb76ef9f19c92677938c56ad37eaa3b5"
+  }
+}
