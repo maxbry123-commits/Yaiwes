@@ -1,0 +1,70 @@
+{
+  "bundle_bytes": 88134391,
+  "bundle_sha256": "2f50b64b72bb7f26b63935f08e2cb297cbe018a35c3ac176d52677a580ce1486",
+  "extracted_tree": {
+    "bytes": 231450934,
+    "files": 1060,
+    "sha256": "1f21181177834f035f5fd6c1b4b967be7eaf94cfa6039fa9f47ac508673427db"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0001",
+      "sha256": "2ef09b892d472ba66ff767c4b8e13c0db906882905ef3739b18196d3e0a7dcf9"
+    },
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0002",
+      "sha256": "50e14beb8f1e1dd94397a61ce49e2aec79e49da815bc098076911d44790372cf"
+    },
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0003",
+      "sha256": "a77207e77d5476a6ddacf2b08c8739a9d2bdcb1aa412308382f2addfe39a8390"
+    },
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0004",
+      "sha256": "33f1a5faf942711458c96135ece80525b4f6736a4324f92b96797a684e2eed6d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0005",
+      "sha256": "8927431bcc70ed51e3c85d39f8d34807b8147a6a4f6e5bcfed3dea7e698c2f34"
+    },
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0006",
+      "sha256": "1aae58d0a7e853151515b7d1842523b6eb5b4b0d648cb95196e53b7926557a3e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "genesis-world.bundle.zip.part-0007",
+      "sha256": "f4579579494c7e7f6d8dc7954881b1efdcc98dfcab29c6a635b487e775005b75"
+    },
+    {
+      "bytes": 54007,
+      "name": "genesis-world.bundle.zip.part-0008",
+      "sha256": "689fe0cee5dd22570a7e4cf9c59bae41be91f36d1760715ae6d153f30e24f30f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "genesis-world",
+  "source_bytes": 231450934,
+  "source_commit": "105898fc0a5f068f22dffbbfa39f5ea89be42a1e",
+  "source_files": 1060,
+  "source_ref": "main",
+  "source_repo": "Genesis-Embodied-AI/genesis-world",
+  "source_tree": {
+    "bytes": 231450934,
+    "files": 1060,
+    "sha256": "1f21181177834f035f5fd6c1b4b967be7eaf94cfa6039fa9f47ac508673427db"
+  }
+}
