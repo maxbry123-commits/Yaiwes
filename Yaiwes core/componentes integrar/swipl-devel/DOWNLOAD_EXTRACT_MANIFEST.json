@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 5887063,
+  "bundle_sha256": "013e969fc13eccd09eaac7179b90f2d7085d7a09b9523ccb2f3372434f80150a",
+  "extracted_tree": {
+    "bytes": 17715875,
+    "files": 1957,
+    "sha256": "30bc8ebd621d9a4cbbdb5bc7a431178699d5b000274dcf58ad46c9511dfa85a6"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 5887063,
+      "name": "swipl-devel.bundle.zip.part-0001",
+      "sha256": "013e969fc13eccd09eaac7179b90f2d7085d7a09b9523ccb2f3372434f80150a"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "swipl-devel",
+  "source_bytes": 17715875,
+  "source_commit": "807b9b38845e869f11681d5792acbb4928a3a8c2",
+  "source_files": 1957,
+  "source_ref": "master",
+  "source_repo": "SWI-Prolog/swipl-devel",
+  "source_tree": {
+    "bytes": 17715875,
+    "files": 1957,
+    "sha256": "30bc8ebd621d9a4cbbdb5bc7a431178699d5b000274dcf58ad46c9511dfa85a6"
+  }
+}
