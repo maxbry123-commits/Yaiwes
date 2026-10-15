@@ -1,0 +1,188 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "labels": [
+    "renovatebot",
+    "dependencies"
+  ],
+  "constraints": {
+    "go": "1.25"
+  },
+  "extends": [
+    "config:best-practices",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update Docker images pinned by digest in the Makefile",
+      "managerFilePatterns": [
+        "/(^|/)Makefile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>docker) depName=(?<depName>[^\\s]+?)\\s+[A-Za-z0-9_]+?_IMAGE\\s*:?=\\s*[^\\s:]+:(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]+)\\s"
+      ]
+    }
+  ],
+  "schedule": [
+    "on tuesday"
+  ],
+  "packageRules": [
+    {
+      "description": "Ensure source compatibility with Go version used by this project",
+      "matchManagers": [
+        "gomod"
+      ],
+      "constraintsFiltering": "strict"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchUpdateTypes": [
+        "pin",
+        "pinDigest",
+        "digest",
+        "lockFileMaintenance",
+        "rollback",
+        "bump",
+        "replacement"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "prBodyNotes": [
+        ":warning: MAJOR VERSION UPDATE :warning: - please manually update this package"
+      ],
+      "labels": [
+        "dependency-major-update"
+      ]
+    },
+    {
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "groupName": "dockerfile deps"
+    },
+    {
+      "matchManagers": [
+        "docker-compose"
+      ],
+      "groupName": "docker-compose deps"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "github-actions deps"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchSourceUrls": [
+        "https://github.com/open-telemetry/opentelemetry-go-contrib"
+      ],
+      "groupName": "All opentelemetry-go-contrib packages"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All go.opentelemetry.io/contrib packages",
+      "matchSourceUrls": [
+        "https://go.opentelemetry.io/otel{/,}**"
+      ],
+      "allowedVersions": "!/v0.59.*/"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All google.golang.org packages",
+      "matchPackageNames": [
+        "google.golang.org{/,}**"
+      ]
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "google.golang.org/grpc"
+      ],
+      "allowedVersions": "!/^v1.84.0$/"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All golang.org/x packages",
+      "matchPackageNames": [
+        "golang.org/x{/,}**"
+      ]
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All github.com/knadh/koanf packages",
+      "matchPackageNames": [
+        "github.com/knadh/koanf{/,}**"
+      ]
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All go.opentelemetry.io/proto packages",
+      "matchPackageNames": [
+        "go.opentelemetry.io/proto{/,}**"
+      ]
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All go.opentelemetry.io/collector packages",
+      "matchPackageNames": [
+        "go.opentelemetry.io/collector{/,}**"
+      ]
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "All go.opentelemetry.io/build-tools packages",
+      "matchPackageNames": [
+        "go.opentelemetry.io/build-tools{/,}**"
+      ]
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "toolchain"
+      ],
+      "enabled": false
+    }
+  ],
+  "gitIgnoredAuthors": [
+    "197425009+otelbot@users.noreply.github.com"
+  ],
+  "ignoreDeps": [
+    "github.com/mattn/go-ieproxy"
+  ],
+  "prConcurrentLimit": 200,
+  "prHourlyLimit": 5,
+  "postUpdateOptions": [
+    "gomodTidyAll",
+    "gomodUpdateImportPaths"
+  ]
+}

@@ -1,0 +1,15 @@
+type: metric
+
+status:
+  class: exporter
+  stability:
+    beta: [traces, logs, metrics]
+
+sending_queue:
+  support: has_overrides
+  overrides:
+    enabled: true
+    num_consumers: 1
+    batch:
+      enabled: false
+      min_size: 123
