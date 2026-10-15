@@ -1,37 +1,35 @@
 {
-  "bundle_bytes": 1245664,
-  "bundle_sha256": "b8133a08b85e266474660b60771adce2befd311f1befafd44df43b54e8e15150",
-  "extracted_tree": {
-    "bytes": 2669357,
-    "files": 315,
-    "sha256": "51d0054410a365e6dbc58628de9df2a31f5fa526a91bb75534d6a45e1f2eb950"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 1245664,
-      "name": "screenshot-to-code.bundle.zip.part-0001",
-      "sha256": "b8133a08b85e266474660b60771adce2befd311f1befafd44df43b54e8e15150"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [
-    "CLAUDE.md"
-  ],
-  "skipped_special_count": 1,
-  "slug": "screenshot-to-code",
-  "source_bytes": 2669357,
-  "source_commit": "a8139779f7c5ae231b7f2a86fa7f83ddc5f7badc",
-  "source_files": 315,
-  "source_ref": "main",
-  "source_repo": "abi/screenshot-to-code",
-  "source_tree": {
-    "bytes": 2669357,
-    "files": 315,
-    "sha256": "51d0054410a365e6dbc58628de9df2a31f5fa526a91bb75534d6a45e1f2eb950"
-  }
+ "bundle_bytes": 1245664,
+ "bundle_sha256": "b8133a08b85e266474660b60771adce2befd311f1befafd44df43b54e8e15150",
+ "extracted_tree": {
+  "bytes": 2669357,
+  "files": 315,
+  "sha256": "51d0054410a365e6dbc58628de9df2a31f5fa526a91bb75534d6a45e1f2eb950"
+ },
+ "extraction_verified": true,
+ "max_github_blob_bytes": 99614720,
+ "no_lfs": true,
+ "part_size_limit_bytes": 12582912,
+ "reconstruction_verified": true,
+ "schema": "yaiwes.hf.download-extract.v1",
+ "skipped_special": [
+  "CLAUDE.md"
+ ],
+ "skipped_special_count": 1,
+ "slug": "screenshot-to-code",
+ "source_bytes": 2669357,
+ "source_commit": "a8139779f7c5ae231b7f2a86fa7f83ddc5f7badc",
+ "source_files": 315,
+ "source_ref": "main",
+ "source_repo": "abi/screenshot-to-code",
+ "source_tree": {
+  "bytes": 2669357,
+  "files": 315,
+  "sha256": "51d0054410a365e6dbc58628de9df2a31f5fa526a91bb75534d6a45e1f2eb950"
+ },
+ "archives_removed_after_motor_1_verification": true,
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "motor_1_matches_manifest": true,
+ "gitattributes_lfs_removed": [],
+ "route_completion": "engine _archives -> motor_1 (CRC + tree hash = manifiesto) -> motor_3 (sha256) -> git add -f (incluye archivos ignorados por el .gitignore del repo)"
 }
