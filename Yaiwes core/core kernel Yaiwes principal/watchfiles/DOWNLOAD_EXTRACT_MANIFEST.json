@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 149757,
+  "bundle_sha256": "5cce4d8fe22c6213b51fbd5ed9fec0c9bf8b2920293c8e341231b238669e885f",
+  "extracted_tree": {
+    "bytes": 467703,
+    "files": 61,
+    "sha256": "5f90c4fcf021f3ef12edc93cdd61a71c4872887936eb01be746cde69c3c2f43d"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 149757,
+      "name": "watchfiles.bundle.zip.part-0001",
+      "sha256": "5cce4d8fe22c6213b51fbd5ed9fec0c9bf8b2920293c8e341231b238669e885f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "watchfiles",
+  "source_bytes": 467703,
+  "source_commit": "0cd8f94447a1c4a6d1b29f80e16274a7e1d68ebe",
+  "source_files": 61,
+  "source_ref": "main",
+  "source_repo": "samuelcolvin/watchfiles",
+  "source_tree": {
+    "bytes": 467703,
+    "files": 61,
+    "sha256": "5f90c4fcf021f3ef12edc93cdd61a71c4872887936eb01be746cde69c3c2f43d"
+  }
+}
