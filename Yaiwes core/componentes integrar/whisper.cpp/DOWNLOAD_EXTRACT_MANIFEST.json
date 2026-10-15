@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 10472039,
+  "bundle_sha256": "5b8d7bfde773b0070f2809f7840df64747b1b6e9a03b7332d4901dc5d866cb4e",
+  "extracted_tree": {
+    "bytes": 39974675,
+    "files": 2039,
+    "sha256": "5d16a22814900191ccef0c8177867a546197390ed16cb8783db414c0e5285803"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 10472039,
+      "name": "whisper.cpp.bundle.zip.part-0001",
+      "sha256": "5b8d7bfde773b0070f2809f7840df64747b1b6e9a03b7332d4901dc5d866cb4e"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "whisper.cpp",
+  "source_bytes": 39974675,
+  "source_commit": "0c7be696371069e0baa2515ed7aa08d5a5473aa6",
+  "source_files": 2039,
+  "source_ref": "master",
+  "source_repo": "ggml-org/whisper.cpp",
+  "source_tree": {
+    "bytes": 39974675,
+    "files": 2039,
+    "sha256": "5d16a22814900191ccef0c8177867a546197390ed16cb8783db414c0e5285803"
+  }
+}
