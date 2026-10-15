@@ -1,0 +1,65 @@
+{
+  "bundle_bytes": 27037096,
+  "bundle_sha256": "0c39dc7495f65289ce64f55b02396ce8d0b1d8e49cdd1ebb2f79e03964dbbde8",
+  "extracted_tree": {
+    "bytes": 76582706,
+    "files": 2199,
+    "sha256": "b16740aecd79ef5272089ec423f6402687d822f9606bcbbc6ffc4cf8ff8f1e1a"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "joern.bundle.zip.part-0001",
+      "sha256": "54c9f8daab7418cebd7cdff8e08206672cab74ef135cead6c906251d557182cf"
+    },
+    {
+      "bytes": 12582912,
+      "name": "joern.bundle.zip.part-0002",
+      "sha256": "eff0cd07998a195247bbf2dafefa8cc0f3c377628f9d2f582164e4476d91b1c8"
+    },
+    {
+      "bytes": 1871272,
+      "name": "joern.bundle.zip.part-0003",
+      "sha256": "515075d6c3ece7ace3f7754ea45a1a1f477fc0fdcb1aebe7c0520005179ea6e7"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "c2cpg.sh",
+    "joern",
+    "joern-cli/frontends/csharpsrc2cpg/csharpsrc2cpg",
+    "joern-cli/frontends/javasrc2cpg/javasrc2cpg",
+    "joern-cli/frontends/jimple2cpg/jimple2cpg",
+    "joern-cli/frontends/kotlin2cpg/kotlin2cpg",
+    "joern-cli/frontends/php2cpg/php2cpg",
+    "joern-cli/frontends/pysrc2cpg/pysrc2cpg",
+    "joern-cli/frontends/rubysrc2cpg/ruby2cpg.sh",
+    "joern-cli/frontends/x2cpg/src/main/resources/symlink-to-main.c",
+    "joern-cli/frontends/x2cpg/src/main/resources/symlink-to-testcode",
+    "joern-export",
+    "joern-flow",
+    "joern-parse",
+    "joern-scan",
+    "joern-slice",
+    "joern-vectors",
+    "lib",
+    "scripts"
+  ],
+  "skipped_special_count": 19,
+  "slug": "joern",
+  "source_bytes": 76582706,
+  "source_commit": "14d72bb5f1a04aa050c44ae9870c53f6db0ef869",
+  "source_files": 2199,
+  "source_ref": "master",
+  "source_repo": "joernio/joern",
+  "source_tree": {
+    "bytes": 76582706,
+    "files": 2199,
+    "sha256": "b16740aecd79ef5272089ec423f6402687d822f9606bcbbc6ffc4cf8ff8f1e1a"
+  }
+}
