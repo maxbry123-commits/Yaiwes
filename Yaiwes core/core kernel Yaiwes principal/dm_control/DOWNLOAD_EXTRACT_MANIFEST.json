@@ -1,0 +1,65 @@
+{
+  "bundle_bytes": 87908938,
+  "bundle_sha256": "951a914832e371c0d432e7bfc288492abba8d967cef2b349ee311cd6a176f9b0",
+  "extracted_tree": {
+    "bytes": 175619557,
+    "files": 2483,
+    "sha256": "ca4b18abe7d4cce707bfaba933f4b3a5b77b247441534ffa8526cddceb411d5d"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "dm_control.bundle.zip.part-0001",
+      "sha256": "68ab175bac44aed3837d3bac8dd1bbedfa30727aad612b44767c660f1115be5b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dm_control.bundle.zip.part-0002",
+      "sha256": "e66972ad9252265e9a3aab49230ab432f9d71f359f8ff4dfb923f9269207f55d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dm_control.bundle.zip.part-0003",
+      "sha256": "5054f627a3b4982fd80b15e75e527da1f32d83b96ca99163d1f7ec0c321b5309"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dm_control.bundle.zip.part-0004",
+      "sha256": "50d1d1450e342a96a272aee768702c437bb97244770193c0903bf3ae87968280"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dm_control.bundle.zip.part-0005",
+      "sha256": "d926dc3e753ded9c831a6320df4e6a4e3cb1d7d7b5f91eb0d752009c52afeab0"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dm_control.bundle.zip.part-0006",
+      "sha256": "c5c225989e3d4bf5ff153f744cc38e466387abc9cc8f733e5c694a717c018f36"
+    },
+    {
+      "bytes": 12411466,
+      "name": "dm_control.bundle.zip.part-0007",
+      "sha256": "42f05fd47b560e0c679923b4ff35592f773dfc620b6f61769e39cd8f1ab4ce0c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "dm_control",
+  "source_bytes": 175619557,
+  "source_commit": "773d5b5d94d8f58943cf56a66b9b9755818fe5b4",
+  "source_files": 2483,
+  "source_ref": "main",
+  "source_repo": "google-deepmind/dm_control",
+  "source_tree": {
+    "bytes": 175619557,
+    "files": 2483,
+    "sha256": "ca4b18abe7d4cce707bfaba933f4b3a5b77b247441534ffa8526cddceb411d5d"
+  }
+}
