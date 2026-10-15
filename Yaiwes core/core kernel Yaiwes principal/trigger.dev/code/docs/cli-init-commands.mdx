@@ -1,0 +1,84 @@
+---
+title: "CLI init command"
+sidebarTitle: "init"
+description: "Use these options when running the CLI `init` command."
+---
+
+import CommonOptions from '/snippets/cli-options-common.mdx';
+
+Run the command like this:
+
+<CodeGroup>
+
+```bash npm
+npx trigger.dev@latest init
+```
+
+```bash pnpm
+pnpm dlx trigger.dev@latest init
+```
+
+```bash yarn
+yarn dlx trigger.dev@latest init
+```
+
+</CodeGroup>
+
+## Arguments
+
+<ParamField body="Project path" type="[path]">
+  The path to the project. Defaults to `.`.
+</ParamField>
+
+## Options
+
+<ParamField body="Javascript" type="--javascript">
+  By default, the init command assumes you are using TypeScript. Use this flag to initialize a
+  project that uses JavaScript.
+</ParamField>
+
+<ParamField body="Project ref" type="--project-ref | -p">
+  The project ref to use when initializing the project.
+</ParamField>
+
+<ParamField body="Package tag" type="--tag | -t">
+  The version of the `@trigger.dev/sdk` package to install. Defaults to the CLI version.
+</ParamField>
+
+<ParamField body="Skip package install" type="--skip-package-install">
+  Skip installing the `@trigger.dev/sdk` package.
+</ParamField>
+
+<ParamField body="Override config" type="--override-config">
+  Override the existing config file if it exists.
+</ParamField>
+
+<ParamField body="Project name" type="--project-name <name>">
+  The name of the project to create when your account has no projects yet.
+</ParamField>
+
+<ParamField body="Organization name" type="--org-name <name>">
+  The organization to create the first project in. Matches an existing organization by name, or creates it if you have none.
+</ParamField>
+
+<ParamField body="Runtime" type="-r, --runtime <runtime>">
+  The runtime to use: `node`, `node-22`, `node-24`, `node-26` or `bun`. Defaults to `node-24`.
+</ParamField>
+
+<ParamField body="Yes" type="-y, --yes">
+  Skip all prompts. Requires `--project-ref`, or `--project-name` with `--org-name` for a new account.
+</ParamField>
+
+<ParamField body="No browser" type="--no-browser">
+  Do not open the browser during login. Print the URL only.
+</ParamField>
+
+<ParamField body="Package arguments" type="--pkg-args">
+  Additional arguments to pass to the package manager. Accepts CSV for multiple args.
+</ParamField>
+
+### Common options
+
+These options are available on most commands.
+
+<CommonOptions />

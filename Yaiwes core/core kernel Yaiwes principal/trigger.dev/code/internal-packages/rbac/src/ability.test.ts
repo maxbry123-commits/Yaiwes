@@ -1,0 +1,309 @@
+import { buildScope } from "@trigger.dev/plugins";
+import { describe, it, expect } from "vitest";
+import {
+  permissiveAbility,
+  superAbility,
+  denyAbility,
+  buildFallbackAbility,
+  buildJwtAbility,
+  scopesWithinAbility,
+} from "./ability.js";
+
+describe("permissiveAbility", () => {
+  it("allows any action on any resource type", () => {
+    expect(permissiveAbility.can("read", { type: "run" })).toBe(true);
+    expect(permissiveAbility.can("write", { type: "deployment" })).toBe(true);
+    expect(permissiveAbility.can("delete", { type: "task" })).toBe(true);
+  });
+
+  it("allows actions on specific resource instances", () => {
+    expect(permissiveAbility.can("read", { type: "run", id: "run_abc123" })).toBe(true);
+  });
+
+  it("does not grant super-user access", () => {
+    expect(permissiveAbility.canSuper()).toBe(false);
+  });
+});
+
+describe("superAbility", () => {
+  it("allows any action on any resource", () => {
+    expect(superAbility.can("read", { type: "run" })).toBe(true);
+    expect(superAbility.can("write", { type: "deployment" })).toBe(true);
+  });
+
+  it("grants super-user access", () => {
+    expect(superAbility.canSuper()).toBe(true);
+  });
+});
+
+describe("denyAbility", () => {
+  it("denies all actions", () => {
+    expect(denyAbility.can("read", { type: "run" })).toBe(false);
+    expect(denyAbility.can("write", { type: "deployment" })).toBe(false);
+  });
+
+  it("does not grant super-user access", () => {
+    expect(denyAbility.canSuper()).toBe(false);
+  });
+});
+
+describe("buildJwtAbility", () => {
+  it("allows action matching a general scope", () => {
+    const ability = buildJwtAbility(["read:runs"]);
+    expect(ability.can("read", { type: "runs" })).toBe(true);
+    expect(ability.can("read", { type: "runs", id: "run_abc" })).toBe(true);
+  });
+
+  it("allows only the specific ID for a scoped permission", () => {
+    const ability = buildJwtAbility(["read:runs:run_abc"]);
+    expect(ability.can("read", { type: "runs", id: "run_abc" })).toBe(true);
+    expect(ability.can("read", { type: "runs", id: "run_xyz" })).toBe(false);
+    expect(ability.can("read", { type: "runs" })).toBe(false);
+  });
+
+  it.each(["read:runs:", "read:runs:   "])(
+    "rejects an explicitly empty resource ID in %s",
+    (scope) => {
+      const ability = buildJwtAbility([scope]);
+      expect(ability.can("read", { type: "runs", id: "run_abc" })).toBe(false);
+      expect(ability.can("read", { type: "runs" })).toBe(false);
+    }
+  );
+
+  it("preserves colons in the resource id (everything after the 2nd colon)", () => {
+    const ability = buildJwtAbility(["read:tags:env:staging"]);
+    expect(ability.can("read", { type: "tags", id: "env:staging" })).toBe(true);
+    expect(ability.can("read", { type: "tags", id: "env" })).toBe(false);
+    expect(ability.can("read", { type: "tags", id: "env:prod" })).toBe(false);
+  });
+
+  it("preserves meaningful whitespace around resource ids", () => {
+    const ability = buildJwtAbility(["read:tags: env:staging "]);
+    expect(ability.can("read", { type: "tags", id: " env:staging " })).toBe(true);
+    expect(ability.can("read", { type: "tags", id: "env:staging" })).toBe(false);
+  });
+
+  it("preserves wildcard actions and ignores resource condition fields", () => {
+    const ability = buildJwtAbility(["*:runs:run_abc"]);
+    const resource = {
+      type: "runs",
+      id: "run_abc",
+      projectId: "proj_123",
+      environmentId: "env_123",
+    };
+
+    expect(ability.can("read", resource)).toBe(true);
+    expect(ability.can("write", resource)).toBe(true);
+    expect(ability.can("read", { ...resource, id: "run_other" })).toBe(false);
+  });
+
+  it("allows any read with read:all scope", () => {
+    const ability = buildJwtAbility(["read:all"]);
+    expect(ability.can("read", { type: "runs" })).toBe(true);
+    expect(ability.can("read", { type: "tasks" })).toBe(true);
+    expect(ability.can("write", { type: "runs" })).toBe(false);
+  });
+
+  it("allows everything with admin scope", () => {
+    const ability = buildJwtAbility(["admin"]);
+    expect(ability.can("read", { type: "runs" })).toBe(true);
+    expect(ability.can("write", { type: "deployments" })).toBe(true);
+  });
+
+  // Pre-RBAC, the legacy checkAuthorization string-matched superScopes;
+  // a scope `admin:sessions` only granted access to routes that
+  // explicitly listed it. After the JWT-ability split we must not let
+  // `admin:<anything>` act as a universal wildcard — it should grant
+  // only the `admin` action against resources of that type.
+  it("admin:<type> is not a universal wildcard", () => {
+    const ability = buildJwtAbility(["admin:sessions"]);
+    expect(ability.can("read", { type: "runs" })).toBe(false);
+    expect(ability.can("write", { type: "tasks" })).toBe(false);
+    expect(ability.can("admin", { type: "runs" })).toBe(false);
+    // But it does grant the admin action on its own type.
+    expect(ability.can("admin", { type: "sessions" })).toBe(true);
+    expect(ability.can("admin", { type: "sessions", id: "ses_abc" })).toBe(true);
+  });
+
+  it("admin:<type>:<id> grants admin action only on that exact resource", () => {
+    const ability = buildJwtAbility(["admin:sessions:ses_abc"]);
+    expect(ability.can("admin", { type: "sessions", id: "ses_abc" })).toBe(true);
+    expect(ability.can("admin", { type: "sessions", id: "ses_xyz" })).toBe(false);
+    expect(ability.can("admin", { type: "runs" })).toBe(false);
+    expect(ability.can("read", { type: "sessions", id: "ses_abc" })).toBe(false);
+  });
+
+  it("never grants canSuper", () => {
+    expect(buildJwtAbility(["admin"]).canSuper()).toBe(false);
+    expect(buildJwtAbility(["read:all"]).canSuper()).toBe(false);
+    expect(buildJwtAbility([]).canSuper()).toBe(false);
+  });
+
+  it("denies everything for empty scopes", () => {
+    const ability = buildJwtAbility([]);
+    expect(ability.can("read", { type: "runs" })).toBe(false);
+  });
+
+  it("denies wrong action with general resource scope", () => {
+    const ability = buildJwtAbility(["read:runs"]);
+    expect(ability.can("write", { type: "runs" })).toBe(false);
+  });
+
+  it("does not revisit the supplied scope set during repeated checks", () => {
+    const rawScopes = Array.from({ length: 300 }, (_, index) => `read:runs:allowed_${index}`);
+    let scopeReads = 0;
+    const scopes = new Proxy(rawScopes, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          scopeReads++;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const ability = buildJwtAbility(scopes);
+    const readsAfterConstruction = scopeReads;
+    const childAliases = Array.from({ length: 13 }, (_, index) => ({
+      type: "runs",
+      id: `denied_${index}`,
+    }));
+
+    for (let child = 0; child < 50; child++) {
+      expect(ability.can("read", childAliases)).toBe(false);
+    }
+
+    expect(readsAfterConstruction).toBeGreaterThan(0);
+    expect(scopeReads).toBe(readsAfterConstruction);
+  });
+});
+
+describe("scopesWithinAbility", () => {
+  it("allows subsets and preserves ids containing colons", () => {
+    const result = scopesWithinAbility(
+      ["read:runs:run_abc", "read:tags:env:staging"],
+      buildJwtAbility(["read:runs", "read:tags:env:staging"])
+    );
+
+    expect(result).toEqual({ ok: true, deniedScopes: [] });
+  });
+
+  it("rejects scopes that broaden or exceed the ability", () => {
+    const result = scopesWithinAbility(
+      ["trigger:tasks:send-email", "trigger:tasks", "read:runs"],
+      buildJwtAbility(["trigger:tasks:send-email"])
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      deniedScopes: ["trigger:tasks", "read:runs"],
+    });
+  });
+
+  it("lets a session scope mint its narrower direction and channel folds", () => {
+    const ability = buildJwtAbility(["read:sessions:chat_abc"]);
+    expect(scopesWithinAbility(["read:sessions:chat_abc:out"], ability).ok).toBe(true);
+    expect(scopesWithinAbility(["read:sessions:chat_abc:channels:tools"], ability).ok).toBe(true);
+    expect(scopesWithinAbility(["read:sessions:chat_abc:channels:tools:out"], ability).ok).toBe(
+      true
+    );
+
+    const channel = buildJwtAbility(["read:sessions:chat_abc:channels:tools"]);
+    expect(scopesWithinAbility(["read:sessions:chat_abc:channels:tools:out"], channel).ok).toBe(
+      true
+    );
+    // The fold only narrows: a channel scope does not contain the session or another channel.
+    expect(scopesWithinAbility(["read:sessions:chat_abc"], channel).ok).toBe(false);
+    expect(scopesWithinAbility(["read:sessions:chat_abc:out"], channel).ok).toBe(false);
+    expect(scopesWithinAbility(["read:sessions:chat_abc:channels:other:out"], channel).ok).toBe(
+      false
+    );
+  });
+
+  it("denies a folded session scope for another session or action", () => {
+    const ability = buildJwtAbility(["read:sessions:chat_abc"]);
+    expect(scopesWithinAbility(["read:sessions:chat_other:out"], ability).ok).toBe(false);
+    expect(
+      scopesWithinAbility(
+        ["read:sessions:chat_abc:out"],
+        buildJwtAbility(["write:sessions:chat_abc"])
+      ).ok
+    ).toBe(false);
+    // Colons inside other resource ids are not a fold.
+    expect(
+      scopesWithinAbility(["read:tags:env:staging"], buildJwtAbility(["read:tags:env"])).ok
+    ).toBe(false);
+  });
+
+  it("allows arbitrary valid scopes for a permissive ability", () => {
+    expect(scopesWithinAbility(["read:runs", "admin"], permissiveAbility)).toEqual({
+      ok: true,
+      deniedScopes: [],
+    });
+  });
+
+  it("rejects malformed scopes for restricted abilities", () => {
+    expect(
+      scopesWithinAbility(["read", "read:runs:", "read:tags:   "], buildJwtAbility(["read:all"]))
+    ).toEqual({
+      ok: false,
+      deniedScopes: ["read", "read:runs:", "read:tags:   "],
+    });
+  });
+});
+
+describe("buildScope", () => {
+  it("distinguishes an absent ID from an explicitly empty ID", () => {
+    expect(buildScope("read", "runs")).toBe("read:runs");
+    expect(() => buildScope("read", "runs", "")).toThrow("Scope resource IDs must not be empty");
+    expect(() => buildScope("read", "runs", "   ")).toThrow("Scope resource IDs must not be empty");
+  });
+
+  it("preserves nonempty IDs exactly", () => {
+    expect(buildScope("read", "tags", " env:staging ")).toBe("read:tags: env:staging ");
+  });
+});
+
+describe("buildJwtAbility — array resources", () => {
+  it("authorizes when any resource in the array passes a scope check", () => {
+    const ability = buildJwtAbility(["read:batch:batch_abc"]);
+    const resources = [
+      { type: "runs", id: "run_xyz" },
+      { type: "batch", id: "batch_abc" },
+      { type: "tasks", id: "task_other" },
+    ];
+    expect(ability.can("read", resources)).toBe(true);
+  });
+
+  it("rejects when no resource in the array passes a scope check", () => {
+    const ability = buildJwtAbility(["read:batch:batch_abc"]);
+    const resources = [
+      { type: "runs", id: "run_xyz" },
+      { type: "batch", id: "batch_other" },
+      { type: "tasks", id: "task_other" },
+    ];
+    expect(ability.can("read", resources)).toBe(false);
+  });
+
+  it("empty array never authorizes", () => {
+    const ability = buildJwtAbility(["read:all"]);
+    expect(ability.can("read", [])).toBe(false);
+  });
+
+  it("authorizes a single resource via the non-array form (backwards compatible)", () => {
+    const ability = buildJwtAbility(["read:runs:run_abc"]);
+    expect(ability.can("read", { type: "runs", id: "run_abc" })).toBe(true);
+  });
+});
+
+describe("buildFallbackAbility", () => {
+  it("returns permissiveAbility for non-admin users", () => {
+    const ability = buildFallbackAbility(false);
+    expect(ability.can("read", { type: "run" })).toBe(true);
+    expect(ability.canSuper()).toBe(false);
+  });
+
+  it("returns superAbility for admin users", () => {
+    const ability = buildFallbackAbility(true);
+    expect(ability.can("read", { type: "run" })).toBe(true);
+    expect(ability.canSuper()).toBe(true);
+  });
+});

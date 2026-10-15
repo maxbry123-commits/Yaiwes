@@ -1,0 +1,194 @@
+import { SimpleStructuredLogger } from "../../utils/structuredLogger.js";
+import type { SupervisorHttpClient } from "./http.js";
+import type { WeightedWorkerQueueSubscription } from "../workerQueue.js";
+import type { WorkerApiDequeueResponseBody, WorkerQueueClass } from "./schemas.js";
+import type { PreDequeueFn, PreSkipFn } from "./types.js";
+import type { ConsumerPoolMetrics } from "./consumerPoolMetrics.js";
+
+const DEQUEUE_REJECTION_BACKOFF_MIN_MS = 1_000;
+const DEQUEUE_REJECTION_BACKOFF_MAX_MS = 30_000;
+
+export interface QueueConsumer {
+  start(): void;
+  stop(): void;
+}
+
+export type RunQueueConsumerOptions = {
+  client: SupervisorHttpClient;
+  intervalMs: number;
+  idleIntervalMs: number;
+  preDequeue?: PreDequeueFn;
+  preSkip?: PreSkipFn;
+  /** Which worker-queue class this consumer pulls from. Defaults to the worker's region queue. */
+  queueClass?: WorkerQueueClass;
+  subscriptions?: WeightedWorkerQueueSubscription[];
+  onDequeue: (
+    messages: WorkerApiDequeueResponseBody,
+    timing?: { dequeueResponseMs: number; pollingIntervalMs: number }
+  ) => Promise<void>;
+  /** Optional shared pool metrics. When provided, dequeue API latency is recorded as a histogram. */
+  metrics?: ConsumerPoolMetrics;
+};
+
+export class RunQueueConsumer implements QueueConsumer {
+  private readonly client: SupervisorHttpClient;
+  private readonly preDequeue?: PreDequeueFn;
+  private readonly preSkip?: PreSkipFn;
+  private readonly queueClass?: WorkerQueueClass;
+  private readonly subscriptions?: WeightedWorkerQueueSubscription[];
+  private readonly onDequeue: (
+    messages: WorkerApiDequeueResponseBody,
+    timing?: { dequeueResponseMs: number; pollingIntervalMs: number }
+  ) => Promise<void>;
+  private readonly metrics?: ConsumerPoolMetrics;
+
+  private readonly logger = new SimpleStructuredLogger("queue-consumer");
+
+  private intervalMs: number;
+  private idleIntervalMs: number;
+  private isEnabled: boolean;
+  private lastScheduledIntervalMs: number;
+  private rejectionBackoffMs = 0;
+
+  constructor(opts: RunQueueConsumerOptions) {
+    this.isEnabled = false;
+    this.intervalMs = opts.intervalMs;
+    this.idleIntervalMs = opts.idleIntervalMs;
+    this.preDequeue = opts.preDequeue;
+    this.preSkip = opts.preSkip;
+    this.queueClass = opts.queueClass;
+    this.subscriptions = opts.subscriptions;
+    this.lastScheduledIntervalMs = opts.idleIntervalMs;
+    this.onDequeue = opts.onDequeue;
+    this.client = opts.client;
+    this.metrics = opts.metrics;
+  }
+
+  start() {
+    if (this.isEnabled) {
+      return;
+    }
+
+    this.isEnabled = true;
+    this.dequeue();
+  }
+
+  stop() {
+    if (!this.isEnabled) {
+      return;
+    }
+
+    this.isEnabled = false;
+  }
+
+  private async dequeue() {
+    this.logger.verbose("dequeue()", {
+      enabled: this.isEnabled,
+      intervalMs: this.intervalMs,
+      idleIntervalMs: this.idleIntervalMs,
+      preDequeue: !!this.preDequeue,
+      preSkip: !!this.preSkip,
+    });
+
+    if (!this.isEnabled) {
+      this.logger.warn("dequeue() - not enabled");
+      return;
+    }
+
+    let preDequeueResult: Awaited<ReturnType<PreDequeueFn>> | undefined;
+    if (this.preDequeue) {
+      this.logger.verbose("preDequeue()");
+
+      try {
+        preDequeueResult = await this.preDequeue();
+      } catch (preDequeueError) {
+        this.logger.error("preDequeue error", { error: preDequeueError });
+      }
+    }
+
+    this.logger.verbose("preDequeueResult", { preDequeueResult });
+
+    if (
+      preDequeueResult?.skipDequeue ||
+      preDequeueResult?.maxResources?.cpu === 0 ||
+      preDequeueResult?.maxResources?.memory === 0
+    ) {
+      this.logger.debug("skipping dequeue", { preDequeueResult });
+
+      if (this.preSkip) {
+        this.logger.debug("preSkip()");
+
+        try {
+          await this.preSkip();
+        } catch (preSkipError) {
+          this.logger.error("preSkip error", { error: preSkipError });
+        }
+      }
+
+      this.scheduleNextDequeue(this.idleIntervalMs);
+      return;
+    }
+
+    let nextIntervalMs = this.idleIntervalMs;
+
+    const dequeueStart = performance.now();
+
+    try {
+      const response = await this.client.dequeue({
+        maxResources: preDequeueResult?.maxResources,
+        queueClass: this.queueClass,
+        subscriptions: this.subscriptions,
+      });
+      const dequeueDurationSeconds = (performance.now() - dequeueStart) / 1000;
+      const dequeueResponseMs = Math.round(dequeueDurationSeconds * 1000);
+
+      if (!response.success) {
+        this.metrics?.observeDequeueLatency(dequeueDurationSeconds, "error");
+        this.logger.error("Failed to dequeue", { error: response.error });
+        if (response.statusCode === 403 || response.statusCode === 422) {
+          this.rejectionBackoffMs = Math.min(
+            Math.max(DEQUEUE_REJECTION_BACKOFF_MIN_MS, this.rejectionBackoffMs * 2),
+            DEQUEUE_REJECTION_BACKOFF_MAX_MS
+          );
+          nextIntervalMs = Math.max(this.idleIntervalMs, this.rejectionBackoffMs);
+        }
+      } else {
+        this.rejectionBackoffMs = 0;
+        this.metrics?.observeDequeueLatency(
+          dequeueDurationSeconds,
+          response.data.length > 0 ? "success" : "empty"
+        );
+
+        try {
+          await this.onDequeue(response.data, {
+            dequeueResponseMs,
+            pollingIntervalMs: this.lastScheduledIntervalMs,
+          });
+
+          if (response.data.length > 0) {
+            nextIntervalMs = this.intervalMs;
+          }
+        } catch (handlerError) {
+          this.logger.error("onDequeue error", { error: handlerError });
+        }
+      }
+    } catch (clientError) {
+      // wrapZodFetch traps all errors into { success: false }, so this branch is
+      // unreachable with the real client today. Record defensively so a future
+      // client that throws can't silently lose error samples.
+      this.metrics?.observeDequeueLatency((performance.now() - dequeueStart) / 1000, "error");
+      this.logger.error("client.dequeue error", { error: clientError });
+    }
+
+    this.scheduleNextDequeue(nextIntervalMs);
+  }
+
+  private scheduleNextDequeue(delayMs: number) {
+    if (delayMs === this.idleIntervalMs && this.idleIntervalMs !== this.intervalMs) {
+      this.logger.verbose("scheduled dequeue with idle interval", { delayMs });
+    }
+
+    this.lastScheduledIntervalMs = delayMs;
+    setTimeout(this.dequeue.bind(this), delayMs);
+  }
+}

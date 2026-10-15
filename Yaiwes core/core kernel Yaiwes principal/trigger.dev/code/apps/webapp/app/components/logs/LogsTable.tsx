@@ -1,0 +1,265 @@
+import { ArrowPathIcon } from "@heroicons/react/20/solid";
+import { useEffect, useRef, useState } from "react";
+import { RunsIcon } from "~/assets/icons/RunsIcon";
+import { LogLevelTooltipInfo } from "~/components/LogLevelTooltipInfo";
+import { Button, LinkButton } from "~/components/primitives/Buttons";
+import { useEnvironment } from "~/hooks/useEnvironment";
+import { useOrganization } from "~/hooks/useOrganizations";
+import { useProject } from "~/hooks/useProject";
+import type { LogEntry } from "~/presenters/v3/LogsListPresenter.server";
+import { cn } from "~/utils/cn";
+import { highlightSearchText } from "~/utils/logUtils";
+import { v3RunSpanPath } from "~/utils/pathBuilder";
+import { DateTimeAccurate } from "../primitives/DateTime";
+import { Paragraph } from "../primitives/Paragraph";
+import { Spinner } from "../primitives/Spinner";
+import {
+  Table,
+  TableBlankRow,
+  TableBody,
+  TableCell,
+  TableCellMenu,
+  TableHeader,
+  TableHeaderCell,
+  TableRow,
+  type TableVariant,
+} from "../primitives/Table";
+import { LogLevel } from "./LogLevel";
+
+type LogsTableProps = {
+  logs: LogEntry[];
+  searchTerm?: string;
+  isLoading?: boolean;
+  isLoadingMore?: boolean;
+  hasMore?: boolean;
+  isIncomplete?: boolean;
+  onLoadMore?: () => void;
+  showKeepSearching?: boolean;
+  onKeepSearching?: () => void;
+  searchedTo?: string;
+  variant?: TableVariant;
+  selectedLogId?: string;
+  onLogSelect?: (logId: string) => void;
+};
+
+// Inner shadow for level highlighting (better scroll performance than border-l)
+function getLevelBoxShadow(level: LogEntry["level"]): string {
+  switch (level) {
+    case "ERROR":
+      return "inset 2px 0 0 0 rgb(239, 68, 68)";
+    case "WARN":
+      return "inset 2px 0 0 0 rgb(234, 179, 8)";
+    case "INFO":
+      return "inset 2px 0 0 0 rgb(59, 130, 246)";
+    case "TRACE":
+      return "inset 2px 0 0 0 rgb(168, 85, 247)";
+    case "DEBUG":
+    default:
+      return "none";
+  }
+}
+
+export function LogsTable({
+  logs,
+  searchTerm,
+  isLoading = false,
+  isLoadingMore = false,
+  hasMore = false,
+  isIncomplete = false,
+  onLoadMore,
+  showKeepSearching = false,
+  onKeepSearching,
+  searchedTo,
+  selectedLogId,
+  onLogSelect,
+}: LogsTableProps) {
+  const organization = useOrganization();
+  const project = useProject();
+  const environment = useEnvironment();
+  const loadMoreRef = useRef<HTMLDivElement>(null);
+  const [showLoadMoreSpinner, setShowLoadMoreSpinner] = useState(false);
+
+  // Show load more spinner only after 0.2 seconds of loading time
+  useEffect(() => {
+    if (!isLoadingMore) {
+      // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes local state after an external or lifecycle change.
+      setShowLoadMoreSpinner(false);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setShowLoadMoreSpinner(true);
+    }, 200);
+
+    return () => clearTimeout(timer);
+  }, [isLoadingMore]);
+
+  useEffect(() => {
+    if (isLoading || !hasMore || isLoadingMore || showKeepSearching || !onLoadMore) return;
+
+    const target = loadMoreRef.current;
+    if (!target) return;
+
+    let active = true;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (active && entries[0]?.isIntersecting) onLoadMore();
+      },
+      { threshold: 0.1 }
+    );
+    observer.observe(target);
+    return () => {
+      active = false;
+      observer.disconnect();
+    };
+  }, [hasMore, isLoading, isLoadingMore, onLoadMore, showKeepSearching]);
+
+  return (
+    <div className="relative h-full overflow-auto border-t scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
+      <Table variant="compact/mono" containerClassName="overflow-visible" showTopBorder={false}>
+        <TableHeader className="sticky top-0 z-10">
+          <TableRow>
+            <TableHeaderCell className="min-w-48 whitespace-nowrap">Time</TableHeaderCell>
+            <TableHeaderCell className="min-w-24 whitespace-nowrap">Run</TableHeaderCell>
+            <TableHeaderCell className="min-w-32 whitespace-nowrap">Task</TableHeaderCell>
+            <TableHeaderCell
+              className="min-w-24 whitespace-nowrap"
+              tooltip={<LogLevelTooltipInfo />}
+              disableTooltipHoverableContent
+            >
+              Level
+            </TableHeaderCell>
+            <TableHeaderCell className="w-full min-w-0">Message</TableHeaderCell>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {logs.length === 0 ? (
+            <BlankState
+              isLoading={isLoading}
+              isPartial={hasMore || isIncomplete}
+              onRefresh={() => window.location.reload()}
+            />
+          ) : (
+            logs.map((log) => {
+              const isSelected = selectedLogId === log.id;
+              const runPath = v3RunSpanPath(
+                organization,
+                project,
+                environment,
+                { friendlyId: log.runId },
+                { spanId: log.spanId }
+              );
+
+              const handleRowClick = () => onLogSelect?.(log.id);
+
+              return (
+                <TableRow
+                  key={log.projectionFingerprint ?? log.id}
+                  className={cn(
+                    "cursor-pointer transition-colors",
+                    isSelected ? "bg-background-hover" : "hover:bg-background-dimmed"
+                  )}
+                  isSelected={isSelected}
+                >
+                  <TableCell
+                    className="whitespace-nowrap tabular-nums"
+                    onClick={handleRowClick}
+                    hasAction
+                    style={{
+                      boxShadow: getLevelBoxShadow(log.level),
+                    }}
+                  >
+                    <DateTimeAccurate date={log.triggeredTimestamp} hour12={false} />
+                  </TableCell>
+                  <TableCell className="min-w-24 cursor-pointer" onClick={handleRowClick}>
+                    <span className="font-mono text-xs">{log.runId}</span>
+                  </TableCell>
+                  <TableCell className="min-w-32" onClick={handleRowClick} hasAction>
+                    <span className="font-mono text-xs">{log.taskIdentifier}</span>
+                  </TableCell>
+                  <TableCell onClick={handleRowClick} hasAction>
+                    <LogLevel level={log.level} />
+                  </TableCell>
+                  <TableCell className="max-w-0 truncate" onClick={handleRowClick} hasAction>
+                    <span className="block truncate font-mono text-xs" title={log.message}>
+                      {highlightSearchText(log.message, searchTerm)}
+                    </span>
+                  </TableCell>
+                  <TableCellMenu
+                    className="pl-32"
+                    hiddenButtons={
+                      <LinkButton
+                        to={runPath}
+                        variant="minimal/small"
+                        TrailingIcon={RunsIcon}
+                        trailingIconClassName="text-text-bright"
+                        className="h-5.5 pl-1.5 pr-2"
+                      >
+                        <span className="text-[0.6875rem] text-text-bright">View run</span>
+                      </LinkButton>
+                    }
+                  />
+                </TableRow>
+              );
+            })
+          )}
+        </TableBody>
+      </Table>
+      {(hasMore || logs.length > 0 || isIncomplete) && (
+        <div ref={loadMoreRef} className="flex items-center justify-center py-12">
+          <div className="flex flex-col items-center gap-3">
+            {searchedTo && <span className="text-text-dimmed">Searched back to {searchedTo}</span>}
+            {hasMore ? (
+              isLoadingMore ? (
+                <div className={cn("flex items-center gap-2", !showLoadMoreSpinner && "invisible")}>
+                  <Spinner /> <span className="text-text-dimmed">Searching…</span>
+                </div>
+              ) : showKeepSearching ? (
+                <Button variant="tertiary/medium" onClick={onKeepSearching}>
+                  Keep searching
+                </Button>
+              ) : null
+            ) : isIncomplete ? (
+              <span className="text-text-dimmed">Search incomplete</span>
+            ) : (
+              <span className="text-text-dimmed">Showing all {logs.length} logs</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BlankState({
+  isLoading,
+  isPartial,
+  onRefresh,
+}: {
+  isLoading?: boolean;
+  isPartial?: boolean;
+  onRefresh?: () => void;
+}) {
+  if (isLoading) return <TableBlankRow colSpan={6} />;
+
+  const handleRefresh = onRefresh ?? (() => window.location.reload());
+
+  return (
+    <TableBlankRow colSpan={6}>
+      <div className="flex flex-col items-center justify-center gap-6">
+        <Paragraph className="w-auto" variant="base/bright">
+          {isPartial
+            ? "No matching logs found in the searched range yet."
+            : "No logs match your filters. Try refreshing or modifying your filters."}
+        </Paragraph>
+        {!isPartial && (
+          <div className="flex items-center gap-2">
+            <Button LeadingIcon={ArrowPathIcon} variant="tertiary/medium" onClick={handleRefresh}>
+              Refresh
+            </Button>
+          </div>
+        )}
+      </div>
+    </TableBlankRow>
+  );
+}

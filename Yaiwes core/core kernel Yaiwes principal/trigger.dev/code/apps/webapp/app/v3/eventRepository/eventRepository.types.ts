@@ -1,0 +1,557 @@
+import type { Attributes, Tracer } from "@opentelemetry/api";
+import type {
+  SpanEvents,
+  TaskEventEnvironment,
+  TaskEventStyle,
+  TaskRunError,
+} from "@trigger.dev/core/v3";
+import type {
+  Prisma,
+  TaskEventKind,
+  TaskEventLevel,
+  TaskEventStatus,
+  TaskRun,
+} from "@trigger.dev/database";
+import type { MetricsV1Input, TraceChunkCursor } from "@internal/clickhouse";
+import type { DetailedTraceEvent, TaskEventStoreTable } from "../taskEventStore.server";
+
+// ============================================================================
+// Event Creation Types
+// ============================================================================
+
+export type LlmMetricsData = {
+  genAiSystem: string;
+  requestModel: string;
+  responseModel: string;
+  baseResponseModel: string;
+  matchedModelId: string;
+  operationId: string;
+  finishReason: string;
+  costSource: string;
+  pricingTierId: string;
+  pricingTierName: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  usageDetails: Record<string, number>;
+  inputCost: number;
+  outputCost: number;
+  totalCost: number;
+  costDetails: Record<string, number>;
+  providerCost: number;
+  msToFirstChunk: number;
+  tokensPerSecond: number;
+  metadata: Record<string, string>;
+  promptSlug: string;
+  promptVersion: number;
+};
+
+export type CreateEventInput = Omit<
+  Prisma.TaskEventCreateInput,
+  | "id"
+  | "createdAt"
+  | "properties"
+  | "metadata"
+  | "style"
+  | "output"
+  | "payload"
+  | "serviceName"
+  | "serviceNamespace"
+  | "tracestate"
+  | "projectRef"
+  | "runIsTest"
+  | "workerId"
+  | "queueId"
+  | "queueName"
+  | "batchId"
+  | "taskPath"
+  | "taskExportName"
+  | "workerVersion"
+  | "idempotencyKey"
+  | "attemptId"
+  | "usageDurationMs"
+  | "usageCostInCents"
+  | "machinePreset"
+  | "machinePresetCpu"
+  | "machinePresetMemory"
+  | "machinePresetCentsPerMs"
+  | "links"
+> & {
+  properties: Attributes;
+  resourceProperties?: Attributes;
+  metadata: Attributes | undefined;
+  style: Attributes | undefined;
+  machineId?: string;
+  runTags?: string[];
+  /** Side-channel data for LLM cost tracking, populated by enrichCreatableEvents */
+  _llmMetrics?: LlmMetricsData;
+};
+
+export type CreatableEventKind = TaskEventKind;
+export type CreatableEventStatus = TaskEventStatus;
+
+// ============================================================================
+// Task Run Types
+// ============================================================================
+
+export type CompleteableTaskRun = Pick<
+  TaskRun,
+  | "friendlyId"
+  | "traceId"
+  | "spanId"
+  | "parentSpanId"
+  | "createdAt"
+  | "completedAt"
+  | "taskIdentifier"
+  | "projectId"
+  | "runtimeEnvironmentId"
+  | "organizationId"
+  | "isTest"
+>;
+
+// ============================================================================
+// Trace and Event Types
+// ============================================================================
+
+export type TraceAttributes = Partial<
+  Pick<
+    CreateEventInput,
+    "isError" | "isCancelled" | "isDebug" | "runId" | "metadata" | "properties" | "style"
+  >
+>;
+
+type SetAttribute<T extends TraceAttributes> = (key: keyof T, value: T[keyof T]) => void;
+
+export type TraceEventOptions = {
+  kind?: CreatableEventKind;
+  context?: Record<string, unknown>;
+  spanParentAsLink?: boolean;
+  spanIdSeed?: string;
+  attributes: TraceAttributes;
+  environment: TaskEventEnvironment;
+  taskSlug: string;
+  startTime?: bigint;
+  endTime?: Date;
+  immediate?: boolean;
+};
+
+export type EventBuilder = {
+  traceId: string;
+  spanId: string;
+  setAttribute: SetAttribute<TraceAttributes>;
+  stop: () => void;
+  failWithError: (error: TaskRunError) => void;
+};
+
+// ============================================================================
+// Configuration Types
+// ============================================================================
+
+export type EventRepoConfig = {
+  batchSize: number;
+  batchInterval: number;
+  retentionInDays: number;
+  partitioningEnabled: boolean;
+  tracer?: Tracer;
+  minConcurrency?: number;
+  maxConcurrency?: number;
+  maxBatchSize?: number;
+  memoryPressureThreshold?: number;
+  loadSheddingThreshold?: number;
+  loadSheddingEnabled?: boolean;
+};
+
+export type QueriedEvent = Prisma.TaskEventGetPayload<{
+  select: {
+    spanId: true;
+    parentId: true;
+    runId: true;
+    message: true;
+    style: true;
+    startTime: true;
+    duration: true;
+    isError: true;
+    isPartial: true;
+    isCancelled: true;
+    level: true;
+    events: true;
+    kind: true;
+    attemptNumber: true;
+  };
+}>;
+
+export type PreparedEvent = Omit<QueriedEvent, "events" | "style" | "duration"> & {
+  duration: number;
+  events: SpanEvents;
+  style: TaskEventStyle;
+};
+
+export type PreparedDetailedEvent = Omit<DetailedTraceEvent, "events" | "style" | "duration"> & {
+  duration: number;
+  events: SpanEvents;
+  style: TaskEventStyle;
+};
+
+export type RunPreparedEvent = PreparedEvent & {
+  taskSlug?: string;
+};
+
+export type SpanDetail = {
+  // ============================================================================
+  // Core Identity & Structure
+  // ============================================================================
+  spanId: string; // Tree structure, span identification
+  parentId: string | null; // Tree hierarchy
+  message: string; // Displayed as span title
+
+  // ============================================================================
+  // Status & State
+  // ============================================================================
+  isError: boolean; // Error status display, filtering, status icons
+  isPartial: boolean; // In-progress status display, timeline calculations
+  isCancelled: boolean; // Cancelled status display, status determination
+  level: TaskEventLevel; // Text styling, timeline rendering decisions
+
+  // ============================================================================
+  // Timing
+  // ============================================================================
+  startTime: Date; // Timeline calculations, display
+  duration: number; // Timeline width, duration display, calculations
+
+  // ============================================================================
+  // Content & Display
+  // ============================================================================
+  events: SpanEvents; // Timeline events, SpanEvents component
+  style: TaskEventStyle; // Icons, variants, accessories (RunIcon, SpanTitle)
+  properties: Record<string, unknown> | string | number | boolean | null | undefined; // Displayed as JSON in span properties (CodeBlock)
+  resourceProperties?: Record<string, unknown> | string | number | boolean | null | undefined; // Displayed as JSON in span resource properties (CodeBlock)
+
+  // ============================================================================
+  // Entity & Relationships
+  // ============================================================================
+  entity: {
+    // Used for entity type switching in SpanEntity
+    type: string | undefined;
+    id: string | undefined;
+    metadata: string | undefined;
+  };
+
+  metadata: any; // Used by SpanPresenter for entity processing
+};
+
+// ============================================================================
+// Span and Link Types
+// ============================================================================
+
+export type SpanSummaryCommon = {
+  id: string;
+  parentId: string | undefined;
+  runId: string;
+  data: {
+    message: string;
+    events: SpanEvents;
+    startTime: Date;
+    duration: number;
+    isError: boolean;
+    isPartial: boolean;
+    isCancelled: boolean;
+    level: NonNullable<CreateEventInput["level"]>;
+    attemptNumber?: number;
+  };
+};
+
+export type SpanSummary = {
+  id: string;
+  parentId: string | undefined;
+  runId: string;
+  data: {
+    message: string;
+    style: TaskEventStyle;
+    events: SpanEvents;
+    startTime: Date;
+    duration: number;
+    isError: boolean;
+    isPartial: boolean;
+    isCancelled: boolean;
+    isDebug: boolean;
+    level: NonNullable<CreateEventInput["level"]>;
+    attemptNumber?: number;
+  };
+};
+
+export type SpanOverride = {
+  isCancelled?: boolean;
+  isError?: boolean;
+  duration?: number;
+  events?: SpanEvents;
+};
+
+export type TraceSummary = {
+  rootSpan: SpanSummary;
+  spans: Array<SpanSummary>;
+  overridesBySpanId?: Record<string, SpanOverride>;
+  /** Set when a subtree fetch hit the row cap before collecting all descendants. */
+  isTruncated?: boolean;
+};
+
+export type TraceChunkEvent = {
+  spanId: string;
+  parentSpanId: string;
+  runId: string;
+  startTime: Date;
+  startTimeNano: string;
+  // Write time (ms since epoch); undefined on the v1 store.
+  insertedAt?: string;
+  duration: number;
+  status: string;
+  kind: string;
+  message: string;
+  metadata: string;
+};
+
+export type { TraceChunkCursor };
+
+export type TraceChunkScopeOptions = {
+  includeDebugLogs?: boolean;
+  // Live tail: only rows written at or after this time (ms since epoch).
+  tailInsertedAtSinceMs?: number;
+  // Only rows written at or before this time.
+  insertedAtEnd?: Date;
+};
+
+export type TraceChunk = {
+  events: Array<TraceChunkEvent>;
+  nextCursor: TraceChunkCursor | null;
+  hasMore: boolean;
+  // A span had more rows at one timestamp than one read allows; the extra rows were skipped.
+  droppedKeyRows?: boolean;
+};
+
+export type TraceErrorEvents = {
+  events: Array<TraceChunkEvent>;
+  isTruncated: boolean;
+};
+
+export type SpanDetailedSummary = {
+  id: string;
+  parentId: string | undefined;
+  runId: string;
+  data: {
+    message: string;
+    taskSlug?: string;
+    events: SpanEvents;
+    startTime: Date;
+    duration: number;
+    isError: boolean;
+    isPartial: boolean;
+    isCancelled: boolean;
+    level: NonNullable<CreateEventInput["level"]>;
+    attemptNumber?: number;
+    properties?: Attributes;
+  };
+  children: Array<SpanDetailedSummary>;
+};
+
+// A single trace event for the streaming export path (the "Download trace"
+// feature). Deliberately flat and self-contained: it carries its own parent ref
+// so hierarchy is reconstructable downstream without ever building a tree. Used
+// by `streamTraceEvents`, which yields these one at a time so an arbitrarily
+// large trace is never fully resident in memory.
+export type StreamedTraceEvent = {
+  spanId: string;
+  parentSpanId: string;
+  startTime: Date;
+  durationNs: number;
+  level: string;
+  message: string;
+  isError: boolean;
+  // Span attributes/properties as a raw JSON string, emitted verbatim (the
+  // ClickHouse store already materialises it as text — no per-row parse).
+  propertiesText: string;
+};
+
+export type TraceDetailedSummary = {
+  traceId: string;
+  rootSpan: SpanDetailedSummary;
+  /** Set when a fetch hit the row cap before collecting all spans. */
+  isTruncated?: boolean;
+};
+
+// ============================================================================
+// Event Repository Interface
+// ============================================================================
+
+/**
+ * Interface for the EventRepository class.
+ * Defines the public API for managing task events, traces, and spans.
+ */
+export interface IEventRepository {
+  maximumLiveReloadingSetting: number;
+  maximumTraceViewCount: number;
+  // Event insertion methods
+  insertMany(events: CreateEventInput[]): void;
+  insertManyImmediate(events: CreateEventInput[]): Promise<void>;
+  insertManyMetrics(rows: MetricsV1Input[]): void;
+
+  // Run event completion methods
+  completeSuccessfulRunEvent(params: { run: CompleteableTaskRun; endTime?: Date }): Promise<void>;
+
+  completeCachedRunEvent(params: {
+    run: CompleteableTaskRun;
+    blockedRun: CompleteableTaskRun;
+    spanId: string;
+    parentSpanId: string;
+    spanCreatedAt: Date;
+    isError: boolean;
+    endTime?: Date;
+  }): Promise<void>;
+
+  completeFailedRunEvent(params: {
+    run: CompleteableTaskRun;
+    endTime?: Date;
+    exception: { message?: string; type?: string; stacktrace?: string };
+  }): Promise<void>;
+
+  completeExpiredRunEvent(params: {
+    run: CompleteableTaskRun;
+    endTime?: Date;
+    ttl: string;
+  }): Promise<void>;
+
+  createAttemptFailedRunEvent(params: {
+    run: CompleteableTaskRun;
+    endTime?: Date;
+    attemptNumber: number;
+    exception: { message?: string; type?: string; stacktrace?: string };
+  }): Promise<void>;
+
+  cancelRunEvent(params: {
+    reason: string;
+    run: CompleteableTaskRun;
+    cancelledAt: Date;
+  }): Promise<void>;
+
+  // Query methods
+  /**
+   * `anchorSpanId` roots the summary at that span (the viewed run), so a window that
+   * starts after the trace root still builds. Returns undefined if it isn't in the rows.
+   */
+  getTraceSummary(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean; anchorSpanId?: string }
+  ): Promise<TraceSummary | undefined>;
+
+  /**
+   * Fetch the anchor span, its ancestors (for override propagation), and all descendants.
+   * `includeAncestors: false` skips the ancestor walk, which has no time bounds.
+   */
+  getTraceSubtreeSummary(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    anchorSpanId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean; includeAncestors?: boolean }
+  ): Promise<TraceSummary | undefined>;
+
+  getTraceChunk(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt: Date | undefined,
+    cursor: TraceChunkCursor | undefined,
+    options?: TraceChunkScopeOptions & { limit?: number }
+  ): Promise<TraceChunk | undefined>;
+
+  getTraceErrorEvents(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt: Date | undefined,
+    options?: { includeDebugLogs?: boolean }
+  ): Promise<TraceErrorEvents | undefined>;
+
+  getTraceSpanWithAncestors(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt: Date | undefined,
+    spanId: string,
+    options?: { includeDebugLogs?: boolean }
+  ): Promise<Array<TraceChunkEvent> | undefined>;
+
+  getTraceDetailedSummary(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean }
+  ): Promise<TraceDetailedSummary | undefined>;
+
+  /** Fetch the anchor span subtree as a detailed hierarchical trace rooted at anchorSpanId. */
+  getTraceDetailedSubtreeSummary(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    anchorSpanId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
+  ): Promise<TraceDetailedSummary | undefined>;
+
+  // Streams a trace's events in start_time order, one at a time, without ever
+  // materialising the full result set or a tree. Powers the streaming trace
+  // export so arbitrarily large traces download with bounded memory.
+  streamTraceEvents(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean }
+  ): AsyncIterable<StreamedTraceEvent>;
+
+  getRunEvents(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    runId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date
+  ): Promise<RunPreparedEvent[]>;
+
+  getSpan(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    spanId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean }
+  ): Promise<SpanDetail | undefined>;
+
+  // Event recording methods
+  recordEvent(
+    message: string,
+    options: TraceEventOptions & { duration?: number; parentId?: string }
+  ): Promise<void>;
+
+  traceEvent<TResult>(
+    message: string,
+    options: TraceEventOptions & { incomplete?: boolean; isError?: boolean },
+    callback: (
+      e: EventBuilder,
+      traceContext: Record<string, string | undefined>,
+      traceparent?: { traceId: string; spanId: string }
+    ) => Promise<TResult>
+  ): Promise<TResult>;
+}

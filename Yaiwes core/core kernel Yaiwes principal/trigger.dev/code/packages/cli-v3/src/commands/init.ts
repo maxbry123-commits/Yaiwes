@@ -1,0 +1,992 @@
+import { intro, isCancel, log, multiselect, outro, select, text } from "@clack/prompts";
+import { context, trace } from "@opentelemetry/api";
+import type { GetProjectResponseBody, LogLevel } from "@trigger.dev/core/v3";
+import { flattenAttributes, tryCatch } from "@trigger.dev/core/v3";
+import { recordSpanException } from "@trigger.dev/core/v3/workers";
+import chalk from "chalk";
+import type { Command } from "commander";
+import { Option as CommandOption } from "commander";
+import { applyEdits, findNodeAtLocation, getNodeValue, modify, parseTree } from "jsonc-parser";
+import { writeFile } from "node:fs/promises";
+import { join, posix, relative, resolve, sep } from "node:path";
+import { addDependency, addDevDependency } from "nypm";
+import { resolveTSConfig } from "pkg-types";
+import { z } from "zod";
+import { CliApiClient } from "../apiClient.js";
+import {
+  CommonCommandOptions,
+  OutroCommandError,
+  SkipCommandError,
+  SkipLoggingError,
+  commonOptions,
+  handleTelemetry,
+  tracer,
+  wrapCommandAction,
+} from "../cli/common.js";
+import { loadConfig } from "../config.js";
+import { cliLink } from "../utilities/cliOutput.js";
+import {
+  createFileFromTemplate,
+  generateTemplateUrl,
+} from "../utilities/createFileFromTemplate.js";
+import { createFile, pathExists, readFile } from "../utilities/fileSystem.js";
+import { printStandloneInitialBanner } from "../utilities/initialBanner.js";
+import { logger } from "../utilities/logger.js";
+import { spinner } from "../utilities/windows.js";
+import { VERSION } from "../version.js";
+import { login, PENDING_AUTHORIZATION_ERROR } from "./login.js";
+import {
+  readConfigHasSeenMCPInstallPrompt,
+  writeConfigHasSeenMCPInstallPrompt,
+} from "../utilities/configFiles.js";
+import { installMcpServer } from "./install-mcp.js";
+import { createProjectWithFreePlanFallback } from "./projects/common.js";
+import { installSkillsFromInit, markSkillsPromptSeen } from "./skills.js";
+
+const cliVersion = VERSION as string;
+const cliTag = cliVersion.includes("v4-beta") ? "v4-beta" : "latest";
+
+const InitCommandOptions = CommonCommandOptions.extend({
+  projectRef: z.string().optional(),
+  projectName: z.string().trim().min(1).max(255).optional(),
+  orgName: z.string().trim().min(3).max(50).optional(),
+  overrideConfig: z.boolean().default(false),
+  tag: z.string().default(cliVersion),
+  skipPackageInstall: z.boolean().default(false),
+  runtime: z.string().default("node-24"),
+  pkgArgs: z.string().optional(),
+  gitRef: z.string().default("main"),
+  javascript: z.boolean().default(false),
+  yes: z.boolean().default(false),
+  browser: z.boolean().default(true),
+});
+
+type InitCommandOptions = z.infer<typeof InitCommandOptions>;
+
+export function configureInitCommand(program: Command) {
+  return commonOptions(
+    program
+      .command("init")
+      .summary("Initialize your existing project for development with Trigger.dev")
+      .description(
+        `Initialize your existing project for development with Trigger.dev.
+
+Examples:
+  # Interactive setup
+  $ trigger.dev init
+
+  # Non-interactive with an existing project
+  $ trigger.dev init --yes --project-ref proj_abc123
+
+  # Bootstrap a new account non-interactively
+  $ trigger.dev init --yes --org-name "Acme" --project-name "My project"
+
+  # Headless / agent (no browser)
+  $ trigger.dev init --yes --project-ref proj_abc123 --no-browser
+
+  # Use a named profile
+  $ trigger.dev init --profile staging`
+      )
+      .argument("[path]", "The path to the project", ".")
+      .option(
+        "-p, --project-ref <project ref>",
+        "The project ref to use when initializing the project"
+      )
+      .option("--project-name <name>", "The name to use when creating the first project")
+      .option("--org-name <name>", "The organization name to use for a new account")
+      .option("--javascript", "Initialize the project with JavaScript instead of TypeScript", false)
+      .option(
+        "-t, --tag <package tag>",
+        "The version of the @trigger.dev/sdk package to install",
+        cliVersion
+      )
+      .option(
+        "-r, --runtime <runtime>",
+        "Which runtime to use for the project. Supported: node, node-22, node-24, node-26, bun",
+        "node-24"
+      )
+      .option("--skip-package-install", "Skip installing the @trigger.dev/sdk package")
+      .option("--override-config", "Override the existing config file if it exists")
+      .option(
+        "--pkg-args <args>",
+        "Additional arguments to pass to the package manager, accepts CSV for multiple args"
+      )
+      .option(
+        "-y, --yes",
+        "Skip all prompts and use defaults (requires --project-ref, or --project-name with --org-name for a new account)"
+      )
+      .option(
+        "--no-browser",
+        "Don't automatically open the browser during login; print the URL only"
+      )
+  )
+    .addOption(
+      new CommandOption(
+        "--git-ref <git ref>",
+        "The git ref to use when fetching templates from GitHub"
+      ).hideHelp()
+    )
+    .action(async (path, options) => {
+      await handleTelemetry(async () => {
+        await printStandloneInitialBanner(true, options.profile);
+        await initCommand(path, options);
+      });
+    });
+}
+
+async function initCommand(dir: string, options: unknown) {
+  return await wrapCommandAction("initCommand", InitCommandOptions, options, async (opts) => {
+    return await _initCommand(dir, opts);
+  });
+}
+
+async function _initCommand(dir: string, options: InitCommandOptions) {
+  const span = trace.getSpan(context.active());
+
+  if (options.yes && !options.projectRef && !options.projectName) {
+    throw new Error("--project-ref or --project-name is required when using --yes flag");
+  }
+
+  // Refuse to run interactively when stdin isn't a TTY (CI, agent harness, etc).
+  // Previously this silently default-and-exited at the first prompt, leaving the
+  // project half-initialized.
+  if (!options.yes && !process.stdin.isTTY) {
+    throw new Error(
+      "Interactive prompts cannot be used in non-TTY environments. Pass --yes with --project-ref, or with --project-name and --org-name for a new account."
+    );
+  }
+
+  const hasSeenMCPInstallPrompt = readConfigHasSeenMCPInstallPrompt();
+
+  // Skip the AI-tooling prompt when --yes is set: the user explicitly chose the CLI
+  // scaffold by running `trigger.dev init` non-interactively, and the prompt would
+  // otherwise hang on a fresh machine where `hasSeenMCPInstallPrompt` is false.
+  if (!hasSeenMCPInstallPrompt && !options.yes) {
+    const tooling = await multiselect({
+      message: "Set up AI tooling for your coding assistant? (optional, space to toggle)",
+      options: [
+        {
+          value: "mcp",
+          label: "MCP server",
+          hint: "live access to your project: trigger tasks, deploy, monitor runs",
+        },
+        {
+          value: "skills",
+          label: "Agent skills",
+          hint: "teach your AI to write Trigger.dev code, version-matched to your SDK",
+        },
+      ],
+      required: false,
+    });
+
+    writeConfigHasSeenMCPInstallPrompt(true);
+
+    const selectedTooling = isCancel(tooling) ? [] : tooling;
+
+    // Track what actually installed (not just what was selected), so the AI hand-off is
+    // only offered, and only described, in terms of tooling that really landed.
+    let installedSkills = false;
+    let installedMcp = false;
+
+    // Skills are auth-free and bundled in the CLI. The user opted in here, so install
+    // straight away (no extra confirm). If they declined, still mark the prompt seen so
+    // `trigger dev` doesn't ask about skills a second time.
+    if (selectedTooling.includes("skills")) {
+      log.step("Installing the Trigger.dev agent skills");
+      const [skillsError, installed] = await tryCatch(installSkillsFromInit());
+      if (skillsError) {
+        log.warn(`Skipped agent skills: ${skillsError.message}`);
+      } else {
+        installedSkills = installed === true;
+      }
+    } else {
+      await tryCatch(markSkillsPromptSeen());
+    }
+
+    // The MCP server is also auth-free.
+    if (selectedTooling.includes("mcp")) {
+      log.step("Welcome to the Trigger.dev MCP server install wizard 🧙");
+
+      const [installError] = await tryCatch(
+        installMcpServer({
+          yolo: false,
+          tag: options.tag,
+          logLevel: options.logLevel,
+        })
+      );
+
+      if (installError) {
+        // Don't abort init if MCP fails: skills may already be installed and the user
+        // still needs the project scaffolded. Warn and carry on.
+        log.warn(`Skipped MCP server: ${installError.message}`);
+      } else {
+        installedMcp = true;
+      }
+    }
+
+    // Vibe path: once AI tooling is actually installed, the user can hand scaffolding to
+    // their assistant instead of the CLI. Only offered when something landed, and the
+    // hand-off message names only the tooling that did.
+    if (installedSkills || installedMcp) {
+      const setupChoice = await select({
+        message: "How do you want to set up your project?",
+        options: [
+          {
+            value: "cli",
+            label: "Scaffold it now with the CLI",
+            hint: "log in, create trigger.config.ts and an example task",
+          },
+          {
+            value: "ai",
+            label: "Let my AI assistant set it up",
+            hint: "hand off and let your assistant bootstrap the project",
+          },
+        ],
+      });
+
+      if (!isCancel(setupChoice) && setupChoice === "ai") {
+        outro(
+          installedSkills && installedMcp
+            ? "Your AI tooling is ready. Ask your assistant to set up Trigger.dev; it can use the trigger-getting-started skill and the MCP server to add the SDK, config, and your first task."
+            : installedSkills
+              ? "Your AI tooling is ready. Ask your assistant to set up Trigger.dev and it will use the trigger-getting-started skill to add the SDK, config, and your first task."
+              : "The MCP server is installed. Ask your assistant to set up Trigger.dev using the MCP server."
+        );
+        return;
+      }
+    }
+  }
+
+  intro("Initializing project");
+
+  const cwd = resolve(process.cwd(), dir);
+
+  if (!(await pathExists(join(cwd, "package.json")))) {
+    throw new Error(
+      `No package.json found in ${cwd}. Run init from the root of an existing JavaScript or TypeScript project.`
+    );
+  }
+
+  const authorization = await login({
+    embedded: true,
+    defaultApiUrl: options.apiUrl,
+    profile: options.profile,
+    browser: options.browser,
+  });
+
+  if (!authorization.ok) {
+    if (authorization.error === "fetch failed") {
+      throw new Error(
+        `Failed to connect to ${authorization.auth?.apiUrl}. Are you sure it's the correct URL?`
+      );
+    } else if (authorization.error === PENDING_AUTHORIZATION_ERROR) {
+      throw new Error(PENDING_AUTHORIZATION_ERROR);
+    } else {
+      throw new Error("You must login first. Use `trigger.dev login` to login.");
+    }
+  }
+
+  span?.setAttributes({
+    "cli.userId": authorization.userId,
+    "cli.email": authorization.email,
+    "cli.config.apiUrl": authorization.auth.apiUrl,
+    "cli.config.profile": authorization.profile,
+  });
+
+  const tsconfigPath = await tryResolveTsConfig(cwd);
+
+  if (!options.overrideConfig) {
+    try {
+      // check to see if there is an existing trigger.dev config file in the project directory
+      const result = await loadConfig({ cwd });
+
+      if (result.configFile && result.configFile !== "trigger.config") {
+        outro(
+          result.configFile
+            ? `Project already initialized: Found config file at ${result.configFile}. Pass --override-config to override`
+            : "Project already initialized"
+        );
+
+        return;
+      }
+    } catch (_e) {
+      // continue
+    }
+  }
+
+  const apiClient = new CliApiClient(authorization.auth.apiUrl, authorization.auth.accessToken);
+
+  const selectedProject = await selectProject(apiClient, {
+    projectRef: options.projectRef,
+    projectName: options.projectName,
+    orgName: options.orgName,
+    nonInteractive: options.yes,
+  });
+
+  span?.setAttributes({
+    ...flattenAttributes(selectedProject, "cli.project"),
+  });
+
+  logger.debug("Selected project", selectedProject);
+
+  log.step(`Configuring project "${selectedProject.name}" (${selectedProject.externalRef})`);
+
+  // Install @trigger.dev/sdk package
+  if (!options.skipPackageInstall) {
+    await installPackages(
+      cwd,
+      options.tag,
+      new CLIInstallPackagesOutputter(options.logLevel, options.tag)
+    );
+  } else {
+    log.info("Skipping package installation");
+  }
+
+  const language = options.javascript ? "javascript" : "typescript";
+
+  // Create the trigger dir
+  const triggerDir = await createTriggerDir(dir, options, language);
+
+  // Create the config file
+  await writeConfigFile(dir, selectedProject, options, triggerDir, language);
+
+  // Add trigger.config.ts to tsconfig.json
+  if (tsconfigPath && language === "typescript") {
+    await addConfigFileToTsConfig(tsconfigPath, options);
+  }
+
+  // Ignore .trigger dir
+  await gitIgnoreDotTriggerDir(dir, options);
+
+  try {
+    const result = await apiClient.markProjectInitialized(selectedProject.externalRef);
+    if (!result.success) {
+      logger.debug("Failed to mark project as initialized", { error: result.error });
+    }
+  } catch (error) {
+    logger.debug("Failed to mark project as initialized", { error });
+  }
+
+  const projectDashboard = cliLink(
+    "project dashboard",
+    `${authorization.dashboardUrl}/projects/v3/${selectedProject.externalRef}`
+  );
+
+  log.success("Successfully initialized your Trigger.dev project 🫡");
+  log.info("Next steps:");
+  log.info(
+    `   1. To start developing, run ${chalk.green(
+      `npx trigger.dev@${cliTag} dev${options.profile ? ` --profile ${options.profile}` : ""}`
+    )} in your project directory`
+  );
+  log.info(`   2. Visit your ${projectDashboard} to view your newly created tasks.`);
+  log.info(
+    `   3. Head over to our ${cliLink("v3 docs", "https://trigger.dev/docs")} to learn more.`
+  );
+  log.info(
+    `   4. Need help? Join our ${cliLink(
+      "Discord community",
+      "https://trigger.dev/discord"
+    )} or email us at ${chalk.cyan("help@trigger.dev")}`
+  );
+
+  outro(`Project initialized successfully. Happy coding!`);
+}
+
+async function createTriggerDir(
+  dir: string,
+  options: InitCommandOptions,
+  language: "typescript" | "javascript"
+) {
+  return await tracer.startActiveSpan("createTriggerDir", async (span) => {
+    try {
+      const defaultValue = join(dir, "src", "trigger");
+
+      let location: string;
+      let example: string;
+
+      if (options.yes) {
+        // Use defaults when --yes flag is set
+        location = defaultValue;
+        example = "simple";
+      } else {
+        const locationPrompt = await text({
+          message: "Where would you like to create the Trigger.dev directory?",
+          defaultValue: defaultValue,
+          placeholder: defaultValue,
+        });
+
+        if (isCancel(locationPrompt)) {
+          throw new OutroCommandError();
+        }
+
+        location = locationPrompt;
+
+        const exampleSelection = await select({
+          message: `Choose an example to create in the ${location} directory`,
+          options: [
+            { value: "simple", label: "Simple (Hello World)" },
+            { value: "schedule", label: "Scheduled Task" },
+            {
+              value: "none",
+              label: "None",
+              hint: "skip creating an example",
+            },
+          ],
+        });
+
+        if (isCancel(exampleSelection)) {
+          throw new OutroCommandError();
+        }
+
+        example = exampleSelection as string;
+      }
+
+      // Ensure that the path is always relative by stripping leading '/' if present
+      const relativeLocation = location.replace(/^\//, "");
+
+      const triggerDir = resolve(process.cwd(), relativeLocation);
+      // The prompt takes a cwd-relative path, but trigger.config dirs are relative to the project dir.
+      const configLocation = relative(resolve(process.cwd(), dir), triggerDir)
+        .split(sep)
+        .join(posix.sep);
+
+      logger.debug({ triggerDir });
+
+      span.setAttributes({
+        "cli.triggerDir": triggerDir,
+      });
+
+      if (await pathExists(triggerDir)) {
+        throw new Error(`Directory already exists at ${triggerDir}`);
+      }
+
+      span.setAttributes({
+        "cli.example": example,
+      });
+
+      if (example === "none") {
+        // Create a .gitkeep file in the trigger dir
+        await createFile(join(triggerDir, ".gitkeep"), "");
+
+        log.step(`Created directory at ${location}`);
+
+        span.end();
+        return { location: configLocation, isCustomValue: location !== defaultValue };
+      }
+
+      const templateUrl = generateTemplateUrl(
+        `examples/${example}.${language === "typescript" ? "ts" : "mjs"}`,
+        options.gitRef
+      );
+      const outputPath = join(triggerDir, `example.${language === "typescript" ? "ts" : "mjs"}`);
+
+      await createFileFromTemplate({
+        templateUrl,
+        outputPath,
+        replacements: {},
+      });
+
+      const relativeOutputPath = relative(process.cwd(), outputPath);
+
+      log.step(`Created example file at ${relativeOutputPath}`);
+
+      span.end();
+
+      return { location: configLocation, isCustomValue: location !== defaultValue };
+    } catch (e) {
+      if (!(e instanceof SkipCommandError)) {
+        recordSpanException(span, e);
+      }
+
+      span.end();
+
+      throw e;
+    }
+  });
+}
+
+async function gitIgnoreDotTriggerDir(dir: string, options: InitCommandOptions) {
+  return await tracer.startActiveSpan("gitIgnoreDotTriggerDir", async (span) => {
+    try {
+      const projectDir = resolve(process.cwd(), dir);
+      const gitIgnorePath = join(projectDir, ".gitignore");
+
+      span.setAttributes({
+        "cli.projectDir": projectDir,
+        "cli.gitIgnorePath": gitIgnorePath,
+      });
+
+      if (!(await pathExists(gitIgnorePath))) {
+        // Create .gitignore file
+        await createFile(gitIgnorePath, ".trigger");
+
+        log.step(`Added .trigger to .gitignore`);
+
+        span.end();
+
+        return;
+      }
+
+      // Check if .gitignore already contains .trigger
+      const gitIgnoreContent = await readFile(gitIgnorePath);
+
+      if (gitIgnoreContent.includes(".trigger")) {
+        span.end();
+
+        return;
+      }
+
+      const newGitIgnoreContent = `${gitIgnoreContent}\n.trigger`;
+
+      await writeFile(gitIgnorePath, newGitIgnoreContent, "utf-8");
+
+      log.step(`Added .trigger to .gitignore`);
+
+      span.end();
+    } catch (e) {
+      if (!(e instanceof SkipCommandError)) {
+        recordSpanException(span, e);
+      }
+
+      span.end();
+
+      throw e;
+    }
+  });
+}
+
+async function addConfigFileToTsConfig(tsconfigPath: string, options: InitCommandOptions) {
+  return await tracer.startActiveSpan("addConfigFileToTsConfig", async (span) => {
+    try {
+      span.setAttributes({
+        "cli.tsconfigPath": tsconfigPath,
+      });
+
+      const tsconfigContent = await readFile(tsconfigPath);
+      const tsconfigContentTree = parseTree(tsconfigContent, undefined);
+      if (!tsconfigContentTree) {
+        span.end();
+
+        return;
+      }
+
+      const tsconfigIncludeOption = findNodeAtLocation(tsconfigContentTree, ["include"]);
+      if (!tsconfigIncludeOption) {
+        span.end();
+
+        return;
+      }
+
+      const tsConfigFileName = "trigger.config.ts";
+      const tsconfigIncludeOptionValue: string[] = getNodeValue(tsconfigIncludeOption);
+      if (tsconfigIncludeOptionValue.includes(tsConfigFileName)) {
+        span.end();
+
+        return;
+      }
+
+      const edits = modify(tsconfigContent, ["include", -1], tsConfigFileName, {
+        isArrayInsertion: true,
+        formattingOptions: {
+          tabSize: 2,
+          insertSpaces: true,
+          eol: "\n",
+        },
+      });
+
+      logger.debug("tsconfig.json edits", { edits });
+
+      const newTsconfigContent = applyEdits(tsconfigContent, edits);
+
+      logger.debug("new tsconfig.json content", { newTsconfigContent });
+
+      await writeFile(tsconfigPath, newTsconfigContent, "utf-8");
+
+      log.step(`Added trigger.config.ts to tsconfig.json`);
+
+      span.end();
+    } catch (e) {
+      if (!(e instanceof SkipCommandError)) {
+        recordSpanException(span, e);
+      }
+
+      span.end();
+
+      throw e;
+    }
+  });
+}
+
+interface InstallPackagesOutputter {
+  startSDK: () => void;
+  installedSDK: () => void;
+  startBuild: () => void;
+  installedBuild: () => void;
+  stoppedWithError: () => void;
+}
+
+class CLIInstallPackagesOutputter implements InstallPackagesOutputter {
+  private installSpinner: ReturnType<typeof spinner>;
+
+  constructor(
+    private readonly logLevel: LogLevel,
+    private readonly tag: string
+  ) {
+    this.installSpinner = spinner();
+  }
+
+  startSDK() {
+    this.installSpinner.start(`Adding @trigger.dev/sdk@${this.tag}`);
+  }
+
+  installedSDK() {
+    this.installSpinner.stop(`@trigger.dev/sdk@${this.tag} installed`);
+  }
+
+  startBuild() {
+    this.installSpinner.start(`Adding @trigger.dev/build@${this.tag} to devDependencies`);
+  }
+
+  installedBuild() {
+    this.installSpinner.stop(`@trigger.dev/build@${this.tag} installed`);
+  }
+
+  stoppedWithError() {
+    if (this.logLevel === "debug") {
+      this.installSpinner.stop(`Failed to install @trigger.dev/sdk@${this.tag}.`);
+    } else {
+      this.installSpinner.stop(
+        `Failed to install @trigger.dev/sdk@${this.tag}. Rerun command with --log-level debug for more details.`
+      );
+    }
+  }
+}
+
+class SilentInstallPackagesOutputter implements InstallPackagesOutputter {
+  startSDK() {}
+  installedSDK() {}
+  startBuild() {}
+  installedBuild() {}
+  stoppedWithError() {}
+}
+
+async function installPackages(
+  projectDir: string,
+  tag: string,
+  outputter: InstallPackagesOutputter = new SilentInstallPackagesOutputter()
+) {
+  try {
+    outputter.startSDK();
+
+    await addDependency(`@trigger.dev/sdk@${tag}`, { cwd: projectDir, silent: true });
+
+    outputter.installedSDK();
+
+    outputter.startBuild();
+
+    await addDevDependency(`@trigger.dev/build@${tag}`, {
+      cwd: projectDir,
+      silent: true,
+    });
+
+    outputter.installedBuild();
+  } catch (e) {
+    outputter.stoppedWithError();
+
+    throw e;
+  }
+}
+
+async function writeConfigFile(
+  dir: string,
+  project: GetProjectResponseBody,
+  options: InitCommandOptions,
+  triggerDir: { location: string; isCustomValue: boolean },
+  language: "typescript" | "javascript"
+) {
+  return await tracer.startActiveSpan("writeConfigFile", async (span) => {
+    try {
+      const spnnr = spinner();
+      spnnr.start("Creating config file");
+
+      const projectDir = resolve(process.cwd(), dir);
+      const outputPath = join(
+        projectDir,
+        `trigger.config.${language === "typescript" ? "ts" : "mjs"}`
+      );
+      const templateUrl = generateTemplateUrl(
+        `trigger.config.${language === "typescript" ? "ts" : "mjs"}`,
+        options.gitRef
+      );
+
+      span.setAttributes({
+        "cli.projectDir": projectDir,
+        "cli.templatePath": templateUrl,
+        "cli.outputPath": outputPath,
+        "cli.runtime": options.runtime,
+      });
+
+      const result = await createFileFromTemplate({
+        templateUrl,
+        replacements: {
+          projectRef: project.externalRef,
+          runtime: options.runtime,
+          triggerDirectoriesOption: triggerDir.isCustomValue
+            ? `\n  dirs: ["${triggerDir.location}"],`
+            : `\n  dirs: ["./src/trigger"],`,
+        },
+        outputPath,
+        override: options.overrideConfig,
+      });
+
+      const relativePathToOutput = relative(process.cwd(), outputPath);
+
+      spnnr.stop(
+        result.success
+          ? `Config file created at ${relativePathToOutput}`
+          : `Failed to create config file: ${result.error}`
+      );
+
+      if (!result.success) {
+        throw new SkipLoggingError(result.error);
+      }
+
+      span.end();
+
+      return result.success;
+    } catch (e) {
+      if (!(e instanceof SkipCommandError)) {
+        recordSpanException(span, e);
+      }
+
+      span.end();
+
+      throw e;
+    }
+  });
+}
+
+type SelectProjectOptions = {
+  projectRef?: string;
+  projectName?: string;
+  orgName?: string;
+  nonInteractive: boolean;
+};
+
+async function selectProject(apiClient: CliApiClient, options: SelectProjectOptions) {
+  return await tracer.startActiveSpan("selectProject", async (span) => {
+    try {
+      if (options.projectRef) {
+        const projectResponse = await apiClient.getProject(options.projectRef);
+
+        if (!projectResponse.success) {
+          log.error(
+            `--project-ref ${options.projectRef} is not a valid project ref. Request to fetch data resulted in: ${projectResponse.error}`
+          );
+
+          throw new SkipCommandError(projectResponse.error);
+        }
+
+        span.setAttributes({
+          ...flattenAttributes(projectResponse.data, "cli.project"),
+        });
+
+        span.end();
+
+        return projectResponse.data;
+      }
+
+      const projectsResponse = await apiClient.getProjects();
+
+      if (!projectsResponse.success) {
+        throw new Error(`Failed to get projects: ${projectsResponse.error}`);
+      }
+
+      if (projectsResponse.data.length === 0) {
+        const project = await createFirstProject(apiClient, options);
+
+        span.setAttributes({
+          ...flattenAttributes(project, "cli.project"),
+        });
+        span.end();
+
+        return project;
+      }
+
+      if (options.nonInteractive) {
+        throw new Error(
+          "Projects already exist for this account. Pass --project-ref when using --yes."
+        );
+      }
+
+      const selectedProject = await select({
+        message: "Select an existing Trigger.dev project",
+        options: projectsResponse.data.map((project) => ({
+          value: project.externalRef,
+          label: `${project.name} - ${project.externalRef}`,
+          hint: project.organization.title,
+        })),
+      });
+
+      if (isCancel(selectedProject)) {
+        throw new OutroCommandError();
+      }
+
+      const projectData = projectsResponse.data.find(
+        (project) => project.externalRef === selectedProject
+      );
+
+      if (!projectData) {
+        throw new Error("Invalid project ref");
+      }
+
+      span.setAttributes({
+        ...flattenAttributes(projectData, "cli.project"),
+      });
+
+      span.end();
+
+      return projectData;
+    } catch (e) {
+      if (!(e instanceof SkipCommandError)) {
+        recordSpanException(span, e);
+      }
+
+      span.end();
+
+      throw e;
+    }
+  });
+}
+
+async function createFirstProject(apiClient: CliApiClient, options: SelectProjectOptions) {
+  const orgsResponse = await apiClient.getOrgs();
+
+  if (!orgsResponse.success) {
+    throw new Error(`Failed to get organizations: ${orgsResponse.error}`);
+  }
+
+  let orgParam: string;
+  const matchingOrgs = options.orgName
+    ? orgsResponse.data.filter((org) => org.title === options.orgName)
+    : [];
+
+  if (matchingOrgs.length > 1) {
+    throw new Error(
+      `Multiple organizations named "${options.orgName}" exist. Run init interactively without --org-name to select one.`
+    );
+  } else if (matchingOrgs.length === 1) {
+    orgParam = matchingOrgs[0]!.id;
+  } else if (options.orgName && orgsResponse.data.length > 0) {
+    throw new Error(
+      `No organization named "${options.orgName}" exists. Omit --org-name to use an existing organization, or create it first with \`trigger.dev orgs create\`.`
+    );
+  } else if (orgsResponse.data.length === 0) {
+    const orgName =
+      options.orgName ??
+      (await promptForBootstrapValue(
+        "What should the organization be called?",
+        options.nonInteractive,
+        "--org-name is required to create an organization when using --yes",
+        { label: "Organization names", minLength: 3, maxLength: 50 }
+      ));
+    const orgResponse = await apiClient.createOrg({ title: orgName });
+
+    if (!orgResponse.success) {
+      if (orgResponse.statusCode === 404) {
+        throw new Error(
+          "Organization creation is disabled on this Trigger.dev instance. Create an organization in the dashboard first."
+        );
+      }
+
+      throw new Error(`Failed to create organization: ${orgResponse.error}`);
+    }
+
+    log.success(`Created organization "${orgResponse.data.title}"`);
+    orgParam = orgResponse.data.id;
+  } else if (orgsResponse.data.length === 1) {
+    orgParam = orgsResponse.data[0]!.id;
+  } else {
+    if (options.nonInteractive) {
+      throw new Error(
+        "Multiple organizations are available. Pass --project-ref or run init interactively."
+      );
+    }
+
+    const selectedOrg = await select({
+      message: "Select an organization for the new project",
+      options: orgsResponse.data.map((org) => ({
+        value: org.id,
+        label: org.title,
+        hint: org.slug,
+      })),
+    });
+
+    if (isCancel(selectedOrg)) {
+      throw new OutroCommandError();
+    }
+
+    orgParam = selectedOrg;
+  }
+
+  const projectName =
+    options.projectName ??
+    (await promptForBootstrapValue(
+      "What should the project be called?",
+      options.nonInteractive,
+      "--project-name is required to create a project when using --yes",
+      { label: "Project names", minLength: 1, maxLength: 255 }
+    ));
+  const projectResponse = await createProjectWithFreePlanFallback(apiClient, orgParam, projectName);
+
+  if (!projectResponse.success) {
+    throw new Error(`Failed to create project: ${projectResponse.error}`);
+  }
+
+  log.success(
+    `Created project "${projectResponse.data.name}" (${projectResponse.data.externalRef})`
+  );
+  return projectResponse.data;
+}
+
+async function promptForBootstrapValue(
+  message: string,
+  nonInteractive: boolean,
+  error: string,
+  constraints: { label: string; minLength: number; maxLength: number }
+) {
+  if (nonInteractive) {
+    throw new Error(error);
+  }
+
+  const value = await text({
+    message,
+    validate: (input) => {
+      const length = input.trim().length;
+      if (length === 0) return "Please enter a name";
+      if (length < constraints.minLength) {
+        return `${constraints.label} must be at least ${constraints.minLength} characters`;
+      }
+      if (length > constraints.maxLength) {
+        return `${constraints.label} must be ${constraints.maxLength} characters or fewer`;
+      }
+      return undefined;
+    },
+  });
+
+  if (isCancel(value)) {
+    throw new OutroCommandError();
+  }
+
+  return value.trim();
+}
+
+async function tryResolveTsConfig(cwd: string) {
+  try {
+    const tsconfigPath = await resolveTSConfig(cwd);
+    return tsconfigPath;
+  } catch (_e) {
+    return;
+  }
+}

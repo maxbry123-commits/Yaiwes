@@ -1,0 +1,45 @@
+---
+title: "CLI whoami command"
+sidebarTitle: "whoami"
+description: "Use these options to display the current logged in user and project details."
+---
+
+import CommonOptions from '/snippets/cli-options-common.mdx';
+
+Run the command like this:
+
+<CodeGroup>
+
+```bash npm
+npx trigger.dev@latest whoami
+```
+
+```bash pnpm
+pnpm dlx trigger.dev@latest whoami
+```
+
+```bash yarn
+yarn dlx trigger.dev@latest whoami
+```
+
+</CodeGroup>
+
+## Options
+
+<ParamField body="Config file" type="-c, --config <config file>">
+  The name of the config file.
+</ParamField>
+
+<ParamField body="Project ref" type="-p, --project-ref <project ref>">
+  The project ref. Overrides the project in the config file.
+</ParamField>
+
+<ParamField body="Env file" type="--env-file <env file>">
+  Path to a `.env` file to read `TRIGGER_PROJECT_REF` from. Defaults to `.env`, `.env.development`, `.env.local`, `.env.development.local` and `dev.vars` in the current directory.
+</ParamField>
+
+### Common options
+
+These options are available on most commands.
+
+<CommonOptions />

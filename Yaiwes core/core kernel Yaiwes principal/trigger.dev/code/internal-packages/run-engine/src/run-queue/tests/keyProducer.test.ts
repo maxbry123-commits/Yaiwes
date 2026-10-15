@@ -1,0 +1,481 @@
+import { describe } from "node:test";
+import { expect, it } from "vitest";
+import { RunQueueFullKeyProducer } from "../keyProducer.js";
+
+describe("KeyProducer", () => {
+  it("queueConcurrencyLimitKey", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueConcurrencyLimitKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:concurrency");
+  });
+
+  it("envConcurrencyLimitKey", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.envConcurrencyLimitKey({
+      id: "e1234",
+      type: "PRODUCTION",
+      project: { id: "p1234" },
+      organization: { id: "o1234" },
+    });
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:concurrency");
+  });
+
+  it("envConcurrencyLimitBurstFactorKey", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.envConcurrencyLimitBurstFactorKey({
+      id: "e1234",
+      type: "PRODUCTION",
+      project: { id: "p1234" },
+      organization: { id: "o1234" },
+    });
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:concurrencyBurstFactor");
+  });
+
+  it("envCurrentDequeuedKey", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.envCurrentDequeuedKey({
+      orgId: "o1234",
+      projectId: "p1234",
+      envId: "e1234",
+    });
+
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:currentDequeued");
+  });
+
+  it("queueKey (no concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name");
+  });
+
+  it("queueKey (w concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ck:c1234");
+  });
+
+  it("queueConcurrencyLimitKeyFromQueue (w concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    const key = keyProducer.queueConcurrencyLimitKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:concurrency");
+  });
+
+  it("queueConcurrencyLimitKeyFromQueue (no concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.queueConcurrencyLimitKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:concurrency");
+  });
+
+  it("queueCurrentConcurrencyKeyFromQueue (w concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    const key = keyProducer.queueCurrentConcurrencyKeyFromQueue(queueKey);
+    expect(key).toBe(
+      "{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ck:c1234:currentConcurrency"
+    );
+  });
+
+  it("queueCurrentConcurrencyKeyFromQueue (no concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.queueCurrentConcurrencyKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:currentConcurrency");
+  });
+
+  it("queueCurrentConcurrencyKey (w concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueCurrentConcurrencyKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    expect(key).toBe(
+      "{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ck:c1234:currentConcurrency"
+    );
+  });
+
+  it("queueCurrentConcurrencyKey (no concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueCurrentConcurrencyKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:currentConcurrency");
+  });
+
+  it("queueCurrentDequeuedKeyFromQueue (w concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+
+    const key = keyProducer.queueCurrentDequeuedKeyFromQueue(queueKey);
+    expect(key).toBe(
+      "{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ck:c1234:currentDequeued"
+    );
+  });
+
+  it("queueCurrentDequeuedKeyFromQueue (no concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.queueCurrentDequeuedKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:currentDequeued");
+  });
+
+  it("queueCurrentDequeuedKey (w concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueCurrentDequeuedKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    expect(key).toBe(
+      "{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ck:c1234:currentDequeued"
+    );
+  });
+
+  it("queueCurrentDequeuedKey (no concurrency)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.queueCurrentDequeuedKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:currentDequeued");
+  });
+
+  it("envConcurrencyLimitKeyFromQueue", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.envConcurrencyLimitKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:concurrency");
+  });
+
+  it("envConcurrencyLimitBurstFactorKeyFromQueue", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.envConcurrencyLimitBurstFactorKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:concurrencyBurstFactor");
+  });
+
+  it("envCurrentConcurrencyKeyFromQueue", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.envCurrentConcurrencyKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:currentConcurrency");
+  });
+
+  it("envCurrentDequeuedKeyFromQueue", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.envCurrentDequeuedKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:currentDequeued");
+  });
+
+  it("envCurrentConcurrencyKey", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.envCurrentConcurrencyKey({
+      id: "e1234",
+      type: "PRODUCTION",
+      project: { id: "p1234" },
+      organization: { id: "o1234" },
+    });
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:currentConcurrency");
+  });
+
+  it("messageKey", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.messageKey("o1234", "m1234");
+    expect(key).toBe("{org:o1234}:message:m1234");
+  });
+
+  it("extractComponentsFromQueue (no concurrencyKey)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const components = keyProducer.descriptorFromQueue(queueKey);
+    expect(components).toEqual({
+      orgId: "o1234",
+      projectId: "p1234",
+      envId: "e1234",
+      queue: "task/task-name",
+      concurrencyKey: undefined,
+    });
+  });
+
+  it("extractComponentsFromQueue (w concurrencyKey)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    const components = keyProducer.descriptorFromQueue(queueKey);
+    expect(components).toEqual({
+      orgId: "o1234",
+      projectId: "p1234",
+      envId: "e1234",
+      queue: "task/task-name",
+      concurrencyKey: "c1234",
+    });
+  });
+
+  it("ckIndexKeyFromQueue", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    const key = keyProducer.ckIndexKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ckIndex");
+  });
+
+  it("ckIndexKeyFromQueue (from wildcard)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const key = keyProducer.ckIndexKeyFromQueue(
+      "{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ck:*"
+    );
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name:ckIndex");
+  });
+
+  it("baseQueueKeyFromQueue (with CK)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name",
+      "c1234"
+    );
+    const key = keyProducer.baseQueueKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name");
+  });
+
+  it("baseQueueKeyFromQueue (no CK)", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const queueKey = keyProducer.queueKey(
+      {
+        id: "e1234",
+        type: "PRODUCTION",
+        project: { id: "p1234" },
+        organization: { id: "o1234" },
+      },
+      "task/task-name"
+    );
+    const key = keyProducer.baseQueueKeyFromQueue(queueKey);
+    expect(key).toBe("{org:o1234}:proj:p1234:env:e1234:queue:task/task-name");
+  });
+
+  it("isCkWildcard", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    expect(keyProducer.isCkWildcard("{org:o1234}:proj:p1234:env:e1234:queue:task/foo:ck:*")).toBe(
+      true
+    );
+    expect(keyProducer.isCkWildcard("{org:o1234}:proj:p1234:env:e1234:queue:task/foo:ck:bar")).toBe(
+      false
+    );
+    expect(keyProducer.isCkWildcard("{org:o1234}:proj:p1234:env:e1234:queue:task/foo")).toBe(false);
+  });
+
+  it("toCkWildcard", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    expect(keyProducer.toCkWildcard("{org:o1234}:proj:p1234:env:e1234:queue:task/foo:ck:bar")).toBe(
+      "{org:o1234}:proj:p1234:env:e1234:queue:task/foo:ck:*"
+    );
+  });
+
+  it("produces ckVtime keys from a CK variant queue name", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const q = "{org:o1}:proj:p1:env:e1:queue:task/my-task:ck:tenant-a";
+    expect(keyProducer.ckVtimeKeyFromQueue(q)).toBe(
+      "{org:o1}:proj:p1:env:e1:queue:task/my-task:ckVtime"
+    );
+    expect(keyProducer.ckVtimeFloorKeyFromQueue(q)).toBe(
+      "{org:o1}:proj:p1:env:e1:queue:task/my-task:ckVtimeFloor"
+    );
+    expect(keyProducer.ckVtimeIdleKeyFromQueue(q)).toBe(
+      "{org:o1}:proj:p1:env:e1:queue:task/my-task:ckVtimeIdle"
+    );
+    // ck wildcard and base-queue inputs normalise the same way
+    expect(keyProducer.ckVtimeKeyFromQueue(q.replace(":ck:tenant-a", ":ck:*"))).toBe(
+      keyProducer.ckVtimeKeyFromQueue(q)
+    );
+    expect(keyProducer.ckVtimeIdleKeyFromQueue(q.replace(":ck:tenant-a", ":ck:*"))).toBe(
+      keyProducer.ckVtimeIdleKeyFromQueue(q)
+    );
+  });
+
+  it("queueConcurrencyKeyLimitKey puts the key after its own part, so no key value can collide", () => {
+    const keyProducer = new RunQueueFullKeyProducer();
+    const env = {
+      id: "e1234",
+      type: "DEVELOPMENT" as const,
+      project: { id: "p1234" },
+      organization: { id: "o1234" },
+    };
+    const base = keyProducer.queueKey(env, "task/my-task");
+    const variant = keyProducer.queueKey(env, "task/my-task", "tenant-a");
+    expect(keyProducer.queueConcurrencyKeyLimitKey(env, "task/my-task", "tenant-a")).toBe(
+      `${base}:ckLimit:tenant-a`
+    );
+    expect(keyProducer.queueConcurrencyKeyLimitKeyFromQueue(variant)).toBe(
+      `${base}:ckLimit:tenant-a`
+    );
+    const colonKey = keyProducer.queueKey(env, "task/my-task", "a:ck:b");
+    expect(keyProducer.queueConcurrencyKeyLimitKeyFromQueue(colonKey)).toBe(
+      `${base}:ckLimit:a:ck:b`
+    );
+    expect(keyProducer.queueConcurrencyKeyLimitKey(env, "task/my-task", "a")).not.toBe(
+      keyProducer.queueKey(env, "task/my-task", "a:ckLimit")
+    );
+  });
+});

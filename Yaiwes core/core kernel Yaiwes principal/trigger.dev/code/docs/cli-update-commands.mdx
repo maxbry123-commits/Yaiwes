@@ -1,0 +1,48 @@
+---
+title: "CLI update command"
+sidebarTitle: "update"
+description: "Use these options when using the `update` CLI command."
+---
+
+import LogLevelOption from "/snippets/cli-options-log-level.mdx";
+import SkipTelemetryOption from "/snippets/cli-options-skip-telemetry.mdx";
+import HelpOption from "/snippets/cli-options-help.mdx";
+import VersionOption from "/snippets/cli-options-version.mdx";
+
+Run the command like this:
+
+<CodeGroup>
+
+```bash npm
+npx trigger.dev@latest update [path]
+```
+
+```bash pnpm
+pnpm dlx trigger.dev@latest update [path]
+```
+
+```bash yarn
+yarn dlx trigger.dev@latest update [path]
+```
+
+</CodeGroup>
+
+## Arguments
+
+<ParamField body="Project path" type="[path]">
+  The directory that contains the `package.json` file. Defaults to `.`.
+</ParamField>
+
+## Options
+
+### Common options
+
+These options are available on most commands.
+
+<LogLevelOption />
+
+<SkipTelemetryOption />
+
+<HelpOption />
+
+<VersionOption />

@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 37234644,
+  "bundle_sha256": "983ffeb268e60dc0ad5a498f912a7b5aef2065c645f186f8a6bf1b33dc58551c",
+  "extracted_tree": {
+    "bytes": 76292394,
+    "files": 6794,
+    "sha256": "b5e4e4a0a2e4aa5761e8579d068e46514cdd71561cde073b7aa53795dbad2681"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "trigger.dev.bundle.zip.part-0001",
+      "sha256": "9b376f08736e0d1d41e744439fea6ace1bdf5262425fd9955bb0558779131704"
+    },
+    {
+      "bytes": 12582912,
+      "name": "trigger.dev.bundle.zip.part-0002",
+      "sha256": "69a681893e7072dd8f6abf33b94b31e76865a6dc5307216bc4ffd6e33e62aa46"
+    },
+    {
+      "bytes": 12068820,
+      "name": "trigger.dev.bundle.zip.part-0003",
+      "sha256": "4621d0bc0f212ecb18219794921a3563fba306884b1343109148b6e1d6e8cad6"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "hosting/docker/webapp/.env",
+    "hosting/docker/worker/.env"
+  ],
+  "skipped_special_count": 2,
+  "slug": "trigger.dev",
+  "source_bytes": 76292394,
+  "source_commit": "d2ed5c0f857e6f5802d570a20c97c108f65ede42",
+  "source_files": 6794,
+  "source_ref": "main",
+  "source_repo": "triggerdotdev/trigger.dev",
+  "source_tree": {
+    "bytes": 76292394,
+    "files": 6794,
+    "sha256": "b5e4e4a0a2e4aa5761e8579d068e46514cdd71561cde073b7aa53795dbad2681"
+  }
+}

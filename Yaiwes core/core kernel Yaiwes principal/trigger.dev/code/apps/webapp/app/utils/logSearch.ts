@@ -1,0 +1,90 @@
+import { normalizeSearchText } from "@trigger.dev/core/utils";
+
+export const MIN_LOGS_SEARCH_LENGTH = 3;
+export const LOGS_SEARCH_RETRY_OVERFETCH_FACTOR = 4;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const RANGE_COMPARISON_TOLERANCE_MS = 1000;
+
+export function logsSearchExpansionPeriod(
+  from: Date | undefined,
+  to: Date,
+  retentionLimitDays: number | undefined
+): string | undefined {
+  if (!from) return undefined;
+
+  const candidateDays = Math.min(retentionLimitDays ?? 7, 7);
+  const currentRangeMs = Math.max(0, to.getTime() - from.getTime());
+  if (candidateDays * DAY_MS <= currentRangeMs + RANGE_COMPARISON_TOLERANCE_MS) {
+    return undefined;
+  }
+
+  return `${candidateDays}d`;
+}
+
+type ProjectedLogIdentity = {
+  projection_fingerprint_string?: string;
+  trace_id: string;
+  span_id: string;
+  run_id: string;
+  start_time: string;
+};
+
+export function prepareLogsSearchPage<T extends ProjectedLogIdentity>(
+  rows: T[],
+  pageSize: number,
+  queryLimit: number
+): { rows: T[]; hasMore: boolean } {
+  const seen = new Set<string>();
+  const uniqueRows = rows.filter((row) => {
+    const identity =
+      row.projection_fingerprint_string ??
+      JSON.stringify([row.trace_id, row.span_id, row.run_id, row.start_time]);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+
+  return {
+    rows: uniqueRows.slice(0, pageSize),
+    hasMore: uniqueRows.length > pageSize || rows.length === queryLimit,
+  };
+}
+
+export function hasMinimumLogsSearchLength(value: string): boolean {
+  return [...value.trim()].length >= MIN_LOGS_SEARCH_LENGTH;
+}
+
+export function escapeClickHouseLike(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
+export type LogsSearchPredicate =
+  | { kind: "word"; term: string }
+  | { kind: "id"; pattern: string }
+  | { kind: "phrase"; pattern: string };
+
+const LOGS_SEARCH_WORD_PATTERN = /^[a-z]+$/;
+const LOGS_SEARCH_ID_PATTERN = /^[a-z0-9_\-.:/@+]+$/;
+const LOGS_SEARCH_ID_CONTENT_PATTERN = /[a-z0-9]/;
+const LOGS_SEARCH_ID_MARKER_PATTERN = /[0-9_\-.:/@+]/;
+
+export function logsSearchPredicate(normalizedTerm: string): LogsSearchPredicate {
+  if (LOGS_SEARCH_WORD_PATTERN.test(normalizedTerm)) {
+    return { kind: "word", term: normalizedTerm };
+  }
+
+  const pattern = `%${escapeClickHouseLike(normalizedTerm)}%`;
+  if (
+    LOGS_SEARCH_ID_PATTERN.test(normalizedTerm) &&
+    LOGS_SEARCH_ID_CONTENT_PATTERN.test(normalizedTerm) &&
+    LOGS_SEARCH_ID_MARKER_PATTERN.test(normalizedTerm)
+  ) {
+    return { kind: "id", pattern };
+  }
+
+  return { kind: "phrase", pattern };
+}
+
+export function normalizeLogsSearchTerm(value: string): string {
+  return normalizeSearchText(value).trim();
+}

@@ -1,0 +1,607 @@
+---
+title: "Alerts"
+description: "Get alerted when runs or deployments fail, or when deployments succeed."
+---
+
+We support receiving alerts for the following events:
+- Run fails
+- Deployment fails
+- Deployment succeeds
+- A new error group appears, regresses, or is unignored
+
+The first three are created from the **Alerts** page. The fourth — an **Error group** alert — is created from the **Errors** page instead, but appears in the same Alerts table once created. It behaves quite differently from a run failure alert; see [Error group alerts](#error-group-alerts) below.
+
+<Note>
+  If you want to be told about **every** run that fails, choose a **run fails** alert. An Error group
+  alert will not do this — it deliberately stays quiet once it has alerted on a given error.
+</Note>
+
+## How to setup alerts
+
+<Steps>
+
+<Step title="Create a new alert">
+Click on "Alerts" in the left hand side menu, then click on "New alert" to open the new alert modal.
+  ![Email alerts](/images/troubleshooting-alerts-blank.png)
+</Step>
+
+<Step title="Choose your alert method">
+Choose to be notified by email, Slack notification or webhook whenever:
+
+- a run fails
+- a deployment fails
+- a deployment succeeds
+
+  ![Email alerts](/images/troubleshooting-alerts-modal.png)
+</Step>
+
+<Step title="Delete or disable alerts">
+Click on the triple dot menu on the right side of the table row and select "Disable" or "Delete".
+
+  ![Disable and delete alerts](/images/troubleshooting-alerts-disable-delete.png)
+</Step>
+
+</Steps>
+
+
+## Error group alerts
+
+Error group alerts are **issue-based**, not run-based. They are created from the **Errors** page in the dashboard (the "Configure alerts…" button), not from the New alert modal on the Alerts page. Once created they show up in the Alerts table alongside your other alerts, labelled "Error group".
+
+An error group is one distinct error — the same error from many runs is a single group, with a status of **Unresolved**, **Resolved** or **Ignored** that you set from the Errors page.
+
+### When an error group alert fires
+
+The alert only fires when a group's status *changes* in one of these three ways:
+
+| Trigger | Meaning |
+| :------ | :------ |
+| New issue | The error has been seen for the first time. |
+| Regression | The group was marked **Resolved**, and the error has occurred again since. |
+| Unignored | The group was **Ignored**, and the ignore condition you set has been breached. |
+
+### Why it goes quiet
+
+This is the part that surprises people, so it is worth stating plainly:
+
+**An Unresolved error group does not alert.** After an error group alert fires, the group is set to Unresolved, and it stays silent no matter how many more times that error occurs. It will only alert again once you mark it **Resolved** (and it then recurs) or **Ignored** (and the ignore condition is breached).
+
+This is intentional — one persistently broken task should not flood your Slack channel with a message per failed run. But it means an Error group alert is not a substitute for a run failure alert. If a task has been failing in production for days and you have had no notification, check whether the only alert you have configured is an Error group alert whose group is sitting at Unresolved.
+
+### Which alert type should I use?
+
+- **"Tell me about every run that fails"** → a **run fails** alert, from the Alerts page. It fires for every run that fails once its retries are exhausted.
+- **"Tell me when something new breaks"** → an **Error group** alert, from the Errors page.
+
+The two are complementary, and many teams want both.
+
+## Alert webhooks
+
+For the alert webhooks you can use the SDK to parse them. Here is an example of how to parse the webhook payload in Remix:
+
+```ts
+import { ActionFunctionArgs, json } from "@remix-run/server-runtime";
+import { webhooks, WebhookError } from "@trigger.dev/sdk";
+
+export async function action({ request }: ActionFunctionArgs) {
+  // Make sure this is a POST request
+  if (request.method !== "POST") {
+    return json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  try {
+    // Construct and verify the webhook event
+    // This secret can be found on your Alerts page when you create a webhook alert
+    const event = await webhooks.constructEvent(request, process.env.ALERT_WEBHOOK_SECRET!);
+
+    // Process the event based on its type
+    switch (event.type) {
+      case "alert.run.failed": {
+        console.log("[Webhook Internal Test] Run failed alert webhook received", { event });
+        break;
+      }
+      case "alert.deployment.success": {
+        console.log("[Webhook Internal Test] Deployment success alert webhook received", { event });
+        break;
+      }
+      case "alert.deployment.failed": {
+        console.log("[Webhook Internal Test] Deployment failed alert webhook received", { event });
+        break;
+      }
+      case "alert.error": {
+        console.log("[Webhook Internal Test] Error group alert webhook received", { event });
+        break;
+      }
+      default: {
+        console.log("[Webhook Internal Test] Unhandled webhook type", { event });
+      }
+    }
+
+    // Return a success response
+    return json({ received: true }, { status: 200 });
+  } catch (err) {
+    // Handle webhook errors
+    if (err instanceof WebhookError) {
+      console.error("Webhook error:", { message: err.message });
+      return json({ error: err.message }, { status: 400 });
+    }
+
+    if (err instanceof Error) {
+      console.error("Error processing webhook:", { message: err.message });
+      return json({ error: err.message }, { status: 400 });
+    }
+
+    // Handle other errors
+    console.error("Error processing webhook:", { err });
+    return json({ error: "Internal server error" }, { status: 500 });
+  }
+}
+```
+
+### Common properties
+
+When you create a webhook alert, you'll receive different payloads depending on the type of alert. All webhooks share some common properties:
+
+<ParamField path="id" type="string">
+  A unique identifier for this webhook event
+</ParamField>
+
+<ParamField path="created" type="datetime">
+  When this webhook event was created
+</ParamField>
+
+<ParamField path="webhookVersion" type="string">
+  The version of the webhook payload format
+</ParamField>
+
+<ParamField path="type" type="string">
+  The type of alert webhook. One of: `alert.run.failed`, `alert.deployment.success`, `alert.deployment.failed`, or `alert.error`
+</ParamField>
+
+### Run Failed Alert
+
+This webhook is sent when a run fails. The payload is available on the `object` property:
+
+<ParamField path="object.task.id" type="string">
+  Unique identifier for the task
+</ParamField>
+
+<ParamField path="object.task.filePath" type="string">
+  File path where the task is defined
+</ParamField>
+
+<ParamField path="object.task.exportName" type="string">
+  Name of the exported task function
+</ParamField>
+
+<ParamField path="object.task.version" type="string">
+  Version of the task
+</ParamField>
+
+<ParamField path="object.task.sdkVersion" type="string">
+  Version of the SDK used
+</ParamField>
+
+<ParamField path="object.task.cliVersion" type="string">
+  Version of the CLI used
+</ParamField>
+
+<ParamField path="object.run.id" type="string">
+  Unique identifier for the run
+</ParamField>
+
+<ParamField path="object.run.number" type="number">
+  Run number
+</ParamField>
+
+<ParamField path="object.run.status" type="string">
+  Current status of the run
+</ParamField>
+
+<ParamField path="object.run.createdAt" type="datetime">
+  When the run was created
+</ParamField>
+
+<ParamField path="object.run.startedAt" type="datetime">
+  When the run started executing
+</ParamField>
+
+<ParamField path="object.run.completedAt" type="datetime">
+  When the run finished executing
+</ParamField>
+
+<ParamField path="object.run.isTest" type="boolean">
+  Whether this is a test run
+</ParamField>
+
+<ParamField path="object.run.idempotencyKey" type="string">
+  Idempotency key for the run
+</ParamField>
+
+<ParamField path="object.run.tags" type="string[]">
+  Associated tags
+</ParamField>
+
+<ParamField path="object.run.error" type="object">
+  Error information
+</ParamField>
+
+<ParamField path="object.run.isOutOfMemoryError" type="boolean">
+  Whether the run was an out-of-memory error
+</ParamField>
+
+<ParamField path="object.run.machine" type="string">
+  Machine preset used for the run
+</ParamField>
+
+<ParamField path="object.run.dashboardUrl" type="string">
+  URL to view the run in the dashboard
+</ParamField>
+
+<ParamField path="object.environment.id" type="string">
+  Environment ID
+</ParamField>
+
+<ParamField path="object.environment.type" type="string">
+  Environment type (`PRODUCTION`, `STAGING`, or `PREVIEW`)
+</ParamField>
+
+<ParamField path="object.environment.slug" type="string">
+  Environment slug
+</ParamField>
+
+<ParamField path="object.environment.branchName" type="string">
+  Environment branch name (optional)
+</ParamField>
+
+<ParamField path="object.organization.id" type="string">
+  Organization ID
+</ParamField>
+
+<ParamField path="object.organization.slug" type="string">
+  Organization slug
+</ParamField>
+
+<ParamField path="object.organization.name" type="string">
+  Organization name
+</ParamField>
+
+<ParamField path="object.project.id" type="string">
+  Project ID
+</ParamField>
+
+<ParamField path="object.project.ref" type="string">
+  Project reference
+</ParamField>
+
+<ParamField path="object.project.slug" type="string">
+  Project slug
+</ParamField>
+
+<ParamField path="object.project.name" type="string">
+  Project name
+</ParamField>
+
+### Deployment Success Alert
+
+This webhook is sent when a deployment succeeds. The payload is available on the `object` property:
+
+<ParamField path="object.deployment.id" type="string">
+  Deployment ID
+</ParamField>
+
+<ParamField path="object.deployment.status" type="string">
+  Deployment status
+</ParamField>
+
+<ParamField path="object.deployment.version" type="string">
+  Deployment version
+</ParamField>
+
+<ParamField path="object.deployment.shortCode" type="string">
+  Short code identifier
+</ParamField>
+
+<ParamField path="object.deployment.deployedAt" type="datetime">
+  When the deployment completed
+</ParamField>
+
+<ParamField path="object.tasks" type="array">
+  Array of deployed tasks with properties: id, filePath, exportName, and triggerSource
+</ParamField>
+
+<ParamField path="object.environment.id" type="string">
+  Environment ID
+</ParamField>
+
+<ParamField path="object.environment.type" type="string">
+  Environment type (`PRODUCTION`, `STAGING`, or `PREVIEW`)
+</ParamField>
+
+<ParamField path="object.environment.slug" type="string">
+  Environment slug
+</ParamField>
+
+<ParamField path="object.organization.id" type="string">
+  Organization ID
+</ParamField>
+
+<ParamField path="object.organization.slug" type="string">
+  Organization slug
+</ParamField>
+
+<ParamField path="object.organization.name" type="string">
+  Organization name
+</ParamField>
+
+<ParamField path="object.project.id" type="string">
+  Project ID
+</ParamField>
+
+<ParamField path="object.project.ref" type="string">
+  Project reference
+</ParamField>
+
+<ParamField path="object.project.slug" type="string">
+  Project slug
+</ParamField>
+
+<ParamField path="object.project.name" type="string">
+  Project name
+</ParamField>
+
+<ParamField path="object.git" type="object">
+  Git metadata for the deployment (optional). When present, `branch`, `commitSha`, `commitMessage`, `commitUrl` and `branchUrl` are always set.
+</ParamField>
+
+<ParamField path="object.git.branch" type="string">
+  Git branch
+</ParamField>
+
+<ParamField path="object.git.commitSha" type="string">
+  Short commit SHA (first 7 characters)
+</ParamField>
+
+<ParamField path="object.git.commitMessage" type="string">
+  Commit message (empty string if unavailable)
+</ParamField>
+
+<ParamField path="object.git.commitUrl" type="string">
+  URL of the commit
+</ParamField>
+
+<ParamField path="object.git.branchUrl" type="string">
+  URL of the branch
+</ParamField>
+
+<ParamField path="object.git.pullRequestNumber" type="number">
+  Pull request number (optional)
+</ParamField>
+
+<ParamField path="object.git.pullRequestTitle" type="string">
+  Pull request title (optional)
+</ParamField>
+
+<ParamField path="object.git.pullRequestUrl" type="string">
+  Pull request URL (optional)
+</ParamField>
+
+<ParamField path="object.git.provider" type="string">
+  Git provider (optional)
+</ParamField>
+
+<ParamField path="object.vercel" type="object">
+  Vercel metadata for the deployment (optional)
+</ParamField>
+
+<ParamField path="object.vercel.deploymentUrl" type="string">
+  URL of the deployment in the Vercel dashboard
+</ParamField>
+
+### Deployment Failed Alert
+
+This webhook is sent when a deployment fails. The payload is available on the `object` property:
+
+<ParamField path="object.deployment.id" type="string">
+  Deployment ID
+</ParamField>
+
+<ParamField path="object.deployment.status" type="string">
+  Deployment status
+</ParamField>
+
+<ParamField path="object.deployment.version" type="string">
+  Deployment version
+</ParamField>
+
+<ParamField path="object.deployment.shortCode" type="string">
+  Short code identifier
+</ParamField>
+
+<ParamField path="object.deployment.failedAt" type="datetime">
+  When the deployment failed
+</ParamField>
+
+<ParamField path="object.error.name" type="string">
+  Error name
+</ParamField>
+
+<ParamField path="object.error.message" type="string">
+  Error message
+</ParamField>
+
+<ParamField path="object.error.stack" type="string">
+  Error stack trace (optional)
+</ParamField>
+
+<ParamField path="object.error.stderr" type="string">
+  Standard error output (optional)
+</ParamField>
+
+<ParamField path="object.environment.id" type="string">
+  Environment ID
+</ParamField>
+
+<ParamField path="object.environment.type" type="string">
+  Environment type (`PRODUCTION`, `STAGING`, or `PREVIEW`)
+</ParamField>
+
+<ParamField path="object.environment.slug" type="string">
+  Environment slug
+</ParamField>
+
+<ParamField path="object.organization.id" type="string">
+  Organization ID
+</ParamField>
+
+<ParamField path="object.organization.slug" type="string">
+  Organization slug
+</ParamField>
+
+<ParamField path="object.organization.name" type="string">
+  Organization name
+</ParamField>
+
+<ParamField path="object.project.id" type="string">
+  Project ID
+</ParamField>
+
+<ParamField path="object.project.ref" type="string">
+  Project reference
+</ParamField>
+
+<ParamField path="object.project.slug" type="string">
+  Project slug
+</ParamField>
+
+<ParamField path="object.project.name" type="string">
+  Project name
+</ParamField>
+
+<ParamField path="object.git" type="object">
+  Git metadata for the deployment (optional). When present, `branch`, `commitSha`, `commitMessage`, `commitUrl` and `branchUrl` are always set.
+</ParamField>
+
+<ParamField path="object.git.branch" type="string">
+  Git branch
+</ParamField>
+
+<ParamField path="object.git.commitSha" type="string">
+  Short commit SHA (first 7 characters)
+</ParamField>
+
+<ParamField path="object.git.commitMessage" type="string">
+  Commit message (empty string if unavailable)
+</ParamField>
+
+<ParamField path="object.git.commitUrl" type="string">
+  URL of the commit
+</ParamField>
+
+<ParamField path="object.git.branchUrl" type="string">
+  URL of the branch
+</ParamField>
+
+<ParamField path="object.git.pullRequestNumber" type="number">
+  Pull request number (optional)
+</ParamField>
+
+<ParamField path="object.git.pullRequestTitle" type="string">
+  Pull request title (optional)
+</ParamField>
+
+<ParamField path="object.git.pullRequestUrl" type="string">
+  Pull request URL (optional)
+</ParamField>
+
+<ParamField path="object.git.provider" type="string">
+  Git provider (optional)
+</ParamField>
+
+<ParamField path="object.vercel" type="object">
+  Vercel metadata for the deployment (optional)
+</ParamField>
+
+<ParamField path="object.vercel.deploymentUrl" type="string">
+  URL of the deployment in the Vercel dashboard
+</ParamField>
+
+### Error Group Alert
+
+This webhook is sent for an [error group alert](#error-group-alerts). The payload is available on the `object` property:
+
+<ParamField path="object.classification" type="string">
+  Why the alert fired. One of: `new_issue`, `regression`, `unignored`
+</ParamField>
+
+<ParamField path="object.error.fingerprint" type="string">
+  Identifier for the error group
+</ParamField>
+
+<ParamField path="object.error.type" type="string">
+  Error type
+</ParamField>
+
+<ParamField path="object.error.message" type="string">
+  Error message
+</ParamField>
+
+<ParamField path="object.error.stackTrace" type="string">
+  Sample stack trace, if available
+</ParamField>
+
+<ParamField path="object.error.firstSeen" type="string">
+  When the error was first seen
+</ParamField>
+
+<ParamField path="object.error.lastSeen" type="string">
+  When the error was last seen
+</ParamField>
+
+<ParamField path="object.error.occurrenceCount" type="number">
+  Number of occurrences
+</ParamField>
+
+<ParamField path="object.error.taskIdentifier" type="string">
+  Task the error occurred in
+</ParamField>
+
+<ParamField path="object.environment.id" type="string">
+  Environment ID
+</ParamField>
+
+<ParamField path="object.environment.name" type="string">
+  Environment name
+</ParamField>
+
+<ParamField path="object.organization.id" type="string">
+  Organization ID
+</ParamField>
+
+<ParamField path="object.organization.slug" type="string">
+  Organization slug
+</ParamField>
+
+<ParamField path="object.organization.name" type="string">
+  Organization name
+</ParamField>
+
+<ParamField path="object.project.id" type="string">
+  Project ID
+</ParamField>
+
+<ParamField path="object.project.ref" type="string">
+  Project reference
+</ParamField>
+
+<ParamField path="object.project.slug" type="string">
+  Project slug
+</ParamField>
+
+<ParamField path="object.project.name" type="string">
+  Project name
+</ParamField>
+
+<ParamField path="object.dashboardUrl" type="string">
+  URL to view the error in the dashboard
+</ParamField>

@@ -1,0 +1,124 @@
+---
+title: "Session channels"
+sidebarTitle: "Channels"
+description: "The raw HTTP endpoints behind a session's .in and .out streams: append records, read them over SSE, and drain them non-streaming."
+---
+
+Every session has two durable streams: `.in` carries records from your clients to the task, `.out` carries records from the task back to your clients. The [`sessions` SDK](/ai-chat/sessions) wraps these as `session.in.*` and `session.out.*`. This page documents the underlying HTTP endpoints for callers that aren't using the TypeScript SDK.
+
+All channel endpoints live under `/realtime/v1/sessions/{session}/{io}`, where:
+
+- `{session}` is the session's friendly ID (`session_…`) or your `externalId`. One token authorizes both forms.
+- `{io}` is either `in` or `out`.
+
+Authorize requests with a secret key or a [session public token](/management/authentication#session-scopes). The token's scopes decide what you can do — see [Authorization](#authorization) below.
+
+## Append a record
+
+Append a single record to a channel.
+
+```bash Append to .in
+curl -X POST "https://api.trigger.dev/realtime/v1/sessions/{session}/in/append" \
+  -H "Authorization: Bearer $TRIGGER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-Part-Id: 0f8c2b1e-..." \
+  --data '{"type":"user-message","text":"hello"}'
+```
+
+The body is the raw record — any text up to 1MiB (records over the per-record cap return `413`). The response is `{ "ok": true, "seq": <number> }`, where `seq` is the sequence number of the appended record. `seq` is omitted when no new record was written, for example when a retry reuses an `X-Part-Id` that was already appended. When the session's run is parked awaiting its deployment, the response also includes `"pendingVersion": true`.
+
+Set the `X-Part-Id` header to a unique value per record to make the append idempotent: replaying the same `X-Part-Id` does not duplicate the record. Appending to a closed session returns `409` (`code: "session_closed"`); appending to an expired session returns `400` (`code: "session_expired"`).
+
+<Warning>
+  Appending to `.out` requires a **secret key**. A session public token (even one with
+  `write:sessions`) can only append to `.in` — appending to `.out` with a public token returns
+  `403`. The `.out` stream is the task's to write.
+</Warning>
+
+## Read a channel over SSE
+
+Subscribe to a channel as a Server-Sent Events stream. New records are delivered as they arrive.
+
+```bash Read .out
+curl -N "https://api.trigger.dev/realtime/v1/sessions/{session}/out" \
+  -H "Authorization: Bearer $TRIGGER_TOKEN" \
+  -H "Last-Event-ID: 42" \
+  -H "Timeout-Seconds: 60"
+```
+
+| Header | Direction | Description |
+| --- | --- | --- |
+| `Last-Event-ID` | request | Resume after this sequence number. Set it to the `seq_num` of the last record you processed. |
+| `Timeout-Seconds` | request | How long the server holds the stream open with no new records before closing, `1`–`600`. |
+
+The stream is passed through from S2. Events are `batch` (records), `ping` (keepalive) and a final `data: [DONE]`. The `id:` line is an internal S2 cursor (`startSeq,endSeq,byteOffset`); do not parse it. Each `batch` event has `data: {"records":[{"seq_num":42,"timestamp":1712150400000,"body":"{\"data\":<record>,\"id\":\"<partId>\"}","headers":[...]}],"tail":{...}}`, where `body` is a JSON string (empty for control records). See the [stream format](/ai-chat/client-protocol#stream-format-s2) for details.
+
+### Control records
+
+Some `.out` events are **control records** rather than data. A control record has an empty body and carries a `trigger-control` header naming its subtype:
+
+| Subtype | Meaning |
+| --- | --- |
+| `turn-complete` | The current turn finished. Can carry sibling headers `public-access-token` (a refreshed session token), `session-in-event-id`, and `session-in-consumed-id`. It also carries a `session-closed` header (and `session-closed-reason`, when a reason was given) when the session was closed during that turn. |
+| `upgrade-required` | The session needs to hand off to a run on a newer deployed version. |
+| `session-closed` | The session was closed. Carries a `session-closed-reason` header when a reason was given. |
+| `pending-version` | The session's run is waiting for its deployment to land. |
+
+Route control records by their subtype instead of treating them as message content. The TypeScript SDK does this for you — `session.out.read` filters control records out of the chunk stream and surfaces them through `onControl`.
+
+## Drain records non-streaming
+
+Fetch a batch of records without holding an SSE connection open. Useful for polling or for reading a tail at startup.
+
+```bash Drain .out
+curl "https://api.trigger.dev/realtime/v1/sessions/{session}/out/records?afterEventId=42" \
+  -H "Authorization: Bearer $TRIGGER_TOKEN"
+```
+
+Pass `afterEventId` to return only records after that sequence number; omit it to read from the start of the retained window. The response is:
+
+```json
+{
+  "records": [
+    { "data": "{\"type\":\"text\",\"text\":\"echo: hello\"}", "id": "a1b2c3d", "seqNum": 43 }
+  ]
+}
+```
+
+Each record carries `data` (the appended record body as a string), `id` (the part ID: the `X-Part-Id` you sent on append, otherwise a generated ID; empty string on control records), `seqNum` (the sequence number), and an optional `headers` array. Page forward by passing the highest `seqNum` you received as the next `afterEventId`.
+
+## Authorization
+
+The action you can take depends on your token and the channel:
+
+| Action | Endpoint | Required authorization |
+| --- | --- | --- |
+| Subscribe to `.out` (SSE) | `GET .../out` | `read:sessions:{id}` or `read:sessions:{id}:out` |
+| Drain `.out` records | `GET .../out/records` | `read:sessions:{id}` or `read:sessions:{id}:out` |
+| Subscribe to `.in` (SSE) | `GET .../in` | Secret key only |
+| Drain `.in` records | `GET .../in/records` | Secret key only |
+| Append to `.in` | `POST .../in/append` | `write:sessions:{id}` |
+| Append to `.out` | `POST .../out/append` | Secret key only |
+
+Each direction has one side that is the task's alone: `.out` is written by the task and read by clients, `.in` is written by clients and read by the task. A public token can read `.out` and append to `.in`; reading `.in` or appending to `.out` requires a secret key. `read:sessions:{id}:out` narrows a read token to the `.out` stream, so a browser-held token cannot also retrieve the session row or read named channels. See [session scopes](/management/authentication#session-scopes) for how to mint a token.
+
+## Using the SDK instead
+
+If you're writing TypeScript, the [`sessions` SDK](/ai-chat/sessions) is the ergonomic path. `sessions.open(idOrExternalId)` returns a `SessionHandle` whose `session.in` and `session.out` channels call these endpoints for you, with auto-retry, `Last-Event-ID` resume, and control-record routing built in:
+
+```ts Your backend
+import { sessions } from "@trigger.dev/sdk";
+
+const session = sessions.open(chatId);
+
+// append to .in
+await session.in.send({ type: "user-message", text: "hello" });
+
+// read .out over SSE
+const stream = await session.out.read({ signal: AbortSignal.timeout(30_000) });
+for await (const chunk of stream) {
+  console.log(chunk);
+}
+```
+
+See [`session.in`](/ai-chat/sessions) and [`session.out`](/ai-chat/sessions) for the full handle API.

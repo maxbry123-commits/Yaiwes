@@ -1,0 +1,138 @@
+import type {
+  PromptManifest,
+  QueueManifest,
+  SkillManifest,
+  SkillMetadata,
+  TaskManifest,
+  WebhookEndpointManifest,
+  WebhookEndpointMetadata,
+  WebhookSubscriberManifest,
+  WorkerManifest,
+  ConcurrencyLimitManifest,
+} from "../schemas/index.js";
+import {
+  type PromptMetadataWithFunctions,
+  type TaskMetadataWithFunctions,
+  type TaskSchema,
+} from "../types/index.js";
+import type { ResourceCatalog } from "./catalog.js";
+
+export class NoopResourceCatalog implements ResourceCatalog {
+  registerTaskMetadata(task: TaskMetadataWithFunctions): void {
+    // noop
+  }
+
+  setCurrentFileContext(filePath: string, entryPoint: string): void {
+    // noop
+  }
+
+  clearCurrentFileContext(): void {
+    // noop
+  }
+
+  updateTaskMetadata(id: string, updates: Partial<TaskMetadataWithFunctions>): void {
+    // noop
+  }
+
+  listTaskManifests(): Array<TaskManifest> {
+    return [];
+  }
+
+  listTaskIdCollisions(): Array<{ id: string; filePaths: string[] }> {
+    return [];
+  }
+
+  getTaskManifest(id: string): TaskManifest | undefined {
+    return undefined;
+  }
+
+  getTask(id: string): TaskMetadataWithFunctions | undefined {
+    return undefined;
+  }
+
+  getTaskSchema(id: string): TaskSchema | undefined {
+    return undefined;
+  }
+
+  taskExists(id: string): boolean {
+    return false;
+  }
+
+  disable() {
+    // noop
+  }
+
+  registerWorkerManifest(workerManifest: WorkerManifest): void {
+    // noop
+  }
+
+  registerQueueMetadata(queue: QueueManifest): void {
+    // noop
+  }
+
+  listQueueManifests(): Array<QueueManifest> {
+    return [];
+  }
+
+  registerConcurrencyLimitMetadata(limit: ConcurrencyLimitManifest): void {}
+
+  listConcurrencyLimitManifests(): Array<ConcurrencyLimitManifest> {
+    return [];
+  }
+
+  registerPromptMetadata(prompt: PromptMetadataWithFunctions): void {
+    // noop
+  }
+
+  listPromptManifests(): Array<PromptManifest> {
+    return [];
+  }
+
+  getPrompt(id: string): PromptMetadataWithFunctions | undefined {
+    return undefined;
+  }
+
+  getPromptSchema(id: string): TaskSchema | undefined {
+    return undefined;
+  }
+
+  registerSkillMetadata(skill: SkillMetadata): void {
+    // noop
+  }
+
+  listSkillManifests(): Array<SkillManifest> {
+    return [];
+  }
+
+  getSkillManifest(id: string): SkillManifest | undefined {
+    return undefined;
+  }
+
+  registerWebhookEndpointMetadata(endpoint: WebhookEndpointMetadata): void {
+    // noop
+  }
+  listWebhookEndpointManifests(): Array<WebhookEndpointManifest> {
+    return [];
+  }
+  getWebhookEndpointManifest(id: string): WebhookEndpointManifest | undefined {
+    return undefined;
+  }
+  listWebhookEndpointIdCollisions(): Array<{ id: string; filePaths: string[] }> {
+    return [];
+  }
+  registerWebhookSubscriber(subscriber: WebhookSubscriberManifest): void {
+    // noop
+  }
+  listWebhookSubscribers(): Array<WebhookSubscriberManifest> {
+    return [];
+  }
+  registerDeclaredSessionWebhook(id: string): void {
+    // noop
+  }
+  markSessionWebhookClaimed(id: string): void {
+    // noop
+  }
+  listUnclaimedSessionWebhooks(): Array<string> {
+    return [];
+  }
+}

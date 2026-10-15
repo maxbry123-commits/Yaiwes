@@ -1,0 +1,445 @@
+import { z } from "zod/v4";
+import { discriminatedUnion } from "../utils/zod.js";
+import type { RequireKeys } from "../types/index.js";
+import {
+  WebhookVerifierArtifact,
+  WebhookRoutingTarget,
+  WebhookSecretProvisioning,
+} from "./webhookConfig.js";
+import {
+  MachineConfig,
+  MachinePreset,
+  MachinePresetName,
+  TaskRunExecution,
+  V3TaskRunExecution,
+} from "./common.js";
+import { ScheduleWindow } from "./scheduleWindow.js";
+
+export * from "./scheduleWindow.js";
+
+/*
+    WARNING: Never import anything from ./messages here. If it's needed in both, put it here instead.
+*/
+export const EnvironmentType = z.enum(["PRODUCTION", "STAGING", "DEVELOPMENT", "PREVIEW"]);
+export type EnvironmentType = z.infer<typeof EnvironmentType>;
+
+export const RunEngineVersionSchema = z.enum(["V1", "V2"]);
+
+export const TaskRunExecutionMetric = z.object({
+  name: z.string(),
+  event: z.string(),
+  timestamp: z.number(),
+  duration: z.number(),
+});
+
+export type TaskRunExecutionMetric = z.infer<typeof TaskRunExecutionMetric>;
+
+export const TaskRunExecutionMetrics = z.array(TaskRunExecutionMetric);
+
+export type TaskRunExecutionMetrics = z.infer<typeof TaskRunExecutionMetrics>;
+
+export const TaskRunExecutionPayload = z.object({
+  execution: TaskRunExecution,
+  traceContext: z.record(z.string(), z.unknown()),
+  environment: z.record(z.string(), z.string()).optional(),
+  metrics: TaskRunExecutionMetrics.optional(),
+});
+
+export type TaskRunExecutionPayload = z.infer<typeof TaskRunExecutionPayload>;
+
+// **IMPORTANT NOTE**: If you change this schema, make sure it is backwards compatible with the previous version as this also used when a worker signals to the coordinator that a TaskRun is complete.
+// Strategies for not breaking backwards compatibility:
+// 1. Add new fields as optional
+// 2. If a field is required, add a default value
+export const V3ProdTaskRunExecution = V3TaskRunExecution.extend({
+  worker: z.object({
+    id: z.string(),
+    contentHash: z.string(),
+    version: z.string(),
+    type: RunEngineVersionSchema.optional(),
+  }),
+  machine: MachinePreset.default({ name: "small-1x", cpu: 1, memory: 1, centsPerMs: 0 }),
+});
+
+export type V3ProdTaskRunExecution = z.infer<typeof V3ProdTaskRunExecution>;
+
+export const V3ProdTaskRunExecutionPayload = z.object({
+  execution: V3ProdTaskRunExecution,
+  traceContext: z.record(z.string(), z.unknown()),
+  environment: z.record(z.string(), z.string()).optional(),
+  metrics: TaskRunExecutionMetrics.optional(),
+});
+
+export type V3ProdTaskRunExecutionPayload = z.infer<typeof V3ProdTaskRunExecutionPayload>;
+
+export const FixedWindowRateLimit = z.object({
+  type: z.literal("fixed-window"),
+  limit: z.number(),
+  window: z.union([
+    z.object({
+      seconds: z.number(),
+    }),
+    z.object({
+      minutes: z.number(),
+    }),
+    z.object({
+      hours: z.number(),
+    }),
+  ]),
+});
+
+export const SlidingWindowRateLimit = z.object({
+  type: z.literal("sliding-window"),
+  limit: z.number(),
+  window: z.union([
+    z.object({
+      seconds: z.number(),
+    }),
+    z.object({
+      minutes: z.number(),
+    }),
+    z.object({
+      hours: z.number(),
+    }),
+  ]),
+});
+
+export const RateLimitOptions = discriminatedUnion("type", [
+  FixedWindowRateLimit,
+  SlidingWindowRateLimit,
+]);
+
+export type RateLimitOptions = z.infer<typeof RateLimitOptions>;
+
+export const RetryOptions = z.object({
+  /** The number of attempts before giving up */
+  maxAttempts: z.number().int().optional(),
+  /** The exponential factor to use when calculating the next retry time.
+   *
+   * Each subsequent retry will be calculated as `previousTimeout * factor`
+   */
+  factor: z.number().optional(),
+  /** The minimum time to wait before retrying */
+  minTimeoutInMs: z.number().int().optional(),
+  /** The maximum time to wait before retrying */
+  maxTimeoutInMs: z.number().int().optional(),
+  /** Randomize the timeout between retries.
+   *
+   * This can be useful to prevent the thundering herd problem where all retries happen at the same time.
+   */
+  randomize: z.boolean().optional(),
+
+  /** If a run fails with an Out Of Memory (OOM) error and you have this set, it will retry with the machine you specify.
+   * Note: it will not default to this [machine](https://trigger.dev/docs/machines) for new runs, only for failures caused by OOM errors.
+   * So if you frequently have attempts failing with OOM errors, you should set the [default machine](https://trigger.dev/docs/machines) to be higher.
+   */
+  outOfMemory: z
+    .object({
+      machine: MachinePresetName.optional(),
+    })
+    .optional(),
+});
+
+export type RetryOptions = z.infer<typeof RetryOptions>;
+
+export const QueueManifest = z.object({
+  /** You can define a shared queue and then pass the name in to your task.
+   *
+   * @example
+   *
+   * ```ts
+   * const myQueue = queue({
+      name: "my-queue",
+      concurrencyLimit: 1,
+    });
+
+    export const task1 = task({
+      id: "task-1",
+      queue: {
+        name: "my-queue",
+      },
+      run: async (payload: { message: string }) => {
+        // ...
+      },
+    });
+
+    export const task2 = task({
+      id: "task-2",
+      queue: {
+        name: "my-queue",
+      },
+      run: async (payload: { message: string }) => {
+        // ...
+      },
+    });
+   * ```
+   */
+  name: z.string(),
+  /** An optional property that specifies the maximum number of concurrent run executions.
+   *
+   * If this property is omitted, the task can potentially use up the full concurrency of an environment */
+  concurrencyLimit: z.number().int().min(0).max(100000).optional().nullable(),
+  /** An optional property that caps the total number of concurrent run executions across ALL
+   * `concurrencyKey` values of this queue. On a queue with a `concurrencyKey`, `concurrencyLimit`
+   * applies per key value; this is the ceiling for the whole queue.
+   *
+   * Caps keyed and keyless runs together, and requires server-side support. */
+  combinedConcurrencyLimit: z.number().int().min(0).max(100000).optional().nullable(),
+});
+
+export type QueueManifest = z.infer<typeof QueueManifest>;
+
+/** A gate a task's runs must also hold a concurrency slot in while executing.
+ * `queue` is the gate queue's name. When `concurrencyKey` is omitted the run's own
+ * `concurrencyKey` is used, so the gate is keyed per tenant; a literal value pins
+ * the gate to one shared slot pool. */
+export const QueueGateManifest = z.object({
+  queue: z.string().min(1).max(128),
+  concurrencyKey: z.string().min(1).max(128).optional(),
+});
+
+export type QueueGateManifest = z.infer<typeof QueueGateManifest>;
+
+/** One limit shape everywhere a limit appears: perKey caps each concurrencyKey pool
+ * (runs without a key share one pool); total caps across everything, keys or not.
+ * Limits start at 1 — "block everything" is a pause or an override, not a declared
+ * limit — so a stored zero always means "no limit" in metrics and engine keys. */
+export const ConcurrencyShapeManifest = z.object({
+  perKey: z.number().int().min(1).max(100000).optional(),
+  total: z.number().int().min(1).max(100000).optional(),
+});
+
+export type ConcurrencyShapeManifest = z.infer<typeof ConcurrencyShapeManifest>;
+
+/** A named, shareable concurrency limit declared with concurrencyLimit(). */
+export const ConcurrencyLimitManifest = ConcurrencyShapeManifest.extend({
+  name: z.string().min(1).max(128),
+});
+
+export type ConcurrencyLimitManifest = z.infer<typeof ConcurrencyLimitManifest>;
+
+/** A task's concurrency declaration: an optional inline limit scoped to the task,
+ * plus up to two named limits the task's runs also hold while executing. */
+export const TaskConcurrencyManifest = z.object({
+  inline: ConcurrencyShapeManifest.optional(),
+  limits: z.string().min(1).max(128).array().max(2).optional(),
+});
+
+export type TaskConcurrencyManifest = z.infer<typeof TaskConcurrencyManifest>;
+
+export const ScheduleMetadata = z.object({
+  cron: z.string(),
+  timezone: z.string(),
+  environments: z.array(EnvironmentType).optional(),
+  window: ScheduleWindow.optional(),
+});
+
+const AgentConfig = z.object({
+  type: z.string(),
+});
+
+const taskMetadata = {
+  id: z.string(),
+  description: z.string().optional(),
+  queue: QueueManifest.extend({ name: z.string().optional() }).optional(),
+  gates: QueueGateManifest.array().max(2).optional(),
+  concurrency: TaskConcurrencyManifest.optional(),
+  retry: RetryOptions.optional(),
+  machine: MachineConfig.optional(),
+  triggerSource: z.string().optional(),
+  agentConfig: AgentConfig.optional(),
+  schedule: ScheduleMetadata.optional(),
+  maxDuration: z.number().optional(),
+  ttl: z.string().or(z.number().nonnegative().int()).optional(),
+  payloadSchema: z.unknown().optional(),
+};
+
+export const TaskMetadata = z.object(taskMetadata);
+
+export type TaskMetadata = z.infer<typeof TaskMetadata>;
+
+export const TaskFile = z.object({
+  entry: z.string(),
+  out: z.string(),
+});
+
+export type TaskFile = z.infer<typeof TaskFile>;
+
+const taskFileMetadata = {
+  filePath: z.string(),
+  exportName: z.string().optional(),
+  entryPoint: z.string(),
+};
+
+export const TaskFileMetadata = z.object(taskFileMetadata);
+
+export type TaskFileMetadata = z.infer<typeof TaskFileMetadata>;
+
+export const TaskManifest = z.object({
+  ...taskMetadata,
+  ...taskFileMetadata,
+});
+
+export type TaskManifest = z.infer<typeof TaskManifest>;
+
+const promptMetadata = {
+  id: z.string(),
+  description: z.string().optional(),
+  content: z.string().optional(),
+  model: z.string().optional(),
+  config: z.record(z.string(), z.unknown()).optional(),
+  variableSchema: z.unknown().optional(),
+};
+
+export const PromptMetadata = z.object(promptMetadata);
+
+export type PromptMetadata = z.infer<typeof PromptMetadata>;
+
+export const PromptManifest = z.object({
+  ...promptMetadata,
+  ...taskFileMetadata,
+});
+
+export type PromptManifest = z.infer<typeof PromptManifest>;
+
+// ── Skills ────────────────────────────────────────────────────────────────
+//
+// A skill is a developer-authored folder (SKILL.md + scripts/references/assets)
+// bundled into the deploy image. SkillMetadata is registered at module load
+// by `ai.defineSkill({ id, path })`; the CLI's built-in bundler picks it up
+// during deploy and copies the folder into the deploy image.
+
+const skillMetadata = {
+  id: z.string(),
+  /** Path to the skill's source folder, relative to the project root. */
+  sourcePath: z.string(),
+};
+
+export const SkillMetadata = z.object(skillMetadata);
+export type SkillMetadata = z.infer<typeof SkillMetadata>;
+
+export const SkillManifest = z.object({
+  ...skillMetadata,
+  ...taskFileMetadata,
+});
+export type SkillManifest = z.infer<typeof SkillManifest>;
+
+// ── Webhooks ────────────────────────────────────────────────────────────────
+
+const webhookEndpointMetadata = {
+  id: z.string(),
+  description: z.string().optional(),
+  source: z.string(),
+  verifierArtifact: WebhookVerifierArtifact,
+  secretProvisioning: WebhookSecretProvisioning.optional(),
+  setupPrompt: z.string().max(20_000).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+};
+
+export const WebhookEndpointMetadata = z.object(webhookEndpointMetadata);
+export type WebhookEndpointMetadata = z.infer<typeof WebhookEndpointMetadata>;
+
+export const WebhookEndpointManifest = z.object({
+  ...webhookEndpointMetadata,
+  ...taskFileMetadata,
+});
+export type WebhookEndpointManifest = z.infer<typeof WebhookEndpointManifest>;
+
+/** A subscriber (`webhook()`, `chat.event`, channel connector) of the endpoint named by `endpointId`. */
+export const WebhookSubscriberManifest = z.object({
+  endpointId: z.string(),
+  target: WebhookRoutingTarget,
+});
+export type WebhookSubscriberManifest = z.infer<typeof WebhookSubscriberManifest>;
+
+export const PostStartCauses = z.enum(["index", "create", "restore"]);
+export type PostStartCauses = z.infer<typeof PostStartCauses>;
+
+export const PreStopCauses = z.enum(["terminate"]);
+export type PreStopCauses = z.infer<typeof PreStopCauses>;
+
+const RegexSchema = z.custom<RegExp>((val) => {
+  try {
+    // Check to see if val is a regex
+    return typeof (val as RegExp).test === "function";
+  } catch {
+    return false;
+  }
+});
+
+export const Config = z.object({
+  project: z.string(),
+  triggerDirectories: z.string().array().optional(),
+  triggerUrl: z.string().optional(),
+  projectDir: z.string().optional(),
+  tsconfigPath: z.string().optional(),
+  retries: z
+    .object({
+      enabledInDev: z.boolean().default(true),
+      default: RetryOptions.optional(),
+    })
+    .optional(),
+  additionalPackages: z.string().array().optional(),
+  additionalFiles: z.string().array().optional(),
+  dependenciesToBundle: z.array(z.union([z.string(), RegexSchema])).optional(),
+  logLevel: z.string().optional(),
+  enableConsoleLogging: z.boolean().optional(),
+  postInstall: z.string().optional(),
+  extraCACerts: z.string().optional(),
+});
+
+export type Config = z.infer<typeof Config>;
+export type ResolvedConfig = RequireKeys<
+  Config,
+  "triggerDirectories" | "triggerUrl" | "projectDir" | "tsconfigPath"
+>;
+
+export const WaitReason = z.enum(["WAIT_FOR_DURATION", "WAIT_FOR_TASK", "WAIT_FOR_BATCH"]);
+
+export type WaitReason = z.infer<typeof WaitReason>;
+
+export const TaskRunExecutionLazyAttemptPayload = z.object({
+  runId: z.string(),
+  attemptCount: z.number().optional(),
+  messageId: z.string(),
+  isTest: z.boolean(),
+  isReplay: z.boolean().default(false),
+  traceContext: z.record(z.string(), z.unknown()),
+  environment: z.record(z.string(), z.string()).optional(),
+  metrics: TaskRunExecutionMetrics.optional(),
+});
+
+export type TaskRunExecutionLazyAttemptPayload = z.infer<typeof TaskRunExecutionLazyAttemptPayload>;
+
+export const ManualCheckpointMetadata = z.object({
+  /** NOT a friendly ID */
+  attemptId: z.string(),
+  previousRunStatus: z.string(),
+  previousAttemptStatus: z.string(),
+});
+
+export type ManualCheckpointMetadata = z.infer<typeof ManualCheckpointMetadata>;
+
+export const RunChainState = z.object({
+  concurrency: z
+    .object({
+      queues: z.array(z.object({ id: z.string(), name: z.string(), holding: z.number() })),
+      environment: z.number().optional(),
+    })
+    .optional(),
+});
+
+export type RunChainState = z.infer<typeof RunChainState>;
+
+export const TriggerTraceContext = z.object({
+  traceparent: z.string().optional(),
+  tracestate: z.string().optional(),
+  external: z
+    .object({
+      traceparent: z.string().optional(),
+      tracestate: z.string().optional(),
+    })
+    .optional(),
+});
+
+export type TriggerTraceContext = z.infer<typeof TriggerTraceContext>;

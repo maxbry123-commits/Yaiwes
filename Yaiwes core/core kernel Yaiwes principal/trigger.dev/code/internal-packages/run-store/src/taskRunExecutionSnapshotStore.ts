@@ -1,0 +1,2008 @@
+// The snapshot-store decorator.
+//
+// It runs a run's birth and transitions through the durable prepare protocol: open the owning
+// Postgres transaction, obtain its xid8, run the writes, PREPARE the ordered unit in MemoryDB hidden
+// from reads BEFORE the transaction commits, let the transaction COMMIT, then FINALIZE the unit so its
+// entries become visible together. A MIRRORED run (dual-write/redis-read) writes the real TaskRun +
+// TRES rows; a REDIS-PRIMARY run (redis-only) writes the TaskRun but NO TRES row, carrying the
+// snapshot and its completed-waitpoint cycle in MemoryDB alone.
+//
+// Reads dispatch on each run's DURABLE residency (resolved from the MemoryDB birth key), NOT the
+// constructed dial: a redis-primary run always reads from MemoryDB (fail-closed, no Postgres fallback)
+// even at a lowered dial, which makes backward-dialing lossless; a mirrored/postgres run uses the dial
+// only for read preference (dual-write reads Postgres, redis-read reads MemoryDB head + Postgres
+// payload).
+
+import type {
+  Prisma,
+  PrismaClientOrTransaction,
+  RuntimeEnvironmentType,
+  TaskRun,
+  TaskRunExecutionStatus,
+  TaskRunStatus,
+} from "@trigger.dev/database";
+import type { TaskRunError } from "@trigger.dev/core/v3/schemas";
+import { generateInternalId } from "@trigger.dev/core/v3/isomorphic";
+import { DelegatingRunStore } from "./delegatingRunStore.js";
+import type {
+  CompletionSnapshotInput,
+  CreateCancelledRunInput,
+  CreateExecutionSnapshotInput,
+  CreateRunInput,
+  ExpireSnapshotInput,
+  LatestExecutionSnapshotRead,
+  LockRunData,
+  ReadClient,
+  SnapshotReadWaitpoint,
+  RescheduleSnapshotInput,
+  RunStore,
+  TaskRunWithWaitpoint,
+} from "./types.js";
+import { deriveDistinctIds, deriveOrder } from "./redisSnapshotStore.js";
+import type {
+  AppendCyclePayload,
+  CompletedWaitpointRecord,
+  CompletedWaitpointResolver,
+  FinalizeResult,
+  GetSinceResult,
+  PreparedEntry,
+  PreparedPgUnit,
+  RedisSnapshotStore,
+  SnapshotRead,
+} from "./redisSnapshotStore.js";
+import {
+  entryFromCompletion,
+  entryFromCreateExecutionSnapshot,
+  entryFromCreateRun,
+  entryFromExpire,
+  entryFromLock,
+  entryFromReschedule,
+  isTerminalEntry,
+} from "./snapshotEntry.js";
+import { SnapshotResidencyResolver } from "./snapshotResidencyResolver.js";
+import {
+  parseSnapshotRoute,
+  metadataWithSnapshotResidency,
+  snapshotResidencyFromMetadata,
+  snapshotRouteFromSnapshot,
+  type SnapshotReadContext,
+  type SnapshotRoute,
+} from "./snapshotResidency.js";
+
+const PROTOCOL_VERSION = 1;
+
+/**
+ * The read/write dial positions this decorator implements. `dual-write` mirrors writes but reads
+ * Postgres; `redis-read` additionally checks a mirrored run's head in MemoryDB, while completed
+ * waitpoint links remain in Postgres; `redis-only` writes redis-primary (no TRES row, the cycle in MemoryDB) and reads
+ * pending-safe from MemoryDB with NO Postgres fallback.
+ */
+export type TaskRunExecutionSnapshotStoreMode = "dual-write" | "redis-read" | "redis-only";
+
+/**
+ * A per-organization dial position. `off` (and, distinctly, "the org is absent from the enrolled
+ * cohort") means the org never joined the mirror: its writes pass straight through to Postgres with
+ * NO prepare protocol and NO MemoryDB read, so the lowest position stays genuinely inert. The three
+ * non-off positions map to the store modes above.
+ */
+export type SnapshotStoreDial = "off" | TaskRunExecutionSnapshotStoreMode;
+
+// Where a read is served from. "unavailable" fails closed retriably; "expired" fails closed for good.
+type SnapshotReadPlan = "postgres" | "mirrored" | "redisPrimary" | "unavailable" | "expired";
+
+const FINALIZE_OUTCOME_UNKNOWN =
+  "finalize outcome unknown after Postgres commit; the recovery worker owns the pending unit";
+
+// The reason, plus a short summary of its cause when there is one, so a logged message names the
+// underlying failure (e.g. a client timeout) without a stack.
+function reasonWithCause(reason: string, cause: unknown): string {
+  if (cause === undefined) return reason;
+  const summary = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+  return `${reason}: ${summary.slice(0, 200)}`;
+}
+
+/**
+ * A read that could not be served authoritatively from MemoryDB right now: a pending unit that is
+ * still in progress, or a MemoryDB availability error. It is RETRIABLE — the caller retries rather
+ * than falling back to a possibly-stale Postgres head. Never thrown for a genuine MemoryDB miss (that
+ * recovers from Postgres for a mirrored run).
+ */
+export class SnapshotReadUnavailableError extends Error {
+  readonly retriable: boolean = true;
+  readonly runId: string;
+  readonly reason: string;
+  readonly cause?: unknown;
+  constructor(runId: string, reason: string, options?: { cause?: unknown }) {
+    super(`snapshot read unavailable for ${runId}: ${reasonWithCause(reason, options?.cause)}`);
+    this.name = "SnapshotReadUnavailableError";
+    this.runId = runId;
+    this.reason = reason;
+    this.cause = options?.cause;
+  }
+}
+
+/**
+ * A read of a redis-primary run whose MemoryDB state has aged out. The TTL is only armed by a FINISHED
+ * entry, so the run's last snapshot was FINISHED and the state will never come back: NOT retriable.
+ * Still a SnapshotReadUnavailableError, so callers that only fail closed keep doing so.
+ */
+export class SnapshotStateExpiredError extends SnapshotReadUnavailableError {
+  override readonly retriable = false;
+  constructor(runId: string) {
+    super(runId, "state expired");
+    this.name = "SnapshotStateExpiredError";
+  }
+}
+
+/**
+ * A transition write whose owning run has an unresolvable durable residency right now (a MemoryDB
+ * availability error, or state that aged out): fail closed and RETRIABLE rather than guess a residency
+ * and risk diverging a mirrored run's head from its Postgres copy.
+ */
+export class SnapshotWriteUnavailableError extends Error {
+  readonly retriable = true;
+  readonly runId: string;
+  readonly cause?: unknown;
+  constructor(runId: string, reason: string, options?: { cause?: unknown }) {
+    super(`snapshot write unavailable for ${runId}: ${reasonWithCause(reason, options?.cause)}`);
+    this.name = "SnapshotWriteUnavailableError";
+    this.runId = runId;
+    this.cause = options?.cause;
+  }
+}
+
+/**
+ * The narrow, bounded-cardinality metric sink the decorator feeds from its own dispatch. Distinct from
+ * the store-level SnapshotStoreMetrics: this records transaction-sized write outcomes and where reads
+ * were served. Every label is a fixed enum; it never carries an organization id. Absent => no-op (the
+ * decorator adds no hot-path work when metrics are not constructed).
+ */
+export type SnapshotDecoratorMetrics = {
+  // One per transaction-sized prepared unit: "written" finalized, "forked" a prepare fork-guard
+  // rejection, "failed" a thrown/rejected prepare or finalize.
+  recordWrite(outcome: "written" | "forked" | "failed"): void;
+  // Where an authoritative read was dispatched from (MemoryDB head vs Postgres).
+  recordReadSource(source: "redis" | "postgres"): void;
+};
+
+/** Reuse one flag result within a read operation, never across requests. */
+type ResolvedSnapshotDial = { organizationId: string; dial: SnapshotStoreDial | undefined };
+
+export type TaskRunExecutionSnapshotStoreOptions = {
+  store: RedisSnapshotStore | (() => RedisSnapshotStore);
+  /** Optional bounded decorator metric sink. The endpoint-absent application uses no decorator. */
+  metrics?: SnapshotDecoratorMetrics;
+  /**
+   * The default dial, used for births and as the mirrored-read preference when `resolveDial` is not
+   * injected. In production a shared store serves many orgs, so `resolveDial` overrides this per run.
+   */
+  mode: TaskRunExecutionSnapshotStoreMode;
+  /**
+   * Current org/global rollout preference. Off/undefined births stay Postgres-only. Existing runs use
+   * snapshot metadata or durable MemoryDB evidence, so stale flags never redefine birth residency.
+   * A mirrored run's current dial can change its read preference, not where it writes.
+   */
+  resolveDial?: (
+    organizationId: string,
+    organizationFlags?: unknown
+  ) => SnapshotStoreDial | undefined | Promise<SnapshotStoreDial | undefined>;
+  /**
+   * Resolves a run's DURABLE residency from the MemoryDB birth key so reads dispatch on the run, not
+   * the dial. This is uncached. When omitted the store builds one over its lazy MemoryDB source.
+   */
+  residencyResolver?: SnapshotResidencyResolver;
+  /** The unit's organization, when the caller carries a trusted one; else taken from the snapshot. */
+  organizationId?: string;
+  /** The stable LOGICAL run-store route the recovery worker uses to reach the owning primary. */
+  logicalRunStoreRoute: string;
+  /** Mint a fresh transition token per unit. Overridable for deterministic tests. */
+  generateTransitionToken?: () => string;
+  /**
+   * Drives recovery resolution for a run with a PENDING prepared unit before a `redis-read` read
+   * trusts the MemoryDB head: it resolves the owning Postgres transaction (via `pg_xact_status`) and
+   * finalizes/aborts, leaving the unit pending only when the transaction is still in progress.
+   * Busy writes require an explicitly committed/aborted transaction; unknown units stay untouched.
+   */
+  resolvePending?: (
+    runId: string,
+    options?: { requireSettledTransaction?: boolean }
+  ) => Promise<void>;
+  /**
+   * Expands a redis-primary snapshot's completed-waitpoint cycle records into `CompletedWaitpoint[]`.
+   * The waitpoint lane owns the implementation (it lives in run-engine because a `deriveFromRun`
+   * record needs a Postgres read); the decorator only injects and calls it. Required for a redis-only
+   * read whose head carries completed waitpoints.
+   */
+  resolveCompletedWaitpoints?: CompletedWaitpointResolver;
+  /**
+   * The primary-read repair seam. When MemoryDB names the authoritative mirrored head id but hydrating
+   * THAT exact row from the caller's read client returns null (a lagging read replica), the row is
+   * re-read from the client this resolves — a WRITER/primary, which the routing store maps to the
+   * OWNING store's primary (read-your-writes). `undefined` (or the option omitted) means no primary is
+   * reachable from the decorator, so such a hydrate miss fails RETRIABLE rather than returning null.
+   */
+  resolvePrimaryReadClient?: (runId: string) => ReadClient | undefined;
+  /**
+   * Redis-only birth readiness. Consulted ONLY at a birth: when a `redis-only` dial would mint a new
+   * redis-primary run but the MemoryDB is not ready (evicting policy, unreadable, version mismatch),
+   * the birth is capped to `mirrored` so it still writes Postgres and never becomes a stranded
+   * redis-primary resident. Enrollment is untouched (the org stays on its dial) and an already-resident
+   * run is never affected — a transition follows durable residency, not this. Default: always ready.
+   */
+  redisPrimaryBirthReady?: () => boolean;
+  /**
+   * Failure-injection seams. `afterPrepare` is invoked inside the owning transaction AFTER the
+   * MemoryDB prepare completes and BEFORE the transaction commits; a throw there rolls the
+   * transaction back, exercising the abort-on-error path. `beforeFinalize` is invoked AFTER the
+   * commit succeeds and BEFORE the MemoryDB finalize; a throw there simulates a process crash after
+   * commit / before finalize, leaving the unit PREPARED + PENDING with Postgres committed — the
+   * interrupted state the recovery worker exists to resolve.
+   */
+  hooks?: {
+    afterPrepare?: () => void | Promise<void>;
+    beforeFinalize?: () => void | Promise<void>;
+  };
+};
+
+/** One collected snapshot write inside an owning transaction: its staged entry plus the run's org and residency. */
+type CollectedEntry = {
+  entry: PreparedEntry;
+  organizationId: string;
+  residency: "mirrored" | "redis-primary";
+};
+
+type CaptureDeps = {
+  runId: string;
+  organizationId?: string;
+  // The owning interactive transaction. Every Postgres write the capturing store issues MUST run on it
+  // (not the delegate's auto-commit client), or a later throw could not roll the write back.
+  tx: PrismaClientOrTransaction;
+  collect: (c: CollectedEntry) => void;
+  resolveResidency: (
+    organizationId: string,
+    kind: "birth" | "transition",
+    routeField?: unknown,
+    organizationFlags?: unknown
+  ) => Promise<"postgres" | "mirrored" | "redis-primary">;
+  mint: <S extends { id?: string; createdAt?: Date }>(s: S) => S;
+  applyRedisControl: <S extends { writeSnapshotRow?: boolean }>(
+    s: S,
+    r: "mirrored" | "redis-primary"
+  ) => S;
+  buildCycle: (
+    cw: { id: string; index?: number }[] | undefined,
+    resolveRecords: (() => Promise<CompletedWaitpointRecord[]>) | undefined,
+    r: "mirrored" | "redis-primary"
+  ) => Promise<AppendCyclePayload | undefined>;
+};
+
+function arraysEqual(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/**
+ * The transaction-bound decorated store the owning transaction runs through (T6.1). It writes each
+ * snapshot to Postgres via the tx-bound delegate and COLLECTS the ordered staged entry; the surrounding
+ * runInTransaction then prepares them as ONE transaction-sized unit. A postgres-resident (inert) run
+ * writes straight through and collects nothing. A run's residency is immutable, so it is resolved once
+ * on the first snapshot write of the transaction and reused (one unit is exactly one run).
+ */
+class CapturingTxStore extends DelegatingRunStore {
+  #residency?: "postgres" | "mirrored" | "redis-primary";
+  constructor(
+    delegate: RunStore,
+    private readonly deps: CaptureDeps
+  ) {
+    super(delegate);
+  }
+
+  async #residencyFor(
+    organizationId: string,
+    kind: "birth" | "transition",
+    routeField?: unknown,
+    organizationFlags?: unknown
+  ): Promise<"postgres" | "mirrored" | "redis-primary"> {
+    if (this.#residency !== undefined) return this.#residency;
+    this.#residency = await this.deps.resolveResidency(
+      organizationId,
+      kind,
+      routeField,
+      organizationFlags
+    );
+    return this.#residency;
+  }
+
+  // A unit is exactly ONE run. Validate the operation's ACTUAL run id against the transaction's bound
+  // run id BEFORE any Postgres mutation, so a multi-run transaction (or a mis-routed write) is rejected
+  // rather than mixed into another run's unit. The actual id, never the bound id, identifies the entry.
+  #assertBoundRun(actualRunId: string): void {
+    if (actualRunId !== this.deps.runId) {
+      throw new Error(
+        `snapshot write for run ${actualRunId} inside a transaction bound to ${this.deps.runId}: one prepared unit is exactly one run`
+      );
+    }
+  }
+
+  override async createRun(
+    params: CreateRunInput,
+    tx?: PrismaClientOrTransaction
+  ): Promise<TaskRunWithWaitpoint> {
+    const runId = params.data.id;
+    const organizationId = this.deps.organizationId ?? params.snapshot.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(
+      organizationId,
+      "birth",
+      undefined,
+      params.organizationFlags
+    );
+    if (residency === "postgres") {
+      // Unreachable for a real birth: the outer createRun shortcuts a postgres birth (and fires
+      // onBirthResidency) before entering runInTransaction, so this tx-bound store only ever sees an
+      // enrolled residency. Kept as a defensive delegate for the postgres branch.
+      return super.createRun(params, this.deps.tx);
+    }
+    const snapshot = this.deps.applyRedisControl(this.deps.mint(params.snapshot), residency);
+    const result = await super.createRun({ ...params, snapshot }, this.deps.tx);
+    // Surface the decided route so the trigger path stamps the INITIAL enqueue without a durable lookup.
+    params.onBirthResidency?.({ runId, organizationId, residency });
+    const entry = entryFromCreateRun(
+      { id: snapshot.id!, runId, createdAt: snapshot.createdAt! },
+      snapshot
+    );
+    this.deps.collect({
+      // A birth asserts the committed head is UNSET (`""`): a second birth on an existing run forks.
+      entry: { entry, kind: "birth", isTerminal: isTerminalEntry(entry), expectedCur: "" },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  override async createExecutionSnapshot(
+    input: CreateExecutionSnapshotInput,
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<{ include: { checkpoint: true } }>> {
+    const runId = input.run.id;
+    const organizationId = this.deps.organizationId ?? input.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(organizationId, "transition", input.snapshotRoute);
+    if (residency === "postgres") return super.createExecutionSnapshot(input, this.deps.tx);
+    const id = input.id ?? generateInternalId();
+    const createdAt = input.createdAt ?? new Date();
+    const withIds = this.deps.applyRedisControl({ ...input, id, createdAt }, residency);
+    const result = await super.createExecutionSnapshot(withIds, this.deps.tx);
+    const entry = entryFromCreateExecutionSnapshot({ id, runId, createdAt }, withIds);
+    const cycle = await this.deps.buildCycle(
+      input.completedWaitpoints,
+      input.resolveCompletedWaitpointRecords,
+      residency
+    );
+    this.deps.collect({
+      // The fork guard: this transition asserts the head is its declared previous snapshot. In a
+      // multi-entry unit the batch validator chains each entry's expectedCur against its predecessor.
+      entry: {
+        entry,
+        kind: "transition",
+        isTerminal: isTerminalEntry(entry),
+        cycle,
+        ...(input.previousSnapshotId !== undefined && { expectedCur: input.previousSnapshotId }),
+      },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  override async lockRunToWorker(
+    runId: string,
+    data: LockRunData,
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunGetPayload<{}>> {
+    const organizationId = this.deps.organizationId ?? data.snapshot.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") return super.lockRunToWorker(runId, data, this.deps.tx);
+    const createdAt = data.snapshot.createdAt ?? new Date();
+    const snapshot = this.deps.applyRedisControl({ ...data.snapshot, createdAt }, residency);
+    const result = await super.lockRunToWorker(runId, { ...data, snapshot }, this.deps.tx);
+    const entry = entryFromLock({ id: snapshot.id, runId, createdAt }, snapshot);
+    // A resume-lock carries the PRECEDING completed-waitpoint cycle: the lock snapshot re-propagates
+    // the waitpoints the head resolved, with no new records. Rebuild the refs EXACTLY: every indexed
+    // ORDER occurrence in position (preserving duplicates, e.g. [A,B,A]), then each DISTINCT unindexed
+    // id absent from the order. A per-id map would collapse repeated indices and drop the true order.
+    // Forward-carry the head's cycle through the SAME buildCycle seam createExecutionSnapshot uses; no
+    // records resolver and no Postgres read (Postgres holds no join rows for a redis-primary run).
+    const inOrder = new Set(snapshot.completedWaitpointOrder);
+    const seenUnindexed = new Set<string>();
+    const completedWaitpoints: { id: string; index?: number }[] =
+      snapshot.completedWaitpointOrder.map((id, index) => ({ id, index }));
+    for (const id of snapshot.completedWaitpointIds) {
+      if (inOrder.has(id) || seenUnindexed.has(id)) continue;
+      seenUnindexed.add(id);
+      completedWaitpoints.push({ id });
+    }
+    const cycle = await this.deps.buildCycle(completedWaitpoints, undefined, residency);
+    this.deps.collect({
+      entry: {
+        entry,
+        kind: "transition",
+        isTerminal: isTerminalEntry(entry),
+        cycle,
+        ...(snapshot.previousSnapshotId !== undefined && {
+          expectedCur: snapshot.previousSnapshotId,
+        }),
+      },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  // A cancellation CREATES the run row with its single terminal snapshot, so it is the run's BIRTH
+  // (expectedCur "": a second birth on an existing run forks), mirrored exactly like createRun.
+  override async createCancelledRun(
+    params: CreateCancelledRunInput,
+    tx?: PrismaClientOrTransaction
+  ): Promise<TaskRun> {
+    const runId = params.data.id;
+    const organizationId = this.deps.organizationId ?? params.snapshot.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(
+      organizationId,
+      "birth",
+      undefined,
+      params.organizationFlags
+    );
+    if (residency === "postgres") return super.createCancelledRun(params, this.deps.tx);
+    const snapshot = this.deps.applyRedisControl(this.deps.mint(params.snapshot), residency);
+    const result = await super.createCancelledRun({ ...params, snapshot }, this.deps.tx);
+    const entry = entryFromCreateRun(
+      { id: snapshot.id!, runId, createdAt: snapshot.createdAt! },
+      snapshot
+    );
+    this.deps.collect({
+      entry: { entry, kind: "birth", isTerminal: isTerminalEntry(entry), expectedCur: "" },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  override async completeAttemptSuccess<S extends Prisma.TaskRunSelect>(
+    runId: string,
+    data: {
+      completedAt: Date;
+      output?: string;
+      outputType: string;
+      usageDurationMs: number;
+      costInCents: number;
+      snapshot: CompletionSnapshotInput;
+    },
+    args: { select: S },
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
+    const organizationId = this.deps.organizationId ?? data.snapshot.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.completeAttemptSuccess(runId, data, args, this.deps.tx);
+    }
+    const id = data.snapshot.id ?? generateInternalId();
+    const createdAt = data.snapshot.createdAt ?? new Date();
+    const snapshot = this.deps.applyRedisControl({ ...data.snapshot, id, createdAt }, residency);
+    const result = await super.completeAttemptSuccess(
+      runId,
+      { ...data, snapshot },
+      args,
+      this.deps.tx
+    );
+    const entry = entryFromCompletion({ id, runId, createdAt }, snapshot);
+    this.deps.collect({
+      entry: { entry, kind: "transition", isTerminal: isTerminalEntry(entry) },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  override async expireRun<S extends Prisma.TaskRunSelect>(
+    runId: string,
+    data: {
+      error: TaskRunError;
+      completedAt: Date;
+      expiredAt: Date;
+      snapshot: ExpireSnapshotInput;
+    },
+    args: { select: S },
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
+    const organizationId = this.deps.organizationId ?? data.snapshot.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") return super.expireRun(runId, data, args, this.deps.tx);
+    const id = data.snapshot.id ?? generateInternalId();
+    const createdAt = data.snapshot.createdAt ?? new Date();
+    const snapshot = this.deps.applyRedisControl({ ...data.snapshot, id, createdAt }, residency);
+    const result = await super.expireRun(runId, { ...data, snapshot }, args, this.deps.tx);
+    const entry = entryFromExpire({ id, runId, createdAt }, snapshot);
+    this.deps.collect({
+      entry: { entry, kind: "transition", isTerminal: isTerminalEntry(entry) },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  // Conditional: the delegate reports `{ count: 0 }` on the P2025 no-op (the run was not
+  // PENDING_VERSION), in which case NO snapshot row was written — collect nothing (no phantom entry).
+  override async expireParkedRun(
+    runId: string,
+    data: {
+      error: TaskRunError;
+      completedAt: Date;
+      expiredAt: Date;
+      statusReason: string;
+      snapshot: ExpireSnapshotInput;
+    },
+    tx?: PrismaClientOrTransaction
+  ): Promise<{ count: number }> {
+    const organizationId = this.deps.organizationId ?? data.snapshot.organizationId;
+    this.#assertBoundRun(runId);
+    const residency = await this.#residencyFor(
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") return super.expireParkedRun(runId, data, this.deps.tx);
+    const id = data.snapshot.id ?? generateInternalId();
+    const createdAt = data.snapshot.createdAt ?? new Date();
+    const snapshot = this.deps.applyRedisControl({ ...data.snapshot, id, createdAt }, residency);
+    const result = await super.expireParkedRun(runId, { ...data, snapshot }, this.deps.tx);
+    if (result.count === 0) return result;
+    const entry = entryFromExpire({ id, runId, createdAt }, snapshot);
+    this.deps.collect({
+      entry: { entry, kind: "transition", isTerminal: isTerminalEntry(entry) },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+
+  // Conditional: rescheduleRun writes a snapshot ONLY when `data.snapshot` is present; a bare delay
+  // update passes straight through and collects nothing (no phantom entry).
+  override async rescheduleRun(
+    runId: string,
+    data: { delayUntil: Date; queueTimestamp?: Date; snapshot?: RescheduleSnapshotInput },
+    tx?: PrismaClientOrTransaction
+  ): Promise<TaskRun> {
+    this.#assertBoundRun(runId);
+    if (data.snapshot === undefined) return super.rescheduleRun(runId, data, this.deps.tx);
+    const snapshotInput = data.snapshot;
+    const organizationId = this.deps.organizationId ?? snapshotInput.organizationId;
+    const residency = await this.#residencyFor(
+      organizationId,
+      "transition",
+      snapshotInput.snapshotRoute
+    );
+    if (residency === "postgres") return super.rescheduleRun(runId, data, this.deps.tx);
+    const id = snapshotInput.id ?? generateInternalId();
+    const createdAt = snapshotInput.createdAt ?? new Date();
+    const snapshot = this.deps.applyRedisControl({ ...snapshotInput, id, createdAt }, residency);
+    const result = await super.rescheduleRun(runId, { ...data, snapshot }, this.deps.tx);
+    const entry = entryFromReschedule({ id, runId, createdAt }, snapshot);
+    this.deps.collect({
+      entry: { entry, kind: "transition", isTerminal: isTerminalEntry(entry) },
+      organizationId,
+      residency,
+    });
+    return result;
+  }
+}
+
+// A read's owning run id, from `where.runId`. A snapshot-id-only lookup (no runId) is not determinable
+// and passes through to Postgres, matching the existing waitpoint-id guard.
+function runIdFromWhere(where: unknown): string | undefined {
+  const runId = (where as { runId?: unknown } | null | undefined)?.runId;
+  return typeof runId === "string" ? runId : undefined;
+}
+
+function snapshotIdFromWhere(where: unknown): string | undefined {
+  const id = (where as { id?: unknown } | null | undefined)?.id;
+  return typeof id === "string" ? id : undefined;
+}
+
+function environmentIdFromWhere(where: unknown): string | undefined {
+  const environmentId = (where as { environmentId?: unknown } | null | undefined)?.environmentId;
+  return typeof environmentId === "string" ? environmentId : undefined;
+}
+
+// The exclusive `createdAt > cursor` bound the read-since window is addressed by.
+function createdAtGtFromWhere(where: unknown): Date | string | undefined {
+  const createdAt = (where as { createdAt?: unknown } | null | undefined)?.createdAt;
+  const gt = (createdAt as { gt?: unknown } | null | undefined)?.gt;
+  return gt instanceof Date || typeof gt === "string" ? gt : undefined;
+}
+
+function toTime(value: unknown): number | undefined {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+  return undefined;
+}
+
+function isAfter(a: unknown, b: unknown): boolean {
+  const ta = toTime(a);
+  const tb = toTime(b);
+  return ta !== undefined && tb !== undefined && ta > tb;
+}
+
+export class TaskRunExecutionSnapshotStore extends DelegatingRunStore {
+  readonly #storeSource: RedisSnapshotStore | (() => RedisSnapshotStore);
+  readonly #mode: TaskRunExecutionSnapshotStoreMode;
+  readonly #resolveDial: NonNullable<TaskRunExecutionSnapshotStoreOptions["resolveDial"]>;
+  readonly #residencyResolver: SnapshotResidencyResolver;
+  readonly #organizationId?: string;
+  readonly #logicalRunStoreRoute: string;
+  readonly #newToken: () => string;
+  readonly #resolvePending: TaskRunExecutionSnapshotStoreOptions["resolvePending"];
+  readonly #resolveCompletedWaitpoints?: CompletedWaitpointResolver;
+  readonly #resolvePrimaryReadClient?: (runId: string) => ReadClient | undefined;
+  readonly #redisPrimaryBirthReady: () => boolean;
+  readonly #metrics?: SnapshotDecoratorMetrics;
+  readonly #hooks?: {
+    afterPrepare?: () => void | Promise<void>;
+    beforeFinalize?: () => void | Promise<void>;
+  };
+
+  constructor(delegate: RunStore, options: TaskRunExecutionSnapshotStoreOptions) {
+    super(delegate);
+    this.#storeSource = options.store;
+    this.#mode = options.mode;
+    this.#resolveDial = options.resolveDial ?? (() => options.mode);
+    this.#residencyResolver =
+      options.residencyResolver ??
+      new SnapshotResidencyResolver({
+        store: options.store,
+      });
+    this.#organizationId = options.organizationId;
+    this.#logicalRunStoreRoute = options.logicalRunStoreRoute;
+    this.#newToken = options.generateTransitionToken ?? (() => generateInternalId());
+    this.#resolvePending = options.resolvePending;
+    this.#resolveCompletedWaitpoints = options.resolveCompletedWaitpoints;
+    this.#resolvePrimaryReadClient = options.resolvePrimaryReadClient;
+    this.#redisPrimaryBirthReady = options.redisPrimaryBirthReady ?? (() => true);
+    this.#metrics = options.metrics;
+    this.#hooks = options.hooks;
+  }
+
+  get #store(): RedisSnapshotStore {
+    return typeof this.#storeSource === "function" ? this.#storeSource() : this.#storeSource;
+  }
+
+  // A direct snapshot write is a ONE-entry owning transaction: an inert (postgres) run passes straight
+  // through honoring the caller's client; a mirrored/redis-primary run routes through the same
+  // runInTransaction orchestration the engine's multi-write transactions use, so the write path is one.
+  override async createRun(
+    params: CreateRunInput,
+    tx?: PrismaClientOrTransaction
+  ): Promise<TaskRunWithWaitpoint> {
+    const runId = params.data.id;
+    const organizationId = this.#organizationId ?? params.snapshot.organizationId;
+    const residency = await this.#birthResidency(organizationId, params.organizationFlags);
+    if (residency === "postgres") {
+      // A postgres-resident birth writes only to Postgres (no runInTransaction/MemoryDB), but while the
+      // decorator is active it still surfaces its FIXED route so the initial enqueue carries an explicit
+      // `postgres` route — the TTL fast path then classifies it as postgres (bulk SQL) with no durable
+      // lookup. The undecorated base store has no such callback, so the unarmed path is unchanged.
+      const result = await super.createRun(params, tx);
+      params.onBirthResidency?.({ runId, organizationId, residency: "postgres" });
+      return result;
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(runId, (store) => store.createRun(params), residency);
+  }
+
+  override async createExecutionSnapshot(
+    input: CreateExecutionSnapshotInput,
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<{ include: { checkpoint: true } }>> {
+    const runId = input.run.id;
+    const organizationId = this.#organizationId ?? input.organizationId;
+    const residency = await this.#writeResidency(
+      runId,
+      organizationId,
+      "transition",
+      input.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.createExecutionSnapshot(input, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(
+      runId,
+      (store) => store.createExecutionSnapshot(input),
+      residency
+    );
+  }
+
+  override async lockRunToWorker(
+    runId: string,
+    data: LockRunData,
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunGetPayload<{}>> {
+    const organizationId = this.#organizationId ?? data.snapshot.organizationId;
+    const residency = await this.#writeResidency(
+      runId,
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.lockRunToWorker(runId, data, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(runId, (store) => store.lockRunToWorker(runId, data), residency);
+  }
+
+  override async createCancelledRun(
+    params: CreateCancelledRunInput,
+    tx?: PrismaClientOrTransaction
+  ): Promise<TaskRun> {
+    const runId = params.data.id;
+    const organizationId = this.#organizationId ?? params.snapshot.organizationId;
+    const residency = await this.#birthResidency(organizationId, params.organizationFlags);
+    if (residency === "postgres") {
+      return super.createCancelledRun(params, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(runId, (store) => store.createCancelledRun(params), residency);
+  }
+
+  override async completeAttemptSuccess<S extends Prisma.TaskRunSelect>(
+    runId: string,
+    data: {
+      completedAt: Date;
+      output?: string;
+      outputType: string;
+      usageDurationMs: number;
+      costInCents: number;
+      snapshot: CompletionSnapshotInput;
+    },
+    args: { select: S },
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
+    const organizationId = this.#organizationId ?? data.snapshot.organizationId;
+    const residency = await this.#writeResidency(
+      runId,
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.completeAttemptSuccess(runId, data, args, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(
+      runId,
+      (store) => store.completeAttemptSuccess(runId, data, args),
+      residency
+    );
+  }
+
+  override async expireRun<S extends Prisma.TaskRunSelect>(
+    runId: string,
+    data: {
+      error: TaskRunError;
+      completedAt: Date;
+      expiredAt: Date;
+      snapshot: ExpireSnapshotInput;
+    },
+    args: { select: S },
+    tx?: PrismaClientOrTransaction
+  ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
+    const organizationId = this.#organizationId ?? data.snapshot.organizationId;
+    const residency = await this.#writeResidency(
+      runId,
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.expireRun(runId, data, args, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(runId, (store) => store.expireRun(runId, data, args), residency);
+  }
+
+  override async expireParkedRun(
+    runId: string,
+    data: {
+      error: TaskRunError;
+      completedAt: Date;
+      expiredAt: Date;
+      statusReason: string;
+      snapshot: ExpireSnapshotInput;
+    },
+    tx?: PrismaClientOrTransaction
+  ): Promise<{ count: number }> {
+    const organizationId = this.#organizationId ?? data.snapshot.organizationId;
+    const residency = await this.#writeResidency(
+      runId,
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.expireParkedRun(runId, data, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(runId, (store) => store.expireParkedRun(runId, data), residency);
+  }
+
+  override async rescheduleRun(
+    runId: string,
+    data: { delayUntil: Date; queueTimestamp?: Date; snapshot?: RescheduleSnapshotInput },
+    tx?: PrismaClientOrTransaction
+  ): Promise<TaskRun> {
+    // A bare delay update writes no snapshot: pass straight through, no prepare protocol.
+    if (data.snapshot === undefined) return super.rescheduleRun(runId, data, tx);
+    const organizationId = this.#organizationId ?? data.snapshot.organizationId;
+    const residency = await this.#writeResidency(
+      runId,
+      organizationId,
+      "transition",
+      data.snapshot.snapshotRoute
+    );
+    if (residency === "postgres") {
+      return super.rescheduleRun(runId, data, tx);
+    }
+    this.#assertOwnsCommit(tx);
+    return this.#runInTransaction(runId, (store) => store.rescheduleRun(runId, data), residency);
+  }
+
+  // ---- Reads ----
+  //
+  // Every read resolves the run's durable residency, then dispatches: a redis-primary run reproduces
+  // its payload from MemoryDB (fail-closed, no Postgres fallback) at ANY dial; a mirrored run reads
+  // its MemoryDB head + Postgres payload at redis-read/redis-only, or straight Postgres at dual-write
+  // or off; a postgres-resident run passes through to Postgres.
+
+  override async findLatestExecutionSnapshot(
+    runId: string,
+    client?: ReadClient,
+    environmentId?: string,
+    serverOrganizationId?: SnapshotReadContext
+  ): Promise<LatestExecutionSnapshotRead | null> {
+    let postgresRead: LatestExecutionSnapshotRead | null | undefined;
+    let context = serverOrganizationId ?? this.#organizationId;
+    const resolvedDial =
+      typeof context === "string"
+        ? { organizationId: context, dial: await this.#resolveDial(context) }
+        : undefined;
+    const dial = resolvedDial?.dial;
+    if (
+      context === undefined ||
+      (typeof context === "string" && (dial === undefined || dial === "off"))
+    ) {
+      // Reuse the original TRES read. Its metadata is birth evidence; an off flag is not.
+      postgresRead = await super.findLatestExecutionSnapshot(runId, client, environmentId);
+      if (postgresRead !== null) context = snapshotRouteFromSnapshot(postgresRead);
+    }
+    const plan = await this.#resolveReadPlan(
+      runId,
+      context,
+      postgresRead !== undefined,
+      resolvedDial
+    );
+    if (plan === "unavailable" || plan === "expired") {
+      // A positive Postgres row is durable evidence, even when the org has since been enabled.
+      // No row means no fallback: never manufacture a Postgres home for a Redis-primary run.
+      const postgres =
+        postgresRead !== undefined
+          ? postgresRead
+          : await super.findLatestExecutionSnapshot(runId, client, environmentId);
+      if (postgres && snapshotResidencyFromMetadata(postgres.metadata) !== "redis-primary") {
+        return postgres;
+      }
+      if (plan === "expired") throw new SnapshotStateExpiredError(runId);
+      throw new SnapshotReadUnavailableError(runId, "residency unresolved or state expired");
+    }
+    if (plan === "postgres") {
+      return postgresRead !== undefined
+        ? postgresRead
+        : super.findLatestExecutionSnapshot(runId, client, environmentId);
+    }
+    await this.#resolvePendingBeforeRead(runId);
+    let head: SnapshotRead | null;
+    try {
+      head = await this.#store.getLatest(runId, environmentId ? { environmentId } : undefined);
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "getLatest failed", { cause: error });
+    }
+    if (head === null) {
+      // Redis-primary holds nothing in Postgres, so a MemoryDB miss is fail-closed, never an empty PG
+      // success. A mirrored run recovers from its complete Postgres copy. A MemoryDB ERROR is never a
+      // miss (it threw above).
+      if (plan === "redisPrimary") {
+        throw await this.#redisPrimaryMissingError(runId, "redis-primary head missing");
+      }
+      return postgresRead !== undefined
+        ? postgresRead
+        : super.findLatestExecutionSnapshot(runId, client, environmentId);
+    }
+    if (plan === "redisPrimary") {
+      // No Postgres row exists: reproduce the full payload from the MemoryDB entry alone.
+      return this.#reproduceSnapshotFromEntry(head, client, environmentId);
+    }
+    // Mirrored runs have a complete Postgres history. An off pod can advance that history during
+    // forward flag propagation, so an older, nonempty Redis head is not proof of the current head.
+    // Reuse the normal payload query, rather than adding a validation query to every mirrored read.
+    const postgres =
+      postgresRead !== undefined
+        ? postgresRead
+        : await super.findLatestExecutionSnapshot(runId, client, environmentId);
+    if (
+      postgres !== null &&
+      (postgres.id === head.id || isAfter(postgres.createdAt, head.entry.createdAt))
+    ) {
+      return postgres;
+    }
+    // Redis may instead lead the caller's read replica. Its named row must then be available on the
+    // owning primary; never replace it with a stale/empty replica result.
+    return this.#hydrateOrRepair(head.id, runId, client, environmentId);
+  }
+
+  override async findSnapshotCompletedWaitpointIds(
+    snapshotId: string,
+    client?: ReadClient,
+    runId?: string,
+    organizationId?: SnapshotReadContext
+  ): Promise<string[]> {
+    if (runId === undefined) {
+      return super.findSnapshotCompletedWaitpointIds(snapshotId, client, runId);
+    }
+    const plan = await this.#resolveReadPlan(runId, organizationId);
+    if (plan === "expired") throw new SnapshotStateExpiredError(runId);
+    if (plan === "unavailable") {
+      throw new SnapshotReadUnavailableError(runId, "residency unresolved or state expired");
+    }
+    // Mirrored writes keep completed-waitpoint links in Postgres, not Redis cycles.
+    if (plan === "postgres" || plan === "mirrored") {
+      return super.findSnapshotCompletedWaitpointIds(snapshotId, client, runId);
+    }
+    let waitpoints;
+    try {
+      waitpoints = await this.#store.getSnapshotWaitpointIds(runId, snapshotId);
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "getSnapshotWaitpointIds failed", {
+        cause: error,
+      });
+    }
+    // Redis-primary holds no Postgres links, so a missing cycle must fail closed.
+    if (!waitpoints.present) {
+      throw new SnapshotReadUnavailableError(runId, "redis-primary waitpoints missing");
+    }
+    return waitpoints.distinctIds;
+  }
+
+  override async findSnapshotCompletedWaitpointIdsWithPresence(
+    snapshotId: string,
+    client?: ReadClient,
+    runId?: string,
+    organizationId?: SnapshotReadContext
+  ): Promise<{ present: boolean; ids: string[] }> {
+    if (runId === undefined) {
+      return super.findSnapshotCompletedWaitpointIdsWithPresence(snapshotId, client, runId);
+    }
+    const plan = await this.#resolveReadPlan(runId, organizationId);
+    if (plan === "expired") throw new SnapshotStateExpiredError(runId);
+    if (plan === "unavailable") {
+      throw new SnapshotReadUnavailableError(runId, "residency unresolved or state expired");
+    }
+    // Preserve Postgres's atomic snapshot/link presence check for mirrored runs too.
+    if (plan === "postgres" || plan === "mirrored") {
+      return super.findSnapshotCompletedWaitpointIdsWithPresence(snapshotId, client, runId);
+    }
+    let waitpoints;
+    try {
+      waitpoints = await this.#store.getSnapshotWaitpointIds(runId, snapshotId);
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "getSnapshotWaitpointIds failed", {
+        cause: error,
+      });
+    }
+    if (!waitpoints.present) {
+      throw new SnapshotReadUnavailableError(runId, "redis-primary waitpoints missing");
+    }
+    return { present: true, ids: waitpoints.distinctIds };
+  }
+
+  // A point read of a specific snapshot within a run (the read-since cursor lookup). A postgres or
+  // mirrored run reads the complete Postgres row by that id; only a redis-primary run (no TRES row)
+  // reproduces it from a MemoryDB point-read, failing closed on a miss (never an empty Postgres hit).
+  override async findExecutionSnapshot<T extends Prisma.TaskRunExecutionSnapshotFindFirstArgs>(
+    args: Prisma.SelectSubset<T, Prisma.TaskRunExecutionSnapshotFindFirstArgs>,
+    client?: ReadClient,
+    organizationId?: SnapshotReadContext
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<T> | null> {
+    const where = (args as { where?: unknown }).where;
+    const runId = runIdFromWhere(where);
+    if (runId === undefined) return super.findExecutionSnapshot(args, client);
+    const context = organizationId ?? this.#organizationId;
+    const resolvedDial =
+      typeof context === "string"
+        ? { organizationId: context, dial: await this.#resolveDial(context) }
+        : undefined;
+    const dial = resolvedDial?.dial;
+    const postgresFirst = typeof context !== "object" && (dial === undefined || dial === "off");
+    if (postgresFirst) {
+      const postgres = await super.findExecutionSnapshot(args, client);
+      if (postgres !== null) {
+        // Preserve the caller's projection. This result is not cached as routing evidence.
+        return postgres;
+      }
+    }
+    const plan = await this.#resolveReadPlan(runId, organizationId, postgresFirst, resolvedDial);
+    if (plan === "expired") throw new SnapshotStateExpiredError(runId);
+    if (plan === "unavailable") {
+      throw new SnapshotReadUnavailableError(runId, "residency unresolved or state expired");
+    }
+    if (plan === "postgres" || plan === "mirrored") {
+      return super.findExecutionSnapshot(args, client);
+    }
+    // Narrow contract: for a redis-primary run this branch serves a by-id point read by reproducing the
+    // full snapshot row from the MemoryDB entry; it does NOT reproduce an arbitrary Prisma `select` /
+    // `where`. The only production caller (run-engine's getExecutionSnapshotsSince) reads the row's
+    // `createdAt` as a since-marker, which the reproduced row always carries.
+    const snapshotId = snapshotIdFromWhere(where);
+    if (snapshotId === undefined) {
+      throw new SnapshotReadUnavailableError(runId, "redis-primary read without a snapshot id");
+    }
+    const environmentId = environmentIdFromWhere(where);
+    await this.#resolvePendingBeforeRead(runId);
+    let read: SnapshotRead | null;
+    try {
+      read = await this.#store.getById(
+        runId,
+        snapshotId,
+        environmentId ? { environmentId } : undefined
+      );
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "getById failed", { cause: error });
+    }
+    if (read === null) {
+      throw await this.#redisPrimaryMissingError(runId, "redis-primary snapshot missing");
+    }
+    return (await this.#reproduceSnapshotFromEntry(
+      read,
+      client,
+      environmentId
+    )) as unknown as Prisma.TaskRunExecutionSnapshotGetPayload<T> | null;
+  }
+
+  // The read-since window (createdAt-gt, checkpoint include, desc, take:50). A postgres run passes
+  // through; a redis-primary run reproduces the window from MemoryDB (fail-closed); a mirrored run
+  // reads the complete Postgres copy but repairs a replica-lagged newest row from the owning primary.
+  override async findManyExecutionSnapshots<T extends Prisma.TaskRunExecutionSnapshotFindManyArgs>(
+    args: Prisma.SelectSubset<T, Prisma.TaskRunExecutionSnapshotFindManyArgs>,
+    client?: ReadClient,
+    organizationId?: SnapshotReadContext
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<T>[]> {
+    const where = (args as { where?: unknown }).where;
+    const runId = runIdFromWhere(where);
+    if (runId === undefined) return super.findManyExecutionSnapshots(args, client);
+    const plan = await this.#resolveReadPlan(runId, organizationId);
+    if (plan === "expired") throw new SnapshotStateExpiredError(runId);
+    if (plan === "unavailable") {
+      throw new SnapshotReadUnavailableError(runId, "residency unresolved or state expired");
+    }
+    if (plan === "postgres") return super.findManyExecutionSnapshots(args, client);
+    const environmentId = environmentIdFromWhere(where);
+    const cursor = createdAtGtFromWhere(where);
+    const take = (args as { take?: unknown }).take;
+    const limit = typeof take === "number" ? take : undefined;
+    if (plan === "redisPrimary") {
+      return (await this.#reproduceWindow(
+        runId,
+        cursor,
+        environmentId,
+        limit,
+        client
+      )) as unknown as Prisma.TaskRunExecutionSnapshotGetPayload<T>[];
+    }
+    return this.#mirroredWindow(args, runId, environmentId, cursor, client);
+  }
+
+  // Chooses a read's source from the run's DURABLE residency and, for a mirrored run, the run ORG's
+  // LIVE per-org dial (never the constructed mode). A redis-primary run is always served from MemoryDB
+  // (fail-closed); a mirrored run reads the complete Postgres copy when its org dial is off/dual-write
+  // and the MemoryDB head under redis-read/redis-only; a postgres-resident run passes
+  // through. Carried server snapshot evidence avoids another residency lookup; no per-run cache.
+  // Records where the read dispatched (MemoryDB head for redis-primary/mirrored-redis-read, else
+  // Postgres); "unavailable" and "expired" served nothing. All read call sites go through this.
+  async #resolveReadPlan(
+    runId: string,
+    organizationId?: SnapshotReadContext,
+    postgresChecked = false,
+    resolvedDial?: ResolvedSnapshotDial
+  ): Promise<SnapshotReadPlan> {
+    const plan = await this.#computeReadPlan(runId, organizationId, postgresChecked, resolvedDial);
+    if (plan === "postgres") this.#metrics?.recordReadSource("postgres");
+    else if (plan === "redisPrimary" || plan === "mirrored")
+      this.#metrics?.recordReadSource("redis");
+    return plan;
+  }
+
+  async #computeReadPlan(
+    runId: string,
+    serverOrganizationId?: SnapshotReadContext,
+    postgresChecked = false,
+    resolvedDial?: ResolvedSnapshotDial
+  ): Promise<SnapshotReadPlan> {
+    const context = serverOrganizationId ?? this.#organizationId;
+    if (typeof context === "object") {
+      if (context.residency === "postgres") return "postgres";
+      if (context.residency === "redis-primary") return "redisPrimary";
+      const dial =
+        resolvedDial?.organizationId === context.organizationId
+          ? resolvedDial.dial
+          : await this.#resolveDial(context.organizationId);
+      return dial === undefined || dial === "off" || dial === "dual-write"
+        ? "postgres"
+        : "mirrored";
+    }
+    const knownOrganization = context;
+    if (knownOrganization !== undefined && resolvedDial?.organizationId !== knownOrganization) {
+      resolvedDial = {
+        organizationId: knownOrganization,
+        dial: await this.#resolveDial(knownOrganization),
+      };
+    }
+    const dial = resolvedDial?.dial;
+    if (!postgresChecked && (dial === undefined || dial === "off")) {
+      const postgres = await this.delegate.findLatestExecutionSnapshot(
+        runId,
+        this.#resolvePrimaryReadClient?.(runId)
+      );
+      if (postgres)
+        return this.#computeReadPlan(
+          runId,
+          snapshotRouteFromSnapshot(postgres),
+          true,
+          resolvedDial
+        );
+    }
+    let res = await this.#residencyResolver.resolve(runId);
+    if (res.kind === "pendingBirth") {
+      // A birth is prepared but not finalized: resolve its owning transaction, then re-resolve once.
+      if (this.#resolvePending) await this.#resolvePending(runId);
+      res = await this.#residencyResolver.resolve(runId);
+    }
+    switch (res.kind) {
+      case "committed": {
+        if (res.residency === "redis-primary") return "redisPrimary";
+        // Prefer server-owned context on this call. Unbound reads still need durable organization
+        // resolution; no pod-local identity cache is populated by this decorator.
+        const organizationId =
+          knownOrganization ??
+          res.organizationId ??
+          (await this.#store.readCommittedOrganizationId(runId));
+        const dial =
+          organizationId === undefined
+            ? undefined
+            : resolvedDial?.organizationId === organizationId
+              ? resolvedDial.dial
+              : await this.#resolveDial(organizationId);
+        if (dial === undefined || dial === "off" || dial === "dual-write") {
+          return "postgres";
+        }
+        return "mirrored";
+      }
+      case "absent":
+        return "postgres";
+      // Redis-primary state aged out after the run finished: fails closed, but permanently.
+      case "expired":
+        return "expired";
+      // An unresolved pendingBirth and error fail closed, retriably.
+      default:
+        return "unavailable";
+    }
+  }
+
+  // A read reached with carried route evidence plans redis-primary without consulting the residency
+  // resolver, so a MemoryDB miss is classified here, only on this already-exceptional path: state that
+  // aged out after the run finished is permanently expired regardless of how the caller identified the
+  // run; every other outcome (committed, pendingBirth, absent, error) stays the retriable miss.
+  async #redisPrimaryMissingError(
+    runId: string,
+    reason: string
+  ): Promise<SnapshotReadUnavailableError> {
+    let kind: string;
+    try {
+      kind = (await this.#residencyResolver.resolve(runId)).kind;
+    } catch {
+      kind = "error";
+    }
+    return kind === "expired"
+      ? new SnapshotStateExpiredError(runId)
+      : new SnapshotReadUnavailableError(runId, reason);
+  }
+
+  // Resolves a PENDING prepared unit before a redis-read trusts the MemoryDB head. A still-pending
+  // unit after resolution means the owning transaction is in progress: fail closed (retriable) rather
+  // than serve the stale pre-pending head. A MemoryDB read error is never a miss: fail closed too.
+  async #resolvePendingBeforeRead(runId: string): Promise<void> {
+    let pending: { prepared: boolean; quarantined: boolean };
+    try {
+      pending = await this.#store.readPendingState(runId);
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "readPendingState failed", { cause: error });
+    }
+    // A quarantined run failed closed durably: never serve its head, even if nothing is pending.
+    if (pending.quarantined) {
+      throw new SnapshotReadUnavailableError(runId, "run is quarantined");
+    }
+    if (!pending.prepared) return;
+    if (!this.#resolvePending) {
+      throw new SnapshotReadUnavailableError(runId, "pending unit and no recovery resolver");
+    }
+    await this.#resolvePending(runId);
+    let after: { prepared: boolean; quarantined: boolean };
+    try {
+      after = await this.#store.readPendingState(runId);
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "readPendingState failed", { cause: error });
+    }
+    // Resolution ended in quarantine (an unresolvable redis-primary unit) or the unit is still pending
+    // (owning transaction in progress): both fail closed rather than serve the stale pre-pending head.
+    if (after.quarantined) {
+      throw new SnapshotReadUnavailableError(runId, "run is quarantined");
+    }
+    if (after.prepared) {
+      throw new SnapshotReadUnavailableError(runId, "pending unit unresolved");
+    }
+  }
+
+  #hydrateSnapshotById(
+    snapshotId: string,
+    client?: ReadClient,
+    environmentId?: string
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<{
+    include: { completedWaitpoints: true; checkpoint: true };
+  }> | null> {
+    return this.delegate.findExecutionSnapshot(
+      {
+        where: { id: snapshotId, isValid: true, ...(environmentId ? { environmentId } : {}) },
+        include: { completedWaitpoints: true, checkpoint: true },
+      },
+      client
+    );
+  }
+
+  // Hydrates a MemoryDB-named mirrored head by id, repairing a replica-lagged miss from the owning
+  // primary. A named head has a committed Postgres row, so a null hydrate is replica lag, never a real
+  // miss: re-read on the primary; if no primary is reachable, fail RETRIABLE. Never returns null.
+  async #hydrateOrRepair(
+    snapshotId: string,
+    runId: string,
+    client?: ReadClient,
+    environmentId?: string
+  ): Promise<LatestExecutionSnapshotRead | null> {
+    const hydrated = await this.#hydrateSnapshotById(snapshotId, client, environmentId);
+    if (hydrated !== null) return hydrated;
+    const primary = this.#resolvePrimaryReadClient?.(runId);
+    if (primary === undefined) {
+      throw new SnapshotReadUnavailableError(
+        runId,
+        "mirrored head absent on read client and no primary read client for repair"
+      );
+    }
+    const repaired = await this.#hydrateSnapshotById(snapshotId, primary, environmentId);
+    if (repaired === null) {
+      throw new SnapshotReadUnavailableError(runId, "mirrored head absent on the owning primary");
+    }
+    return repaired;
+  }
+
+  // The mirrored read-since window. The complete Postgres copy is authoritative, but the committed head
+  // (named by MemoryDB) can lag on the caller's read replica: read Postgres, and only when the head
+  // belongs in the window (after the cursor) yet is missing as the newest row, repair from the primary.
+  async #mirroredWindow<T extends Prisma.TaskRunExecutionSnapshotFindManyArgs>(
+    args: Prisma.SelectSubset<T, Prisma.TaskRunExecutionSnapshotFindManyArgs>,
+    runId: string,
+    environmentId: string | undefined,
+    cursor: Date | string | undefined,
+    client?: ReadClient
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<T>[]> {
+    await this.#resolvePendingBeforeRead(runId);
+    const rows = await this.delegate.findManyExecutionSnapshots(args, client);
+    let head: SnapshotRead | null;
+    try {
+      head = await this.#store.getLatest(runId, environmentId ? { environmentId } : undefined);
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "getLatest failed", { cause: error });
+    }
+    if (head === null) return rows;
+    if (rows.length > 0 && (rows[0] as { id?: unknown }).id === head.id) return rows;
+    // The head is not the window's newest row. Only a head AFTER the cursor belongs in this window; a
+    // head at/older than the cursor means the (possibly empty) window is genuinely current.
+    const headCreatedAt = (head.entry as { createdAt?: unknown }).createdAt;
+    if (cursor === undefined || !isAfter(headCreatedAt, cursor)) return rows;
+    const primary = this.#resolvePrimaryReadClient?.(runId);
+    if (primary === undefined) {
+      throw new SnapshotReadUnavailableError(
+        runId,
+        "mirrored head absent from window and no primary read client for repair"
+      );
+    }
+    return this.delegate.findManyExecutionSnapshots(args, primary);
+  }
+
+  // Reproduces the read-since window entirely from MemoryDB for a redis-primary run (no TRES rows). The
+  // window is cursor-addressed; getSinceCreatedAt returns entries ascending, so they are emitted DESC
+  // (newest first) to match the Postgres order, and only the newest carries the waitpoint order.
+  async #reproduceWindow(
+    runId: string,
+    cursor: Date | string | undefined,
+    environmentId: string | undefined,
+    limit: number | undefined,
+    client?: ReadClient
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<{ include: { checkpoint: true } }>[]> {
+    await this.#resolvePendingBeforeRead(runId);
+    if (cursor === undefined) {
+      throw new SnapshotReadUnavailableError(runId, "redis-primary window read without a cursor");
+    }
+    let result: GetSinceResult;
+    try {
+      result = await this.#store.getSinceCreatedAt(runId, cursor, {
+        ...(environmentId ? { environmentId } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      });
+    } catch (error) {
+      throw new SnapshotReadUnavailableError(runId, "getSinceCreatedAt failed", { cause: error });
+    }
+    // Redis-primary holds nothing in Postgres, so a MemoryDB miss is fail-closed, never an empty window.
+    if (result.kind === "miss") {
+      throw await this.#redisPrimaryMissingError(runId, "redis-primary window missing");
+    }
+    const ascending = result.entries;
+    // A dangling cycle means the head's completed-waitpoint order is UNKNOWN (its cycle key aged out),
+    // not empty. Emitting an empty order here would silently drop the runner's completed results and can
+    // hang it, so fail closed. A redis-primary run has no Postgres copy to fall back to; the caller
+    // (recovery / retry) treats this as a transient read failure. A genuine no-cycle head is not dangling
+    // and still returns its (empty) order normally below.
+    const headEntry = ascending[ascending.length - 1];
+    if (headEntry?.danglingCycle) {
+      throw new SnapshotReadUnavailableError(
+        runId,
+        "redis-primary window head has a dangling completed-waitpoint cycle (order unknown)"
+      );
+    }
+    const headOrder = result.headWaitpointIds.order;
+    const rows: Prisma.TaskRunExecutionSnapshotGetPayload<{ include: { checkpoint: true } }>[] = [];
+    for (let i = ascending.length - 1; i >= 0; i--) {
+      const isHead = i === ascending.length - 1;
+      rows.push(await this.#reproduceWindowRow(ascending[i], isHead ? headOrder : [], client));
+    }
+    return rows;
+  }
+
+  // One reproduced window row: the scalar document plus its checkpoint (checkpoints stay in Postgres).
+  // The completed-waitpoint relation is deliberately absent (the window excludes it to avoid the N×M
+  // explosion); only the scalar completedWaitpointOrder is carried, populated for the newest row.
+  async #reproduceWindowRow(
+    read: SnapshotRead,
+    completedWaitpointOrder: string[],
+    client?: ReadClient
+  ): Promise<Prisma.TaskRunExecutionSnapshotGetPayload<{ include: { checkpoint: true } }>> {
+    const entry = read.entry as {
+      runId: string;
+      executionStatus: string;
+      description: string;
+      runStatus: string;
+      environmentId: string;
+      environmentType: string;
+      projectId: string;
+      organizationId: string;
+      previousSnapshotId?: string;
+      batchId?: string;
+      attemptNumber?: number;
+      checkpointId?: string;
+      workerId?: string;
+      runnerId?: string;
+      metadata?: unknown;
+      error?: string;
+      createdAt: string;
+    };
+    const checkpoint = entry.checkpointId
+      ? await this.delegate.findTaskRunCheckpointById(entry.checkpointId, entry.runId, client)
+      : null;
+    const createdAt = new Date(entry.createdAt);
+    return {
+      id: read.id,
+      engine: "V2",
+      executionStatus: entry.executionStatus,
+      description: entry.description,
+      isValid: read.isValid,
+      error: entry.error ?? null,
+      previousSnapshotId: entry.previousSnapshotId ?? null,
+      runId: entry.runId,
+      runStatus: entry.runStatus,
+      batchId: entry.batchId ?? null,
+      attemptNumber: entry.attemptNumber ?? null,
+      environmentId: entry.environmentId,
+      environmentType: entry.environmentType,
+      projectId: entry.projectId,
+      organizationId: entry.organizationId,
+      completedWaitpointOrder,
+      checkpointId: entry.checkpointId ?? null,
+      checkpoint,
+      workerId: entry.workerId ?? null,
+      runnerId: entry.runnerId ?? null,
+      createdAt,
+      updatedAt: createdAt,
+      lastHeartbeatAt: null,
+      metadata: entry.metadata ?? null,
+    } as unknown as Prisma.TaskRunExecutionSnapshotGetPayload<{ include: { checkpoint: true } }>;
+  }
+
+  // Reproduces the snapshot read entirely from the MemoryDB entry: the scalar document, its
+  // completed-waitpoint cycle resolved into unenhanced read rows, and the checkpoint hydrated from
+  // Postgres by id (checkpoints stay in Postgres). A dangling or insufficient cycle fails closed
+  // rather than returning a lossy set; Postgres holds no join rows to fall back to.
+  async #reproduceSnapshotFromEntry(
+    head: SnapshotRead,
+    client?: ReadClient,
+    environmentId?: string
+  ): Promise<LatestExecutionSnapshotRead | null> {
+    const runId = head.entry.runId as string;
+    // The one cast that belongs here: the stored entry is untyped JSON, so parsing it names the column
+    // types it was written from. The RETURN needs no cast — it is a snapshot-read DTO, not a Prisma row.
+    const entry = head.entry as {
+      executionStatus: TaskRunExecutionStatus;
+      description: string;
+      runStatus: TaskRunStatus;
+      environmentId: string;
+      environmentType: RuntimeEnvironmentType;
+      projectId: string;
+      organizationId: string;
+      previousSnapshotId?: string;
+      batchId?: string;
+      attemptNumber?: number;
+      checkpointId?: string;
+      workerId?: string;
+      runnerId?: string;
+      metadata?: Prisma.JsonValue;
+      error?: string;
+      createdAt: string;
+    };
+
+    let completedWaitpoints: SnapshotReadWaitpoint[] = [];
+    let completedWaitpointOrder: string[] = [];
+    if (head.cycle) {
+      let cw;
+      try {
+        cw = await this.#store.getSnapshotCompletedWaitpoints(runId, head.id);
+      } catch (error) {
+        throw new SnapshotReadUnavailableError(runId, "getSnapshotCompletedWaitpoints failed", {
+          cause: error,
+        });
+      }
+      if (!cw.present || cw.danglingCycle) {
+        throw new SnapshotReadUnavailableError(runId, "redis-primary cycle unreachable");
+      }
+      if (cw.distinctIds.length > 0 && cw.records.length === 0) {
+        throw new SnapshotReadUnavailableError(runId, "redis-primary cycle records missing");
+      }
+      if (!this.#resolveCompletedWaitpoints) {
+        throw new SnapshotReadUnavailableError(runId, "no completed-waitpoint resolver");
+      }
+      completedWaitpoints = await this.#resolveCompletedWaitpoints({
+        runId,
+        batchId: entry.batchId,
+        pointer: head.cycle,
+        order: cw.order,
+        records: cw.records,
+      });
+      completedWaitpointOrder = cw.order;
+    }
+
+    const checkpoint = entry.checkpointId
+      ? await this.delegate.findTaskRunCheckpointById(entry.checkpointId, runId, client)
+      : null;
+
+    const createdAt = new Date(entry.createdAt);
+    return {
+      id: head.id,
+      engine: "V2",
+      executionStatus: entry.executionStatus,
+      description: entry.description,
+      isValid: head.isValid,
+      error: entry.error ?? null,
+      previousSnapshotId: entry.previousSnapshotId ?? null,
+      runId,
+      runStatus: entry.runStatus,
+      batchId: entry.batchId ?? null,
+      attemptNumber: entry.attemptNumber ?? null,
+      environmentId: entry.environmentId,
+      environmentType: entry.environmentType,
+      projectId: entry.projectId,
+      organizationId: entry.organizationId,
+      completedWaitpoints,
+      completedWaitpointOrder,
+      checkpointId: entry.checkpointId ?? null,
+      checkpoint,
+      workerId: entry.workerId ?? null,
+      runnerId: entry.runnerId ?? null,
+      createdAt,
+      updatedAt: createdAt,
+      lastHeartbeatAt: null,
+      metadata: entry.metadata ?? null,
+    };
+  }
+
+  /**
+   * The durable prepare protocol, orchestrated around the OWNING transaction (T6.1). The callback runs
+   * through a transaction-bound decorated store that writes each snapshot to Postgres and collects the
+   * ordered staged entry. Every snapshot the transaction produces becomes ONE transaction-sized
+   * PreparedPgUnit: the MemoryDB prepare happens inside the transaction before commit, the finalize
+   * after commit succeeds. A throw before commit aborts the prepared unit; an ambiguous commit (the
+   * callback returned but the commit itself threw) leaves the unit PENDING for the recovery worker.
+   * A transaction that produces no mirrored snapshot entry (all-postgres, or no snapshot write) commits
+   * exactly as the undecorated store would, with no MemoryDB work.
+   */
+  override async runInTransaction<R>(
+    runId: string | undefined,
+    fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
+  ): Promise<R> {
+    return this.#runInTransaction(runId, fn);
+  }
+
+  async #runInTransaction<R>(
+    runId: string | undefined,
+    fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>,
+    decidedResidency?: "postgres" | "mirrored" | "redis-primary"
+  ): Promise<R> {
+    if (runId === undefined) return this.delegate.runInTransaction(runId, fn);
+    const boundRunId = runId;
+    const collected: CollectedEntry[] = [];
+    const transitionToken = this.#newToken();
+    let prepared = false;
+    let callbackReturned = false;
+
+    let result: R;
+    try {
+      result = await this.delegate.runInTransaction(boundRunId, async (txStore, tx) => {
+        const capturing = new CapturingTxStore(txStore, {
+          runId: boundRunId,
+          organizationId: this.#organizationId,
+          tx,
+          collect: (c) => collected.push(c),
+          resolveResidency: (organizationId, kind, routeField, organizationFlags) =>
+            decidedResidency !== undefined
+              ? Promise.resolve(decidedResidency)
+              : this.#writeResidency(
+                  boundRunId,
+                  organizationId,
+                  kind,
+                  routeField,
+                  organizationFlags
+                ),
+          mint: (s) => this.#withMintedSnapshot(s),
+          applyRedisControl: (s, r) => this.#withResidencyControl(s, r),
+          buildCycle: (cw, resolveRecords, r) =>
+            this.#buildCycle(boundRunId, cw, resolveRecords, r),
+        });
+        const value = await fn(capturing, tx);
+        if (collected.length === 0) return value;
+
+        const residency = collected[0].residency;
+        const postgresXid = await this.#currentXid(tx);
+        const unit: PreparedPgUnit = {
+          protocolVersion: PROTOCOL_VERSION,
+          transitionToken,
+          postgresXid,
+          runId: boundRunId,
+          organizationId: collected[0].organizationId,
+          residency,
+          logicalRunStoreRoute: this.#logicalRunStoreRoute,
+          entries: collected.map((c) => c.entry),
+          // A redis-primary unit has no TRES row to point at, so no commit probe: a null xid status is
+          // the accepted fail-closed boundary the recovery worker quarantines, never guesses. A mirrored
+          // unit points at the FIRST entry of the transaction, whose presence proves the whole tx committed.
+          ...(residency === "mirrored"
+            ? { commitProbeSnapshotId: collected[0].entry.entry.id }
+            : {}),
+        };
+        let prep;
+        try {
+          prep = await this.#store.prepare(unit);
+          if (prep.outcome === "busy" && this.#resolvePending) {
+            // Only the conflict path does recovery work. A live/unknown transaction is left alone;
+            // token-fenced finalize/abort settles an ended transaction before ONE prepare retry.
+            await this.#resolvePending(boundRunId, { requireSettledTransaction: true });
+            prep = await this.#store.prepare(unit);
+          }
+          if (
+            residency === "mirrored" &&
+            prep.outcome === "forkGuard" &&
+            prep.reason === "head" &&
+            (await this.#repairMirroredBase(unit, prep.actualCur))
+          ) {
+            prep = await this.#store.prepare(unit);
+          }
+        } catch (error) {
+          this.#metrics?.recordWrite("failed");
+          throw error;
+        }
+        if (prep.outcome !== "prepared" && prep.outcome !== "idempotent") {
+          // A fork guard is a distinct, expected write outcome; any other rejection is a failure.
+          this.#metrics?.recordWrite(prep.outcome === "forkGuard" ? "forked" : "failed");
+          throw new Error(`snapshot prepare rejected: ${prep.outcome}`);
+        }
+        prepared = true;
+        if (this.#hooks?.afterPrepare) {
+          await this.#hooks.afterPrepare();
+        }
+        callbackReturned = true;
+        return value;
+      });
+    } catch (error) {
+      // A throw from inside the callback rolled the transaction back: abort the prepared unit so no
+      // orphan pending record remains. A throw AFTER the callback returned is an ambiguous commit:
+      // leave the unit PENDING and let the recovery worker resolve it via pg_xact_status.
+      if (prepared && !callbackReturned) {
+        await this.#store.abortPrepared(boundRunId, transitionToken).catch(() => undefined);
+      }
+      throw error;
+    }
+
+    if (!prepared) return result;
+
+    // A throw here leaves the unit PREPARED + PENDING with Postgres committed: the interrupted state
+    // recovery resolves. It is deliberately outside the try above, so it never triggers an abort.
+    if (this.#hooks?.beforeFinalize) {
+      await this.#hooks.beforeFinalize();
+    }
+    let finalizeResult: FinalizeResult;
+    try {
+      finalizeResult = await this.#store.finalize(boundRunId, transitionToken);
+    } catch (error) {
+      // A thrown finalize (e.g. a client timeout) is AMBIGUOUS: Postgres has committed and the Lua may
+      // well have applied. Never report a definitive failure for a transition that may have applied:
+      // prove it applied, else retry the token-fenced, idempotent finalize ONCE. Only if that is still
+      // unresolved fail closed and retriable, leaving the pending unit for the recovery worker.
+      if (await this.#stagedEntriesAlreadyApplied(boundRunId, collected)) {
+        this.#metrics?.recordWrite("written");
+        return result;
+      }
+      let retried: FinalizeResult;
+      try {
+        retried = await this.#store.finalize(boundRunId, transitionToken);
+      } catch (retryError) {
+        this.#metrics?.recordWrite("failed");
+        throw new SnapshotWriteUnavailableError(boundRunId, FINALIZE_OUTCOME_UNKNOWN, {
+          cause: retryError,
+        });
+      }
+      await this.#settleFinalizeOutcome(boundRunId, collected, retried, { cause: error });
+      return result;
+    }
+    await this.#settleFinalizeOutcome(boundRunId, collected, finalizeResult);
+    return result;
+  }
+
+  // The outcome of a finalize that returned. Resolves when the staged entries are (or are proven to be)
+  // the committed state; otherwise records the failure and throws. `afterThrown` marks a retry after a
+  // thrown finalize: an unproven stale is reported as an unknown outcome and an unproven noop as an
+  // applied finalize whose proof failed, both carrying that cause.
+  async #settleFinalizeOutcome(
+    boundRunId: string,
+    collected: CollectedEntry[],
+    finalizeResult: FinalizeResult,
+    afterThrown?: { cause: unknown }
+  ): Promise<void> {
+    // A finalized unit is the ONLY unconditional success: its entries were applied now. No read on this
+    // hot path. Every other outcome must not report success unless read-back PROVES the unit was already
+    // applied — a transaction that published nothing to MemoryDB must not let its caller advance.
+    if (finalizeResult.outcome === "finalized") {
+      this.#metrics?.recordWrite("written");
+      return;
+    }
+    // baseMissing: the delayed finalize found the base gone (an aged-out redis-primary base). It applied
+    // nothing and must NOT reconstruct the base; fail closed and RETRIABLE, leaving the pending unit for
+    // the recovery worker to resolve. A redis-primary run has no Postgres snapshot fallback.
+    if (finalizeResult.outcome === "baseMissing") {
+      this.#metrics?.recordWrite("failed");
+      throw new SnapshotWriteUnavailableError(
+        boundRunId,
+        "finalize found an expired base; the recovery worker owns the pending unit"
+      );
+    }
+    // stale (a newer token superseded our finalize) or noop (a lost-reply repeat): success ONLY when
+    // read-back proves every staged entry is already the committed state, including its completed-
+    // waitpoint cycle. Otherwise the write is unproven and fails closed. This read is exceptional-path
+    // only; it never runs on the normal finalized success above.
+    if (finalizeResult.outcome === "stale" || finalizeResult.outcome === "noop") {
+      if (await this.#stagedEntriesAlreadyApplied(boundRunId, collected)) {
+        this.#metrics?.recordWrite("written");
+        return;
+      }
+      this.#metrics?.recordWrite("failed");
+      if (afterThrown) {
+        // A noop means the unit was already applied and no pending unit remains: only the proof
+        // failed, so this must not hand the unit to the recovery worker. A stale is still unknown.
+        throw new SnapshotWriteUnavailableError(
+          boundRunId,
+          finalizeResult.outcome === "noop"
+            ? "finalize applied but the read-back proof failed"
+            : FINALIZE_OUTCOME_UNKNOWN,
+          afterThrown
+        );
+      }
+      throw new SnapshotWriteUnavailableError(
+        boundRunId,
+        `finalize ${finalizeResult.outcome} but the staged entries are not applied`
+      );
+    }
+    this.#metrics?.recordWrite("failed");
+    throw new SnapshotWriteUnavailableError(
+      boundRunId,
+      // Unreachable by the type; kept as a runtime guard against an unknown Lua reply.
+      `finalize returned an unexpected outcome: ${(finalizeResult as { outcome: string }).outcome}`
+    );
+  }
+
+  async #repairMirroredBase(unit: PreparedPgUnit, observedCur: string): Promise<boolean> {
+    const expectedCur = unit.entries[0]?.expectedCur;
+    const primary = this.#resolvePrimaryReadClient?.(unit.runId);
+    if (!expectedCur || primary === undefined) return false;
+    // This separate primary read cannot see the uncommitted snapshot just staged by our callback.
+    // A losing concurrent writer is not repaired: its expected predecessor is no longer the PG head.
+    const committed = await this.delegate.findLatestExecutionSnapshot(unit.runId, primary);
+    if (committed?.id !== expectedCur || committed.organizationId !== unit.organizationId)
+      return false;
+    return this.#store.repairMirroredHead(committed, observedCur);
+  }
+
+  // Exceptional-path proof for a stale/noop finalize: every staged entry must ALREADY be the committed
+  // state (an already-applied finalize — a lost-reply repeat, or a superseding token that subsumes our
+  // entries), byte-for-byte, with any completed-waitpoint cycle it carried reproduced exactly. This is
+  // NOT a presence check: the SAME snapshot id carrying DIFFERENT contents (a genuine conflict) must
+  // fail closed, so the stored raw is compared to the exact raw we staged, never just `!== null`. A
+  // missing entry, a mismatched raw, a gapped/refused keyspace, a MemoryDB read error, or a cycle that
+  // does not reproduce leaves the write unproven. No base is reconstructed; this only reads, and its
+  // reads do not retry: a read error is already "unproven", and the run lock is held meanwhile.
+  async #stagedEntriesAlreadyApplied(runId: string, collected: CollectedEntry[]): Promise<boolean> {
+    for (const c of collected) {
+      const id = c.entry.entry.id;
+      let read: SnapshotRead | null;
+      try {
+        read = await this.#store.getById(runId, id, { retry: false });
+      } catch {
+        return false;
+      }
+      if (read === null) return false;
+      // The stored raw the append/finalize wrote is `JSON.stringify(entry)` (redisSnapshotStore.
+      // #stageEntry); compare against the same serialization of the entry we staged. Any field
+      // difference under a reused id is a conflict and fails closed here.
+      if (read.raw !== JSON.stringify(c.entry.entry)) return false;
+      if (c.entry.cycle && !(await this.#stagedCycleReproduces(runId, id, c.entry.cycle))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Exact cycle reproduction for the stale/noop proof. Both a `new` cycle and a `carryForward` cycle now
+  // carry their complete refs AND records, so the proof is the same for both: the reproduced cycle must
+  // be present, non-dangling, and match the staged order, distinct ids and records byte-for-byte. Mere
+  // presence is NOT proof — mismatched cycle contents (a superseding cycle under a reused id) fail closed.
+  async #stagedCycleReproduces(
+    runId: string,
+    snapshotId: string,
+    cycle: AppendCyclePayload
+  ): Promise<boolean> {
+    let cw;
+    try {
+      cw = await this.#store.getSnapshotCompletedWaitpoints(runId, snapshotId, { retry: false });
+    } catch {
+      return false;
+    }
+    if (!cw.present || cw.danglingCycle) return false;
+    const refs = cycle.completedWaitpoints ?? [];
+    if (!arraysEqual(cw.order, deriveOrder(refs))) return false;
+    if (!arraysEqual([...cw.distinctIds].sort(), [...deriveDistinctIds(refs)].sort())) return false;
+    return JSON.stringify(cw.records) === JSON.stringify(cycle.records ?? []);
+  }
+
+  // Forces xid8 assignment and returns it; the subsequent writes in this transaction inherit it, and
+  // it is the xid pg_xact_status will report to the recovery worker.
+  async #currentXid(tx: PrismaClientOrTransaction): Promise<string> {
+    const rows = (await tx.$queryRawUnsafe("SELECT pg_current_xact_id()::text AS xid")) as Array<{
+      xid: string;
+    }>;
+    return rows[0].xid;
+  }
+
+  #withMintedSnapshot<S extends { id?: string; createdAt?: Date }>(snapshot: S): S {
+    return {
+      ...snapshot,
+      id: snapshot.id ?? generateInternalId(),
+      createdAt: snapshot.createdAt ?? new Date(),
+    };
+  }
+
+  // The BIRTH residency, from the org's CURRENT dial. Off / not-enrolled is inert (postgres, plain
+  // passthrough); dual-write and redis-read mirror; redis-only is redis-primary.
+  async #birthResidency(
+    organizationId: string,
+    organizationFlags?: unknown
+  ): Promise<"postgres" | "mirrored" | "redis-primary"> {
+    const dial = await this.#resolveDial(organizationId, organizationFlags);
+    if (dial === undefined || dial === "off") return "postgres";
+    // A redis-only dial mints a redis-primary run ONLY when the store is ready; otherwise it degrades to
+    // a mirrored birth (still fully written to Postgres) rather than stranding a new resident on an
+    // unready MemoryDB. This gates NEW births alone: existing residents follow durable residency.
+    if (dial === "redis-only") return this.#redisPrimaryBirthReady() ? "redis-primary" : "mirrored";
+    return "mirrored";
+  }
+
+  // The residency a write must use. A birth follows the org's live dial (above). A transition follows
+  // the RUN's IMMUTABLE durable residency, never the live dial: a redis-primary run keeps writing
+  // redis-primary after the org dials down, a mirrored run keeps mirroring, so a lowered dial drains
+  // rather than freezing a resident run's head. Positive unmarked Postgres evidence bypasses MemoryDB.
+  async #writeResidency(
+    runId: string,
+    organizationId: string,
+    kind: "birth" | "transition",
+    routeField?: unknown,
+    organizationFlags?: unknown
+  ): Promise<"postgres" | "mirrored" | "redis-primary"> {
+    if (kind === "birth") return this.#birthResidency(organizationId, organizationFlags);
+    // Server-only evidence from the preceding snapshot avoids a second hot-path read. A local dial
+    // cannot identify an existing run, including when it still says off during forward propagation.
+    const wire = parseSnapshotRoute(routeField);
+    if (wire && wire.organizationId === organizationId) return wire.residency;
+    const previous = await this.delegate.findLatestExecutionSnapshot(
+      runId,
+      this.#resolvePrimaryReadClient?.(runId)
+    );
+    if (previous) {
+      if (previous.organizationId !== organizationId) {
+        throw new SnapshotWriteUnavailableError(runId, "snapshot organization mismatch");
+      }
+      return snapshotResidencyFromMetadata(previous.metadata);
+    }
+    let res = await this.#residencyResolver.resolve(runId);
+    if (res.kind === "pendingBirth") {
+      if (this.#resolvePending) await this.#resolvePending(runId);
+      res = await this.#residencyResolver.resolve(runId);
+    }
+    switch (res.kind) {
+      case "committed":
+        return res.residency;
+      case "absent":
+        throw new SnapshotWriteUnavailableError(
+          runId,
+          "existing snapshot is absent from both stores"
+        );
+      // expired state, an unresolved pendingBirth, and a MemoryDB error cannot name a residency: fail
+      // closed rather than guess and risk diverging a mirrored head from its Postgres copy.
+      default:
+        throw new SnapshotWriteUnavailableError(
+          runId,
+          `durable residency unresolved (${res.kind})`
+        );
+    }
+  }
+
+  // Background callers without a preceding snapshot use the existing transition resolver.
+  // A lagging dial cannot redefine a run's birth storage. Unknown state remains an error.
+  override async readSnapshotRoute(
+    runId: string,
+    organizationId: string
+  ): Promise<SnapshotRoute | undefined> {
+    const residency = await this.#writeResidency(runId, organizationId, "transition");
+    return { runId, organizationId, residency };
+  }
+
+  // A redis-primary run's only home is MemoryDB, so the delegate writes the run mutation but no TRES
+  // row and no snapshot-to-waitpoint join rows. Mirrored writes both, exactly as before.
+  #withResidencyControl<S extends { writeSnapshotRow?: boolean }>(
+    snapshot: S,
+    residency: "mirrored" | "redis-primary"
+  ): S {
+    const input = snapshot as S & {
+      snapshotMetadata?: unknown;
+      metadata?: unknown;
+      snapshot?: { metadata?: unknown };
+    };
+    return {
+      ...snapshot,
+      snapshotMetadata: metadataWithSnapshotResidency(
+        input.snapshotMetadata ?? input.snapshot?.metadata ?? input.metadata,
+        residency
+      ),
+      ...(residency === "redis-primary" && { writeSnapshotRow: false }),
+    };
+  }
+
+  // The completed-waitpoint cycle a redis-primary transition carries in MemoryDB. Mirrored writes leave
+  // the cycle unset (Postgres still holds the join rows).
+  async #buildCycle(
+    runId: string,
+    completedWaitpoints: { id: string; index?: number }[] | undefined,
+    resolveRecords: (() => Promise<CompletedWaitpointRecord[]>) | undefined,
+    residency: "mirrored" | "redis-primary"
+  ): Promise<AppendCyclePayload | undefined> {
+    if (residency !== "redis-primary") return undefined;
+    if (!completedWaitpoints || completedWaitpoints.length === 0) return undefined;
+    // Fresh completions arrive WITH a resolver (born at the waitpoint unblock site): fetch the records
+    // lazily here — the only branch that needs them — and mint a new cycle.
+    const records = resolveRecords ? await resolveRecords() : undefined;
+    if (records && records.length > 0) {
+      return { kind: "new", completedWaitpoints, records };
+    }
+    // Refs WITHOUT a resolver is a forward-carry (dequeue/checkpoint re-propagating a prior snapshot's
+    // completed waitpoints). Fetch and VALIDATE the head's COMPLETE cycle here, inside the owning
+    // transaction, and carry its full records forward: the carried payload must be able to re-mint the
+    // cycle EXACTLY if the head cycle is gone by finalize. If the head cycle is missing, dangling, or
+    // cannot reproduce the carried refs and every distinct id's record, we THROW so the Postgres
+    // transaction rolls back rather than advancing the head with a cycle that has ids but no records.
+    const head = await this.#store.getLatest(runId);
+    if (!head?.cycle) {
+      throw new SnapshotWriteUnavailableError(runId, "forward-carry found no head cycle to carry");
+    }
+    const headCycle = await this.#store.getSnapshotCompletedWaitpoints(runId, head.id);
+    const order = deriveOrder(completedWaitpoints);
+    const distinctIds = deriveDistinctIds(completedWaitpoints);
+    const everyIdHasRecord = distinctIds.every((id) => headCycle.records.some((r) => r.id === id));
+    if (
+      !headCycle.present ||
+      headCycle.danglingCycle ||
+      !arraysEqual(headCycle.order, order) ||
+      !arraysEqual([...headCycle.distinctIds].sort(), [...distinctIds].sort()) ||
+      !everyIdHasRecord
+    ) {
+      throw new SnapshotWriteUnavailableError(
+        runId,
+        "forward-carry cannot reproduce the complete completed-waitpoint cycle"
+      );
+    }
+    return {
+      kind: "carryForward",
+      cycleSeq: head.cycle.cycleSeq,
+      completedWaitpoints,
+      records: headCycle.records,
+    };
+  }
+
+  // The prepare protocol must own its own commit boundary, so a mirrored write can never run inside an
+  // OPEN interactive transaction. But callers routinely pass a bare PrismaClient as a routing hint (so
+  // the routing delegate picks the owning DB by id), not an open transaction: that is fine, because the
+  // decorator ignores it and opens its own boundary via runInTransaction. The two are distinguished by
+  // `$transaction`, which a full client exposes and an interactive TransactionClient does not.
+  #assertOwnsCommit(tx: PrismaClientOrTransaction | undefined): void {
+    if (tx !== undefined && !("$transaction" in tx)) {
+      throw new Error(
+        `TaskRunExecutionSnapshotStore (mode ${this.#mode}) cannot mirror a write inside a caller-supplied transaction`
+      );
+    }
+  }
+}

@@ -1,0 +1,1974 @@
+import type {
+  BackgroundWorkerMetadata,
+  BackgroundWorkerSourceFileMetadata,
+  BackgroundWorkerWarning,
+  CreateBackgroundWorkerRequestBody,
+  PromptResource,
+  QueueManifest,
+  StoredWebhookRoutingTarget,
+  TaskResource,
+  WebhookEndpointResource,
+  WebhookRoutingTarget,
+  WebhookSubscriberResource,
+} from "@trigger.dev/core/v3";
+import { FILTER_AST_VERSION, tryCatch } from "@trigger.dev/core/v3";
+import { FilterParseError, parseFilter } from "@internal/webhook-engine";
+import {
+  BackgroundWorkerId,
+  WebhookEndpointId,
+  isWebhookEndpointFriendlyId,
+  stringifyDuration,
+} from "@trigger.dev/core/v3/isomorphic";
+import { randomBytes } from "node:crypto";
+import type {
+  BackgroundWorker,
+  TaskQueue,
+  TaskQueueConcurrencyVersion,
+  TaskQueueRole,
+  TaskQueueType,
+} from "@trigger.dev/database";
+import cronstrue from "cronstrue";
+import type { PrismaClientOrTransaction, WebhookDatabase } from "~/db.server";
+import { $transaction, Prisma, boundedIn, webhookPrisma } from "~/db.server";
+import { sanitizeQueueName } from "~/models/taskQueue.server";
+import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
+import { logger } from "~/services/logger.server";
+import { organizationHasWebhooksAccess } from "~/v3/webhooksAccess.server";
+import { safeEnvironmentLogFields } from "~/services/safeEnvironmentLog";
+import { syncTaskIdentifiers } from "~/services/taskIdentifierRegistry.server";
+import {
+  type TaskMetadataCache,
+  type TaskMetadataEntry,
+} from "~/services/taskMetadataCache.server";
+import { taskMetadataCacheInstance } from "~/services/taskMetadataCacheInstance.server";
+import { generateFriendlyId } from "../friendlyIdentifiers";
+import {
+  anonymousConcurrencyLimitQueueName,
+  CONCURRENCY_LIMIT_QUEUE_PREFIX,
+} from "./concurrencyLimitNames.server";
+import { engine } from "../runEngine.server";
+import {
+  removeQueueConcurrencyLimits,
+  removeQueueTotalConcurrencyLimits,
+  updateEnvConcurrencyLimits,
+  updateQueueConcurrencyLimits,
+  updateQueueTotalConcurrencyLimits,
+} from "../runQueue.server";
+import { resolveScheduleWindow } from "@internal/schedule-engine";
+import { scheduleEngine } from "../scheduleEngine.server";
+import { normalizeScheduleWindow } from "../scheduleWindow.server";
+import { resolveNewScheduleDefaultWindowSeconds } from "../scheduleDefaultWindow.server";
+import {
+  assertCronMeetsFreeMinimum,
+  minimumWindowForNewSchedule,
+  resolveFreeSchedulePolicyContext,
+  resolveMinimumWindowOnUpdate,
+} from "../freeSchedulePolicy.server";
+import { calculateNextBuildVersion } from "../utils/calculateNextBuildVersion";
+import { clampMaxDuration } from "../utils/maxDuration";
+import { BaseService, ServiceValidationError } from "./baseService.server";
+import { CheckScheduleService } from "./checkSchedule.server";
+import { CronPattern } from "../schedules";
+import { explicitWindowBelowMinimum } from "../explicitWindowBelowMinimum";
+import { projectPubSub } from "./projectPubSub.server";
+
+import { assertNoDuplicateTaskIds } from "./duplicateTaskIds.server";
+import { stripBackgroundWorkerMetadataForStorage } from "./stripBackgroundWorkerMetadataForStorage.server";
+
+export type BackgroundWorkerWithWarnings = BackgroundWorker & {
+  warnings: BackgroundWorkerWarning[];
+};
+
+export class CreateBackgroundWorkerService extends BaseService {
+  private readonly _taskMetaCache: TaskMetadataCache;
+
+  constructor(
+    prisma?: PrismaClientOrTransaction,
+    replica?: PrismaClientOrTransaction,
+    taskMetaCache: TaskMetadataCache = taskMetadataCacheInstance
+  ) {
+    super(prisma, replica);
+    this._taskMetaCache = taskMetaCache;
+  }
+
+  public async call(
+    projectRef: string,
+    environment: AuthenticatedEnvironment,
+    body: CreateBackgroundWorkerRequestBody
+  ): Promise<BackgroundWorkerWithWarnings> {
+    return this.traceWithEnv("call", environment, async (span) => {
+      span.setAttribute("projectRef", projectRef);
+
+      const project = await this._prisma.project.findFirstOrThrow({
+        where: {
+          externalRef: projectRef,
+          environments: {
+            some: {
+              id: environment.id,
+            },
+          },
+        },
+        include: {
+          backgroundWorkers: {
+            where: {
+              runtimeEnvironmentId: environment.id,
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+            take: 1,
+          },
+        },
+      });
+
+      validateWorkerConcurrencyDeclarations(body.metadata);
+
+      const latestBackgroundWorker = project.backgroundWorkers[0];
+
+      // Validate before persisting a worker or accepting a matching hash from an earlier attempt.
+      const preparedSchedules = await prepareDeclarativeSchedules(
+        body.metadata.tasks,
+        environment,
+        this._prisma
+      );
+
+      if (latestBackgroundWorker?.contentHash === body.metadata.contentHash) {
+        return { ...latestBackgroundWorker, warnings: [] };
+      }
+
+      const nextVersion = calculateNextBuildVersion(project.backgroundWorkers[0]?.version);
+
+      logger.debug(`Creating background worker`, {
+        nextVersion,
+        lastVersion: project.backgroundWorkers[0]?.version,
+      });
+
+      const backgroundWorker = await this._prisma.backgroundWorker.create({
+        data: {
+          ...BackgroundWorkerId.generate(),
+          version: nextVersion,
+          runtimeEnvironmentId: environment.id,
+          projectId: project.id,
+          metadata: stripBackgroundWorkerMetadataForStorage(body.metadata),
+          contentHash: body.metadata.contentHash,
+          cliVersion: body.metadata.cliPackageVersion,
+          sdkVersion: body.metadata.packageVersion,
+          runtime: body.metadata.runtime,
+          runtimeVersion: body.metadata.runtimeVersion,
+          supportsLazyAttempts: body.supportsLazyAttempts,
+          engine: body.engine,
+        },
+      });
+
+      //upgrade the project to engine "V2" if it's not already
+      if (project.engine === "V1" && body.engine === "V2") {
+        await this._prisma.project.update({
+          where: {
+            id: project.id,
+          },
+          data: {
+            engine: "V2",
+          },
+        });
+      }
+
+      const [filesError, tasksToBackgroundFiles] = await tryCatch(
+        createBackgroundFiles(
+          body.metadata.sourceFiles,
+          backgroundWorker,
+          environment,
+          this._prisma
+        )
+      );
+
+      if (filesError) {
+        logger.error("Error creating background worker files", {
+          error: filesError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+
+        throw new ServiceValidationError("Error creating background worker files");
+      }
+
+      const [resourcesError, workerTaskEntries] = await tryCatch(
+        createWorkerResources(
+          body.metadata,
+          backgroundWorker,
+          environment,
+          this._prisma,
+          tasksToBackgroundFiles
+        )
+      );
+
+      if (resourcesError) {
+        if (resourcesError instanceof ServiceValidationError) {
+          // Customer-facing config error (e.g. duplicate task ids). Surface the
+          // real message to the client via the rethrow.
+          logger.warn("Error creating worker resources", {
+            error: resourcesError.message,
+          });
+          throw resourcesError;
+        }
+
+        logger.error("Error creating worker resources", {
+          error: resourcesError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+        throw new ServiceValidationError("Error creating worker resources");
+      }
+
+      const [schedulesError, scheduleWarnings] = await tryCatch(
+        syncDeclarativeSchedules(
+          body.metadata.tasks,
+          backgroundWorker,
+          environment,
+          this._prisma,
+          scheduleEngine,
+          preparedSchedules
+        )
+      );
+
+      if (schedulesError) {
+        if (schedulesError instanceof ServiceValidationError) {
+          // Customer schedule config (typically invalid cron). Surface to
+          // client via the rethrow; system returns gracefully.
+          logger.warn("Error syncing declarative schedules", {
+            error: schedulesError.message,
+            backgroundWorker,
+            environment: safeEnvironmentLogFields(environment),
+          });
+          throw schedulesError;
+        }
+
+        // Wrapping the underlying error into a ServiceValidationError below
+        // would otherwise hide it once the SDK-level filter drops SVEs; log at
+        // error so the underlying cause stays visible. Mirrors the
+        // waitpointCompletionPacket.server.ts pattern from dac9c83bd.
+        logger.error("Error syncing declarative schedules", {
+          error: schedulesError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+
+        throw new ServiceValidationError("Error syncing declarative schedules");
+      }
+
+      const [webhooksError] = await tryCatch(
+        syncDeclarativeWebhooks(
+          {
+            endpoints: body.metadata.webhookEndpoints,
+            subscribers: body.metadata.webhookSubscribers,
+          },
+          backgroundWorker,
+          environment,
+          this._prisma,
+          webhookPrisma
+        )
+      );
+      if (webhooksError) {
+        if (webhooksError instanceof ServiceValidationError) {
+          logger.warn("Error syncing declarative webhooks", {
+            error: webhooksError.message,
+            backgroundWorker,
+            environment: safeEnvironmentLogFields(environment),
+          });
+          throw webhooksError;
+        }
+
+        logger.error("Error syncing declarative webhooks", {
+          error: webhooksError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+
+        throw new ServiceValidationError("Error syncing declarative webhooks");
+      }
+
+      const [syncIdentifiersError] = await tryCatch(
+        syncTaskIdentifiers(
+          environment.id,
+          project.id,
+          backgroundWorker.id,
+          body.metadata.tasks.map((t) => ({ id: t.id, triggerSource: t.triggerSource }))
+        )
+      );
+
+      if (syncIdentifiersError) {
+        logger.error("Error syncing task identifiers", {
+          error: syncIdentifiersError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+      }
+
+      // Populate task metadata cache. DEV workers are always "current" because
+      // `findCurrentWorkerFromEnvironment` resolves DEV current as the latest
+      // worker by createdAt. Non-DEV (deploy-built) workers are not promoted
+      // here — promotion writes the `:env:` keyspace later in
+      // changeCurrentDeployment / createDeploymentBackgroundWorkerV3.
+      // Cache calls log+swallow internally, so a Redis blip can't break
+      // anything else here. Empty `workerTaskEntries` is intentional — the
+      // populate methods clear stale hashes for zero-task deploys.
+      if (workerTaskEntries) {
+        if (environment.type === "DEVELOPMENT") {
+          await this._taskMetaCache.populateByCurrentWorker(
+            environment.id,
+            backgroundWorker.id,
+            workerTaskEntries
+          );
+        } else {
+          await this._taskMetaCache.populateByWorker(backgroundWorker.id, workerTaskEntries);
+        }
+      }
+
+      const [updateConcurrencyLimitsError] = await tryCatch(
+        updateEnvConcurrencyLimits(environment, undefined, this._prisma)
+      );
+
+      if (updateConcurrencyLimitsError) {
+        logger.error("Error updating environment concurrency limits", {
+          error: updateConcurrencyLimitsError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+      }
+
+      const [publishError] = await tryCatch(
+        projectPubSub.publish(`project:${project.id}:env:${environment.id}`, "WORKER_CREATED", {
+          environmentId: environment.id,
+          environmentType: environment.type,
+          createdAt: backgroundWorker.createdAt,
+          taskCount: body.metadata.tasks.length,
+          type: "local",
+        })
+      );
+
+      if (publishError) {
+        logger.error("Error publishing WORKER_CREATED event", {
+          error: publishError,
+          backgroundWorker,
+          environment: safeEnvironmentLogFields(environment),
+        });
+      }
+
+      if (backgroundWorker.engine === "V2") {
+        const [schedulePendingVersionsError] = await tryCatch(
+          engine.scheduleEnqueueRunsForBackgroundWorker(backgroundWorker.id)
+        );
+
+        if (schedulePendingVersionsError) {
+          logger.error("Error scheduling pending versions", {
+            error: schedulePendingVersionsError,
+          });
+        }
+      }
+
+      return { ...backgroundWorker, warnings: scheduleWarnings ?? [] };
+    });
+  }
+}
+
+export async function createWorkerResources(
+  metadata: BackgroundWorkerMetadata,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction,
+  tasksToBackgroundFiles?: Map<string, string>
+): Promise<TaskMetadataEntry[]> {
+  // Defense-in-depth against two tasks sharing an id (across all task types,
+  // e.g. a schedule and a regular task). Note: the CLI's resource catalog keys
+  // tasks by id and overwrites collisions, so duplicates are normally already
+  // collapsed before reaching here — this guards against any client that sends
+  // an un-deduplicated task list.
+  assertNoDuplicateTaskIds(metadata.tasks);
+
+  // Create the queues
+  const queues = await createWorkerQueues(metadata, worker, environment, prisma);
+  await createWorkerConcurrencyLimits(metadata, worker, environment, prisma);
+
+  // Create the tasks
+  const taskEntries = await createWorkerTasks(
+    metadata,
+    queues,
+    worker,
+    environment,
+    prisma,
+    tasksToBackgroundFiles
+  );
+
+  // Register prompts
+  if (metadata.prompts && metadata.prompts.length > 0) {
+    await createWorkerPrompts(metadata.prompts, worker, environment, prisma);
+  }
+
+  return taskEntries;
+}
+
+async function createWorkerTasks(
+  metadata: BackgroundWorkerMetadata,
+  queues: Array<TaskQueue>,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction,
+  tasksToBackgroundFiles?: Map<string, string>
+): Promise<TaskMetadataEntry[]> {
+  // Create tasks in chunks of 20
+  const CHUNK_SIZE = 20;
+  const entries: TaskMetadataEntry[] = [];
+  for (let i = 0; i < metadata.tasks.length; i += CHUNK_SIZE) {
+    const chunk = metadata.tasks.slice(i, i + CHUNK_SIZE);
+    const chunkEntries = await Promise.all(
+      chunk.map((task) =>
+        createWorkerTask(task, queues, worker, environment, prisma, tasksToBackgroundFiles)
+      )
+    );
+    for (const entry of chunkEntries) {
+      if (entry) entries.push(entry);
+    }
+  }
+
+  await retireStaleAnonymousConcurrencyLimitRows(metadata.tasks, environment, prisma);
+
+  return entries;
+}
+
+/**
+ * A task whose inline limit no longer compiles to its anonymous LIMIT row (the
+ * limit moved onto the task's own default queue, or was removed) leaves that
+ * row behind, where it would shadow the live task/<id> name on the
+ * concurrency-limits surface and keep stale engine keys. Retiring clears the
+ * row's bounds and override state — dropping it from listing and name
+ * resolution so the queue-row fallback resolves — and removes its engine keys.
+ */
+/**
+ * Best-effort engine sync of a limit row's bounds (pause-aware): both writes
+ * settle, and any rejection is surfaced in the logs rather than swallowed — a
+ * silent failure here is a limit the dashboard reports but the engine does not
+ * enforce.
+ */
+async function syncLimitRowEngineStateBestEffort(
+  environment: AuthenticatedEnvironment,
+  row: Pick<TaskQueue, "name" | "paused" | "concurrencyLimit" | "totalConcurrencyLimit">
+): Promise<void> {
+  const results = await Promise.allSettled([
+    row.paused
+      ? updateQueueConcurrencyLimits(environment, row.name, 0)
+      : typeof row.concurrencyLimit === "number"
+        ? updateQueueConcurrencyLimits(environment, row.name, row.concurrencyLimit)
+        : removeQueueConcurrencyLimits(environment, row.name),
+    typeof row.totalConcurrencyLimit === "number"
+      ? updateQueueTotalConcurrencyLimits(environment, row.name, row.totalConcurrencyLimit)
+      : removeQueueTotalConcurrencyLimits(environment, row.name),
+  ]);
+  const failures = results.filter((result) => result.status === "rejected");
+  if (failures.length > 0) {
+    logger.error("syncLimitRowEngineStateBestEffort: engine sync failed", {
+      environmentId: environment.id,
+      queueName: row.name,
+      errors: failures.map((failure) => String((failure as PromiseRejectedResult).reason)),
+    });
+  }
+}
+
+async function retireStaleAnonymousConcurrencyLimitRows(
+  tasks: TaskResource[],
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+): Promise<void> {
+  const candidateNames = tasks
+    .filter((task) => !(task.concurrency?.inline && task.queue?.name))
+    .map((task) => anonymousConcurrencyLimitQueueName(task.id));
+  if (candidateNames.length === 0) {
+    return;
+  }
+
+  const staleRows = await prisma.taskQueue.findMany({
+    where: {
+      runtimeEnvironmentId: environment.id,
+      role: "LIMIT",
+      name: { in: boundedIn(candidateNames) },
+      OR: [{ concurrencyLimit: { not: null } }, { totalConcurrencyLimit: { not: null } }],
+    },
+    select: { id: true, name: true, updatedAt: true },
+  });
+  if (staleRows.length === 0) {
+    return;
+  }
+
+  /** Engine keys go first, and the row's bounds are only nulled once both
+   * removals succeeded: a failed removal leaves the row bounded, so the next
+   * deploy retries the retirement instead of stranding a stale engine limit
+   * (worst case a pause-by-zero) that nothing can see or clear. Each null is
+   * guarded on the row's read updatedAt, so a concurrent writer (an operator
+   * override, or another deploy re-creating the limit) wins and its own engine
+   * sync governs; a racing limits-surface sync converges via its freshness
+   * re-check against the nulled row. */
+  for (const row of staleRows) {
+    /** Both removals settle before anything else runs, so no removal is still
+     * in flight when the heal writes; on any failure the heal re-reads the row
+     * fresh (a concurrent writer may have moved it since the findMany) and
+     * re-syncs the engine to whatever is persisted now. */
+    const removals = await Promise.allSettled([
+      removeQueueConcurrencyLimits(environment, row.name),
+      removeQueueTotalConcurrencyLimits(environment, row.name),
+    ]);
+    const removalFailures = removals.filter((result) => result.status === "rejected");
+    if (removalFailures.length > 0) {
+      logger.error(
+        "retireStaleAnonymousConcurrencyLimitRows: engine cleanup failed, healing and retrying next deploy",
+        {
+          environmentId: environment.id,
+          queueName: row.name,
+          errors: removalFailures.map((failure) =>
+            String((failure as PromiseRejectedResult).reason)
+          ),
+        }
+      );
+      const fresh = await prisma.taskQueue.findFirst({ where: { id: row.id } });
+      if (fresh) {
+        await syncLimitRowEngineStateBestEffort(environment, fresh);
+      }
+      continue;
+    }
+    const retired = await prisma.taskQueue.updateMany({
+      where: { id: row.id, updatedAt: row.updatedAt },
+      data: {
+        concurrencyLimit: null,
+        concurrencyLimitBase: null,
+        concurrencyLimitOverriddenAt: null,
+        concurrencyLimitOverriddenBy: null,
+        concurrencyLimitOverridePercent: null,
+        totalConcurrencyLimit: null,
+        totalConcurrencyLimitBase: null,
+        totalConcurrencyLimitOverriddenAt: null,
+        totalConcurrencyLimitOverriddenBy: null,
+      },
+    });
+    if (retired.count === 0) {
+      /** A concurrent writer (an operator override, or another deploy) took the
+       * row between the read and the null, and the key removal above may have
+       * erased the engine state that writer just synced — including a
+       * pause-by-zero. Restore the engine from the fresh row so the winner's
+       * bounds stay enforced; both writers write the same fresh values, so the
+       * race converges. */
+      const fresh = await prisma.taskQueue.findFirst({ where: { id: row.id } });
+      if (fresh) {
+        await syncLimitRowEngineStateBestEffort(environment, fresh);
+      }
+    }
+  }
+}
+
+async function createWorkerTask(
+  task: TaskResource,
+  queues: Array<TaskQueue>,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction,
+  tasksToBackgroundFiles?: Map<string, string>
+): Promise<TaskMetadataEntry | null> {
+  let queue: TaskQueue | undefined;
+  let compiledGates: Array<{ queue: string; concurrencyKey?: string }> = [];
+  let resolvedTriggerSource: "SCHEDULED" | "AGENT" | "WEBHOOK" | "STANDARD" | undefined;
+  let resolvedTtl: string | null | undefined;
+
+  try {
+    const concurrency = task.concurrency;
+
+    if (task.queue?.name) {
+      assertNotReservedQueueName(task.queue.name, `Task "${task.id}"`);
+    }
+
+    if (concurrency && typeof task.queue?.concurrencyLimit === "number") {
+      throw new ServiceValidationError(
+        `Task "${task.id}" declares both a queue concurrencyLimit and the concurrency option; use concurrency.`
+      );
+    }
+
+    compiledGates = (concurrency?.limits ?? []).map((name) => ({
+      queue: concurrencyLimitQueueName(name),
+    }));
+
+    let queueConcurrencyLimit = task.queue?.concurrencyLimit;
+    let queueTotalConcurrencyLimit = task.queue?.combinedConcurrencyLimit;
+
+    if (concurrency?.inline) {
+      if (!task.queue?.name) {
+        queueConcurrencyLimit = concurrency.inline.perKey;
+        queueTotalConcurrencyLimit = concurrency.inline.total;
+      } else {
+        if (compiledGates.length > 1) {
+          throw new ServiceValidationError(
+            `Task "${task.id}": an inline limit on a shared queue uses a gate slot, so at most one named limit can be combined with it.`
+          );
+        }
+        const anonymousQueueName = anonymousConcurrencyLimitQueueName(task.id);
+        await createWorkerQueue(
+          {
+            name: anonymousQueueName,
+            concurrencyLimit: concurrency.inline.perKey ?? null,
+            combinedConcurrencyLimit: concurrency.inline.total ?? null,
+          },
+          `task/${task.id}`,
+          "NAMED",
+          worker,
+          environment,
+          prisma,
+          "LIMIT",
+          "V2"
+        );
+        compiledGates = [{ queue: anonymousQueueName }, ...compiledGates];
+      }
+    }
+
+    queue = queues.find((queue) => queue.name === task.queue?.name);
+
+    if (!queue) {
+      // Create a TaskQueue
+      queue = await createWorkerQueue(
+        {
+          name: task.queue?.name ?? `task/${task.id}`,
+          concurrencyLimit: queueConcurrencyLimit,
+          combinedConcurrencyLimit: queueTotalConcurrencyLimit,
+        },
+        task.queue?.name ?? task.id,
+        task.queue?.name ? "NAMED" : "VIRTUAL",
+        worker,
+        environment,
+        prisma,
+        "QUEUE",
+        /**
+         * V2 marks rows whose limit fields hold the new perKey/total vocabulary. That
+         * only happens when an inline limit compiles into the task's own default queue;
+         * a shared queue keeps V1 regardless of task concurrency (which lives in gates
+         * and LIMIT rows), matching rows materialized from queue() declarations.
+         */
+        concurrency?.inline && !task.queue?.name ? "V2" : "V1"
+      );
+    }
+
+    resolvedTriggerSource =
+      task.triggerSource === "schedule"
+        ? ("SCHEDULED" as const)
+        : task.triggerSource === "agent"
+          ? ("AGENT" as const)
+          : task.triggerSource === "webhook"
+            ? ("WEBHOOK" as const)
+            : ("STANDARD" as const);
+
+    resolvedTtl =
+      typeof task.ttl === "number" ? (stringifyDuration(task.ttl) ?? null) : (task.ttl ?? null);
+
+    let taskPersisted = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await prisma.backgroundWorkerTask.createMany({
+        data: {
+          friendlyId: generateFriendlyId("task"),
+          projectId: worker.projectId,
+          runtimeEnvironmentId: worker.runtimeEnvironmentId,
+          workerId: worker.id,
+          slug: task.id,
+          description: task.description,
+          filePath: task.filePath,
+          exportName: task.exportName,
+          retryConfig: task.retry,
+          queueConfig: task.queue,
+          gates: compiledGates.length > 0 ? compiledGates : task.gates,
+          machineConfig: task.machine,
+          triggerSource: resolvedTriggerSource,
+          config: task.agentConfig ? (task.agentConfig as any) : undefined,
+          fileId: tasksToBackgroundFiles?.get(task.id) ?? null,
+          maxDurationInSeconds: task.maxDuration ? clampMaxDuration(task.maxDuration) : null,
+          ttl: resolvedTtl,
+          queueId: queue.id,
+          payloadSchema: task.payloadSchema as any,
+        },
+        skipDuplicates: true,
+      });
+
+      if (result.count === 1) {
+        taskPersisted = true;
+        break;
+      }
+
+      const existing = await prisma.backgroundWorkerTask.findFirst({
+        where: { workerId: worker.id, slug: task.id },
+        select: { id: true },
+      });
+
+      if (existing) {
+        taskPersisted = true;
+        break;
+      }
+    }
+
+    if (!taskPersisted) {
+      throw new Error("Failed to create background worker task after unique constraint conflicts");
+    }
+
+    return {
+      slug: task.id,
+      ttl: resolvedTtl,
+      triggerSource: resolvedTriggerSource,
+      queueId: queue.id,
+      queueName: queue.name,
+      gates: compiledGates.length > 0 ? compiledGates : (task.gates ?? null),
+    };
+  } catch (error) {
+    if (error instanceof ServiceValidationError) {
+      throw error;
+    }
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      logger.error("Prisma Error creating background worker task", {
+        error: {
+          code: error.code,
+          message: error.message,
+        },
+        workerId: worker.id,
+      });
+    } else if (error instanceof Error) {
+      logger.error("Error creating background worker task", {
+        error: {
+          name: error.name,
+          message: error.message,
+          stack: error.stack,
+        },
+        workerId: worker.id,
+      });
+    } else {
+      logger.error("Unknown error creating background worker task", {
+        error,
+        workerId: worker.id,
+      });
+    }
+    return null;
+  }
+}
+
+async function createWorkerQueues(
+  metadata: BackgroundWorkerMetadata,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+) {
+  if (!metadata.queues) {
+    return [];
+  }
+
+  const CHUNK_SIZE = 20;
+  const allQueues: Awaited<ReturnType<typeof createWorkerQueue>>[] = [];
+
+  // Process queues in chunks
+  for (let i = 0; i < metadata.queues.length; i += CHUNK_SIZE) {
+    const chunk = metadata.queues.slice(i, i + CHUNK_SIZE);
+    const queueChunk = await Promise.all(
+      chunk.map(async (queue) => {
+        assertNotReservedQueueName(queue.name, `Queue "${queue.name}"`);
+        return createWorkerQueue(queue, queue.name, "NAMED", worker, environment, prisma);
+      })
+    );
+    allQueues.push(...queueChunk.filter(Boolean));
+  }
+
+  return allQueues;
+}
+
+/**
+ * Rejects invalid concurrency declarations before any worker rows are written, so a
+ * failed deploy leaves nothing behind for a same-content retry to return.
+ */
+export function validateWorkerConcurrencyDeclarations(metadata: BackgroundWorkerMetadata): void {
+  for (const queue of metadata.queues ?? []) {
+    assertNotReservedQueueName(queue.name, `Queue "${queue.name}"`);
+  }
+
+  for (const limit of metadata.concurrencyLimits ?? []) {
+    assertValidConcurrencyLimitName(limit.name);
+  }
+
+  for (const task of metadata.tasks) {
+    if (task.queue?.name) {
+      assertNotReservedQueueName(task.queue.name, `Task "${task.id}"`);
+    }
+
+    for (const gate of task.gates ?? []) {
+      assertNotReservedQueueName(gate.queue, `Task "${task.id}" gate "${gate.queue}"`);
+    }
+
+    const concurrency = task.concurrency;
+    if (!concurrency) {
+      continue;
+    }
+
+    if (typeof task.queue?.concurrencyLimit === "number") {
+      throw new ServiceValidationError(
+        `Task "${task.id}" declares both a queue concurrencyLimit and the concurrency option; use concurrency.`
+      );
+    }
+
+    for (const name of concurrency.limits ?? []) {
+      assertValidConcurrencyLimitName(name);
+    }
+
+    if (concurrency.inline && task.queue?.name) {
+      if ((concurrency.limits ?? []).length > 1) {
+        throw new ServiceValidationError(
+          `Task "${task.id}": an inline limit on a shared queue uses a gate slot, so at most one named limit can be combined with it.`
+        );
+      }
+    }
+  }
+}
+
+const CONCURRENCY_LIMIT_NAME_MAX_LENGTH = 128 - CONCURRENCY_LIMIT_QUEUE_PREFIX.length;
+
+/**
+ * Named limits require a strict charset so distinct declared names can never merge
+ * onto one row after queue-name sanitization (which strips disallowed characters).
+ */
+function assertValidConcurrencyLimitName(name: string): void {
+  if (!new RegExp(`^[a-zA-Z0-9_-]{1,${CONCURRENCY_LIMIT_NAME_MAX_LENGTH}}$`).test(name)) {
+    throw new ServiceValidationError(
+      `Concurrency limit name "${name}" must be 1-${CONCURRENCY_LIMIT_NAME_MAX_LENGTH} characters using only letters, numbers, underscores and hyphens.`
+    );
+  }
+}
+
+function concurrencyLimitQueueName(limitName: string): string {
+  assertValidConcurrencyLimitName(limitName);
+  return `${CONCURRENCY_LIMIT_QUEUE_PREFIX}${limitName}`;
+}
+
+/** User queue names may not claim the reserved limit/ namespace. */
+function assertNotReservedQueueName(name: string, context: string): void {
+  if (sanitizeQueueName(name).startsWith(CONCURRENCY_LIMIT_QUEUE_PREFIX)) {
+    throw new ServiceValidationError(
+      `${context}: queue names starting with "${CONCURRENCY_LIMIT_QUEUE_PREFIX}" are reserved for concurrency limits.`
+    );
+  }
+}
+
+/**
+ * Materializes the worker's declared named concurrency limits (plus any names tasks
+ * reference without declaring, created uncapped) as LIMIT-role TaskQueue rows. The
+ * columns mirror the declared shape exactly: perKey caps each key pool (and the
+ * keyless pool); total caps everything together via the group set.
+ */
+async function createWorkerConcurrencyLimits(
+  metadata: BackgroundWorkerMetadata,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+) {
+  const declared = new Map((metadata.concurrencyLimits ?? []).map((l) => [l.name, l]));
+
+  for (const task of metadata.tasks) {
+    for (const name of task.concurrency?.limits ?? []) {
+      if (!declared.has(name)) {
+        declared.set(name, { name });
+      }
+    }
+  }
+
+  for (const limit of declared.values()) {
+    await createWorkerQueue(
+      {
+        name: concurrencyLimitQueueName(limit.name),
+        concurrencyLimit: limit.perKey ?? null,
+        combinedConcurrencyLimit: limit.total ?? null,
+      },
+      limit.name,
+      "NAMED",
+      worker,
+      environment,
+      prisma,
+      "LIMIT",
+      "V2"
+    );
+  }
+}
+
+async function createWorkerQueue(
+  queue: QueueManifest,
+  orderableName: string,
+  queueType: TaskQueueType,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction,
+  role: TaskQueueRole = "QUEUE",
+  concurrencyVersion: TaskQueueConcurrencyVersion = "V1"
+) {
+  let queueName = sanitizeQueueName(queue.name);
+
+  const baseConcurrencyLimit =
+    typeof queue.concurrencyLimit === "number"
+      ? Math.max(Math.min(queue.concurrencyLimit, environment.maximumConcurrencyLimit), 0)
+      : queue.concurrencyLimit;
+
+  const taskQueue = await upsertWorkerQueueRecord(
+    queueName,
+    baseConcurrencyLimit ?? null,
+    queue.combinedConcurrencyLimit ?? null,
+    orderableName,
+    queueType,
+    worker,
+    prisma,
+    0,
+    role,
+    concurrencyVersion
+  );
+
+  const syncQueueLimitsToEngine = async (row: {
+    name: string;
+    paused: boolean;
+    concurrencyLimit: number | null;
+    totalConcurrencyLimit: number | null;
+  }) => {
+    /**
+     * The total limit key is separate from the per-queue limit key that pause zeroes,
+     * so it is safe to sync it regardless of the paused state. The engine clamps it
+     * to the environment limit at read time, so the raw declared value is stored.
+     */
+    if (typeof row.totalConcurrencyLimit === "number") {
+      await updateQueueTotalConcurrencyLimits(environment, row.name, row.totalConcurrencyLimit);
+    } else {
+      await removeQueueTotalConcurrencyLimits(environment, row.name);
+    }
+
+    if (!row.paused) {
+      logger.debug("createWorkerQueue: syncing concurrency limit", {
+        workerId: worker.id,
+        taskQueue: row,
+        orgId: environment.organizationId,
+        projectId: environment.projectId,
+        environmentId: environment.id,
+        concurrencyLimit: row.concurrencyLimit,
+      });
+      if (typeof row.concurrencyLimit === "number") {
+        await updateQueueConcurrencyLimits(environment, row.name, row.concurrencyLimit);
+      } else {
+        await removeQueueConcurrencyLimits(environment, row.name);
+      }
+    } else {
+      /**
+       * A paused queue's engine limit is 0 (what pause wrote). Re-asserting it here
+       * heals the race where a pause lands between this deploy's row read and its
+       * engine sync, which would otherwise overwrite the 0 with the declared limit
+       * and leave a queue the dashboard shows as paused still dequeuing.
+       */
+      logger.debug("createWorkerQueue: queue is paused, re-asserting the paused limit", {
+        workerId: worker.id,
+        taskQueue: row,
+        orgId: environment.organizationId,
+        projectId: environment.projectId,
+        environmentId: environment.id,
+      });
+      await updateQueueConcurrencyLimits(environment, row.name, 0);
+    }
+  };
+
+  await syncQueueLimitsToEngine(taskQueue);
+
+  /**
+   * The optimistic markers only guard the Postgres write; an override or reset can
+   * still land between that write and the engine sync above, which would leave the
+   * engine holding this deploy's stale values. Re-read the markers and re-sync from
+   * the fresh row until they stop moving (bounded): every actor writes Postgres
+   * before its own engine sync, so re-syncing whatever is freshest converges. A
+   * marker moving after the final read is healed by that actor's own engine sync
+   * or the next deploy.
+   */
+  let syncedMarkers = {
+    concurrency: taskQueue.concurrencyLimitOverriddenAt?.getTime(),
+    total: taskQueue.totalConcurrencyLimitOverriddenAt?.getTime(),
+    paused: taskQueue.paused,
+  };
+
+  for (let i = 0; i < 3; i++) {
+    const freshQueue = await prisma.taskQueue.findFirst({
+      where: { id: taskQueue.id },
+      select: {
+        name: true,
+        paused: true,
+        concurrencyLimit: true,
+        totalConcurrencyLimit: true,
+        concurrencyLimitOverriddenAt: true,
+        totalConcurrencyLimitOverriddenAt: true,
+      },
+    });
+
+    if (
+      !freshQueue ||
+      (freshQueue.concurrencyLimitOverriddenAt?.getTime() === syncedMarkers.concurrency &&
+        freshQueue.totalConcurrencyLimitOverriddenAt?.getTime() === syncedMarkers.total &&
+        freshQueue.paused === syncedMarkers.paused)
+    ) {
+      break;
+    }
+
+    await syncQueueLimitsToEngine(freshQueue);
+    syncedMarkers = {
+      concurrency: freshQueue.concurrencyLimitOverriddenAt?.getTime(),
+      total: freshQueue.totalConcurrencyLimitOverriddenAt?.getTime(),
+      paused: freshQueue.paused,
+    };
+  }
+
+  return taskQueue;
+}
+
+async function upsertWorkerQueueRecord(
+  queueName: string,
+  concurrencyLimit: number | null,
+  totalConcurrencyLimit: number | null,
+  orderableName: string,
+  queueType: TaskQueueType,
+  worker: BackgroundWorker,
+  prisma: PrismaClientOrTransaction,
+  attempt: number = 0,
+  role: TaskQueueRole = "QUEUE",
+  concurrencyVersion: TaskQueueConcurrencyVersion = "V1"
+): Promise<TaskQueue> {
+  if (attempt > 3) {
+    throw new Error("Failed to insert queue record");
+  }
+
+  try {
+    let taskQueue = await prisma.taskQueue.findFirst({
+      where: {
+        runtimeEnvironmentId: worker.runtimeEnvironmentId,
+        name: queueName,
+      },
+    });
+
+    /**
+     * Queue names are unique per environment with no role distinction, and slashes were
+     * historically legal in user queue names, so a pre-existing user queue can occupy a
+     * limit/ name (or, defensively, the reverse). Silently reusing such a row would
+     * overwrite its limits and hide it from its management surface, so a role mismatch
+     * fails the deploy with an actionable rename instead.
+     */
+    if (taskQueue && taskQueue.role !== role) {
+      throw new ServiceValidationError(
+        role === "LIMIT"
+          ? `Concurrency limit "${queueName.slice(
+              CONCURRENCY_LIMIT_QUEUE_PREFIX.length
+            )}" collides with an existing queue named "${queueName}" in this environment. Rename the concurrency limit and deploy again (renaming the queue in code does not free the name, because its historical queue row keeps it).`
+          : `Queue "${queueName}" collides with an existing concurrency limit row in this environment. Rename the queue and deploy again.`
+      );
+    }
+
+    if (!taskQueue) {
+      taskQueue = await prisma.taskQueue.create({
+        data: {
+          friendlyId: generateFriendlyId("queue"),
+          version: "V2",
+          role,
+          concurrencyVersion,
+          name: queueName,
+          orderableName,
+          concurrencyLimit,
+          totalConcurrencyLimit,
+          runtimeEnvironmentId: worker.runtimeEnvironmentId,
+          projectId: worker.projectId,
+          type: queueType,
+          workers: {
+            connect: {
+              id: worker.id,
+            },
+          },
+        },
+      });
+    } else {
+      const hasOverride = taskQueue.concurrencyLimitOverriddenAt !== null;
+      const hasTotalOverride = taskQueue.totalConcurrencyLimitOverriddenAt !== null;
+
+      /**
+       * The override markers in the where clause make this an optimistic-concurrency
+       * update: a concurrent override/reset between the read above and this write
+       * changes a marker, the update misses (P2025) and the catch below retries with
+       * a fresh read, so a deploy can never clobber an operator's override.
+       */
+      taskQueue = await prisma.taskQueue.update({
+        where: {
+          id: taskQueue.id,
+          concurrencyLimitOverriddenAt: taskQueue.concurrencyLimitOverriddenAt,
+          totalConcurrencyLimitOverriddenAt: taskQueue.totalConcurrencyLimitOverriddenAt,
+        },
+        data: {
+          workers: { connect: { id: worker.id } },
+          version: "V2",
+          concurrencyVersion,
+          orderableName,
+          // Declared again, so bring an archived queue back.
+          archivedAt: null,
+          // If overridden, keep current limit and update base; otherwise update limit normally
+          concurrencyLimit: hasOverride ? undefined : concurrencyLimit,
+          concurrencyLimitBase: hasOverride ? concurrencyLimit : undefined,
+          totalConcurrencyLimit: hasTotalOverride ? undefined : totalConcurrencyLimit,
+          totalConcurrencyLimitBase: hasTotalOverride ? totalConcurrencyLimit : undefined,
+        },
+      });
+    }
+
+    return taskQueue;
+  } catch (error) {
+    /**
+     * P2002: the queue was created concurrently. P2025: an override/reset moved a
+     * marker under the optimistic update. Both re-read and retry.
+     */
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      (error.code === "P2002" || error.code === "P2025")
+    ) {
+      return await upsertWorkerQueueRecord(
+        queueName,
+        concurrencyLimit,
+        totalConcurrencyLimit,
+        orderableName,
+        queueType,
+        worker,
+        prisma,
+        attempt + 1,
+        role,
+        concurrencyVersion
+      );
+    }
+    throw error;
+  }
+}
+//CreateDeclarativeScheduleError with a message
+export class CreateDeclarativeScheduleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CreateDeclarativeScheduleError";
+  }
+}
+
+// TODO: centralize (the P2 dynamic webhooks.create() API will also mint opaqueIds).
+function generateOpaqueId(): string {
+  return randomBytes(16).toString("base64url");
+}
+
+export const MAX_WEBHOOK_SUBSCRIBERS_PER_ENDPOINT = 25;
+
+/**
+ * Reconcile the declared webhook endpoints with this environment's endpoint rows. Each declared
+ * endpoint gets one row (and one URL), even with no subscribers; every subscriber naming it becomes
+ * one of its routing targets, with its filter compiled here so a bad filter fails the deploy rather
+ * than ingest. Endpoints no longer declared are deactivated. An absent endpoint list (an older
+ * client) leaves every row alone.
+ */
+export async function syncDeclarativeWebhooks(
+  declared: {
+    endpoints: WebhookEndpointResource[] | undefined;
+    subscribers: WebhookSubscriberResource[] | undefined;
+  },
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction,
+  // Endpoint rows live on the webhook DB; the task-existence check below stays on the main client.
+  webhookPrisma: WebhookDatabase
+) {
+  const { endpoints } = declared;
+  if (endpoints === undefined) return;
+  if (!(await organizationHasWebhooksAccess(environment.organizationId, prisma))) {
+    if (endpoints.length > 0) {
+      logger.warn("Not syncing webhook endpoints: the organization doesn't have webhooks access", {
+        organizationId: environment.organizationId,
+        environmentId: environment.id,
+        endpoints: endpoints.length,
+      });
+    }
+    return;
+  }
+
+  const endpointIds = new Set<string>();
+  for (const endpoint of endpoints) {
+    if (endpointIds.has(endpoint.id)) {
+      throw new ServiceValidationError(
+        `Webhook endpoint "${endpoint.id}" is declared more than once`
+      );
+    }
+    endpointIds.add(endpoint.id);
+
+    if (isWebhookEndpointFriendlyId(endpoint.id)) {
+      throw new ServiceValidationError(
+        `Webhook endpoint id "${endpoint.id}" can't start with "wh_": that prefix is reserved for the ids Trigger.dev generates`
+      );
+    }
+
+    if (
+      "config" in endpoint.verifierArtifact &&
+      endpoint.verifierArtifact.config.scheme === "url-secret" &&
+      endpoint.verifierArtifact.config.placement === "path"
+    ) {
+      throw new ServiceValidationError(
+        `Webhook endpoint "${endpoint.id}" uses url-secret verification with path placement, which cannot be verified on the hosted ingress URL. Use query placement or a header-based scheme.`
+      );
+    }
+  }
+
+  const targetsByEndpoint = new Map<string, StoredWebhookRoutingTarget[]>();
+  for (const subscriber of declared.subscribers ?? []) {
+    const { endpointId, target } = subscriber;
+    if (!endpointIds.has(endpointId)) {
+      throw new ServiceValidationError(
+        `Webhook subscriber "${target.id}" references unknown endpoint "${endpointId}"`
+      );
+    }
+    const targets = targetsByEndpoint.get(endpointId) ?? [];
+    if (targets.some((existing) => existing.id === target.id)) {
+      throw new ServiceValidationError(
+        `Webhook endpoint "${endpointId}" has more than one subscriber with id "${target.id}"`
+      );
+    }
+    targets.push(compileRoutingTarget(endpointId, target));
+    targetsByEndpoint.set(endpointId, targets);
+  }
+
+  for (const [endpointId, targets] of targetsByEndpoint) {
+    if (targets.length > MAX_WEBHOOK_SUBSCRIBERS_PER_ENDPOINT) {
+      throw new ServiceValidationError(
+        `Webhook endpoint "${endpointId}" has ${targets.length} subscribers; the limit is ${MAX_WEBHOOK_SUBSCRIBERS_PER_ENDPOINT}`
+      );
+    }
+  }
+
+  const targetTaskSlugs = new Set(
+    Array.from(targetsByEndpoint.values()).flatMap((targets) => targets.map(routingTargetTaskSlug))
+  );
+  if (targetTaskSlugs.size > 0) {
+    const found = await prisma.backgroundWorkerTask.findMany({
+      where: { workerId: worker.id, slug: { in: boundedIn(Array.from(targetTaskSlugs)) } },
+      select: { slug: true },
+    });
+    const foundSlugs = new Set(found.map((task) => task.slug));
+    for (const [endpointId, targets] of targetsByEndpoint) {
+      for (const target of targets) {
+        const slug = routingTargetTaskSlug(target);
+        if (!foundSlugs.has(slug)) {
+          throw new ServiceValidationError(
+            `Webhook subscriber "${target.id}" on endpoint "${endpointId}" routes to unknown task "${slug}"`
+          );
+        }
+      }
+    }
+  }
+
+  const existing = await webhookPrisma.webhookEndpoint.findMany({
+    where: {
+      runtimeEnvironmentId: environment.id,
+      endpointTenantId: "",
+      endpointExternalRef: "",
+    },
+  });
+  const missing = new Set(existing.map((e) => e.declaredId));
+
+  for (const endpoint of endpoints) {
+    missing.delete(endpoint.id);
+
+    const data = {
+      source: endpoint.source,
+      routingTargets: (targetsByEndpoint.get(endpoint.id) ??
+        []) as unknown as Prisma.InputJsonValue,
+      verifierArtifact: endpoint.verifierArtifact as unknown as Prisma.InputJsonValue,
+      secretProvisioning: endpoint.secretProvisioning ?? "either",
+      setupPrompt: endpoint.setupPrompt ?? null,
+      metadata: (endpoint.metadata ?? {}) as unknown as Prisma.InputJsonValue,
+    };
+
+    const found = existing.find((e) => e.declaredId === endpoint.id);
+    if (found) {
+      await webhookPrisma.webhookEndpoint.update({
+        where: { id: found.id },
+        data: {
+          ...data,
+          ...(found.manuallyDeactivatedAt === null ? { status: "ACTIVE" as const } : {}),
+        },
+      });
+    } else {
+      const { id, friendlyId } = WebhookEndpointId.generate();
+      await webhookPrisma.webhookEndpoint.create({
+        data: {
+          id,
+          friendlyId,
+          opaqueId: generateOpaqueId(), // CSPRNG, NOT a friendlyId
+          organizationId: environment.organizationId,
+          projectId: environment.projectId,
+          runtimeEnvironmentId: environment.id,
+          environmentType: environment.type,
+          endpointTenantId: "",
+          endpointExternalRef: "",
+          declaredId: endpoint.id,
+          status: "ACTIVE",
+          ...data,
+        },
+      });
+    }
+  }
+
+  if (missing.size > 0) {
+    await webhookPrisma.webhookEndpoint.updateMany({
+      where: {
+        runtimeEnvironmentId: environment.id,
+        endpointTenantId: "",
+        endpointExternalRef: "",
+        declaredId: { in: boundedIn(Array.from(missing)) },
+      },
+      data: { status: "INACTIVE" },
+    });
+  }
+}
+
+function routingTargetTaskSlug(target: WebhookRoutingTarget): string {
+  return target.type === "task" ? target.taskId : target.taskIdentifier;
+}
+
+function compileRoutingTarget(
+  endpointId: string,
+  target: WebhookRoutingTarget
+): StoredWebhookRoutingTarget {
+  const compile = (field: "filter" | "startOn", expression: string) => {
+    try {
+      return parseFilter(expression);
+    } catch (error) {
+      if (error instanceof FilterParseError) {
+        throw new ServiceValidationError(
+          `Webhook subscriber "${target.id}" on endpoint "${endpointId}" has an invalid ${field}: ${error.message}`
+        );
+      }
+      throw error;
+    }
+  };
+
+  if (target.type === "session" && target.startOn) {
+    compile("startOn", target.startOn);
+  }
+  if (!target.filter) return target;
+  return {
+    ...target,
+    filterAst: compile("filter", target.filter),
+    filterAstVersion: FILTER_AST_VERSION,
+  };
+}
+
+type MaybeNormalizedScheduleWindow = ReturnType<typeof resolveScheduleWindow>["window"];
+
+function scheduleWindowsEqual(
+  a: MaybeNormalizedScheduleWindow,
+  b: MaybeNormalizedScheduleWindow
+): boolean {
+  if (!a || !b) {
+    return a === b;
+  }
+  if (a.type !== b.type) {
+    return false;
+  }
+  return a.type === "duration" && b.type === "duration"
+    ? a.durationSeconds === b.durationSeconds
+    : a.type === "percentage" && b.type === "percentage"
+      ? a.percentage === b.percentage
+      : false;
+}
+
+function newDeclarativeSchedulePolicyWarning({
+  taskId,
+  explicitWindow,
+  cron,
+  timezone,
+  defaultWindowDurationSeconds,
+  minimumWindowDurationSeconds,
+}: {
+  taskId: string;
+  explicitWindow: string | undefined;
+  cron: string;
+  timezone?: string | null;
+  defaultWindowDurationSeconds: number | null;
+  minimumWindowDurationSeconds: number | null;
+}): BackgroundWorkerWarning | undefined {
+  const defaultMinutes =
+    defaultWindowDurationSeconds !== null
+      ? Math.round(defaultWindowDurationSeconds / 60)
+      : undefined;
+  const minimumMinutes =
+    minimumWindowDurationSeconds !== null
+      ? Math.round(minimumWindowDurationSeconds / 60)
+      : undefined;
+  const prefix = `Task \`${taskId}\``;
+
+  if (!explicitWindow) {
+    if (defaultMinutes && minimumMinutes) {
+      return {
+        code: "schedule_default_window",
+        message: `${prefix} got the ${defaultMinutes}-minute default cron window.`,
+      };
+    }
+    if (defaultMinutes) {
+      return {
+        code: "schedule_default_window",
+        message: `${prefix} got the ${defaultMinutes}-minute default cron window.`,
+      };
+    }
+    if (minimumMinutes) {
+      return {
+        code: "schedule_minimum_window",
+        message: `${prefix} got the minimum Free plan cron window of ${minimumMinutes} minutes.`,
+      };
+    }
+    return undefined;
+  }
+
+  if (
+    minimumMinutes &&
+    minimumWindowDurationSeconds !== null &&
+    explicitWindowBelowMinimum({
+      explicitWindow,
+      cron,
+      timezone,
+      minimumWindowDurationSeconds,
+    })
+  ) {
+    return {
+      code: "schedule_minimum_window",
+      message: `${prefix} uses the Free plan ${minimumMinutes}-minute minimum window.`,
+    };
+  }
+
+  return undefined;
+}
+
+async function prepareDeclarativeSchedules(
+  tasks: TaskResource[],
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+) {
+  const tasksWithDeclarativeSchedules = tasks.filter(
+    (task): task is TaskResource & { schedule: NonNullable<TaskResource["schedule"]> } =>
+      task.schedule !== undefined &&
+      (!task.schedule.environments?.length || task.schedule.environments.includes(environment.type))
+  );
+  logger.info("Syncing declarative schedules", {
+    tasksWithDeclarativeSchedules,
+    environment: safeEnvironmentLogFields(environment),
+  });
+
+  const existingDeclarativeSchedules = await prisma.taskSchedule.findMany({
+    where: {
+      type: "DECLARATIVE",
+      projectId: environment.projectId,
+      instances: {
+        some: {
+          environmentId: environment.id,
+        },
+      },
+    },
+    select: {
+      id: true,
+      friendlyId: true,
+      taskIdentifier: true,
+      generatorExpression: true,
+      timezone: true,
+      windowDurationSeconds: true,
+      windowPercentage: true,
+      defaultWindowDurationSeconds: true,
+      minimumWindowDurationSeconds: true,
+      instances: {
+        select: {
+          id: true,
+          environmentId: true,
+        },
+      },
+    },
+  });
+
+  const existingByTask = new Map(
+    existingDeclarativeSchedules.map((schedule) => [schedule.taskIdentifier, schedule])
+  );
+  const hasNewSchedules = tasksWithDeclarativeSchedules.some(
+    (task) => !existingByTask.has(task.id)
+  );
+  const hasRestrictedSchedules = tasksWithDeclarativeSchedules.some((task) => {
+    const existing = existingByTask.get(task.id);
+    return existing && existing.minimumWindowDurationSeconds !== null;
+  });
+
+  // Restricted rows still check paid status with rollout off.
+  const defaultWindowDurationSeconds = hasNewSchedules
+    ? await resolveNewScheduleDefaultWindowSeconds(prisma, environment.organizationId)
+    : null;
+  const policy =
+    hasNewSchedules || hasRestrictedSchedules
+      ? await resolveFreeSchedulePolicyContext(prisma, {
+          id: environment.organizationId,
+          featureFlags: environment.organization.featureFlags,
+        })
+      : undefined;
+
+  const preparedTasks = [];
+  const warnings: BackgroundWorkerWarning[] = [];
+  for (const task of tasksWithDeclarativeSchedules) {
+    const existingSchedule = existingByTask.get(task.id);
+
+    const minimumWindowDurationSeconds = existingSchedule
+      ? existingSchedule.minimumWindowDurationSeconds === null
+        ? null
+        : resolveMinimumWindowOnUpdate(policy!, existingSchedule.minimumWindowDurationSeconds)
+            .minimumWindowDurationSeconds
+      : minimumWindowForNewSchedule(policy!, "DECLARATIVE");
+
+    if (minimumWindowDurationSeconds !== null) {
+      const cron = CronPattern.safeParse(task.schedule.cron);
+      if (!cron.success) {
+        throw new ServiceValidationError(
+          `Invalid cron expression: ${cron.error.issues[0].message}`
+        );
+      }
+      assertCronMeetsFreeMinimum({
+        cron: task.schedule.cron,
+        timezone: task.schedule.timezone,
+        minimumWindowDurationSeconds,
+        scheduleType: "DECLARATIVE",
+        environmentType: environment.type,
+        taskIdentifier: task.id,
+      });
+    }
+    if (!existingSchedule) {
+      const warning = newDeclarativeSchedulePolicyWarning({
+        taskId: task.id,
+        explicitWindow: task.schedule.window,
+        cron: task.schedule.cron,
+        timezone: task.schedule.timezone,
+        defaultWindowDurationSeconds,
+        minimumWindowDurationSeconds,
+      });
+      if (warning) {
+        warnings.push(warning);
+      }
+    }
+
+    preparedTasks.push({
+      task,
+      existingSchedule,
+      minimumWindowDurationSeconds,
+    });
+  }
+
+  return { existingDeclarativeSchedules, preparedTasks, defaultWindowDurationSeconds, warnings };
+}
+
+export async function syncDeclarativeSchedules(
+  tasks: TaskResource[],
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction,
+  engine: Pick<typeof scheduleEngine, "registerNextTaskScheduleInstance"> = scheduleEngine,
+  prepared?: Awaited<ReturnType<typeof prepareDeclarativeSchedules>>,
+  quotaLimit?: number
+) {
+  let { existingDeclarativeSchedules, preparedTasks, defaultWindowDurationSeconds, warnings } =
+    prepared ?? (await prepareDeclarativeSchedules(tasks, environment, prisma));
+
+  let missingSchedules = new Set(existingDeclarativeSchedules.map((schedule) => schedule.id));
+  const declaredTaskIds = new Set(preparedTasks.map(({ task }) => task.id));
+  let quotaExclusions = {
+    environmentId: environment.id,
+    scheduleIds: existingDeclarativeSchedules
+      .filter((schedule) => !declaredTaskIds.has(schedule.taskIdentifier))
+      .map((schedule) => schedule.id),
+  };
+
+  const validate = async (db: PrismaClientOrTransaction) => {
+    const checkSchedule = new CheckScheduleService(db);
+    let pendingCreations = 0;
+    for (const { task, existingSchedule } of preparedTasks) {
+      await checkSchedule.call(
+        environment.projectId,
+        {
+          cron: task.schedule.cron,
+          timezone: task.schedule.timezone,
+          taskIdentifier: task.id,
+          friendlyId: existingSchedule?.friendlyId,
+          window: task.schedule.window,
+        },
+        [environment.id],
+        quotaExclusions,
+        pendingCreations,
+        quotaLimit
+      );
+      if (!existingSchedule && environment.type !== "DEVELOPMENT") pendingCreations++;
+    }
+    return pendingCreations;
+  };
+  const pendingCreations = await validate(prisma);
+
+  const registrations: Array<{ instanceId: string; preserveExistingJob?: boolean }> = [];
+  const transactional =
+    quotaExclusions.scheduleIds.length > 0 && pendingCreations > 0 && "$transaction" in prisma;
+  const apply = async (db: PrismaClientOrTransaction) => {
+    for (const { task, existingSchedule, minimumWindowDurationSeconds } of preparedTasks) {
+      const normalizedWindow = normalizeScheduleWindow(task.schedule.window);
+
+      if (existingSchedule) {
+        // Compare effective windows so equivalent explicit/default values preserve the pending job.
+        const previousWindow = resolveScheduleWindow({
+          windowDurationSeconds: existingSchedule.windowDurationSeconds,
+          windowPercentage: existingSchedule.windowPercentage,
+          defaultWindowDurationSeconds: existingSchedule.defaultWindowDurationSeconds,
+        }).window;
+        const nextWindow = resolveScheduleWindow({
+          windowDurationSeconds: normalizedWindow.windowDurationSeconds,
+          windowPercentage: normalizedWindow.windowPercentage,
+          defaultWindowDurationSeconds: existingSchedule.defaultWindowDurationSeconds,
+        }).window;
+        const timingChanged =
+          existingSchedule.generatorExpression !== task.schedule.cron ||
+          existingSchedule.timezone !== task.schedule.timezone ||
+          !scheduleWindowsEqual(previousWindow, nextWindow) ||
+          // Clearing the minimum changes the effective range.
+          existingSchedule.minimumWindowDurationSeconds !== minimumWindowDurationSeconds;
+        const persistedValuesChanged =
+          existingSchedule.generatorExpression !== task.schedule.cron ||
+          existingSchedule.timezone !== task.schedule.timezone ||
+          existingSchedule.windowDurationSeconds !== normalizedWindow.windowDurationSeconds ||
+          existingSchedule.windowPercentage !== normalizedWindow.windowPercentage ||
+          existingSchedule.minimumWindowDurationSeconds !== minimumWindowDurationSeconds;
+        const schedule = persistedValuesChanged
+          ? await db.taskSchedule.update({
+              where: {
+                id: existingSchedule.id,
+              },
+              data: {
+                generatorExpression: task.schedule.cron,
+                generatorDescription: cronstrue.toString(task.schedule.cron),
+                timezone: task.schedule.timezone,
+                minimumWindowDurationSeconds,
+                ...normalizedWindow,
+              },
+              include: {
+                instances: true,
+              },
+            })
+          : existingSchedule;
+
+        missingSchedules.delete(existingSchedule.id);
+        const instances = timingChanged
+          ? schedule.instances
+          : schedule.instances.filter((instance) => instance.environmentId === environment.id);
+        if (instances.length === 0) {
+          throw new CreateDeclarativeScheduleError(
+            `Missing instance for declarative schedule ${schedule.id}`
+          );
+        }
+        for (const instance of instances) {
+          const registration = { instanceId: instance.id, preserveExistingJob: !timingChanged };
+          if (transactional) registrations.push(registration);
+          else await engine.registerNextTaskScheduleInstance(registration);
+        }
+      } else {
+        const newSchedule = await db.taskSchedule.create({
+          data: {
+            friendlyId: generateFriendlyId("sched"),
+            projectId: environment.projectId,
+            taskIdentifier: task.id,
+            generatorExpression: task.schedule.cron,
+            generatorDescription: cronstrue.toString(task.schedule.cron),
+            timezone: task.schedule.timezone,
+            type: "DECLARATIVE",
+            minimumWindowDurationSeconds,
+            ...normalizedWindow,
+            defaultWindowDurationSeconds,
+            instances: {
+              create: [
+                {
+                  environmentId: environment.id,
+                  projectId: environment.projectId,
+                },
+              ],
+            },
+          },
+          include: {
+            instances: true,
+          },
+        });
+
+        const instance = newSchedule.instances.at(0);
+
+        if (instance) {
+          const registration = { instanceId: instance.id };
+          if (transactional) registrations.push(registration);
+          else await engine.registerNextTaskScheduleInstance(registration);
+        } else {
+          throw new CreateDeclarativeScheduleError(
+            `Missing instance for declarative schedule ${newSchedule.id}`
+          );
+        }
+      }
+    }
+
+    //Delete instances for this environment
+    //Delete schedules that have no instances left
+    const potentiallyDeletableSchedules = existingDeclarativeSchedules.filter((schedule) =>
+      missingSchedules.has(schedule.id)
+    );
+
+    const scheduleIdsToDelete: string[] = [];
+    const scheduleIdsToDetachFromEnvironment: string[] = [];
+
+    for (const schedule of potentiallyDeletableSchedules) {
+      const canDeleteSchedule =
+        schedule.instances.length === 0 ||
+        schedule.instances.every((instance) => instance.environmentId === environment.id);
+
+      if (canDeleteSchedule) {
+        scheduleIdsToDelete.push(schedule.id);
+      } else if (schedule.instances.some((instance) => instance.environmentId === environment.id)) {
+        scheduleIdsToDetachFromEnvironment.push(schedule.id);
+      }
+    }
+
+    if (scheduleIdsToDelete.length > 0) {
+      await db.taskSchedule.deleteMany({
+        where: {
+          id: {
+            in: boundedIn(scheduleIdsToDelete),
+          },
+        },
+      });
+    }
+
+    if (scheduleIdsToDetachFromEnvironment.length > 0) {
+      await db.taskScheduleInstance.deleteMany({
+        where: {
+          taskScheduleId: {
+            in: boundedIn(scheduleIdsToDetachFromEnvironment),
+          },
+          environmentId: environment.id,
+        },
+      });
+    }
+  };
+
+  if (transactional) {
+    await $transaction(
+      prisma,
+      "syncDeclarativeSchedules",
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${environment.projectId} FOR UPDATE`;
+        ({ existingDeclarativeSchedules, preparedTasks, defaultWindowDurationSeconds, warnings } =
+          await prepareDeclarativeSchedules(tasks, environment, tx));
+        missingSchedules = new Set(existingDeclarativeSchedules.map((schedule) => schedule.id));
+        const declaredTaskIds = new Set(preparedTasks.map(({ task }) => task.id));
+        quotaExclusions = {
+          environmentId: environment.id,
+          scheduleIds: existingDeclarativeSchedules
+            .filter((schedule) => !declaredTaskIds.has(schedule.taskIdentifier))
+            .map((schedule) => schedule.id),
+        };
+        await validate(tx);
+        await apply(tx);
+      },
+      { timeout: 120_000 }
+    );
+  } else {
+    await apply(prisma);
+  }
+
+  for (const registration of registrations) {
+    await engine.registerNextTaskScheduleInstance(registration);
+  }
+
+  return warnings;
+}
+
+export async function createBackgroundFiles(
+  files: Array<BackgroundWorkerSourceFileMetadata> | undefined,
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+) {
+  // Maps from each taskId to the backgroundWorkerFileId
+  const results = new Map<string, string>();
+
+  if (!files) {
+    return results;
+  }
+
+  for (const file of files) {
+    const backgroundWorkerFile = await prisma.backgroundWorkerFile.upsert({
+      where: {
+        projectId_contentHash: {
+          projectId: environment.projectId,
+          contentHash: file.contentHash,
+        },
+      },
+      create: {
+        friendlyId: generateFriendlyId("file"),
+        projectId: environment.projectId,
+        contentHash: file.contentHash,
+        filePath: file.filePath,
+        contents: Buffer.from(file.contents),
+        backgroundWorkers: {
+          connect: {
+            id: worker.id,
+          },
+        },
+      },
+      update: {
+        backgroundWorkers: {
+          connect: {
+            id: worker.id,
+          },
+        },
+      },
+    });
+
+    for (const taskId of file.taskIds) {
+      results.set(taskId, backgroundWorkerFile.id);
+    }
+  }
+
+  return results;
+}
+
+import { createHash } from "crypto";
+
+function hashContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+async function createWorkerPrompts(
+  prompts: PromptResource[],
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+) {
+  for (const promptResource of prompts) {
+    try {
+      // Upsert the Prompt record (identity + schema)
+      const prompt = await prisma.prompt.upsert({
+        where: {
+          projectId_runtimeEnvironmentId_slug: {
+            projectId: worker.projectId,
+            runtimeEnvironmentId: environment.id,
+            slug: promptResource.id,
+          },
+        },
+        create: {
+          friendlyId: generateFriendlyId("prompt"),
+          organizationId: environment.organizationId,
+          projectId: worker.projectId,
+          runtimeEnvironmentId: environment.id,
+          slug: promptResource.id,
+          description: promptResource.description,
+          filePath: promptResource.filePath,
+          exportName: promptResource.exportName,
+          variableSchema: promptResource.variableSchema as any,
+          defaultModel: promptResource.model,
+          defaultConfig: promptResource.config as any,
+        },
+        update: {
+          description: promptResource.description,
+          filePath: promptResource.filePath,
+          exportName: promptResource.exportName,
+          variableSchema: promptResource.variableSchema as any,
+          defaultModel: promptResource.model,
+          defaultConfig: promptResource.config as any,
+        },
+      });
+
+      // Compute the version-definition hash for dedup. Includes the model and
+      // config, not just the prompt text, so changing a code prompt's model or
+      // config creates a new version — otherwise a model-only change is silently
+      // skipped and the old model keeps serving.
+      const contentString = promptResource.content ?? "";
+      const contentHash = hashContent(
+        JSON.stringify({
+          content: contentString,
+          model: promptResource.model ?? null,
+          config: promptResource.config ?? null,
+        })
+      );
+
+      // Find the latest version overall (for version numbering) and the latest
+      // code-sourced version (for content dedup). We compare against the latest
+      // code version specifically so that dashboard edits don't interfere with
+      // dedup — if the code hasn't changed since the last deploy, we skip even
+      // if a dashboard edit happened in between.
+      const latestVersion = await prisma.promptVersion.findFirst({
+        where: { promptId: prompt.id },
+        orderBy: { version: "desc" },
+      });
+
+      const latestCodeVersion = await prisma.promptVersion.findFirst({
+        where: { promptId: prompt.id, source: "code" },
+        orderBy: { version: "desc" },
+      });
+
+      if (latestCodeVersion?.contentHash === contentHash) {
+        // Code definition (text + model + config) unchanged since last deploy —
+        // skip creating a new version.
+        continue;
+      }
+
+      const nextVersion = (latestVersion?.version ?? 0) + 1;
+
+      // Determine labels for the new version.
+      // Deploys always move "current" to the new code version. If a dashboard
+      // override exists, it sits on top via the "override" label and the API
+      // serves that instead — so "current" movement is safe.
+      const labels = ["latest", "current"];
+
+      // Wrap label removal + version creation in a transaction so labels
+      // aren't stripped if the create fails (e.g. concurrent deploy race).
+      await $transaction(prisma, async (tx) => {
+        // Remove "latest" label from all existing versions
+        if (latestVersion) {
+          await tx.$executeRaw`
+            UPDATE "prompt_versions"
+            SET "labels" = array_remove("labels", 'latest')
+            WHERE "promptId" = ${prompt.id} AND 'latest' = ANY("labels")
+          `;
+        }
+
+        // Remove "current" from any existing version
+        await tx.$executeRaw`
+          UPDATE "prompt_versions"
+          SET "labels" = array_remove("labels", 'current')
+          WHERE "promptId" = ${prompt.id} AND 'current' = ANY("labels")
+        `;
+
+        await tx.promptVersion.create({
+          data: {
+            promptId: prompt.id,
+            version: nextVersion,
+            textContent: contentString,
+            model: promptResource.model,
+            config: promptResource.config as any,
+            source: "code",
+            contentHash,
+            labels,
+            workerId: worker.id,
+          },
+        });
+      });
+
+      logger.debug("Registered prompt version", {
+        promptSlug: promptResource.id,
+        version: nextVersion,
+        labels,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        logger.warn("Prompt version already exists", { prompt: promptResource.id });
+      } else {
+        logger.error("Error creating prompt version", {
+          error: error instanceof Error ? error.message : String(error),
+          prompt: promptResource.id,
+        });
+      }
+    }
+  }
+}

@@ -1,0 +1,200 @@
+import { z } from "zod";
+import { RuntimeEnvironmentType } from "@trigger.dev/database";
+import type { MinimalAuthenticatedEnvironment } from "../shared/index.js";
+
+/**
+ * A gate is another declared queue this run must also hold a concurrency slot in
+ * while it executes. The run waits in its own queue; each gate contributes an
+ * extra admit condition (the gate queue's per-key limit, and its total limit when
+ * the entry is keyed) and an extra slot held until release. `queue` is the bare
+ * queue name; the org/project/env scope comes from the run's own payload.
+ */
+export const QueueGate = z.object({
+  queue: z.string().min(1).max(128),
+  concurrencyKey: z.string().min(1).max(128).optional(),
+});
+export type QueueGate = z.infer<typeof QueueGate>;
+
+export const InputPayload = z.object({
+  runId: z.string(),
+  /** Deprecated: not read on the V2 dequeue path; will stop being written in a follow-up. Optional to keep new readers compatible with old payloads that still include it, and vice versa. */
+  taskIdentifier: z.string().optional(),
+  orgId: z.string(),
+  projectId: z.string(),
+  environmentId: z.string(),
+  environmentType: z.nativeEnum(RuntimeEnvironmentType),
+  queue: z.string(),
+  concurrencyKey: z.string().optional(),
+  timestamp: z.number(),
+  // Unix ms the run became eligible (delayUntil if set, else triggered-at), pre-priority.
+  // Dequeue scheduling delay = dequeueTime - eligibleAtMs. Optional for old-payload compat.
+  eligibleAtMs: z.number().optional(),
+  attempt: z.number(),
+  /** TTL expiration timestamp (unix ms). If set, run will be expired when this time is reached. */
+  ttlExpiresAt: z.number().optional(),
+  // Server-owned birth evidence for TTL jobs. Never copied to a worker/API response.
+  snapshotRoute: z.unknown().optional(),
+  /** Additional queues this run must also hold a slot in while executing. At most
+   * four: three requested gates plus the task's anonymous inline-limit gate. */
+  gates: QueueGate.array().max(4).optional(),
+});
+export type InputPayload = z.infer<typeof InputPayload>;
+
+export const OutputPayloadV1 = InputPayload.extend({
+  version: z.literal("1"),
+  masterQueues: z.string().array(),
+});
+export type OutputPayloadV1 = z.infer<typeof OutputPayloadV1>;
+
+export const OutputPayloadV2 = InputPayload.extend({
+  version: z.literal("2"),
+  workerQueue: z.string(),
+});
+export type OutputPayloadV2 = z.infer<typeof OutputPayloadV2>;
+
+export const OutputPayload = z.compile(
+  z.discriminatedUnion("version", [OutputPayloadV1, OutputPayloadV2])
+);
+
+export type OutputPayload = z.infer<typeof OutputPayload>;
+
+export type QueueDescriptor = {
+  orgId: string;
+  projectId: string;
+  envId: string;
+  queue: string;
+  concurrencyKey: string | undefined;
+};
+
+export type WorkerQueueSelection = {
+  queue: string;
+  weight: number;
+};
+
+export type WorkerQueuePopOptions = {
+  blockingPop?: boolean;
+  blockingPopTimeoutSeconds?: number;
+};
+
+export type EnvDescriptor = {
+  orgId: string;
+  projectId: string;
+  envId: string;
+};
+
+export type RunQueueKeyProducerEnvironment = Omit<
+  MinimalAuthenticatedEnvironment,
+  "maximumConcurrencyLimit" | "concurrencyLimitBurstFactor"
+>;
+
+export interface RunQueueKeyProducer {
+  //queue
+  queueKey(
+    orgId: string,
+    projId: string,
+    envId: string,
+    queue: string,
+    concurrencyKey?: string
+  ): string;
+  queueKey(env: RunQueueKeyProducerEnvironment, queue: string, concurrencyKey?: string): string;
+
+  legacyMasterQueueKey(masterQueueName: string): string;
+
+  masterQueueKeyForEnvironment(envId: string, shardCount: number): string;
+  masterQueueKeyForShard(shard: number): string;
+  masterQueueShardForEnvironment(envId: string, shardCount: number): number;
+  workerQueueKey(workerQueue: string): string;
+
+  envQueueKey(env: RunQueueKeyProducerEnvironment): string;
+  envQueueKeyFromQueue(queue: string): string;
+  queueConcurrencyLimitKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
+  queueConcurrencyLimitKeyFromQueue(queue: string): string;
+  queueCurrentConcurrencyKeyFromQueue(queue: string): string;
+  queueCurrentConcurrencyKey(
+    env: RunQueueKeyProducerEnvironment,
+    queue: string,
+    concurrencyKey?: string
+  ): string;
+  queueCurrentDequeuedKeyFromQueue(queue: string): string;
+  queueCurrentDequeuedKey(
+    env: RunQueueKeyProducerEnvironment,
+    queue: string,
+    concurrencyKey?: string
+  ): string;
+  queueGroupConcurrencyKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
+  queueGroupConcurrencyKeyFromQueue(queue: string): string;
+  queueTotalConcurrencyLimitKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
+  queueTotalConcurrencyLimitKeyFromQueue(queue: string): string;
+  queueConcurrencyKeyLimitKey(
+    env: RunQueueKeyProducerEnvironment,
+    queue: string,
+    concurrencyKey: string
+  ): string;
+  queueConcurrencyKeyLimitKeyFromQueue(queue: string): string;
+  gateQueuedCounterKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
+
+  //env oncurrency
+  envCurrentConcurrencyKey(env: EnvDescriptor): string;
+  envCurrentConcurrencyKey(env: RunQueueKeyProducerEnvironment): string;
+
+  envConcurrencyLimitKey(env: EnvDescriptor): string;
+  envConcurrencyLimitKey(env: RunQueueKeyProducerEnvironment): string;
+
+  envCurrentDequeuedKey(env: EnvDescriptor): string;
+  envCurrentDequeuedKey(env: RunQueueKeyProducerEnvironment): string;
+
+  envConcurrencyLimitBurstFactorKey(env: EnvDescriptor): string;
+  envConcurrencyLimitBurstFactorKey(env: RunQueueKeyProducerEnvironment): string;
+  envConcurrencyLimitBurstFactorKeyFromQueue(queue: string): string;
+
+  envConcurrencyLimitKeyFromQueue(queue: string): string;
+  envCurrentConcurrencyKeyFromQueue(queue: string): string;
+  envCurrentDequeuedKeyFromQueue(queue: string): string;
+
+  //message payload
+  messageKeyPrefixFromQueue(queue: string): string;
+  messageKey(orgId: string, messageId: string): string;
+  //utils
+  orgIdFromQueue(queue: string): string;
+  envIdFromQueue(queue: string): string;
+  projectIdFromQueue(queue: string): string;
+  descriptorFromQueue(queue: string): QueueDescriptor;
+
+  deadLetterQueueKey(env: RunQueueKeyProducerEnvironment): string;
+  deadLetterQueueKey(env: EnvDescriptor): string;
+  deadLetterQueueKeyFromQueue(queue: string): string;
+
+  // Concurrency sweeper methods
+  markedForAckKey(): string;
+  currentConcurrencySetKeyScanPattern(): string;
+
+  // TTL system methods
+  ttlQueueKeyForShard(shard: number): string;
+
+  // CK index methods
+  ckIndexKeyFromQueue(queue: string): string;
+  ckVtimeKeyFromQueue(queue: string): string;
+  ckVtimeFloorKeyFromQueue(queue: string): string;
+  ckVtimeIdleKeyFromQueue(queue: string): string;
+  baseQueueKeyFromQueue(queue: string): string;
+  isCkWildcard(queue: string): boolean;
+  toCkWildcard(queue: string): string;
+
+  // Per-base-queue counters for CK queues
+  queueLengthCounterKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
+  queueLengthCounterKeyFromQueue(queue: string): string;
+  queueRunningCounterKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
+  queueRunningCounterKeyFromQueue(queue: string): string;
+}
+
+export type EnvQueues = {
+  envId: string;
+  queues: string[];
+};
+
+export interface RunQueueSelectionStrategy {
+  distributeFairQueuesFromParentQueue(
+    parentQueue: string,
+    consumerId: string
+  ): Promise<Array<EnvQueues>>;
+}

@@ -1,0 +1,1603 @@
+import { createHmac, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
+import {
+  containerTestWithIsolatedRedis,
+  createStandalonePostgresContainer,
+} from "@internal/testcontainers";
+import { createRedisClient } from "@internal/redis";
+import { type Prisma, PrismaClient } from "@trigger.dev/database";
+import type { RedisOptions } from "@internal/redis";
+import type { Meter } from "@internal/tracing";
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from "@opentelemetry/sdk-metrics";
+import { WebhookDeliveryId, WebhookEndpointId } from "@trigger.dev/core/v3/isomorphic";
+import { expect } from "vitest";
+import { WebhookEngine } from "./index.js";
+import { parseFilter } from "./filter/index.js";
+import type {
+  DeliverWebhookToSessionCallback,
+  DeliverWebhookToSessionParams,
+  TriggerWebhookTaskCallback,
+  TriggerWebhookTaskParams,
+} from "./types.js";
+
+// End-to-end ingest -> deliver over a real Postgres + Redis: the de-risking test for the atomic
+// front gate (happy path, concurrent dedup, crash recovery) and the Run-Engine idempotencyKey wiring.
+
+const SECRET = "whsec_integration_secret";
+const SECRET_KEY = "secretref_integration";
+
+const VERIFIER_CONFIG = {
+  scheme: "hmac",
+  algorithm: "sha256",
+  encoding: "hex",
+  signatureHeader: "stripe-signature",
+  signature: { itemSeparator: ",", fieldSeparator: "=", field: "v1" },
+  timestamp: { source: { from: "signatureField", field: "t" }, toleranceSeconds: 300 },
+  signingString: { template: "{timestamp}.{body}" },
+  idempotencyField: { from: "body", name: "id" },
+} as const;
+
+// Live clock so the 300s tolerance passes (the engine calls verify() without an injected clock).
+function signedInput(eventId: string, opaqueId: string, type = "payment_intent.succeeded") {
+  const body = JSON.stringify({ id: eventId, type });
+  const t = Math.floor(Date.now() / 1000);
+  const sig = createHmac("sha256", SECRET).update(`${t}.${body}`).digest("hex");
+  return {
+    opaqueId,
+    rawBytes: new TextEncoder().encode(body),
+    headers: { "stripe-signature": `t=${t},v1=${sig}` },
+    url: `https://api.example.com/webhooks/v1/ingest/${opaqueId}`,
+  };
+}
+
+async function createEndpoint(prisma: PrismaClient, over?: { filter?: string }) {
+  return prisma.webhookEndpoint.create({
+    data: {
+      friendlyId: WebhookEndpointId.generate().friendlyId,
+      opaqueId: `op_${randomBytes(12).toString("hex")}`,
+      organizationId: "org_test",
+      projectId: "proj_test",
+      runtimeEnvironmentId: "env_test",
+      environmentType: "PRODUCTION",
+      source: "stripe",
+      declaredId: "handle-stripe-webhook",
+      routingTargets: [
+        {
+          type: "task",
+          id: "handle-stripe-task",
+          taskId: "handle-stripe-task",
+          ...(over?.filter
+            ? {
+                filter: over.filter,
+                filterAst: parseFilter(over.filter) as unknown as Prisma.InputJsonValue,
+                filterAstVersion: 1,
+              }
+            : {}),
+        },
+      ],
+      verifierArtifact: { kind: "config", config: VERIFIER_CONFIG },
+      signingSecretKey: SECRET_KEY,
+      status: "ACTIVE",
+    },
+  });
+}
+
+// Models Run-Engine idempotency: same idempotencyKey -> same run, so distinct runs = runsByKey.size.
+function makeTriggerTaskStub() {
+  const calls: TriggerWebhookTaskParams[] = [];
+  const runsByKey = new Map<string, string>();
+  let runCounter = 0;
+  const triggerTask: TriggerWebhookTaskCallback = async (params) => {
+    calls.push(params);
+    let runId = runsByKey.get(params.idempotencyKey);
+    if (!runId) {
+      runId = `run_${++runCounter}`;
+      runsByKey.set(params.idempotencyKey, runId);
+    }
+    return { success: true, runId };
+  };
+  return { triggerTask, calls, runsByKey };
+}
+
+// Session-routing endpoint: routes to a find-or-created session (keyTemplate -> externalId) instead
+// of a task. The stub stands in for the webapp's deliverToSession port (find-or-create + append).
+async function createSessionEndpoint(
+  prisma: PrismaClient,
+  keyTemplate: string,
+  startOn?: string,
+  targetId = "agent-x:orders"
+) {
+  return prisma.webhookEndpoint.create({
+    data: {
+      friendlyId: WebhookEndpointId.generate().friendlyId,
+      opaqueId: `op_${randomBytes(12).toString("hex")}`,
+      organizationId: "org_test",
+      projectId: "proj_test",
+      runtimeEnvironmentId: "env_test",
+      environmentType: "PRODUCTION",
+      source: "stripe",
+      declaredId: targetId,
+      routingTargets: [
+        {
+          type: "session",
+          id: targetId,
+          taskIdentifier: "agent-x",
+          keyTemplate,
+          actionType: "order.event",
+          deliverAs: "action",
+          ...(startOn ? { startOn } : {}),
+        },
+      ],
+      verifierArtifact: { kind: "config", config: VERIFIER_CONFIG },
+      signingSecretKey: SECRET_KEY,
+      status: "ACTIVE",
+    },
+  });
+}
+
+function makeDeliverToSessionStub() {
+  const calls: DeliverWebhookToSessionParams[] = [];
+  const runsByExternalId = new Map<string, string>();
+  let runCounter = 0;
+  const deliverToSession: DeliverWebhookToSessionCallback = async (params) => {
+    calls.push(params);
+    let runId = runsByExternalId.get(params.externalId);
+    if (!runId) {
+      runId = `srun_${++runCounter}`;
+      runsByExternalId.set(params.externalId, runId);
+    }
+    return { success: true, runId };
+  };
+  return { deliverToSession, calls, runsByExternalId };
+}
+
+function buildEngine(
+  prisma: PrismaClient,
+  redisOptions: RedisOptions,
+  triggerTask: TriggerWebhookTaskCallback,
+  over?: {
+    workerDisabled?: boolean;
+    endpointCacheTtlMs?: number;
+    resolveSigningSecret?: (key: string) => Promise<string | undefined>;
+    resolveVerifyToken?: (endpointId: string) => Promise<string | undefined>;
+    deliverToSession?: DeliverWebhookToSessionCallback;
+    meter?: Meter;
+    retentionDays?: (environmentId: string) => Promise<number>;
+  }
+) {
+  return new WebhookEngine({
+    meter: over?.meter,
+    resolveVerifyToken: over?.resolveVerifyToken,
+    prisma,
+    redis: redisOptions,
+    worker: {
+      concurrency: 1,
+      pollIntervalMs: 50,
+      disabled: over?.workerDisabled,
+      retryBaseDelayMs: 20,
+    },
+    endpointCache:
+      over?.endpointCacheTtlMs !== undefined ? { ttlMs: over.endpointCacheTtlMs } : undefined,
+    triggerTask,
+    deliverToSession: over?.deliverToSession,
+    retention: over?.retentionDays ? { forEnvironment: over.retentionDays } : undefined,
+    resolveSigningSecret:
+      over?.resolveSigningSecret ?? (async (key) => (key === SECRET_KEY ? SECRET : undefined)),
+    logLevel: "error",
+  });
+}
+
+async function waitFor(fn: () => Promise<boolean>, timeoutMs = 10_000, intervalMs = 50) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await fn()) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+}
+
+/** The delivery row, once its deliver job has written it. Ingest only queues the job. */
+async function deliveryRow(prisma: PrismaClient, id: string, timeoutMs = 10_000) {
+  let row: Awaited<ReturnType<PrismaClient["webhookDelivery"]["findFirst"]>> = null;
+  await waitFor(async () => {
+    row = await prisma.webhookDelivery.findFirst({ where: { id } });
+    return row !== null;
+  }, timeoutMs);
+  return row!;
+}
+
+containerTestWithIsolatedRedis(
+  "a delivery is stamped with its org's retention class, rounded up, in its row and its id",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask } = makeTriggerTaskStub();
+    const lookups: string[] = [];
+    let days = 7;
+    const engine = buildEngine(prisma, redisOptions, triggerTask, {
+      retentionDays: async (environmentId) => {
+        lookups.push(environmentId);
+        if (days < 0) throw new Error("limits unavailable");
+        return days;
+      },
+    });
+
+    try {
+      const stamped = async (eventId: string) => {
+        const result = await engine.ingest(signedInput(eventId, endpoint.opaqueId));
+        if (result.outcome !== "accepted") throw new Error(result.outcome);
+        const row = await deliveryRow(prisma, result.deliveryId);
+        expect(WebhookDeliveryId.parseRetentionDays(result.deliveryFriendlyId)).toBe(
+          row.retentionDays
+        );
+        return row.retentionDays;
+      };
+
+      expect(await stamped("evt_retention_7")).toBe(7);
+      days = 60;
+      expect(await stamped("evt_retention_60")).toBe(90);
+      days = -1;
+      expect(await stamped("evt_retention_failed")).toBe(30);
+      expect(lookups).toEqual([
+        endpoint.runtimeEnvironmentId,
+        endpoint.runtimeEnvironmentId,
+        endpoint.runtimeEnvironmentId,
+      ]);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "ingest -> deliver routes a verified event to exactly one run",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls, runsByKey } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const eventId = "evt_happy_1";
+      const result = await engine.ingest(signedInput(eventId, endpoint.opaqueId));
+
+      expect(result.outcome).toBe("accepted");
+      if (result.outcome !== "accepted") return;
+      const deliveryId = result.deliveryId;
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      const delivery = await prisma.webhookDelivery.findFirst({ where: { id: deliveryId } });
+      expect(delivery?.runId).toBe("run_1");
+      expect(delivery?.externalDeliveryId).toBe(eventId);
+
+      expect(calls).toHaveLength(1);
+      expect(runsByKey.size).toBe(1);
+      expect(calls[0].taskId).toBe("handle-stripe-task");
+      expect(calls[0].idempotencyKey).toBe(`${endpoint.id}:${eventId}`);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "ingest -> deliver routes the full event when it exceeds the dashboard snapshot cap",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const eventId = "evt_large_1";
+      const blob = "x".repeat(64 * 1024);
+      const body = JSON.stringify({ id: eventId, type: "payment_intent.succeeded", blob });
+      const t = Math.floor(Date.now() / 1000);
+      const sig = createHmac("sha256", SECRET).update(`${t}.${body}`).digest("hex");
+
+      const result = await engine.ingest({
+        opaqueId: endpoint.opaqueId,
+        rawBytes: new TextEncoder().encode(body),
+        headers: { "stripe-signature": `t=${t},v1=${sig}` },
+        url: `https://api.example.com/webhooks/v1/ingest/${endpoint.opaqueId}`,
+      });
+
+      expect(result.outcome).toBe("accepted");
+      if (result.outcome !== "accepted") return;
+      const deliveryId = result.deliveryId;
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].payload).toEqual({ id: eventId, type: "payment_intent.succeeded", blob });
+
+      const delivery = await prisma.webhookDelivery.findFirst({ where: { id: deliveryId } });
+      const stored = delivery?.parsedEvent as { blob?: string; truncated?: boolean } | null;
+      expect(stored?.blob).toBe(blob);
+      expect(stored?.truncated).toBeUndefined();
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+// Two-database mode: point the engine at a SEPARATE Postgres (the future data-plane DB) with the
+// fixture's `prisma` as the main DB, and prove webhook writes land only on the injected client (a
+// leaked query onto the main client would show up as a row there). Runtime backstop to the types.
+containerTestWithIsolatedRedis(
+  "two-database mode: webhook writes land on the injected client's DB, never the main DB",
+  async ({ prisma, redisOptions }) => {
+    const { container: webhookContainer, url: webhookUrl } =
+      await createStandalonePostgresContainer();
+    const webhookDb = new PrismaClient({ datasources: { db: { url: webhookUrl } } });
+    const { triggerTask } = makeTriggerTaskStub();
+    const engine = buildEngine(webhookDb, redisOptions, triggerTask);
+
+    try {
+      // The endpoint lives on the webhook DB; the engine reads it from its own client.
+      const endpoint = await createEndpoint(webhookDb);
+
+      const eventId = "evt_two_db_1";
+      const result = await engine.ingest(signedInput(eventId, endpoint.opaqueId));
+      expect(result.outcome).toBe("accepted");
+      if (result.outcome !== "accepted") return;
+
+      await waitFor(async () => {
+        const d = await webhookDb.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      // The delivery + endpoint are on the webhook DB...
+      expect(await webhookDb.webhookDelivery.count()).toBe(1);
+      expect(await webhookDb.webhookEndpoint.count()).toBe(1);
+
+      // ...and nothing leaked onto the main DB.
+      expect(await prisma.webhookDelivery.count()).toBe(0);
+      expect(await prisma.webhookEndpoint.count()).toBe(0);
+    } finally {
+      await engine.quit();
+      await webhookDb.$disconnect();
+      await webhookContainer.stop();
+    }
+  },
+  120_000
+);
+
+containerTestWithIsolatedRedis(
+  "a provider handshake (url_verification) echoes the challenge and records no delivery",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await prisma.webhookEndpoint.create({
+      data: {
+        friendlyId: WebhookEndpointId.generate().friendlyId,
+        opaqueId: `op_${randomBytes(12).toString("hex")}`,
+        organizationId: "org_test",
+        projectId: "proj_test",
+        runtimeEnvironmentId: "env_test",
+        environmentType: "PRODUCTION",
+        source: "slack",
+        declaredId: "handle-slack-channel",
+        routingTargets: [{ type: "task", id: "unused", taskId: "unused" }],
+        verifierArtifact: {
+          kind: "config",
+          config: VERIFIER_CONFIG,
+          handshake: {
+            matchPath: "type",
+            matchValue: "url_verification",
+            respondPath: "challenge",
+          },
+        },
+        signingSecretKey: SECRET_KEY,
+        status: "ACTIVE",
+      },
+    });
+    const { triggerTask } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const body = JSON.stringify({ type: "url_verification", challenge: "chal_xyz" });
+      const t = Math.floor(Date.now() / 1000);
+      const sig = createHmac("sha256", SECRET).update(`${t}.${body}`).digest("hex");
+      const result = await engine.ingest({
+        opaqueId: endpoint.opaqueId,
+        rawBytes: new TextEncoder().encode(body),
+        headers: { "stripe-signature": `t=${t},v1=${sig}` },
+        url: `https://api.example.com/webhooks/v1/ingest/${endpoint.opaqueId}`,
+      });
+
+      expect(result.outcome).toBe("handshake");
+      if (result.outcome === "handshake") {
+        expect(result.body).toBe("chal_xyz");
+        expect(result.status).toBe(200);
+      }
+
+      const count = await prisma.webhookDelivery.count({
+        where: { webhookEndpointId: endpoint.id },
+      });
+      expect(count).toBe(0);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "an Ed25519 PING handshake answers 204 with no body, events carry the declared 204/401 contract",
+  async ({ prisma, redisOptions }) => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const der = publicKey.export({ type: "spki", format: "der" });
+    const rawPublicKeyHex = Buffer.from(der.subarray(der.length - 32)).toString("hex");
+    const endpoint = await prisma.webhookEndpoint.create({
+      data: {
+        friendlyId: WebhookEndpointId.generate().friendlyId,
+        opaqueId: `op_${randomBytes(12).toString("hex")}`,
+        organizationId: "org_test",
+        projectId: "proj_test",
+        runtimeEnvironmentId: "env_test",
+        environmentType: "PRODUCTION",
+        source: "discord",
+        declaredId: "handle-discord",
+        routingTargets: [
+          { type: "task", id: "handle-discord-task", taskId: "handle-discord-task" },
+        ],
+        verifierArtifact: {
+          kind: "preset",
+          preset: "discord",
+          config: {
+            scheme: "asymmetric",
+            algorithm: "ed25519",
+            encoding: "hex",
+            signatureHeader: "x-signature-ed25519",
+            signature: {},
+            timestamp: { source: { from: "header", name: "x-signature-timestamp" } },
+            signingString: { template: "{timestamp}{body}" },
+            publicKeyEncoding: "raw-hex",
+          },
+          handshake: { matchPath: "type", matchValue: "0", respondStatus: 204 },
+          response: { acceptedStatus: 204, rejectedStatus: 401 },
+        },
+        signingSecretKey: SECRET_KEY,
+        status: "ACTIVE",
+      },
+    });
+    const { triggerTask } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, {
+      resolveSigningSecret: async (key) => (key === SECRET_KEY ? rawPublicKeyHex : undefined),
+    });
+    const send = (body: string, tamper = false) => {
+      const ts = String(Math.floor(Date.now() / 1000));
+      const sig = cryptoSign(null, Buffer.from(`${ts}${body}`), privateKey).toString("hex");
+      return engine.ingest({
+        opaqueId: endpoint.opaqueId,
+        rawBytes: new TextEncoder().encode(body),
+        headers: {
+          "x-signature-ed25519": tamper ? sig.replace(/^../, "00") : sig,
+          "x-signature-timestamp": ts,
+        },
+        url: `https://api.example.com/webhooks/v1/ingest/${endpoint.opaqueId}`,
+      });
+    };
+
+    try {
+      const ping = await send(JSON.stringify({ version: 1, application_id: "app_1", type: 0 }));
+      expect(ping).toMatchObject({ outcome: "handshake", status: 204, body: "" });
+      expect(
+        await prisma.webhookDelivery.count({ where: { webhookEndpointId: endpoint.id } })
+      ).toBe(0);
+
+      const event = await send(
+        JSON.stringify({
+          version: 1,
+          application_id: "app_1",
+          type: 1,
+          event: { type: "APPLICATION_AUTHORIZED", timestamp: "2026-09-14T00:00:00Z", data: {} },
+        })
+      );
+      expect(event.outcome).toBe("accepted");
+      if (event.outcome === "accepted") {
+        expect(event.response).toEqual({ acceptedStatus: 204, rejectedStatus: 401 });
+        await deliveryRow(prisma, event.deliveryId);
+      }
+      expect(
+        await prisma.webhookDelivery.count({ where: { webhookEndpointId: endpoint.id } })
+      ).toBe(1);
+
+      const bad = await send(JSON.stringify({ version: 1, type: 0 }), true);
+      expect(bad.outcome).toBe("verification_failed");
+      if (bad.outcome === "verification_failed") {
+        expect(bad.response).toEqual({ acceptedStatus: 204, rejectedStatus: 401 });
+      }
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a GET verification echoes the challenge when the token matches the secret, and records nothing",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await prisma.webhookEndpoint.create({
+      data: {
+        friendlyId: WebhookEndpointId.generate().friendlyId,
+        opaqueId: `op_${randomBytes(12).toString("hex")}`,
+        organizationId: "org_test",
+        projectId: "proj_test",
+        runtimeEnvironmentId: "env_test",
+        environmentType: "PRODUCTION",
+        source: "whatsapp",
+        declaredId: "handle-whatsapp",
+        routingTargets: [{ type: "task", id: "unused", taskId: "unused" }],
+        verifierArtifact: {
+          kind: "config",
+          config: VERIFIER_CONFIG,
+          getHandshake: {
+            matchParam: "hub.mode",
+            matchValue: "subscribe",
+            tokenParam: "hub.verify_token",
+            challengeParam: "hub.challenge",
+          },
+        },
+        signingSecretKey: SECRET_KEY,
+        status: "ACTIVE",
+      },
+    });
+    const plain = await createEndpoint(prisma);
+    const { triggerTask } = makeTriggerTaskStub();
+    const VERIFY_TOKEN = "whvt_integration_verify_token";
+    const engine = buildEngine(prisma, redisOptions, triggerTask, {
+      resolveVerifyToken: async (endpointId) =>
+        endpointId === endpoint.id ? VERIFY_TOKEN : undefined,
+    });
+    const query = (over: Record<string, string> = {}) => ({
+      "hub.mode": "subscribe",
+      "hub.verify_token": VERIFY_TOKEN,
+      "hub.challenge": "1158201444",
+      ...over,
+    });
+
+    try {
+      expect(await engine.rejectUnsupportedMethod(endpoint.opaqueId)).toEqual({
+        outcome: "method_not_allowed",
+        allowedMethods: ["GET", "HEAD", "POST"],
+      });
+      expect(await engine.rejectUnsupportedMethod(plain.opaqueId)).toEqual({
+        outcome: "method_not_allowed",
+        allowedMethods: ["POST"],
+      });
+      expect(await engine.rejectUnsupportedMethod("op_nope")).toEqual({
+        outcome: "endpoint_not_found",
+      });
+
+      const ok = await engine.verifyGetHandshake({ opaqueId: endpoint.opaqueId, query: query() });
+      expect(ok).toMatchObject({ outcome: "handshake", status: 200, body: "1158201444" });
+
+      const badToken = await engine.verifyGetHandshake({
+        opaqueId: endpoint.opaqueId,
+        query: query({ "hub.verify_token": "guess" }),
+      });
+      expect(badToken.outcome).toBe("verification_failed");
+
+      const signingSecretIsNotAToken = await engine.verifyGetHandshake({
+        opaqueId: endpoint.opaqueId,
+        query: query({ "hub.verify_token": SECRET }),
+      });
+      expect(signingSecretIsNotAToken.outcome).toBe("verification_failed");
+
+      const noTokenEngine = buildEngine(prisma, redisOptions, triggerTask);
+      try {
+        const unset = await noTokenEngine.verifyGetHandshake({
+          opaqueId: endpoint.opaqueId,
+          query: query(),
+        });
+        expect(unset).toMatchObject({
+          outcome: "verification_failed",
+          error: "verify token not set",
+        });
+      } finally {
+        await noTokenEngine.quit();
+      }
+
+      const badMode = await engine.verifyGetHandshake({
+        opaqueId: endpoint.opaqueId,
+        query: query({ "hub.mode": "unsubscribe" }),
+      });
+      expect(badMode.outcome).toBe("verification_failed");
+
+      const noHandshake = await engine.verifyGetHandshake({
+        opaqueId: plain.opaqueId,
+        query: query(),
+      });
+      expect(noHandshake.outcome).toBe("method_not_allowed");
+
+      const noSigningSecret = await prisma.webhookEndpoint.create({
+        data: {
+          friendlyId: WebhookEndpointId.generate().friendlyId,
+          opaqueId: `op_${randomBytes(12).toString("hex")}`,
+          organizationId: "org_test",
+          projectId: "proj_test",
+          runtimeEnvironmentId: "env_test",
+          environmentType: "PRODUCTION",
+          source: "whatsapp",
+          declaredId: "handle-whatsapp-fresh",
+          routingTargets: [{ type: "task", id: "unused", taskId: "unused" }],
+          verifierArtifact: {
+            kind: "config",
+            config: VERIFIER_CONFIG,
+            getHandshake: { tokenParam: "hub.verify_token", challengeParam: "hub.challenge" },
+          },
+          signingSecretKey: null,
+          status: "ACTIVE",
+        },
+      });
+      expect(await engine.rejectUnsupportedMethod(noSigningSecret.opaqueId)).toEqual({
+        outcome: "method_not_allowed",
+        allowedMethods: ["GET", "HEAD", "POST"],
+      });
+      await prisma.webhookEndpoint.update({
+        where: { id: plain.id },
+        data: { status: "INACTIVE" },
+      });
+      expect(await engine.rejectUnsupportedMethod(plain.opaqueId)).toEqual({
+        outcome: "endpoint_inactive",
+      });
+
+      const freshEngine = buildEngine(prisma, redisOptions, triggerTask, {
+        resolveVerifyToken: async (endpointId) =>
+          endpointId === noSigningSecret.id ? VERIFY_TOKEN : undefined,
+      });
+      try {
+        const beforeSecret = await freshEngine.verifyGetHandshake({
+          opaqueId: noSigningSecret.opaqueId,
+          query: query(),
+        });
+        expect(beforeSecret).toMatchObject({
+          outcome: "handshake",
+          status: 200,
+          body: "1158201444",
+        });
+      } finally {
+        await freshEngine.quit();
+      }
+
+      const unknown = await engine.verifyGetHandshake({ opaqueId: "op_nope", query: query() });
+      expect(unknown.outcome).toBe("endpoint_not_found");
+
+      await prisma.webhookEndpoint.update({
+        where: { id: plain.id },
+        data: { status: "ACTIVE", verifierArtifact: { kind: "invalid" } },
+      });
+      expect(await engine.rejectUnsupportedMethod(plain.opaqueId)).toEqual({
+        outcome: "method_not_allowed",
+        allowedMethods: ["POST"],
+      });
+      expect(await engine.verifyGetHandshake({ opaqueId: plain.opaqueId, query: query() })).toEqual(
+        {
+          outcome: "verification_failed",
+          error: "corrupt verifier artifact",
+        }
+      );
+
+      expect(
+        await prisma.webhookDelivery.count({
+          where: { webhookEndpointId: { in: [endpoint.id, plain.id] } },
+        })
+      ).toBe(0);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "concurrent duplicate deliveries collapse to one delivery row and one run",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls, runsByKey } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const eventId = "evt_dupe_1";
+      const input = signedInput(eventId, endpoint.opaqueId);
+
+      const [a, b] = await Promise.all([engine.ingest(input), engine.ingest(input)]);
+
+      // The atomic SET NX claim guarantees exactly one accepted and one duplicate.
+      expect([a.outcome, b.outcome].sort()).toEqual(["accepted", "duplicate"]);
+
+      const accepted = (a.outcome === "accepted" ? a : b) as Extract<
+        typeof a,
+        { outcome: "accepted" }
+      >;
+      const duplicate = (a.outcome === "duplicate" ? a : b) as Extract<
+        typeof a,
+        { outcome: "duplicate" }
+      >;
+      expect(duplicate.deliveryId).toBe(accepted.deliveryFriendlyId);
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: accepted.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      const rows = await prisma.webhookDelivery.findMany({
+        where: { webhookEndpointId: endpoint.id },
+      });
+      expect(rows).toHaveLength(1);
+
+      expect(calls).toHaveLength(1);
+      expect(runsByKey.size).toBe(1);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "stores curated, size-bounded headers (drops credentials and oversized headers)",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const input = signedInput("evt_headers_1", endpoint.opaqueId);
+      input.headers["authorization"] = "Bearer super-secret";
+      input.headers["cookie"] = "session=abc";
+      input.headers["x-custom"] = "keep-me";
+      input.headers["x-huge"] = "z".repeat(8 * 1024);
+
+      const result = await engine.ingest(input);
+      expect(result.outcome).toBe("accepted");
+      if (result.outcome !== "accepted") return;
+
+      const delivery = await deliveryRow(prisma, result.deliveryId);
+      const stored = delivery.headers as Record<string, string>;
+
+      expect(stored["authorization"]).toBeUndefined();
+      expect(stored["cookie"]).toBeUndefined();
+      expect(stored["x-huge"]).toBeUndefined();
+      expect(stored["x-custom"]).toBe("keep-me");
+      expect(stored["stripe-signature"]).toBeDefined();
+      expect(JSON.stringify(stored).length).toBeLessThanOrEqual(4 * 1024 + 256);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "caches the endpoint + secret across ingests and re-reads after the TTL",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask } = makeTriggerTaskStub();
+    let secretReads = 0;
+    const engine = buildEngine(prisma, redisOptions, triggerTask, {
+      endpointCacheTtlMs: 200,
+      resolveSigningSecret: async (key) => {
+        secretReads++;
+        return key === SECRET_KEY ? SECRET : undefined;
+      },
+    });
+
+    try {
+      expect((await engine.ingest(signedInput("evt_cache_1", endpoint.opaqueId))).outcome).toBe(
+        "accepted"
+      );
+      expect((await engine.ingest(signedInput("evt_cache_2", endpoint.opaqueId))).outcome).toBe(
+        "accepted"
+      );
+      // Second ingest hit the cache, so the secret was resolved only once.
+      expect(secretReads).toBe(1);
+
+      // After the TTL the entry expires and the next ingest re-resolves.
+      await new Promise((r) => setTimeout(r, 250));
+      expect((await engine.ingest(signedInput("evt_cache_3", endpoint.opaqueId))).outcome).toBe(
+        "accepted"
+      );
+      expect(secretReads).toBe(2);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a retry that finds its delivery claimed but never queued queues it under the same id",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+    const gate = createRedisClient(redisOptions);
+
+    try {
+      const eventId = "evt_crash_1";
+      const input = signedInput(eventId, endpoint.opaqueId);
+      const gateKey = `webhookdedupe:{${endpoint.id}}:${eventId}`;
+      const claimed = WebhookDeliveryId.generate({ retentionDays: 30 });
+
+      // The first attempt claimed the key and died before queueing its job: no row, no job.
+      await gate.set(gateKey, `c:${claimed.friendlyId}`, "EX", 3600, "NX");
+
+      const retry = await engine.ingest(input);
+      expect(retry).toMatchObject({ outcome: "duplicate", deliveryId: claimed.friendlyId });
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: claimed.id } });
+        return d?.status === "SUCCEEDED";
+      });
+      expect(await gate.get(gateKey)).toBe(`p:${claimed.friendlyId}`);
+      expect(await gate.ttl(gateKey)).toBeGreaterThan(3000);
+
+      // Once promoted, a further retry is a plain duplicate: no second delivery, no second run.
+      expect(await engine.ingest(input)).toMatchObject({
+        outcome: "duplicate",
+        deliveryId: claimed.friendlyId,
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(
+        await prisma.webhookDelivery.count({ where: { webhookEndpointId: endpoint.id } })
+      ).toBe(1);
+      expect(calls).toHaveLength(1);
+    } finally {
+      await gate.quit();
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a retry while the first attempt's job is already queued or ran makes no second delivery",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+    const gate = createRedisClient(redisOptions);
+
+    try {
+      const eventId = "evt_crash_after_enqueue";
+      const input = signedInput(eventId, endpoint.opaqueId);
+      const gateKey = `webhookdedupe:{${endpoint.id}}:${eventId}`;
+
+      const first = await engine.ingest(input);
+      if (first.outcome !== "accepted") throw new Error(first.outcome);
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: first.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      // As if the first attempt died between queueing its job and promoting the gate.
+      await gate.set(gateKey, `c:${first.deliveryFriendlyId}`, "KEEPTTL", "XX");
+
+      expect(await engine.ingest(input)).toMatchObject({
+        outcome: "duplicate",
+        deliveryId: first.deliveryFriendlyId,
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      const rows = await prisma.webhookDelivery.findMany({
+        where: { webhookEndpointId: endpoint.id },
+      });
+      expect(rows.map((row) => row.status)).toEqual(["SUCCEEDED"]);
+      expect(calls).toHaveLength(1);
+    } finally {
+      await gate.quit();
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "filter gate: a non-matching event is recorded FILTERED and not routed; a match is routed",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma, {
+      filter: "event.type == 'payment_intent.succeeded'",
+    });
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      // Matching event -> routed to a run as usual.
+      const match = await engine.ingest(signedInput("evt_match", endpoint.opaqueId));
+      expect(match.outcome).toBe("accepted");
+      if (match.outcome !== "accepted") return;
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: match.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+      expect(calls).toHaveLength(1);
+
+      // Non-matching event -> still received (200 + row), recorded FILTERED, never routed.
+      const filtered = await engine.ingest(
+        signedInput("evt_nomatch", endpoint.opaqueId, "payment_intent.failed")
+      );
+      expect(filtered.outcome).toBe("accepted");
+      if (filtered.outcome !== "accepted") return;
+
+      const row = await deliveryRow(prisma, filtered.deliveryId);
+      expect(row.status).toBe("FILTERED");
+      expect(row.runId).toBeNull();
+      expect(row.filterReason).toContain("event.type");
+
+      // The deliver worker must never pick it up: no new triggerTask call after a beat.
+      await new Promise((r) => setTimeout(r, 300));
+      expect(calls).toHaveLength(1);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "session routing resolves the key and delivers to the session port",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createSessionEndpoint(prisma, "{body.id}");
+    const { triggerTask } = makeTriggerTaskStub();
+    const { deliverToSession, calls } = makeDeliverToSessionStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, { deliverToSession });
+
+    try {
+      const eventId = "evt_sess_1";
+      const result = await engine.ingest(signedInput(eventId, endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.externalId).toBe(eventId); // {body.id} -> event id
+      expect(calls[0]?.taskIdentifier).toBe("agent-x");
+      expect(calls[0]?.actionType).toBe("order.event");
+      expect((calls[0]!.event as { id: string }).id).toBe(eventId);
+      const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(calls[0]?.deliveryId).toBe(d?.friendlyId);
+      expect(calls[0]?.deliveryId).toMatch(/^whd_/);
+      expect(calls[0]?.externalDeliveryId).toBe(eventId);
+      expect(d?.runId).toBe("srun_1"); // the session's run, from the port
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a form-encoded body routes as the decoded form to a filtered task and a session keyed on its fields",
+  async ({ prisma, redisOptions }) => {
+    const filter = "event.command == '/miphy'";
+    const endpoint = await prisma.webhookEndpoint.create({
+      data: {
+        friendlyId: WebhookEndpointId.generate().friendlyId,
+        opaqueId: `op_${randomBytes(12).toString("hex")}`,
+        organizationId: "org_test",
+        projectId: "proj_test",
+        runtimeEnvironmentId: "env_test",
+        environmentType: "PRODUCTION",
+        source: "slack",
+        declaredId: "slack-commands",
+        routingTargets: [
+          {
+            type: "task",
+            id: "miphy-command",
+            taskId: "miphy-command",
+            filter,
+            filterAst: parseFilter(filter) as unknown as Prisma.InputJsonValue,
+            filterAstVersion: 1,
+          },
+          {
+            type: "task",
+            id: "other-command",
+            taskId: "other-command",
+            filter: "event.command == '/other'",
+            filterAst: parseFilter("event.command == '/other'") as unknown as Prisma.InputJsonValue,
+            filterAstVersion: 1,
+          },
+          {
+            type: "session",
+            id: "agent-x:commands",
+            taskIdentifier: "agent-x",
+            keyTemplate: "{body.channel_id}:{body.user_id}",
+            actionType: "slash.command",
+            deliverAs: "action",
+          },
+        ],
+        verifierArtifact: { kind: "config", config: VERIFIER_CONFIG },
+        signingSecretKey: SECRET_KEY,
+        status: "ACTIVE",
+      },
+    });
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const sessions = makeDeliverToSessionStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, {
+      deliverToSession: sessions.deliverToSession,
+    });
+
+    try {
+      const body =
+        "team_id=T1&channel_id=C1&user_id=U1&command=%2Fmiphy&text=a+raccoon+dancing&trigger_id=13.4";
+      const t = Math.floor(Date.now() / 1000);
+      const sig = createHmac("sha256", SECRET).update(`${t}.${body}`).digest("hex");
+      const result = await engine.ingest({
+        opaqueId: endpoint.opaqueId,
+        rawBytes: new TextEncoder().encode(body),
+        headers: {
+          "stripe-signature": `t=${t},v1=${sig}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        url: `https://api.example.com/webhooks/v1/ingest/${endpoint.opaqueId}`,
+      });
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      const event = {
+        team_id: "T1",
+        channel_id: "C1",
+        user_id: "U1",
+        command: "/miphy",
+        text: "a raccoon dancing",
+        trigger_id: "13.4",
+      };
+      const delivery = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(delivery?.errorMessage).toBeNull();
+      expect(delivery?.parsedEvent).toEqual(event);
+      const targets = (delivery?.targets ?? []) as Array<{ id: string; status: string }>;
+      expect(targets.map((t) => [t.id, t.status])).toEqual([
+        ["miphy-command", "SUCCEEDED"],
+        ["other-command", "FILTERED"],
+        ["agent-x:commands", "SUCCEEDED"],
+      ]);
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.taskId).toBe("miphy-command");
+      expect(calls[0]?.payload).toEqual(event);
+      expect(sessions.calls).toHaveLength(1);
+      expect(sessions.calls[0]?.externalId).toBe("C1:U1");
+      expect(sessions.calls[0]?.event).toEqual(event);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "session delivery with an unresolvable key is FAILED and never calls the port",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createSessionEndpoint(prisma, "{body.customerId}"); // not in the body
+    const { triggerTask } = makeTriggerTaskStub();
+    const { deliverToSession, calls } = makeDeliverToSessionStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, { deliverToSession });
+
+    try {
+      const result = await engine.ingest(signedInput("evt_sess_nokey", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "FAILED";
+      });
+
+      expect(calls).toHaveLength(0);
+      const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(d?.errorMessage).toContain("key resolved empty: {event.customerId}");
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "startOn is evaluated and passed to the port as isSessionStart (default true when absent)",
+  async ({ prisma, redisOptions }) => {
+    const gated = await createSessionEndpoint(prisma, "{body.id}", "event.type == 'session.start'");
+    const open = await createSessionEndpoint(prisma, "{body.id}", undefined, "agent-y:orders"); // no startOn
+    const { triggerTask } = makeTriggerTaskStub();
+    const { deliverToSession, calls } = makeDeliverToSessionStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, { deliverToSession });
+
+    try {
+      const rStart = await engine.ingest(signedInput("evt_start", gated.opaqueId, "session.start"));
+      const rOther = await engine.ingest(signedInput("evt_other", gated.opaqueId, "message"));
+      const rOpen = await engine.ingest(signedInput("evt_open", open.opaqueId, "message"));
+      for (const r of [rStart, rOther, rOpen]) {
+        if (r.outcome !== "accepted") throw new Error(`expected accepted, got ${r.outcome}`);
+      }
+
+      await waitFor(async () => calls.length === 3);
+      const byId = (id: string) => calls.find((c) => (c.event as { id: string }).id === id);
+      expect(byId("evt_start")?.isSessionStart).toBe(true); // matches startOn
+      expect(byId("evt_other")?.isSessionStart).toBe(false); // does not match startOn
+      expect(byId("evt_open")?.isSessionStart).toBe(true); // no startOn -> default true
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a skipped session result is recorded FILTERED with the reason and no run",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createSessionEndpoint(
+      prisma,
+      "{body.id}",
+      "event.type == 'session.start'"
+    );
+    const { triggerTask } = makeTriggerTaskStub();
+    // Stand in for the webapp: resume-only (no session yet) + not a start event -> skipped.
+    const calls: DeliverWebhookToSessionParams[] = [];
+    const deliverToSession: DeliverWebhookToSessionCallback = async (params) => {
+      calls.push(params);
+      if (!params.isSessionStart) {
+        return {
+          success: true,
+          skipped: true,
+          skippedReason: "startOn: not a session-start event",
+        };
+      }
+      return { success: true, runId: "srun_start" };
+    };
+    const engine = buildEngine(prisma, redisOptions, triggerTask, { deliverToSession });
+
+    try {
+      const skip = await engine.ingest(signedInput("evt_skip", endpoint.opaqueId, "message"));
+      const start = await engine.ingest(signedInput("evt_go", endpoint.opaqueId, "session.start"));
+      if (skip.outcome !== "accepted" || start.outcome !== "accepted")
+        throw new Error("expected accepted");
+
+      await waitFor(async () => {
+        const a = await prisma.webhookDelivery.findFirst({ where: { id: skip.deliveryId } });
+        const b = await prisma.webhookDelivery.findFirst({ where: { id: start.deliveryId } });
+        return a?.status === "FILTERED" && b?.status === "SUCCEEDED";
+      });
+
+      const skipped = await prisma.webhookDelivery.findFirst({ where: { id: skip.deliveryId } });
+      expect(skipped?.status).toBe("FILTERED");
+      expect(skipped?.filterReason).toContain("startOn");
+      expect(skipped?.runId).toBeNull();
+
+      const started = await prisma.webhookDelivery.findFirst({ where: { id: start.deliveryId } });
+      expect(started?.runId).toBe("srun_start");
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "session delivery fails when the deliverToSession port is not configured",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createSessionEndpoint(prisma, "{body.id}");
+    const { triggerTask } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask); // no deliverToSession port
+
+    try {
+      const result = await engine.ingest(signedInput("evt_sess_noport", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "FAILED";
+      });
+
+      const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(d?.errorMessage).toContain("not configured");
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a delivery whose port keeps failing transiently is FAILED after max attempts (not stuck PENDING)",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    let calls = 0;
+    const triggerTask: TriggerWebhookTaskCallback = async () => {
+      calls++;
+      return { success: false, errorType: "SYSTEM_ERROR", error: "boom" };
+    };
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const result = await engine.ingest(signedInput("evt_exhaust", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      // 5 attempts with backoff (~1+2+4+8s), then the final attempt marks FAILED instead of PENDING.
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "FAILED";
+      }, 40_000);
+
+      const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(d?.status).toBe("FAILED");
+      expect(d?.errorMessage).toContain("boom");
+      expect(calls).toBe(5); // maxAttempts; not left retrying / stuck PENDING
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a delivery whose job throws on every attempt is FAILED, not left PENDING with no job",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    let armed = false;
+    const failing = new Proxy(prisma, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (prop !== "webhookEndpoint")
+          return typeof value === "function" ? value.bind(target) : value;
+        return new Proxy(value, {
+          get(delegate, method) {
+            const fn = Reflect.get(delegate, method);
+            if (method !== "findFirst") return typeof fn === "function" ? fn.bind(delegate) : fn;
+            return async (args: unknown) => {
+              if (armed) throw new Error("database unavailable");
+              return fn.call(delegate, args);
+            };
+          },
+        });
+      },
+    });
+    const engine = buildEngine(failing, redisOptions, triggerTask, { workerDisabled: true });
+    const worker = buildEngine(failing, redisOptions, triggerTask);
+
+    try {
+      const result = await engine.ingest(signedInput("evt_job_throws", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+      armed = true;
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "FAILED";
+      }, 40_000);
+
+      const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(d?.errorMessage).toContain("database unavailable");
+      expect(d?.processedAt).not.toBeNull();
+      expect(calls).toHaveLength(0);
+    } finally {
+      await engine.quit();
+      await worker.quit();
+    }
+  },
+  60_000
+);
+
+containerTestWithIsolatedRedis(
+  "a delivery whose database is down keeps retrying past the attempt limit and lands once it is back",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    let failures = 0;
+    const down = new Proxy(prisma, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (prop !== "webhookDelivery")
+          return typeof value === "function" ? value.bind(target) : value;
+        return new Proxy(value, {
+          get(delegate, method) {
+            const fn = Reflect.get(delegate, method);
+            if (method !== "create") return typeof fn === "function" ? fn.bind(delegate) : fn;
+            return async (args: unknown) => {
+              if (failures < 8) {
+                failures++;
+                throw Object.assign(new Error("Can't reach database server"), {
+                  name: "PrismaClientKnownRequestError",
+                  code: "P1001",
+                });
+              }
+              return fn.call(delegate, args);
+            };
+          },
+        });
+      },
+    });
+    const engine = buildEngine(down, redisOptions, triggerTask);
+
+    try {
+      const result = await engine.ingest(signedInput("evt_db_down", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      }, 40_000);
+      expect(failures).toBe(8);
+      expect(calls).toHaveLength(1);
+    } finally {
+      await engine.quit();
+    }
+  },
+  60_000
+);
+
+containerTestWithIsolatedRedis(
+  "a delivery retrying after a failure on our infrastructure shows no error",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const stub = makeTriggerTaskStub();
+    let failures = 0;
+    let release = false;
+    const triggerTask: TriggerWebhookTaskCallback = async (params) => {
+      if (!release) {
+        failures++;
+        return {
+          success: false,
+          error: "Can't reach database server at internal-db:5432",
+          errorType: "INFRASTRUCTURE",
+        };
+      }
+      return stub.triggerTask(params);
+    };
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const result = await engine.ingest(signedInput("evt_infra_quiet", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+
+      await waitFor(async () => failures >= 2, 20_000);
+      const pending = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(pending?.status).toBe("PENDING");
+      expect(pending?.errorMessage).toBeNull();
+      expect(JSON.stringify(pending?.targets)).not.toContain("error");
+
+      release = true;
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      }, 40_000);
+      const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+      expect(d?.errorMessage).toBeNull();
+      expect(stub.calls).toHaveLength(1);
+    } finally {
+      await engine.quit();
+    }
+  },
+  60_000
+);
+
+function inMemoryMetrics() {
+  const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+  const reader = new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 });
+  const provider = new MeterProvider({ readers: [reader] });
+  return {
+    meter: provider.getMeter("webhook-engine-test"),
+    /** Each data point of a metric: a counter's sum, or how many samples a histogram took. */
+    async points(name: string) {
+      await reader.forceFlush();
+      const metric = exporter
+        .getMetrics()
+        .at(-1)
+        ?.scopeMetrics.flatMap((scope) => scope.metrics)
+        .find((m) => m.descriptor.name === name);
+      return (metric?.dataPoints ?? [])
+        .map((point) => ({
+          attributes: point.attributes,
+          value: typeof point.value === "number" ? point.value : point.value.count,
+        }))
+        .sort((a, b) => JSON.stringify(a.attributes).localeCompare(JSON.stringify(b.attributes)));
+    },
+    shutdown: () => provider.shutdown(),
+  };
+}
+
+containerTestWithIsolatedRedis(
+  "ingest outcomes, settlements and per-target results are recorded once, after the write lands",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask } = makeTriggerTaskStub();
+    const metrics = inMemoryMetrics();
+    let failedSettle = false;
+    const flaky = new Proxy(prisma, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (prop !== "webhookDelivery")
+          return typeof value === "function" ? value.bind(target) : value;
+        return new Proxy(value, {
+          get(delegate, method) {
+            const fn = Reflect.get(delegate, method);
+            if (method !== "updateMany") return typeof fn === "function" ? fn.bind(delegate) : fn;
+            return async (args: { data?: { status?: string } }) => {
+              if (!failedSettle && args.data?.status === "SUCCEEDED") {
+                failedSettle = true;
+                throw new Error("database unavailable");
+              }
+              return fn.call(delegate, args);
+            };
+          },
+        });
+      },
+    });
+    const engine = buildEngine(flaky, redisOptions, triggerTask, { meter: metrics.meter });
+
+    try {
+      const result = await engine.ingest(signedInput("evt_metrics", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+      await engine.ingest(signedInput("evt_metrics", endpoint.opaqueId));
+      await engine.ingest({
+        ...signedInput("evt_metrics_bad", endpoint.opaqueId),
+        rawBytes: new TextEncoder().encode("{}"),
+      });
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      }, 20_000);
+
+      expect(failedSettle).toBe(true);
+      expect(await metrics.points("webhook_ingest_total")).toEqual([
+        { attributes: { path: "endpoint", outcome: "accepted" }, value: 1 },
+        { attributes: { path: "endpoint", outcome: "duplicate" }, value: 1 },
+        { attributes: { path: "endpoint", outcome: "verification_failed" }, value: 1 },
+      ]);
+      expect(await metrics.points("webhook_delivery_settle_latency_ms")).toEqual([
+        { attributes: { status: "SUCCEEDED" }, value: 1 },
+      ]);
+      expect(await metrics.points("webhook_delivery_target_results_total")).toEqual([
+        { attributes: { type: "task", status: "SUCCEEDED" }, value: 1 },
+      ]);
+    } finally {
+      await engine.quit();
+      await metrics.shutdown();
+    }
+  },
+  60_000
+);
+
+containerTestWithIsolatedRedis(
+  "a delivery filtered at ingest is recorded as settled",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma, { filter: "event.type == 'never.sent'" });
+    const { triggerTask } = makeTriggerTaskStub();
+    const metrics = inMemoryMetrics();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, { meter: metrics.meter });
+
+    try {
+      const result = await engine.ingest(signedInput("evt_metrics_filtered", endpoint.opaqueId));
+      if (result.outcome !== "accepted")
+        throw new Error(`expected accepted, got ${result.outcome}`);
+      await deliveryRow(prisma, result.deliveryId);
+
+      expect(await metrics.points("webhook_delivery_settle_latency_ms")).toEqual([
+        { attributes: { status: "FILTERED" }, value: 1 },
+      ]);
+      expect(await metrics.points("webhook_delivery_target_results_total")).toEqual([
+        { attributes: { type: "task", status: "FILTERED" }, value: 1 },
+      ]);
+    } finally {
+      await engine.quit();
+      await metrics.shutdown();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "simulateInject skips verification: an unsigned body that ingest() rejects is still recorded + routed",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls, runsByKey } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const eventId = "evt_simulate_1";
+      const body = JSON.stringify({ id: eventId, type: "payment_intent.succeeded" });
+      const unsignedInput = {
+        opaqueId: endpoint.opaqueId,
+        rawBytes: new TextEncoder().encode(body),
+        headers: {},
+        url: `https://api.example.com/webhooks/v1/ingest/${endpoint.opaqueId}`,
+      };
+
+      const rejected = await engine.ingest(unsignedInput);
+      expect(rejected.outcome).toBe("verification_failed");
+
+      const simulated = await engine.simulateInject(unsignedInput);
+      expect(simulated.outcome).toBe("accepted");
+      if (simulated.outcome !== "accepted") return;
+
+      await waitFor(async () => {
+        const d = await prisma.webhookDelivery.findFirst({ where: { id: simulated.deliveryId } });
+        return d?.status === "SUCCEEDED";
+      });
+
+      const delivery = await prisma.webhookDelivery.findFirst({
+        where: { id: simulated.deliveryId },
+      });
+      expect(delivery?.runId).toBe("run_1");
+      expect(delivery?.externalDeliveryId).toBe(eventId);
+      expect(delivery?.errorMessage).toBeNull();
+
+      expect(calls).toHaveLength(1);
+      expect(runsByKey.size).toBe(1);
+      expect(calls[0].taskId).toBe("handle-stripe-task");
+      expect(calls[0].idempotencyKey).toBe(`${endpoint.id}:${eventId}`);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "simulateInject honors the endpoint filter: a non-matching event is recorded FILTERED, not routed",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma, {
+      filter: "event.type == 'payment_intent.succeeded'",
+    });
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask);
+
+    try {
+      const body = JSON.stringify({ id: "evt_simulate_filtered", type: "charge.refunded" });
+      const simulated = await engine.simulateInject({
+        opaqueId: endpoint.opaqueId,
+        rawBytes: new TextEncoder().encode(body),
+        headers: {},
+        url: `https://api.example.com/webhooks/v1/ingest/${endpoint.opaqueId}`,
+      });
+      expect(simulated.outcome).toBe("accepted");
+      if (simulated.outcome !== "accepted") return;
+
+      const delivery = await deliveryRow(prisma, simulated.deliveryId);
+      expect(delivery.status).toBe("FILTERED");
+      expect(calls).toHaveLength(0);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "missing signing credentials preserve the endpoint response contract without recording deliveries",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const { triggerTask, calls } = makeTriggerTaskStub();
+    const engine = buildEngine(prisma, redisOptions, triggerTask, { workerDisabled: true });
+    try {
+      for (const signingSecretKey of [null, "unresolved-secret-key"]) {
+        for (const rejectedStatus of [undefined, 400, 401, 403]) {
+          const response = rejectedStatus === undefined ? undefined : { rejectedStatus };
+          await prisma.webhookEndpoint.update({
+            where: { id: endpoint.id },
+            data: {
+              signingSecretKey,
+              verifierArtifact: {
+                kind: "config",
+                config: VERIFIER_CONFIG,
+                ...(response ? { response } : {}),
+              },
+            },
+          });
+          expect(await engine.ingest(signedInput("missing-secret", endpoint.opaqueId))).toEqual({
+            outcome: "secret_missing",
+            response,
+          });
+        }
+      }
+      expect(await prisma.webhookDelivery.count()).toBe(0);
+      expect(calls).toHaveLength(0);
+    } finally {
+      await engine.quit();
+    }
+  }
+);

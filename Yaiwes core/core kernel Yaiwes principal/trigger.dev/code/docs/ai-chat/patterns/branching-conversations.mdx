@@ -1,0 +1,145 @@
+---
+title: "Branching conversations"
+sidebarTitle: "Branching conversations"
+description: "Persist an active conversation branch and use transcript storage and actions to switch the agent's context."
+---
+
+Keep an explicit active branch for each chat. Use your storage adapter's `loadContext` to give the model that branch, and use actions to fork or switch it.
+
+A fork copies the conversation up to a selected message. Later messages belong to that branch only. For example, one branch can keep Oslo as a destination while another changes it to Tokyo.
+
+## Store the active branch
+
+Your database needs a chat record with an `activeBranchId`, plus messages for each branch. You can store each branch as a snapshot or use parent pointers to share message prefixes. Persist the selected branch explicitly; choosing the newest leaf loses the selection when someone switches to an older branch.
+
+Keep the transcript's `final` flags, opaque runtime state, and stream cursors. A partial assistant response must stay partial after a reload. See [transcript storage](/ai-chat/transcript-storage) for the adapter contract and pagination helpers.
+
+The examples below use application helpers from `@/lib/branches`. Implement them against your database with these guarantees:
+
+| Helper | Behavior |
+| --- | --- |
+| `readActiveMessages(chatId)` | Return the selected branch in message order. |
+| `forkBranch(chatId, messageId)` | Copy the active prefix through the selected message, create a branch, and select it in one transaction. Reject messages outside this chat. |
+| `selectBranch(chatId, branchId)` | Select an existing branch belonging to this chat. |
+| `branchStorage.load` | Return the active transcript, runtime state, final flags, and resume cursors. |
+| `branchStorage.save` | Save the supplied transcript to the active branch and retain the supplied runtime state and cursors. |
+
+Make repeated saves idempotent by message ID. Serialize branch changes with transcript writes so a turn can't save its response into a different branch.
+
+## Load the selected context
+
+A storage adapter with `loadContext` owns the model's context on every turn and action. Include incoming user messages in the selected branch. Handle regeneration explicitly by removing trailing assistant messages before returning the context.
+
+```ts lib/branch-storage.ts
+import type { UIMessage } from "ai";
+import type {
+  LoadContextEvent,
+  TranscriptScope,
+  TranscriptStorage,
+} from "@trigger.dev/sdk/ai";
+import { branchStorage, readActiveMessages } from "@/lib/branches";
+
+export const storage: TranscriptStorage = {
+  ...branchStorage,
+  async loadContext<T extends UIMessage>(
+    { chatId }: TranscriptScope,
+    event: LoadContextEvent<unknown, T>
+  ): Promise<T[]> {
+    const messages = [...(await readActiveMessages(chatId))] as T[];
+
+    if (event.trigger === "regenerate-message") {
+      while (messages.length && messages.at(-1)!.role !== "user") {
+        messages.pop();
+      }
+    }
+
+    for (const incoming of event.incomingMessages) {
+      if (incoming.role === "user" && !messages.some((m) => m.id === incoming.id)) {
+        messages.push(incoming);
+      }
+    }
+
+    return messages;
+  },
+};
+```
+
+This pattern supports plain user messages. For tools that wait for browser results or approval, retain the canonical assistant message in your returned context. The SDK merges incoming tool-result state into that message by ID.
+
+`loadContext` also receives `previousMessages`, including any tail recovered from the session stream. If your database missed a save, reconcile that tail with the active branch before returning context. Recovery needs to preserve branch ownership; appending every recovered message to whichever branch is selected can mix conversations.
+
+## Fork and switch through actions
+
+Perform branch changes in `onAction` and update `chat.history` to match the selected branch. Returning without `chat.turn()` completes the action without asking the model for a response. The runtime still calls `storage.save` with reason `action`.
+
+```ts trigger/chat.ts
+import { chat } from "@trigger.dev/sdk/ai";
+import { anthropic } from "@ai-sdk/anthropic";
+import { z } from "zod";
+import { storage } from "@/lib/branch-storage";
+import { forkBranch, selectBranch, readActiveMessages } from "@/lib/branches";
+
+export const myChat = chat.agent({
+  id: "branching-chat",
+  storage,
+  actionSchema: z.discriminatedUnion("type", [
+    z.object({ type: z.literal("fork"), messageId: z.string() }),
+    z.object({ type: z.literal("switch"), branchId: z.string() }),
+  ]),
+  onAction: async ({ chatId, action }) => {
+    if (action.type === "fork") {
+      await forkBranch(chatId, action.messageId);
+    } else {
+      await selectBranch(chatId, action.branchId);
+    }
+
+    chat.history.set(await readActiveMessages(chatId));
+  },
+  run: async ({ messages, signal, streamText }) => {
+    return streamText({
+      model: anthropic("claude-sonnet-4-5"),
+      messages,
+      abortSignal: signal,
+    });
+  },
+});
+```
+
+Wait for a response to finish before forking or switching. Start with forks at completed assistant messages. Forking inside an unresolved tool exchange needs a policy for pending tool calls and already-performed side effects.
+
+## Update the frontend after the action
+
+Use `useChatActions` with `useChat`'s `sendMessage`. It consumes the action's response stream and keeps request state in the chat hook. After the action completes, reload the selected transcript so the visible messages match the next model call.
+
+```tsx app/chat/BranchPicker.tsx
+import { useChat } from "@ai-sdk/react";
+import { useChatActions } from "@trigger.dev/sdk/chat/react";
+import { loadTranscript } from "@/app/actions";
+
+// Inside your chat component, with its existing chatId and transport:
+const { sendMessage, setMessages, status } = useChat({ id: chatId, transport });
+const { sendAction } = useChatActions({ sendMessage });
+const busy = status === "submitted" || status === "streaming";
+
+async function switchBranch(branchId: string) {
+  await sendAction({ type: "switch", branchId });
+  const transcript = await loadTranscript({ chatId });
+  setMessages(transcript.messages);
+}
+
+<button disabled={busy} onClick={() => switchBranch(branch.id)}>
+  {branch.label}
+</button>
+```
+
+Authenticate `loadTranscript` and check ownership before reading the chat. Validate branch IDs on the server even when the frontend only offers branches from that chat. If you use `transport.sendAction` directly, consume its returned stream before sending another message.
+
+## Check branch isolation
+
+1. Tell the agent the destination is Oslo and wait for the response.
+2. Fork at that response, then change the destination to Tokyo.
+3. Switch to the original branch and ask for the destination. It should answer Oslo.
+4. Switch to the fork and ask again. It should answer Tokyo.
+5. Reload the page and repeat the checks. The selected branch and its messages should survive the reload.
+
+Also test regeneration, repeated storage saves, and continuation in a fresh run. An in-memory branch choice can pass the first four steps and still disappear when the worker restarts.
