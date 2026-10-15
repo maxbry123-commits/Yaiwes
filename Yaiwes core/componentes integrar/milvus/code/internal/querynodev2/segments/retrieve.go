@@ -1,0 +1,327 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package segments
+
+import (
+	"context"
+	"sync"
+
+	"github.com/apache/arrow/go/v17/arrow"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v3/util/contextutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+type RetrieveSegmentResult struct {
+	Result  *segcorepb.RetrieveResults
+	Segment Segment
+
+	// Record carries the user output columns when the Arrow transport was used;
+	// nil otherwise. Result then holds only the system columns, so the two are
+	// read together. The RECEIVER owns it: whoever consumes a
+	// []RetrieveSegmentResult must Release every non-nil Record once it has
+	// materialized the selection, including on error paths.
+	Record arrow.Record
+}
+
+// ReleaseRecords releases every Arrow record held by results. Safe to call
+// more than once and on results that carry none, so callers can defer it
+// immediately after the retrieve without tracking which path ran.
+func ReleaseRecords(results []RetrieveSegmentResult) {
+	for i := range results {
+		if results[i].Record != nil {
+			results[i].Record.Release()
+			results[i].Record = nil
+		}
+	}
+}
+
+// retrieveOnSegments performs retrieve on listed segments
+// all segment ids are validated before calling this function
+func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, segType SegmentType, plan *RetrievePlan, req *querypb.QueryRequest) ([]RetrieveSegmentResult, error) {
+	resultCh := make(chan RetrieveSegmentResult, len(segments))
+
+	plan.SetIgnoreNonPk(shouldEnableIgnoreNonPk(req, len(segments), plan.ShouldIgnoreNonPk()))
+	// A local, not a field on the shared plan type: nothing outside this
+	// function reads it, and it is never passed to C.
+	useArrow := shouldUseArrowTransport(req, plan)
+
+	label := metrics.SealedSegmentLabel
+	if segType == commonpb.SegmentState_Growing {
+		label = metrics.GrowingSegmentLabel
+	}
+
+	retriever := func(ctx context.Context, s Segment) error {
+		tr := timerecord.NewTimeRecorder("retrieveOnSegments")
+		var (
+			result *segcorepb.RetrieveResults
+			record arrow.Record
+			err    error
+		)
+		if useArrow {
+			result, record, err = s.RetrieveArrow(ctx, plan)
+		} else {
+			result, err = s.Retrieve(ctx, plan)
+		}
+		if err != nil {
+			return err
+		}
+
+		if mlog.LevelEnabled(mlog.DebugLevel) && req.GetReq().GetIsCount() {
+			// A segment may legitimately return an empty count result (no
+			// field data or a 0-row scalar array), e.g. a segment with no
+			// rows matching the filter during rollout. Skip the comparison
+			// log in that case.
+			if countRet, ok := getCountRet(result); ok {
+				allRetrieveCount := result.AllRetrieveCount
+				if allRetrieveCount != countRet {
+					mlog.Debug(ctx, "count segment done with delete",
+						mlog.Uint64("mvcc", req.GetReq().GetMvccTimestamp()),
+						mlog.String("channel", s.LoadInfo().GetInsertChannel()),
+						mlog.FieldSegmentID(s.ID()),
+						mlog.Int64("allRetrieveCount", allRetrieveCount),
+						mlog.Int64("countRet", countRet))
+				} else {
+					mlog.Debug(ctx, "count segment done",
+						mlog.Uint64("mvcc", req.GetReq().GetMvccTimestamp()),
+						mlog.String("channel", s.LoadInfo().GetInsertChannel()),
+						mlog.FieldSegmentID(s.ID()),
+						mlog.Int64("allRetrieveCount", allRetrieveCount),
+						mlog.Int64("countRet", countRet))
+				}
+			}
+		}
+		resultCh <- RetrieveSegmentResult{
+			Result:  result,
+			Segment: s,
+			Record:  record,
+		}
+		metrics.QueryNodeSQSegmentLatency.WithLabelValues(paramtable.GetStringNodeID(),
+			contextutil.GetQueryLabel(ctx), label).Observe(float64(tr.ElapseSpan().Microseconds()) / 1000.0)
+		return nil
+	}
+
+	err := doOnSegments(ctx, mgr, segments, retriever)
+	close(resultCh)
+
+	results := make([]RetrieveSegmentResult, 0, len(segments))
+	for r := range resultCh {
+		results = append(results, r)
+	}
+	if err != nil {
+		// Drain first, then release. The segments that DID succeed have
+		// already pushed their results, and on the Arrow path each one holds a
+		// cdata-imported record whose C memory is freed by a release callback,
+		// not by the GC -- so returning without draining leaks the entire
+		// payload of every surviving segment. A canceled context or a segment
+		// released mid-query is routine, so this accumulates.
+		ReleaseRecords(results)
+		return nil, err
+	}
+	return results, nil
+}
+
+// getCountRet extracts the count(*) value from a per-segment retrieve result.
+// A segment may return an empty result (no field data, or a 0-row scalar
+// array) for a count(*) request, in which case ok is false and the caller must
+// not index into the raw data slices.
+func getCountRet(result *segcorepb.RetrieveResults) (int64, bool) {
+	if len(result.GetFieldsData()) == 0 {
+		return 0, false
+	}
+	longData := result.GetFieldsData()[0].GetScalars().GetLongData()
+	if longData == nil || len(longData.GetData()) == 0 {
+		return 0, false
+	}
+	return longData.GetData()[0], true
+}
+
+// shouldEnableIgnoreNonPk determines whether to use two-phase retrieval
+// (first fetch PKs only, then fetch full field data for selected rows).
+//
+// Note: ORDER BY queries are excluded at the C++ layer — ShouldIgnoreNonPk()
+// in plan_c.cpp returns false when has_order_by_=true, so planShouldIgnoreNonPk
+// is already false for ORDER BY. No explicit !hasOrderBy check is needed here.
+func shouldEnableIgnoreNonPk(req *querypb.QueryRequest, segmentNum int, planShouldIgnoreNonPk bool) bool {
+	hasGroupBy := len(req.GetReq().GetGroupByFieldIds()) > 0 || len(req.GetReq().GetAggregates()) > 0
+	return !hasGroupBy && segmentNum > 1 && req.GetReq().GetLimit() != typeutil.Unlimited && planShouldIgnoreNonPk
+}
+
+// shouldUseArrowTransport decides, per request, whether the retrieve CGO
+// boundary returns user output columns as Arrow instead of a protobuf blob.
+//
+// Two shapes are excluded:
+//
+//   - aggregation: its columns all carry field_id 0 and are identified by
+//     position, so the Go side cannot match them by id. THIS is the guard;
+//     MaterializeArrowSelection's duplicate-id check is only a backstop, and a
+//     late one -- it fires after the retrieve and the reduce, and its only
+//     outcome is failing the user's query, since there is no fallback by then.
+//   - ignore_non_pk: every user column is withheld, so there is nothing to
+//     carry and the Arrow batch would be pure overhead.
+//
+// count(*) needs no exclusion of its own: the proxy compiles it to an
+// aggregate (dql/task_query.go:658 sets Query.Aggregates from
+// translateOutputFields), so hasAggregation below already excludes it. An
+// earlier explicit exclusion keyed off internalpb.RetrieveRequest.IsCount,
+// which no writer ever sets -- createCntPlan sets planpb.QueryPlanNode.IsCount
+// instead, and is itself referenced only by its own unit test -- so it was dead
+// code twice over.
+func shouldUseArrowTransport(req *querypb.QueryRequest, plan *RetrievePlan) bool {
+	// Same switch as the IgnoreNonPk Arrow path (ignore_non_pk_ops.go): both are
+	// the "hand Arrow across the CGO boundary instead of protobuf" interface, so
+	// they share one operator-facing knob rather than accumulating one per call
+	// site.
+	if !paramtable.Get().CommonCfg.InterfaceZeroCopyEnabled.GetAsBool() {
+		return false
+	}
+	hasAggregation := len(req.GetReq().GetGroupByFieldIds()) > 0 ||
+		len(req.GetReq().GetAggregates()) > 0
+	// ORDER BY is excluded because OrderByLimitOperator sorts by field VALUES
+	// (compareFieldValuesAt reads them out of FieldsData) and reorderResult
+	// re-slices every column, so unlike the plain reduce it genuinely needs the
+	// payload materialized. Carrying a selection there needs an Arrow-valued
+	// comparator, which is real work rather than plumbing.
+	//
+	// Structurally it has MORE to gain than the plain reduce, not less: that
+	// pipeline copies the payload twice today (buildMergedRetrieveResults then
+	// sliceFieldData), where reorderResult under a selection would permute the
+	// selection's row refs and copy nothing. Unmeasured -- the claim is from
+	// reading the two pipelines, not from a benchmark.
+	hasOrderBy := len(req.GetReq().GetOrderByFields()) > 0
+	return !hasAggregation && !hasOrderBy && !plan.IsIgnoreNonPk()
+}
+
+func retrieveOnSegmentsWithStream(ctx context.Context, mgr *Manager, segments []Segment, segType SegmentType, plan *RetrievePlan, svr streamrpc.QueryStreamServer) error {
+	var (
+		errs = make([]error, len(segments))
+		wg   sync.WaitGroup
+	)
+
+	label := metrics.SealedSegmentLabel
+	if segType == commonpb.SegmentState_Growing {
+		label = metrics.GrowingSegmentLabel
+	}
+
+	for i, segment := range segments {
+		wg.Add(1)
+		go func(segment Segment, i int) {
+			defer wg.Done()
+			tr := timerecord.NewTimeRecorder("retrieveOnSegmentsWithStream")
+			var result *segcorepb.RetrieveResults
+			err := doOnSegment(ctx, mgr, segment, func(ctx context.Context, segment Segment) error {
+				var err error
+				result, err = segment.Retrieve(ctx, plan)
+				return err
+			})
+			if err != nil {
+				errs[i] = err
+				return
+			}
+
+			if len(result.GetOffset()) != 0 {
+				if err = svr.Send(&internalpb.RetrieveResults{
+					Status:     merr.Success(),
+					Ids:        result.GetIds(),
+					FieldsData: result.GetFieldsData(),
+					CostAggregation: &internalpb.CostAggregation{
+						TotalRelatedDataSize: GetSegmentRelatedDataSize(segment),
+					},
+					SealedSegmentIDsRetrieved: []int64{segment.ID()},
+					AllRetrieveCount:          result.GetAllRetrieveCount(),
+					ScannedRemoteBytes:        result.GetScannedRemoteBytes(),
+					ScannedTotalBytes:         result.GetScannedTotalBytes(),
+				}); err != nil {
+					errs[i] = err
+				}
+			}
+
+			errs[i] = nil
+			metrics.QueryNodeSQSegmentLatency.WithLabelValues(paramtable.GetStringNodeID(),
+				contextutil.GetQueryLabel(ctx), label).Observe(float64(tr.ElapseSpan().Microseconds()) / 1000.0)
+		}(segment, i)
+	}
+	wg.Wait()
+	return merr.Combine(errs...)
+}
+
+// retrieve will retrieve all the validate target segments
+func Retrieve(ctx context.Context, manager *Manager, plan *RetrievePlan, req *querypb.QueryRequest) ([]RetrieveSegmentResult, []Segment, error) {
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
+
+	var err error
+	var SegType commonpb.SegmentState
+	var retrieveSegments []Segment
+
+	segIDs := req.GetSegmentIDs()
+	collID := req.Req.GetCollectionID()
+
+	mlog.Debug(ctx, "retrieve on segments", mlog.Int64s("segmentIDs", segIDs), mlog.FieldCollectionID(collID))
+
+	if req.GetScope() == querypb.DataScope_Historical {
+		SegType = SegmentTypeSealed
+		retrieveSegments, err = validateOnHistorical(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
+	} else {
+		SegType = SegmentTypeGrowing
+		retrieveSegments, err = validateOnStream(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
+	}
+
+	if err != nil {
+		return nil, retrieveSegments, err
+	}
+
+	result, err := retrieveOnSegments(ctx, manager, retrieveSegments, SegType, plan, req)
+	return result, retrieveSegments, err
+}
+
+// retrieveStreaming will retrieve all the validate target segments  and  return by stream
+func RetrieveStream(ctx context.Context, manager *Manager, plan *RetrievePlan, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) ([]Segment, error) {
+	var err error
+	var SegType commonpb.SegmentState
+	var retrieveSegments []Segment
+
+	segIDs := req.GetSegmentIDs()
+	collID := req.Req.GetCollectionID()
+	mlog.Debug(ctx, "retrieve stream on segments", mlog.Int64s("segmentIDs", segIDs), mlog.FieldCollectionID(collID))
+
+	if req.GetScope() == querypb.DataScope_Historical {
+		SegType = SegmentTypeSealed
+		retrieveSegments, err = validateOnHistorical(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
+	} else {
+		SegType = SegmentTypeGrowing
+		retrieveSegments, err = validateOnStream(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
+	}
+
+	if err != nil {
+		return retrieveSegments, err
+	}
+
+	err = retrieveOnSegmentsWithStream(ctx, manager, retrieveSegments, SegType, plan, srv)
+	return retrieveSegments, err
+}

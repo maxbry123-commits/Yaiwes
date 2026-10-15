@@ -1,0 +1,743 @@
+/*
+ * # Licensed to the LF AI & Data foundation under one
+ * # or more contributor license agreements. See the NOTICE file
+ * # distributed with this work for additional information
+ * # regarding copyright ownership. The ASF licenses this file
+ * # to you under the Apache License, Version 2.0 (the
+ * # "License"); you may not use this file except in compliance
+ * # with the License. You may obtain a copy of the License at
+ * #
+ * #     http://www.apache.org/licenses/LICENSE-2.0
+ * #
+ * # Unless required by applicable law or agreed to in writing, software
+ * # distributed under the License is distributed on an "AS IS" BASIS,
+ * # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * # See the License for the specific language governing permissions and
+ * # limitations under the License.
+ */
+
+package chain
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"testing"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/util/function/chain/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+)
+
+// =============================================================================
+// Mock FunctionExpr implementations for MapOp tests
+// =============================================================================
+
+// doubleScoreExpr doubles the float32 score column.
+type doubleScoreExpr struct{}
+
+func (e *doubleScoreExpr) Name() string { return "double_score" }
+func (e *doubleScoreExpr) OutputDataTypes() []arrow.DataType {
+	return []arrow.DataType{arrow.PrimitiveTypes.Float32}
+}
+func (e *doubleScoreExpr) IsRunnable(stage string) bool { return true }
+func (e *doubleScoreExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	input := inputs[0]
+	chunks := make([]arrow.Array, len(input.Chunks()))
+	for i, chunk := range input.Chunks() {
+		f32 := chunk.(*array.Float32)
+		b := array.NewFloat32Builder(ctx.Pool())
+		for j := 0; j < f32.Len(); j++ {
+			if f32.IsNull(j) {
+				b.AppendNull()
+			} else {
+				b.Append(f32.Value(j) * 2)
+			}
+		}
+		chunks[i] = b.NewArray()
+		b.Release()
+	}
+	result := arrow.NewChunked(arrow.PrimitiveTypes.Float32, chunks)
+	for _, c := range chunks {
+		c.Release()
+	}
+	return []*arrow.Chunked{result}, nil
+}
+
+type captureInputsExpr struct {
+	inputs []*arrow.Chunked
+}
+
+func (e *captureInputsExpr) Name() string { return "capture_inputs" }
+func (e *captureInputsExpr) OutputDataTypes() []arrow.DataType {
+	return []arrow.DataType{arrow.PrimitiveTypes.Float32}
+}
+func (e *captureInputsExpr) IsRunnable(stage string) bool { return true }
+func (e *captureInputsExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	e.inputs = append([]*arrow.Chunked(nil), inputs...)
+	return (&doubleScoreExpr{}).Execute(ctx, inputs[:1])
+}
+
+// errorExpr always returns an error on Execute.
+type errorExpr struct{}
+
+func (e *errorExpr) Name() string { return "error_expr" }
+func (e *errorExpr) OutputDataTypes() []arrow.DataType {
+	return []arrow.DataType{arrow.PrimitiveTypes.Float32}
+}
+func (e *errorExpr) IsRunnable(stage string) bool { return true }
+func (e *errorExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	return nil, fmt.Errorf("intentional error")
+}
+
+// wrongOutputCountExpr returns 2 outputs when only 1 is expected.
+type wrongOutputCountExpr struct{}
+
+func (e *wrongOutputCountExpr) Name() string { return "wrong_count" }
+func (e *wrongOutputCountExpr) OutputDataTypes() []arrow.DataType {
+	return nil // dynamic output types
+}
+func (e *wrongOutputCountExpr) IsRunnable(stage string) bool { return true }
+func (e *wrongOutputCountExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	// Return 2 outputs
+	b1 := array.NewFloat32Builder(ctx.Pool())
+	b1.Append(1.0)
+	arr1 := b1.NewArray()
+	b1.Release()
+
+	b2 := array.NewFloat32Builder(ctx.Pool())
+	b2.Append(2.0)
+	arr2 := b2.NewArray()
+	b2.Release()
+
+	c1 := arrow.NewChunked(arrow.PrimitiveTypes.Float32, []arrow.Array{arr1})
+	c2 := arrow.NewChunked(arrow.PrimitiveTypes.Float32, []arrow.Array{arr2})
+	arr1.Release()
+	arr2.Release()
+
+	return []*arrow.Chunked{c1, c2}, nil
+}
+
+// dynamicFloat64OutputExpr models a dynamic UDF whose output type is known only at runtime.
+type dynamicFloat64OutputExpr struct{}
+
+func (e *dynamicFloat64OutputExpr) Name() string                      { return "dynamic_float64" }
+func (e *dynamicFloat64OutputExpr) OutputDataTypes() []arrow.DataType { return nil }
+func (e *dynamicFloat64OutputExpr) IsRunnable(stage string) bool      { return true }
+func (e *dynamicFloat64OutputExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	b := array.NewFloat64Builder(ctx.Pool())
+	b.Append(1.5)
+	arr := b.NewArray()
+	b.Release()
+
+	output := arrow.NewChunked(arrow.PrimitiveTypes.Float64, []arrow.Array{arr})
+	arr.Release()
+	return []*arrow.Chunked{output}, nil
+}
+
+type dynamicInt64OutputExpr struct{}
+
+func (e *dynamicInt64OutputExpr) Name() string                      { return "dynamic_int64" }
+func (e *dynamicInt64OutputExpr) OutputDataTypes() []arrow.DataType { return nil }
+func (e *dynamicInt64OutputExpr) IsRunnable(stage string) bool      { return true }
+func (e *dynamicInt64OutputExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	b := array.NewInt64Builder(ctx.Pool())
+	b.Append(16777217)
+	arr := b.NewArray()
+	b.Release()
+
+	output := arrow.NewChunked(arrow.PrimitiveTypes.Int64, []arrow.Array{arr})
+	arr.Release()
+	return []*arrow.Chunked{output}, nil
+}
+
+type dynamicStringOutputExpr struct{}
+
+func (e *dynamicStringOutputExpr) Name() string                      { return "dynamic_string" }
+func (e *dynamicStringOutputExpr) OutputDataTypes() []arrow.DataType { return nil }
+func (e *dynamicStringOutputExpr) IsRunnable(stage string) bool      { return true }
+func (e *dynamicStringOutputExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	b := array.NewStringBuilder(ctx.Pool())
+	b.Append("not a score")
+	arr := b.NewArray()
+	b.Release()
+
+	output := arrow.NewChunked(arrow.BinaryTypes.String, []arrow.Array{arr})
+	arr.Release()
+	return []*arrow.Chunked{output}, nil
+}
+
+type dynamicNullableOutputExpr struct {
+	dataType arrow.Type
+}
+
+type dynamicFloatingOutputExpr struct {
+	dataType arrow.DataType
+	value    float64
+}
+
+func (e *dynamicFloatingOutputExpr) Name() string                      { return "dynamic_floating" }
+func (e *dynamicFloatingOutputExpr) OutputDataTypes() []arrow.DataType { return nil }
+func (e *dynamicFloatingOutputExpr) IsRunnable(stage string) bool      { return true }
+func (e *dynamicFloatingOutputExpr) Execute(ctx *types.FuncContext, _ []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	chunks := make([]arrow.Array, 0, 2)
+	for _, values := range [][]float64{{1}, {2, e.value}} {
+		builder := array.NewBuilder(ctx.Pool(), e.dataType)
+		switch b := builder.(type) {
+		case *array.Float32Builder:
+			for _, value := range values {
+				b.Append(float32(value))
+			}
+		case *array.Float64Builder:
+			b.AppendValues(values, nil)
+		}
+		chunks = append(chunks, builder.NewArray())
+		builder.Release()
+	}
+	output := arrow.NewChunked(e.dataType, chunks)
+	for _, chunk := range chunks {
+		chunk.Release()
+	}
+	return []*arrow.Chunked{output}, nil
+}
+
+func (e *dynamicNullableOutputExpr) Name() string                      { return "dynamic_nullable" }
+func (e *dynamicNullableOutputExpr) OutputDataTypes() []arrow.DataType { return nil }
+func (e *dynamicNullableOutputExpr) IsRunnable(stage string) bool      { return true }
+func (e *dynamicNullableOutputExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) ([]*arrow.Chunked, error) {
+	var output arrow.Array
+	switch e.dataType {
+	case arrow.FLOAT32:
+		builder := array.NewFloat32Builder(ctx.Pool())
+		builder.Append(0.9)
+		builder.AppendNull()
+		output = builder.NewArray()
+		builder.Release()
+	case arrow.FLOAT64:
+		builder := array.NewFloat64Builder(ctx.Pool())
+		builder.Append(0.9)
+		builder.AppendNull()
+		output = builder.NewArray()
+		builder.Release()
+	default:
+		return nil, merr.WrapErrServiceInternalMsg("unsupported nullable test output type %s", e.dataType)
+	}
+
+	chunked := arrow.NewChunked(output.DataType(), []arrow.Array{output})
+	output.Release()
+	return []*arrow.Chunked{chunked}, nil
+}
+
+// =============================================================================
+// MapOp Test Suite
+// =============================================================================
+
+type MapOpTestSuite struct {
+	suite.Suite
+	pool *memory.CheckedAllocator
+}
+
+func (s *MapOpTestSuite) SetupTest() {
+	s.pool = memory.NewCheckedAllocator(memory.NewGoAllocator())
+}
+
+func (s *MapOpTestSuite) TearDownTest() {
+	s.pool.AssertSize(s.T(), 0)
+}
+
+func TestMapOpTestSuite(t *testing.T) {
+	suite.Run(t, new(MapOpTestSuite))
+}
+
+func (s *MapOpTestSuite) createTestDF(ids []int64, scores []float32, chunkSizes []int64) *DataFrame {
+	builder := NewDataFrameBuilder()
+	builder.SetChunkSizes(chunkSizes)
+
+	offset := 0
+	idChunks := make([]arrow.Array, len(chunkSizes))
+	scoreChunks := make([]arrow.Array, len(chunkSizes))
+	for i, size := range chunkSizes {
+		idBuilder := array.NewInt64Builder(s.pool)
+		scoreBuilder := array.NewFloat32Builder(s.pool)
+		for j := 0; j < int(size); j++ {
+			idBuilder.Append(ids[offset+j])
+			scoreBuilder.Append(scores[offset+j])
+		}
+		idChunks[i] = idBuilder.NewArray()
+		idBuilder.Release()
+		scoreChunks[i] = scoreBuilder.NewArray()
+		scoreBuilder.Release()
+		offset += int(size)
+	}
+
+	err := builder.AddColumnFromChunks(types.IDFieldName, idChunks)
+	s.Require().NoError(err)
+	err = builder.AddColumnFromChunks(types.ScoreFieldName, scoreChunks)
+	s.Require().NoError(err)
+
+	return builder.Build()
+}
+
+func (s *MapOpTestSuite) TestNewMapOpNilFunction() {
+	_, err := NewMapOp(nil, []string{"in"}, []string{"out"})
+	s.Error(err)
+	s.Contains(err.Error(), "function is nil")
+}
+
+func (s *MapOpTestSuite) TestNewMapOpOutputCountMismatch() {
+	fn := &doubleScoreExpr{}
+	// Function outputs 1 column but we specify 2 output names
+	_, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{"out1", "out2"})
+	s.Error(err)
+	s.Contains(err.Error(), "output columns count")
+}
+
+func (s *MapOpTestSuite) TestNewMapOpSuccess() {
+	fn := &doubleScoreExpr{}
+	op, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+	s.Equal("Map", op.Name())
+	s.Equal([]string{types.ScoreFieldName}, op.Inputs())
+	s.Equal([]string{types.ScoreFieldName}, op.Outputs())
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteBasic() {
+	df := s.createTestDF(
+		[]int64{1, 2, 3},
+		[]float32{1.0, 2.0, 3.0},
+		[]int64{3},
+	)
+	defer df.Release()
+
+	fn := &doubleScoreExpr{}
+	op, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	result, err := ExecuteOperator(ctx, df, op)
+	s.Require().NoError(err)
+	defer result.Release()
+
+	// Scores should be doubled
+	scoreCol := result.Column(types.ScoreFieldName)
+	scores := scoreCol.Chunk(0).(*array.Float32)
+	s.InDelta(2.0, float64(scores.Value(0)), 1e-6)
+	s.InDelta(4.0, float64(scores.Value(1)), 1e-6)
+	s.InDelta(6.0, float64(scores.Value(2)), 1e-6)
+
+	// ID column should be preserved
+	idCol := result.Column(types.IDFieldName)
+	s.NotNil(idCol)
+	ids := idCol.Chunk(0).(*array.Int64)
+	s.Equal(int64(1), ids.Value(0))
+	s.Equal(int64(2), ids.Value(1))
+	s.Equal(int64(3), ids.Value(2))
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteMultiChunk() {
+	df := s.createTestDF(
+		[]int64{1, 2, 3, 4},
+		[]float32{1.0, 2.0, 3.0, 4.0},
+		[]int64{2, 2},
+	)
+	defer df.Release()
+
+	fn := &doubleScoreExpr{}
+	op, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	result, err := ExecuteOperator(ctx, df, op)
+	s.Require().NoError(err)
+	defer result.Release()
+
+	s.Equal(int64(4), result.NumRows())
+	scores0 := result.Column(types.ScoreFieldName).Chunk(0).(*array.Float32)
+	scores1 := result.Column(types.ScoreFieldName).Chunk(1).(*array.Float32)
+	s.InDelta(2.0, float64(scores0.Value(0)), 1e-6)
+	s.InDelta(4.0, float64(scores0.Value(1)), 1e-6)
+	s.InDelta(6.0, float64(scores1.Value(0)), 1e-6)
+	s.InDelta(8.0, float64(scores1.Value(1)), 1e-6)
+}
+
+func (s *MapOpTestSuite) TestMapOpExecutePreservesDuplicateInputPositions() {
+	df := s.createTestDF(
+		[]int64{1, 2},
+		[]float32{1.0, 2.0},
+		[]int64{2},
+	)
+	defer df.Release()
+
+	fn := &captureInputsExpr{}
+	op, err := NewMapOp(
+		fn,
+		[]string{types.ScoreFieldName, types.ScoreFieldName, types.IDFieldName},
+		[]string{types.ScoreFieldName},
+	)
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	result, err := ExecuteOperator(ctx, df, op)
+	s.Require().NoError(err)
+	defer result.Release()
+
+	s.Require().Len(fn.inputs, 3)
+	s.Same(df.Column(types.ScoreFieldName), fn.inputs[0])
+	s.Same(df.Column(types.ScoreFieldName), fn.inputs[1])
+	s.Same(df.Column(types.IDFieldName), fn.inputs[2])
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteColumnNotFound() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	fn := &doubleScoreExpr{}
+	op, err := NewMapOp(fn, []string{"nonexistent"}, []string{"out"})
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	_, err = ExecuteOperator(ctx, df, op)
+	s.Error(err)
+	s.Contains(err.Error(), "not found")
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteFunctionError() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	fn := &errorExpr{}
+	op, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	_, err = ExecuteOperator(ctx, df, op)
+	s.Error(err)
+	s.Contains(err.Error(), "intentional error")
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteOutputCountMismatchAtRuntime() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	fn := &wrongOutputCountExpr{} // returns 2 outputs but we expect 1
+	op, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{"out1"})
+	s.Require().NoError(err) // passes creation (dynamic types)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	_, err = ExecuteOperator(ctx, df, op)
+	s.Error(err)
+	s.ErrorIs(err, merr.ErrFunctionFailed)
+	s.Equal(merr.Code(merr.ErrFunctionFailed), merr.Code(err))
+	s.Contains(err.Error(), "function returned 2 outputs, expected 1")
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteConvertsNumericScoreOutputsToFloat32() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	tests := []struct {
+		name     string
+		function types.FunctionExpr
+		expected float32
+	}{
+		{name: "float64", function: &dynamicFloat64OutputExpr{}, expected: 1.5},
+		{name: "int64 with precision loss", function: &dynamicInt64OutputExpr{}, expected: 16777216},
+	}
+	for _, test := range tests {
+		s.Run(test.name, func() {
+			op, err := NewMapOp(test.function, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+			s.Require().NoError(err)
+
+			ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+			result, err := ExecuteOperator(ctx, df, op)
+			s.Require().NoError(err)
+			defer result.Release()
+
+			score := result.Column(types.ScoreFieldName)
+			s.Equal(arrow.FLOAT32, score.DataType().ID())
+			s.Equal(test.expected, score.Chunk(0).(*array.Float32).Value(0))
+		})
+	}
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteRejectsNonNumericScoreOutput() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	op, err := NewMapOp(&dynamicStringOutputExpr{}, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	_, err = ExecuteOperator(ctx, df, op)
+	s.ErrorIs(err, merr.ErrFunctionFailed)
+	s.Equal(merr.Code(merr.ErrFunctionFailed), merr.Code(err))
+	s.Contains(err.Error(), `output 0 mapped to "$score" must be numeric, got utf8`)
+}
+
+func (s *MapOpTestSuite) TestMapOpAllowsNullUntilScoreExport() {
+	df := s.createTestDF([]int64{1, 2}, []float32{1.0, 2.0}, []int64{2})
+	defer df.Release()
+
+	for _, dataType := range []arrow.Type{arrow.FLOAT32, arrow.FLOAT64} {
+		s.Run(dataType.String(), func() {
+			op, err := NewMapOp(
+				&dynamicNullableOutputExpr{dataType: dataType},
+				[]string{types.ScoreFieldName},
+				[]string{types.ScoreFieldName},
+			)
+			s.Require().NoError(err)
+
+			ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+			result, err := ExecuteOperator(ctx, df, op)
+			s.Require().NoError(err)
+			defer result.Release()
+			_, err = ToSearchResultData(result)
+			s.ErrorIs(err, merr.ErrFunctionFailed)
+			s.Contains(err.Error(), "$score contains null")
+			sorted, err := ExecuteOperator(ctx, result, newSortOp(types.ScoreFieldName, true, types.IDFieldName))
+			s.Require().NoError(err)
+			defer sorted.Release()
+			limited, err := ExecuteOperator(ctx, sorted, NewLimitOp(1, 0))
+			s.Require().NoError(err)
+			defer limited.Release()
+			exported, err := ToSearchResultData(limited)
+			s.Require().NoError(err)
+			s.Equal([]float32{0.9}, exported.Scores)
+		})
+	}
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteAllowsNullRegularOutput() {
+	df := s.createTestDF([]int64{1, 2}, []float32{1.0, 2.0}, []int64{2})
+	defer df.Release()
+
+	op, err := NewMapOp(
+		&dynamicNullableOutputExpr{dataType: arrow.FLOAT64},
+		[]string{types.ScoreFieldName},
+		[]string{"nullable_output"},
+	)
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	result, err := ExecuteOperator(ctx, df, op)
+	s.Require().NoError(err)
+	defer result.Release()
+	s.Equal(1, result.Column("nullable_output").Chunk(0).NullN())
+}
+
+func (s *MapOpTestSuite) TestMapOpFiniteScoreConstraint() {
+	df := s.createTestDF([]int64{1, 2, 3}, []float32{1, 2, 3}, []int64{1, 2})
+	defer df.Release()
+	for _, dataType := range []arrow.DataType{arrow.PrimitiveTypes.Float32, arrow.PrimitiveTypes.Float64} {
+		for _, tc := range []struct {
+			name       string
+			value      float64
+			validScore bool
+		}{
+			{"nan", math.NaN(), false},
+			{"positive_infinity", math.Inf(1), false},
+			{"negative_infinity", math.Inf(-1), false},
+			{"positive_overflow", math.MaxFloat64, false},
+			{"negative_overflow", -math.MaxFloat64, false},
+			{"max_finite", math.MaxFloat32, true},
+			{"min_finite", -math.MaxFloat32, true},
+		} {
+			for _, destination := range []string{types.ScoreFieldName, "regular_output"} {
+				s.Run(dataType.Name()+"/"+tc.name+"/"+destination, func() {
+					op, err := NewMapOp(&dynamicFloatingOutputExpr{dataType: dataType, value: tc.value},
+						[]string{types.ScoreFieldName}, []string{destination})
+					s.Require().NoError(err)
+					ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+					result, err := ExecuteOperator(ctx, df, op)
+					s.Require().NoError(err)
+					defer result.Release()
+					if destination != types.ScoreFieldName {
+						// Model a schema-backed regular output for FieldData export.
+						fieldType, err := ToMilvusType(dataType)
+						s.Require().NoError(err)
+						result.fieldTypes[destination] = fieldType
+					}
+					exported, exportErr := ToSearchResultData(result)
+					if destination == types.ScoreFieldName && !tc.validScore {
+						s.Nil(exported)
+						s.Require().ErrorIs(exportErr, merr.ErrFunctionFailed)
+						s.Contains(exportErr.Error(), "$score contains non-finite value")
+						s.Contains(exportErr.Error(), "chunk 1 at row 1")
+					} else {
+						s.Require().NoError(exportErr)
+					}
+					if destination == types.ScoreFieldName && math.IsNaN(tc.value) {
+						sorted, err := ExecuteOperator(ctx, result, newSortOp(types.ScoreFieldName, true, types.IDFieldName))
+						s.Require().NoError(err)
+						defer sorted.Release()
+						limited, err := ExecuteOperator(ctx, sorted, NewLimitOp(1, 0))
+						s.Require().NoError(err)
+						defer limited.Release()
+						clean, err := ToSearchResultData(limited)
+						s.Require().NoError(err)
+						s.Equal([]float32{1, 2}, clean.Scores)
+					}
+					column := result.Column(destination)
+					wantType := dataType
+					if destination == types.ScoreFieldName {
+						wantType = arrow.PrimitiveTypes.Float32
+					}
+					s.Equal(wantType, column.DataType())
+					s.Zero(column.NullN())
+					want := tc.value
+					var got float64
+					switch chunk := column.Chunk(1).(type) {
+					case *array.Float32:
+						got, want = float64(chunk.Value(1)), float64(float32(want))
+					case *array.Float64:
+						got = chunk.Value(1)
+					}
+					if math.IsNaN(want) {
+						s.True(math.IsNaN(got))
+					} else {
+						s.Equal(want, got)
+					}
+				})
+			}
+		}
+	}
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteAllowsFloat64ForRegularOutput() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	op, err := NewMapOp(&dynamicFloat64OutputExpr{}, []string{types.ScoreFieldName}, []string{"float64_output"})
+	s.Require().NoError(err)
+
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	result, err := ExecuteOperator(ctx, df, op)
+	s.Require().NoError(err)
+	defer result.Release()
+	s.Equal(arrow.FLOAT64, result.Column("float64_output").DataType().ID())
+}
+
+func (s *MapOpTestSuite) TestMapScoreConvertibleTypes() {
+	for _, dataType := range []arrow.Type{arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64, arrow.FLOAT64} {
+		s.True(isMapScoreConvertibleType(dataType), dataType.String())
+	}
+	for _, dataType := range []arrow.Type{arrow.BOOL, arrow.STRING, arrow.UINT64} {
+		s.False(isMapScoreConvertibleType(dataType), dataType.String())
+	}
+}
+
+func (s *MapOpTestSuite) TestMapOpString() {
+	fn := &doubleScoreExpr{}
+	op, err := NewMapOp(fn, []string{"in"}, []string{"out"})
+	s.Require().NoError(err)
+	s.Equal("Map(double_score)", op.String())
+}
+
+func (s *MapOpTestSuite) TestMapOpStringNilFunction() {
+	op := &MapOp{}
+	s.Equal("Map(nil)", op.String())
+}
+
+func (s *MapOpTestSuite) TestMapOpExecuteNilFunction() {
+	op := &MapOp{}
+	ctx := types.NewFuncContextFull(context.TODO(), s.pool, "rerank")
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	_, err := ExecuteOperator(ctx, df, op)
+	s.Error(err)
+	s.Contains(err.Error(), "function is nil")
+}
+
+func (s *MapOpTestSuite) TestNewMapOpFromReprNilFunction() {
+	repr := &OperatorRepr{
+		Type:    types.OpTypeMap,
+		Inputs:  []string{"in"},
+		Outputs: []string{"out"},
+	}
+	_, err := NewMapOpFromRepr(repr)
+	s.Error(err)
+	s.Contains(err.Error(), "requires function")
+}
+
+func (s *MapOpTestSuite) TestNewMapOpFromReprNoInputs() {
+	repr := &OperatorRepr{
+		Type:     types.OpTypeMap,
+		Function: &FunctionRepr{Name: "num_combine", Params: map[string]*schemapb.FunctionParamValue{}},
+		Outputs:  []string{"out"},
+	}
+	_, err := NewMapOpFromRepr(repr)
+	s.Error(err)
+	s.Contains(err.Error(), "requires inputs")
+}
+
+func (s *MapOpTestSuite) TestNewMapOpFromReprNoOutputs() {
+	repr := &OperatorRepr{
+		Type:     types.OpTypeMap,
+		Function: &FunctionRepr{Name: "num_combine", Params: map[string]*schemapb.FunctionParamValue{}},
+		Inputs:   []string{"in"},
+	}
+	_, err := NewMapOpFromRepr(repr)
+	s.Error(err)
+	s.Contains(err.Error(), "requires outputs")
+}
+
+func (s *MapOpTestSuite) TestExecuteOperatorRejectsInvalidInputSchema() {
+	builder := NewDataFrameBuilder()
+	builder.SetChunkSizes([]int64{1})
+	idBuilder := array.NewInt64Builder(s.pool)
+	idBuilder.Append(1)
+	idChunk := idBuilder.NewArray()
+	idBuilder.Release()
+	s.Require().NoError(builder.AddColumnFromChunks(types.IDFieldName, []arrow.Array{idChunk}))
+	df := builder.Build()
+	defer df.Release()
+
+	// Reject an invalid schema at the execution entry, before evaluating the expression.
+	df.schema = arrow.NewSchema([]arrow.Field{
+		{Name: types.IDFieldName, Type: arrow.PrimitiveTypes.Int64},
+		{Name: "missing", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	op, err := NewMapOp(&doubleScoreExpr{}, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+	output, err := ExecuteOperator(types.NewFuncContext(s.pool), df, op)
+	s.Nil(output)
+	s.Error(err)
+	s.Contains(err.Error(), "schema")
+}
+
+func (s *MapOpTestSuite) TestAssemblyRejectsNilOutput() {
+	df := s.createTestDF([]int64{1}, []float32{1.0}, []int64{1})
+	defer df.Release()
+
+	op, err := NewMapOp(&doubleScoreExpr{}, []string{types.ScoreFieldName}, []string{types.ScoreFieldName})
+	s.Require().NoError(err)
+	_, err = assembleOperatorResult(types.NewFuncContext(s.pool), df, op.Outputs(), &OperatorResult{
+		Columns: []NamedColumn{{Field: arrow.Field{Name: types.ScoreFieldName, Type: arrow.PrimitiveTypes.Float32}}},
+	})
+	s.Error(err)
+	s.Contains(err.Error(), "column is nil")
+}
+
+func (s *MapOpTestSuite) TestMapOpReleasesPartialOutputsOnFunctionError() {
+	df := s.createTestDF([]int64{1}, []float32{1}, []int64{1})
+	defer df.Release()
+	fn := &selectionMaskExpr{
+		dt:     arrow.PrimitiveTypes.Int64,
+		chunks: []string{"[7]"},
+		err:    merr.ErrServiceUnavailable,
+	}
+	// Even when the partial output count differs, preserve the execution error.
+	op, err := NewMapOp(fn, []string{types.ScoreFieldName}, []string{"a", "b"})
+	s.Require().NoError(err)
+	result, err := ExecuteOperator(types.NewFuncContext(s.pool), df, op)
+	s.Nil(result)
+	s.ErrorIs(err, merr.ErrServiceUnavailable)
+	// TearDownTest checks that the partial output has been released.
+}

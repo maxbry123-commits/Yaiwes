@@ -1,0 +1,1840 @@
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License
+
+#include <folly/FBVector.h>
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <random>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "common/EasyAssert.h"
+#include "common/QueryInfo.h"
+#include "common/QueryResult.h"
+#include "common/Types.h"
+#include "common/VectorTrait.h"
+#include "common/common_type_c.h"
+#include "common/protobuf_utils.h"
+#include "common/type_c.h"
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
+#include "index/contracts/Registry.h"
+#include "index/IndexTypeAdapter.h"
+#include "storage/artifact/FileSource.h"
+#include "segcore/test_utils/ConsumerIndexTestUtils.h"
+#include "knowhere/binaryset.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/config.h"
+#include "knowhere/dataset.h"
+#include "knowhere/expected.h"
+#include "knowhere/index/index.h"
+#include "knowhere/index/index_factory.h"
+#include "knowhere/version.h"
+#include "pb/common.pb.h"
+#include "pb/cgo_msg.pb.h"
+#include "pb/index_coord.pb.h"
+#include "pb/plan.pb.h"
+#include "query/PlanImpl.h"
+#include "query/PlanNode.h"
+#include "segcore/Collection.h"
+#include "segcore/SegmentSealed.h"
+#include "segcore/Types.h"
+#include "segcore/collection_c.h"
+#include "segcore/load_index_c.h"
+#include "segcore/plan_c.h"
+#include "segcore/segment_c.h"
+#include "storage/DiskFileManagerImpl.h"
+#include "storage/LocalChunkManagerSingleton.h"
+#include "storage/Util.h"
+#include "test_utils/DataGen.h"
+#include "test_utils/GenExprProto.h"
+#include "test_utils/PbHelper.h"
+#include "segcore/test_utils/ConsumerCApiTestUtils.h"
+#include "test_utils/cachinglayer_test_utils.h"
+#include "test_utils/storage_test_utils.h"
+
+using namespace milvus;
+using namespace milvus::segcore;
+using namespace milvus::index;
+using namespace milvus::test;
+using namespace knowhere;
+using namespace milvus::test::consumer;
+
+const int64_t ROW_COUNT = 10 * 1000;
+const int64_t BIAS = 4200;
+
+namespace {
+
+// This source is limited to the materialized-entry load used below. It owns
+// the externally serialized Knowhere entries and introduces no filesystem path.
+class BinarySetSource final : public storage::FileSource {
+ public:
+    explicit BinarySetSource(const knowhere::BinarySet& binary_set) {
+        for (const auto& [name, entry] : binary_set.binary_map_) {
+            entries_.emplace(
+                name,
+                std::vector<uint8_t>(entry->data.get(),
+                                     entry->data.get() + entry->size));
+        }
+    }
+
+    storage::Generation
+    Gen() const override {
+        return storage::Generation::V1V2;
+    }
+    std::vector<std::string>
+    EntryNames() const override {
+        std::vector<std::string> names;
+        for (const auto& [name, bytes] : entries_) {
+            names.push_back(name);
+        }
+        return names;
+    }
+    bool
+    HasEntry(std::string_view name) const override {
+        return entries_.find(std::string(name)) != entries_.end();
+    }
+    int64_t
+    EntrySize(std::string_view name) const override {
+        return entries_.at(std::string(name)).size();
+    }
+    std::vector<uint8_t>
+    ReadEntry(std::string_view name) override {
+        return entries_.at(std::string(name));
+    }
+    void
+    ReadEntryToLocalFile(std::string_view, const std::string&) override {
+        ThrowInfo(Unsupported, "binary-set consumer source is memory-only");
+    }
+    void
+    ReadEntriesToLocalFile(const std::vector<std::string>&,
+                           const std::string&) override {
+        ThrowInfo(Unsupported, "binary-set consumer source is memory-only");
+    }
+    std::vector<std::string>
+    ReadEntriesToLocalDir(const std::vector<std::string>&,
+                          const std::string&) override {
+        ThrowInfo(Unsupported, "binary-set consumer source is memory-only");
+    }
+
+ private:
+    std::map<std::string, std::vector<uint8_t>> entries_;
+};
+
+// The C API releases its cache-owned reader. Each reader retains the same
+// DiskFileManager generation owner used by production load cleanup.
+class LocalDirOwningReader : public index::IIndexReaderBase {
+ public:
+    explicit LocalDirOwningReader(const storage::FileManagerContext& context)
+        : disk_file_manager_(
+              std::make_shared<storage::DiskFileManagerImpl>(context)),
+          local_index_prefix_(disk_file_manager_->GetLocalIndexObjectPrefix()) {
+    }
+
+    const std::string&
+    LocalIndexPrefix() const {
+        return local_index_prefix_;
+    }
+
+    void
+    KeepGenerationAlive(index::IIndexReaderBasePtr reader) {
+        dependent_generations_.push_back(std::move(reader));
+    }
+
+    index::ReaderCaps
+    Caps() const override {
+        return {};
+    }
+    index::Domain
+    CoordDomain() const override {
+        return index::Domain::Row;
+    }
+    int64_t
+    Count() const override {
+        return 0;
+    }
+    DataType
+    ValueType() const override {
+        return DataType::VECTOR_FLOAT;
+    }
+    int64_t
+    MemoryUsage() const override {
+        return 0;
+    }
+    cachinglayer::ResourceUsage
+    CellByteSize() const override {
+        return {0, 0};
+    }
+
+ private:
+    std::shared_ptr<storage::DiskFileManagerImpl> disk_file_manager_;
+    std::string local_index_prefix_;
+    std::vector<index::IIndexReaderBasePtr> dependent_generations_;
+};
+
+milvus::storage::FileManagerContext
+MakeFileManagerContext(const milvus::segcore::LoadIndexInfo& load_index_info) {
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+
+    milvus::proto::schema::FieldSchema field_schema;
+    field_schema.set_fieldid(load_index_info.field_id);
+    field_schema.set_data_type(milvus::proto::schema::DataType::FloatVector);
+
+    milvus::storage::FieldDataMeta field_meta{load_index_info.collection_id,
+                                              load_index_info.partition_id,
+                                              load_index_info.segment_id,
+                                              load_index_info.field_id,
+                                              field_schema};
+    milvus::storage::IndexMeta index_meta{load_index_info.segment_id,
+                                          load_index_info.field_id,
+                                          load_index_info.index_build_id,
+                                          load_index_info.index_version,
+                                          "clean_loaded_index",
+                                          "vector",
+                                          milvus::DataType::VECTOR_FLOAT,
+                                          DIM,
+                                          false};
+    return milvus::storage::FileManagerContext(
+        field_meta, index_meta, local_chunk_manager, nullptr);
+}
+
+std::pair<std::unique_ptr<LocalDirOwningReader>, std::string>
+CreateLocalDirOwningReaderFile(
+    const milvus::storage::FileManagerContext& file_manager_context,
+    const std::string& file_name) {
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+    auto index = std::make_unique<LocalDirOwningReader>(file_manager_context);
+    auto local_file = index->LocalIndexPrefix() + file_name;
+    local_chunk_manager->CreateFile(local_file);
+    EXPECT_TRUE(local_chunk_manager->Exist(local_file));
+    return {std::move(index), local_file};
+}
+
+}  // namespace
+
+auto
+generate_data(int N) {
+    std::vector<char> raw_data;
+    std::vector<uint64_t> timestamps;
+    std::vector<int64_t> uids;
+    std::default_random_engine e(42);
+    std::normal_distribution<> dis(0.0, 1.0);
+    for (int i = 0; i < N; ++i) {
+        uids.push_back(10 * N + i);
+        timestamps.push_back(0);
+        float vec[DIM];
+        for (auto& x : vec) {
+            x = dis(e);
+        }
+        raw_data.insert(raw_data.end(),
+                        (const char*)std::begin(vec),
+                        (const char*)std::end(vec));
+        int age = e() % 100;
+        raw_data.insert(raw_data.end(),
+                        (const char*)&age,
+                        ((const char*)&age) + sizeof(age));
+    }
+    return std::make_tuple(raw_data, timestamps, uids);
+}
+
+TEST(CApiTest, LoadIndexSearch) {
+    // generator index
+    constexpr auto TOPK = 10;
+
+    auto N = 1024 * 10;
+    auto num_query = 100;
+    auto [raw_data, timestamps, uids] = generate_data(N);
+    auto get_index_obj = knowhere::IndexFactory::Instance().Create<float>(
+        knowhere::IndexEnum::INDEX_FAISS_IVFSQ8,
+        knowhere::Version::GetCurrentVersion().VersionNumber());
+    auto indexing = get_index_obj.value();
+    auto conf =
+        knowhere::Json{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
+                       {knowhere::meta::DIM, DIM},
+                       {knowhere::meta::TOPK, TOPK},
+                       {knowhere::indexparam::NLIST, 100},
+                       {knowhere::indexparam::NPROBE, 4}};
+
+    auto database = knowhere::GenDataSet(N, DIM, raw_data.data());
+    indexing.Train(database, conf);
+    indexing.Add(database, conf);
+
+    EXPECT_EQ(indexing.Count(), N);
+    EXPECT_EQ(indexing.Dim(), DIM);
+
+    // serializ index to binarySet
+    knowhere::BinarySet binary_set;
+    indexing.Serialize(binary_set);
+
+    // Load the external serialized engine through the public loader contract.
+    auto adapted = index::AdaptIndexType(
+        {.index_type = knowhere::IndexEnum::INDEX_FAISS_IVFSQ8,
+         .field_type = DataType::VECTOR_FLOAT,
+         .index_engine_version =
+             knowhere::Version::GetCurrentVersion().VersionNumber(),
+         .params = conf});
+    storage::LoadOptions options;
+    options.params = adapted.params;
+    const auto loader =
+        index::LoaderRegistry::Instance().Lookup(adapted.family);
+    ASSERT_TRUE(static_cast<bool>(loader));
+    auto reader =
+        loader.Load({index::OpenedIndexSource{index::LegacyIndexSource{
+                         std::make_shared<BinarySetSource>(binary_set), false}},
+                     options});
+    ASSERT_NE(reader, nullptr);
+    EXPECT_EQ(reader->Count(), N);
+    auto* vectors = dynamic_cast<const index::IVectorReader*>(reader.get());
+    ASSERT_NE(vectors, nullptr);
+    EXPECT_EQ(vectors->Dim(), DIM);
+
+    // search
+    auto query_dataset =
+        knowhere::GenDataSet(num_query, DIM, raw_data.data() + BIAS * DIM);
+
+    auto result = indexing.Search(query_dataset, conf, nullptr);
+    ASSERT_TRUE(result.has_value());
+    SearchResult loaded_result;
+    vectors->Search(query_dataset,
+                    {conf, knowhere::metric::L2, TOPK, {}},
+                    milvus::BitsetView{},
+                    nullptr,
+                    loaded_result);
+    ASSERT_EQ(loaded_result.seg_offsets_.size(), num_query * TOPK);
+    ASSERT_EQ(loaded_result.distances_.size(), num_query * TOPK);
+    for (int64_t i = 0; i < num_query * TOPK; ++i) {
+        EXPECT_EQ(loaded_result.seg_offsets_[i], result.value()->GetIds()[i]);
+        EXPECT_FLOAT_EQ(loaded_result.distances_[i],
+                        result.value()->GetDistance()[i]);
+    }
+}
+
+TEST(LoadIndexCTest,
+     SerializedResourceEstimateRejectsInvalidInputsAndClearsOutput) {
+    const uint8_t malformed[] = {0xff};
+    for (const auto& input : std::vector<std::pair<const uint8_t*, uint64_t>>{
+             {nullptr, 0},
+             {malformed, sizeof(malformed)},
+             {malformed,
+              static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1}}) {
+        LoadResourceRequest request{1, 2, 3, 4, true};
+        auto status = EstimateLoadIndexResourceFromSerializedInfo(
+            input.first, input.second, &request);
+        EXPECT_NE(status.error_code, milvus::Success);
+        if (status.error_code != milvus::Success &&
+            status.error_msg != nullptr) {
+            free(const_cast<char*>(status.error_msg));
+        }
+        EXPECT_EQ(request.max_memory_cost, 0);
+        EXPECT_EQ(request.max_disk_cost, 0);
+        EXPECT_EQ(request.final_memory_cost, 0);
+        EXPECT_EQ(request.final_disk_cost, 0);
+        EXPECT_FALSE(request.has_raw_data);
+    }
+    auto status =
+        EstimateLoadIndexResourceFromSerializedInfo(malformed, 1, nullptr);
+    EXPECT_NE(status.error_code, milvus::Success);
+    if (status.error_code != milvus::Success && status.error_msg != nullptr) {
+        free(const_cast<char*>(status.error_msg));
+    }
+}
+
+TEST(LoadIndexCTest, SerializedResourceEstimatePreservesMmapAdmissionCosts) {
+    constexpr uint64_t bytes = 1ULL << 30;
+    milvus::proto::cgo::LoadIndexInfo info;
+    info.set_collectionid(1);
+    info.set_partitionid(2);
+    info.set_segmentid(3);
+    info.set_index_engine_version(
+        knowhere::Version::GetCurrentVersion().VersionNumber());
+    info.set_index_file_size(bytes);
+    info.set_num_rows(100);
+    auto* field = info.mutable_field();
+    field->set_fieldid(101);
+    field->set_name("vector");
+    field->set_data_type(milvus::proto::schema::DataType::FloatVector);
+    auto* dim = field->add_type_params();
+    dim->set_key("dim");
+    dim->set_value("128");
+    auto& params = *info.mutable_index_params();
+    params["index_type"] = "HNSW";
+    params["metric_type"] = "L2";
+    params["M"] = "30";
+    for (const bool mmap : {false, true}) {
+        info.set_enable_mmap(mmap);
+        const auto serialized = info.SerializeAsString();
+        LoadResourceRequest request{};
+        auto status = EstimateLoadIndexResourceFromSerializedInfo(
+            reinterpret_cast<const uint8_t*>(serialized.data()),
+            serialized.size(),
+            &request);
+        EXPECT_EQ(status.error_code, milvus::Success)
+            << (status.error_msg == nullptr ? "" : status.error_msg);
+        if (status.error_code != milvus::Success) {
+            free(const_cast<char*>(status.error_msg));
+            return;
+        }
+        EXPECT_TRUE(request.has_raw_data);
+        EXPECT_EQ(request.max_memory_cost, mmap ? bytes / 8 : 2 * bytes);
+        EXPECT_EQ(request.final_memory_cost, mmap ? 0 : bytes);
+        EXPECT_EQ(request.max_disk_cost, mmap ? bytes : 0);
+        EXPECT_EQ(request.final_disk_cost, mmap ? bytes : 0);
+    }
+}
+
+TEST(LoadIndexCTest, FinishLoadIndexInfoPreservesIndexStorePathVersion) {
+    milvus::proto::cgo::LoadIndexInfo proto;
+    proto.set_collectionid(100);
+    proto.set_partitionid(20);
+    proto.set_segmentid(30);
+    auto* field = proto.mutable_field();
+    field->set_fieldid(100);
+    field->set_name("vec");
+    field->set_data_type(milvus::proto::schema::DataType::FloatVector);
+    auto* dim_param = field->add_type_params();
+    dim_param->set_key("dim");
+    dim_param->set_value("128");
+    proto.set_indexid(50);
+    proto.set_index_buildid(60);
+    proto.set_index_version(1);
+    proto.set_index_engine_version(1);
+    proto.set_index_file_size(1024);
+    proto.set_num_rows(1000);
+    proto.set_index_store_path_version(
+        milvus::proto::index::IndexStorePathVersion::
+            INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED);
+
+    std::string serialized;
+    ASSERT_TRUE(proto.SerializeToString(&serialized));
+
+    milvus::segcore::LoadIndexInfo load_index_info;
+    auto status =
+        FinishLoadIndexInfo(static_cast<CLoadIndexInfo>(&load_index_info),
+                            reinterpret_cast<const uint8_t*>(serialized.data()),
+                            serialized.size());
+
+    ASSERT_EQ(status.error_code, milvus::Success);
+    EXPECT_EQ(load_index_info.index_store_path_version,
+              milvus::proto::index::IndexStorePathVersion::
+                  INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED);
+}
+
+TEST(LoadIndexCTest, CleanLoadedIndexDoesNotRemoveSiblingGeneration) {
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+
+    milvus::segcore::LoadIndexInfo load_index_info;
+    load_index_info.collection_id = 100;
+    load_index_info.partition_id = 20;
+    load_index_info.segment_id = 30;
+    load_index_info.field_id = 40;
+    load_index_info.index_build_id = 50;
+    load_index_info.index_version = 1;
+    load_index_info.field_type = milvus::DataType::VECTOR_FLOAT;
+    load_index_info.dim = DIM;
+
+    auto file_manager_context = MakeFileManagerContext(load_index_info);
+    auto [index, index_file] =
+        CreateLocalDirOwningReaderFile(file_manager_context, "index_data");
+    auto [cache_index, cache_index_file] = CreateLocalDirOwningReaderFile(
+        file_manager_context, "cache_index_data");
+    auto [sibling_index, sibling_file] = CreateLocalDirOwningReaderFile(
+        file_manager_context, "sibling_index_data");
+    // Both owned generations leave with the cache; the independently held
+    // sibling generation must survive the C API cleanup.
+    index->KeepGenerationAlive(std::move(cache_index));
+    load_index_info.cache_index = CreateReaderCache(std::move(index));
+    ASSERT_TRUE(local_chunk_manager->Exist(index_file));
+    ASSERT_TRUE(local_chunk_manager->Exist(cache_index_file));
+    ASSERT_NE(sibling_index, nullptr);
+    ASSERT_TRUE(local_chunk_manager->Exist(sibling_file));
+
+    auto status =
+        CleanLoadedIndex(static_cast<CLoadIndexInfo>(&load_index_info));
+
+    ASSERT_EQ(status.error_code, milvus::Success);
+    EXPECT_TRUE(local_chunk_manager->Exist(sibling_file));
+    EXPECT_FALSE(local_chunk_manager->Exist(index_file));
+    EXPECT_FALSE(local_chunk_manager->Exist(cache_index_file));
+}
+
+template <class TraitType>
+void
+Test_Indexing_Without_Predicate() {
+    GET_ELEM_TYPE_FOR_VECTOR_TRAIT
+
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string =
+        generate_collection_schema<TraitType>(knowhere::metric::L2, DIM);
+    auto collection = NewCollection(schema_string.c_str());
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<elem_type>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * DIM;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    milvus::proto::plan::PlanNode plan_node;
+    auto vector_anns = plan_node.mutable_vector_anns();
+    vector_anns->set_vector_type(TraitType::vector_type);
+    vector_anns->set_placeholder_tag("$0");
+    vector_anns->set_field_id(100);
+    auto query_info = vector_anns->mutable_query_info();
+    query_info->set_topk(5);
+    query_info->set_round_decimal(-1);
+    query_info->set_metric_type("L2");
+    query_info->set_search_params(R"({"nprobe": 10})");
+    auto plan_str = plan_node.SerializeAsString();
+
+    // create place_holder_group
+    int num_queries = 5;
+    auto raw_group =
+        CreatePlaceholderGroupFromBlob<TraitType>(num_queries, DIM, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    status = CreateSearchPlanByExpr(
+        collection, plan_str.data(), plan_str.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+
+    Timestamp timestmap = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestmap,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   TraitType::data_type,
+                                   knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFSQ8,
+                                   DIM,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, DIM, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), TraitType::data_type, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestmap,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_raw_index_json =
+        SearchResultToJson(*search_result_on_raw_index);
+    auto search_result_on_bigIndex_json =
+        SearchResultToJson((*(SearchResult*)c_search_result_on_bigIndex));
+
+    ASSERT_EQ(search_result_on_raw_index_json.dump(1),
+              search_result_on_bigIndex_json.dump(1));
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_Without_Predicate) {
+    Test_Indexing_Without_Predicate<milvus::FloatVector>();
+    Test_Indexing_Without_Predicate<milvus::Float16Vector>();
+    Test_Indexing_Without_Predicate<milvus::BFloat16Vector>();
+    Test_Indexing_Without_Predicate<milvus::Int8Vector>();
+}
+
+TEST(CApiTest, Indexing_Expr_Without_Predicate) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string = generate_collection_schema<milvus::FloatVector>(
+        knowhere::metric::L2, DIM);
+    auto collection = NewCollection(schema_string.c_str());
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<float>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * DIM;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    auto raw_group =
+        CreatePlaceholderGroupFromBlob(num_queries, DIM, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto binary_plan = schema_handle.ParseSearch(
+        "", "fakevec", 5, "L2", R"({"nprobe": 10})", -1);
+    status = CreateSearchPlanByExpr(
+        collection, binary_plan.data(), binary_plan.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_FLOAT,
+                                   knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFSQ8,
+                                   DIM,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, DIM, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_FLOAT, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_raw_index_json =
+        SearchResultToJson(*search_result_on_raw_index);
+    auto search_result_on_bigIndex_json =
+        SearchResultToJson((*(SearchResult*)c_search_result_on_bigIndex));
+
+    ASSERT_EQ(search_result_on_raw_index_json.dump(1),
+              search_result_on_bigIndex_json.dump(1));
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_With_float_Predicate_Range) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string = generate_collection_schema<milvus::FloatVector>(
+        knowhere::metric::L2, DIM);
+    auto collection = NewCollection(schema_string.c_str());
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<float>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * DIM;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 10;
+    auto raw_group =
+        CreatePlaceholderGroupFromBlob(num_queries, DIM, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto plan_str =
+        schema_handle.ParseSearch("counter >= 4200 and counter < 4210",
+                                  "fakevec",
+                                  5,
+                                  "L2",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, plan_str.data(), plan_str.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_FLOAT,
+                                   knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFSQ8,
+                                   DIM,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, DIM, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_FLOAT, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    for (int i = 0; i < num_queries; ++i) {
+        auto offset = i * TOPK;
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[offset]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_Expr_With_float_Predicate_Range) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string = generate_collection_schema<milvus::FloatVector>(
+        knowhere::metric::L2, DIM);
+    auto collection = NewCollection(schema_string.c_str());
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = 1000 * 10;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<float>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * DIM;
+
+    {
+        int64_t offset;
+        PreInsert(segment, N, &offset);
+
+        auto insert_data = serialize(dataset.raw_);
+        auto ins_res = Insert(segment,
+                              offset,
+                              N,
+                              dataset.row_ids_.data(),
+                              dataset.timestamps_.data(),
+                              insert_data.data(),
+                              insert_data.size());
+        ASSERT_EQ(ins_res.error_code, Success);
+    }
+
+    // create place_holder_group
+    int num_queries = 10;
+    auto raw_group =
+        CreatePlaceholderGroupFromBlob(num_queries, DIM, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto binary_plan =
+        schema_handle.ParseSearch("counter >= 4200 and counter < 4210",
+                                  "fakevec",
+                                  5,
+                                  "L2",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, binary_plan.data(), binary_plan.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_FLOAT,
+                                   knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFSQ8,
+                                   DIM,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, DIM, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_FLOAT, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    for (int i = 0; i < num_queries; ++i) {
+        auto offset = i * TOPK;
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[offset]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_With_float_Predicate_Term) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string = generate_collection_schema<milvus::FloatVector>(
+        knowhere::metric::L2, DIM);
+    auto collection = NewCollection(schema_string.c_str());
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<float>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * DIM;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    auto raw_group =
+        CreatePlaceholderGroupFromBlob(num_queries, DIM, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto plan_str =
+        schema_handle.ParseSearch("counter in [4200, 4201, 4202, 4203, 4204]",
+                                  "fakevec",
+                                  5,
+                                  "L2",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, plan_str.data(), plan_str.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_FLOAT,
+                                   knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFSQ8,
+                                   DIM,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, DIM, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_FLOAT, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    for (int i = 0; i < num_queries; ++i) {
+        auto offset = i * TOPK;
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[offset]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_Expr_With_float_Predicate_Term) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string = generate_collection_schema<milvus::FloatVector>(
+        knowhere::metric::L2, DIM);
+    auto collection = NewCollection(schema_string.c_str());
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = 1000 * 10;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<float>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * DIM;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    auto raw_group =
+        CreatePlaceholderGroupFromBlob(num_queries, DIM, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto binary_plan =
+        schema_handle.ParseSearch("counter in [4200, 4201, 4202, 4203, 4204]",
+                                  "fakevec",
+                                  5,
+                                  "L2",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, binary_plan.data(), binary_plan.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_FLOAT,
+                                   knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFSQ8,
+                                   DIM,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, DIM, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_FLOAT, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    for (int i = 0; i < num_queries; ++i) {
+        auto offset = i * TOPK;
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[offset]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_With_binary_Predicate_Range) {
+    auto dim = 16;
+    // insert data to segment
+    constexpr auto TOPK = 5;
+
+    std::string schema_string =
+        generate_collection_schema<milvus::BinaryVector>(
+            knowhere::metric::JACCARD, dim);
+    auto collection =
+        NewCollection(schema_string.c_str(), knowhere::metric::JACCARD);
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<uint8_t>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * dim / 8;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    auto raw_group = CreatePlaceholderGroupFromBlob<milvus::BinaryVector>(
+        num_queries, dim, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto plan_str =
+        schema_handle.ParseSearch("counter >= 4200 and counter < 4210",
+                                  "fakevec",
+                                  5,
+                                  "JACCARD",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, plan_str.data(), plan_str.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_BINARY,
+                                   knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT,
+                                   dim,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, dim, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_BINARY, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    for (int i = 0; i < num_queries; ++i) {
+        auto offset = i * TOPK;
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[offset]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Range) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+    auto dim = 16;
+
+    std::string schema_string =
+        generate_collection_schema<milvus::BinaryVector>(
+            knowhere::metric::JACCARD, dim);
+    auto collection =
+        NewCollection(schema_string.c_str(), knowhere::metric::JACCARD);
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<uint8_t>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * dim / 8;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    auto raw_group = CreatePlaceholderGroupFromBlob<milvus::BinaryVector>(
+        num_queries, dim, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto binary_plan =
+        schema_handle.ParseSearch("counter >= 4200 and counter < 4210",
+                                  "fakevec",
+                                  5,
+                                  "JACCARD",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, binary_plan.data(), binary_plan.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_TRUE(res_before_load_index.error_code == Success)
+        << res_before_load_index.error_msg;
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_BINARY,
+                                   knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT,
+                                   dim,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, dim, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_BINARY, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    for (int i = 0; i < num_queries; ++i) {
+        auto offset = i * TOPK;
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[offset]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_With_binary_Predicate_Term) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+    auto dim = 16;
+
+    std::string schema_string =
+        generate_collection_schema<milvus::BinaryVector>(
+            knowhere::metric::JACCARD, dim);
+    auto collection =
+        NewCollection(schema_string.c_str(), knowhere::metric::JACCARD);
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<uint8_t>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * dim / 8;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    int topK = 5;
+    auto raw_group = CreatePlaceholderGroupFromBlob<milvus::BinaryVector>(
+        num_queries, dim, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto plan_str =
+        schema_handle.ParseSearch("counter in [4200, 4201, 4202, 4203, 4204]",
+                                  "fakevec",
+                                  5,
+                                  "JACCARD",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, plan_str.data(), plan_str.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_BINARY,
+                                   knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT,
+                                   dim,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, dim, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_BINARY, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    // This test asserts on seg_offsets_/distances_ via topk_per_nq_prefix_sum_.
+    // The full reduce pipeline isn't needed — just materialize the prefix sum
+    // for the dense (no invalid rows) search result.
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    search_result_on_bigIndex->topk_per_nq_prefix_sum_.resize(num_queries + 1);
+    for (int64_t i = 0; i <= num_queries; ++i) {
+        search_result_on_bigIndex->topk_per_nq_prefix_sum_[i] = i * topK;
+    }
+
+    for (int i = 0; i < num_queries; ++i) {
+        ASSERT_EQ(search_result_on_bigIndex->topk_per_nq_prefix_sum_.size(),
+                  search_result_on_bigIndex->total_nq_ + 1);
+        auto offset = search_result_on_bigIndex->topk_per_nq_prefix_sum_[i];
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[i * TOPK]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
+
+TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Term) {
+    // insert data to segment
+    constexpr auto TOPK = 5;
+    auto dim = 16;
+
+    std::string schema_string =
+        generate_collection_schema<milvus::BinaryVector>(
+            knowhere::metric::JACCARD, dim);
+    auto collection =
+        NewCollection(schema_string.c_str(), knowhere::metric::JACCARD);
+    auto schema = ((segcore::Collection*)collection)->get_schema();
+    CSegmentInterface segment;
+    auto status = NewSegment(collection, Growing, -1, &segment, false);
+    ASSERT_EQ(status.error_code, Success);
+
+    auto N = ROW_COUNT;
+    auto dataset = DataGen(schema, N);
+    auto vec_col = dataset.get_col<uint8_t>(FieldId(100));
+    auto query_ptr = vec_col.data() + BIAS * dim / 8;
+
+    int64_t offset;
+    PreInsert(segment, N, &offset);
+
+    auto insert_data = serialize(dataset.raw_);
+    auto ins_res = Insert(segment,
+                          offset,
+                          N,
+                          dataset.row_ids_.data(),
+                          dataset.timestamps_.data(),
+                          insert_data.data(),
+                          insert_data.size());
+    ASSERT_EQ(ins_res.error_code, Success);
+
+    // create place_holder_group
+    int num_queries = 5;
+    int topK = 5;
+    auto raw_group = CreatePlaceholderGroupFromBlob<milvus::BinaryVector>(
+        num_queries, dim, query_ptr);
+    auto blob = raw_group.SerializeAsString();
+
+    // search on segment's small index
+    void* plan = nullptr;
+    ScopedSchemaHandle schema_handle(*schema);
+    auto binary_plan =
+        schema_handle.ParseSearch("counter in [4200, 4201, 4202, 4203, 4204]",
+                                  "fakevec",
+                                  5,
+                                  "JACCARD",
+                                  R"({"nprobe": 10})",
+                                  -1);
+    status = CreateSearchPlanByExpr(
+        collection, binary_plan.data(), binary_plan.size(), &plan);
+    ASSERT_EQ(status.error_code, Success);
+
+    void* placeholderGroup = nullptr;
+    status = ParsePlaceholderGroup(
+        plan, blob.data(), blob.length(), &placeholderGroup);
+    ASSERT_EQ(status.error_code, Success);
+
+    std::vector<CPlaceholderGroup> placeholderGroups;
+    placeholderGroups.push_back(placeholderGroup);
+    Timestamp timestamp = 10000000;
+
+    CSearchResult c_search_result_on_smallIndex;
+    auto res_before_load_index = CSearch(segment,
+                                         plan,
+                                         placeholderGroup,
+                                         timestamp,
+                                         &c_search_result_on_smallIndex);
+    ASSERT_EQ(res_before_load_index.error_code, Success);
+
+    // load index to segment
+    auto indexing = generate_index(vec_col.data(),
+                                   DataType::VECTOR_BINARY,
+                                   knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT,
+                                   dim,
+                                   N);
+
+    // gen query dataset
+    auto query_dataset = knowhere::GenDataSet(num_queries, dim, query_ptr);
+    auto vec_index =
+        dynamic_cast<const index::IVectorReader*>(indexing.reader.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    SearchResult result_on_index;
+    vec_index->Search(query_dataset,
+                      MakeVectorSearchParams(search_info),
+                      milvus::BitsetView{},
+                      nullptr,
+                      result_on_index);
+    auto ids = result_on_index.seg_offsets_.data();
+    auto dis = result_on_index.distances_.data();
+    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
+    std::vector<float> vec_dis;
+    for (int j = 0; j < TOPK * num_queries; ++j) {
+        vec_dis.push_back(dis[j] * -1);
+    }
+
+    auto search_result_on_raw_index =
+        (SearchResult*)c_search_result_on_smallIndex;
+    search_result_on_raw_index->seg_offsets_ = vec_ids;
+    search_result_on_raw_index->distances_ = vec_dis;
+
+    // load index for vec field, load raw data for scalar field
+    auto load_index_info =
+        MakeLoadIndexInfo(std::move(indexing), DataType::VECTOR_BINARY, 100);
+    auto sealed_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    sealed_segment->DropFieldData(FieldId(100));
+    sealed_segment->LoadIndex(load_index_info);
+
+    CSearchResult c_search_result_on_bigIndex;
+    auto res_after_load_index = CSearch(sealed_segment.get(),
+                                        plan,
+                                        placeholderGroup,
+                                        timestamp,
+                                        &c_search_result_on_bigIndex);
+    ASSERT_EQ(res_after_load_index.error_code, Success);
+
+    // See the sibling test above — manually materialize topk_per_nq_prefix_sum_
+    // instead of running the full reduce pipeline.
+    auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
+    search_result_on_bigIndex->topk_per_nq_prefix_sum_.resize(num_queries + 1);
+    for (int64_t i = 0; i <= num_queries; ++i) {
+        search_result_on_bigIndex->topk_per_nq_prefix_sum_[i] = i * topK;
+    }
+
+    for (int i = 0; i < num_queries; ++i) {
+        ASSERT_EQ(search_result_on_bigIndex->topk_per_nq_prefix_sum_.size(),
+                  search_result_on_bigIndex->total_nq_ + 1);
+        auto offset = search_result_on_bigIndex->topk_per_nq_prefix_sum_[i];
+        ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], BIAS + i);
+        ASSERT_EQ(search_result_on_bigIndex->distances_[offset],
+                  search_result_on_raw_index->distances_[i * TOPK]);
+    }
+
+    DeleteSearchPlan(plan);
+    DeletePlaceholderGroup(placeholderGroup);
+    DeleteSearchResult(c_search_result_on_smallIndex);
+    DeleteSearchResult(c_search_result_on_bigIndex);
+    DeleteCollection(collection);
+    DeleteSegment(segment);
+}
