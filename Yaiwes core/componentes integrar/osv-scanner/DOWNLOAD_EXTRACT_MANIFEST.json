@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 16033820,
+  "bundle_sha256": "3ca173299bea2d513b8d7ee4580a3fa2df7160166d922b09d88d7d47b59c5986",
+  "extracted_tree": {
+    "bytes": 52892695,
+    "files": 1134,
+    "sha256": "b9e7de74852135b7e5782f60d78ca2b1cc178f395a73322dfd14c54d03b1b390"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "osv-scanner.bundle.zip.part-0001",
+      "sha256": "fefad6569fd689890cee8d28ca0d8b9000c465d5638dafe863aecaa4ff5ccdc1"
+    },
+    {
+      "bytes": 3450908,
+      "name": "osv-scanner.bundle.zip.part-0002",
+      "sha256": "e04c3949539a4eae5df0d8350a2265e13a8a0542655aefcebf73b81428507a91"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "osv-scanner",
+  "source_bytes": 52892695,
+  "source_commit": "f455353546889009663c1f8b640d5880a01c889a",
+  "source_files": 1134,
+  "source_ref": "main",
+  "source_repo": "google/osv-scanner",
+  "source_tree": {
+    "bytes": 52892695,
+    "files": 1134,
+    "sha256": "b9e7de74852135b7e5782f60d78ca2b1cc178f395a73322dfd14c54d03b1b390"
+  }
+}
