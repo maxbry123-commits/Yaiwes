@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 353840,
+  "bundle_sha256": "fecf041e1b6d484a2dd91d163bb1dd82883284a7ab19da6005728e787ad10931",
+  "extracted_tree": {
+    "bytes": 902871,
+    "files": 112,
+    "sha256": "ec2759743ac4c98a5a0463f59472eebfb348ee0fcb83b0bece1a82ba9b1e15bc"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 353840,
+      "name": "blt.bundle.zip.part-0001",
+      "sha256": "fecf041e1b6d484a2dd91d163bb1dd82883284a7ab19da6005728e787ad10931"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "blt",
+  "source_bytes": 902871,
+  "source_commit": "9774ed4fcc78313f9f218295f3d7e4decdadf2ae",
+  "source_files": 112,
+  "source_ref": "main",
+  "source_repo": "facebookresearch/blt",
+  "source_tree": {
+    "bytes": 902871,
+    "files": 112,
+    "sha256": "ec2759743ac4c98a5a0463f59472eebfb348ee0fcb83b0bece1a82ba9b1e15bc"
+  }
+}
