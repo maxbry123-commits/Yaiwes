@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 277157,
+  "bundle_sha256": "1fb6cbcc02d5bd5af9a68054d6390abf86f3bb69330f5f1ca610b80131e6d159",
+  "extracted_tree": {
+    "bytes": 721313,
+    "files": 183,
+    "sha256": "16f4d9baf4f6236512919dc6fbba023d7c5a31936ed912b630c686c8da42b563"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 277157,
+      "name": "in-toto.bundle.zip.part-0001",
+      "sha256": "1fb6cbcc02d5bd5af9a68054d6390abf86f3bb69330f5f1ca610b80131e6d159"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "in-toto",
+  "source_bytes": 721313,
+  "source_commit": "e352b43ad7cb8915d84c36d791aa61346152a0a3",
+  "source_files": 183,
+  "source_ref": "develop",
+  "source_repo": "in-toto/in-toto",
+  "source_tree": {
+    "bytes": 721313,
+    "files": 183,
+    "sha256": "16f4d9baf4f6236512919dc6fbba023d7c5a31936ed912b630c686c8da42b563"
+  }
+}
