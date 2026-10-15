@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 234775,
+  "bundle_sha256": "3946a992d970927d93f8a6157b9c293800645a3dcb72e9049c77faaec751941c",
+  "extracted_tree": {
+    "bytes": 806925,
+    "files": 127,
+    "sha256": "787dc63ca0c7c255234232d02c3c4ae8bfa68ddfb5157ff88dd24e9c97b40cd2"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 234775,
+      "name": "android_env.bundle.zip.part-0001",
+      "sha256": "3946a992d970927d93f8a6157b9c293800645a3dcb72e9049c77faaec751941c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "android_env",
+  "source_bytes": 806925,
+  "source_commit": "c3cdb8461121be4c4a044fd50f1a3019da7864d1",
+  "source_files": 127,
+  "source_ref": "main",
+  "source_repo": "google-deepmind/android_env",
+  "source_tree": {
+    "bytes": 806925,
+    "files": 127,
+    "sha256": "787dc63ca0c7c255234232d02c3c4ae8bfa68ddfb5157ff88dd24e9c97b40cd2"
+  }
+}
