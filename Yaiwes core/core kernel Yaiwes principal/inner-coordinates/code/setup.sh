@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Inner Coordinates — one-shot dependency setup & check.
+# 装齐/自检本项目需要的 peekaboo + cliclick + Pillow,并提示权限与 iPhone 镜像前提。
+set -uo pipefail
+have(){ command -v "$1" >/dev/null 2>&1; }
+ok(){ printf "  \033[32mok\033[0m   %s\n" "$1"; }
+miss(){ printf "  \033[31mMISS\033[0m %s\n" "$1"; }
+
+echo "Inner Coordinates · setup"
+echo "── checking dependencies ──"
+
+# cliclick — real CGEvents: modified-key paste (Cmd+V into mirror) + clicks. Essential.
+if have cliclick; then ok "cliclick"; else
+  if have brew; then echo "  installing cliclick…"; brew install cliclick && ok "cliclick" || miss "cliclick (brew install cliclick failed)";
+  else miss "cliclick — install Homebrew (https://brew.sh) then: brew install cliclick"; fi
+fi
+
+# peekaboo — click / move / swipe + screenshots. Auto-installs from steipete's Homebrew tap.
+if have peekaboo; then ok "peekaboo ($(peekaboo --version 2>/dev/null | head -1))"; else
+  if have brew; then
+    echo "  installing peekaboo (brew install steipete/tap/peekaboo)…"
+    brew install steipete/tap/peekaboo && ok "peekaboo" || miss "peekaboo (tap install failed — try: brew install steipete/tap/peekaboo)"
+  else miss "peekaboo — install Homebrew (https://brew.sh) then: brew install steipete/tap/peekaboo"; fi
+  echo "       (clicks can also fall back to cliclick c:x,y; swipe gestures use peekaboo)"
+fi
+
+# python3 + Pillow — for grab-grid.sh (coordinate-grid screenshots).
+if have python3; then
+  if python3 -c "import PIL" 2>/dev/null; then ok "Pillow (python3 -c 'import PIL')"; else
+    echo "  installing Pillow…"; python3 -m pip install --user Pillow >/dev/null 2>&1 && ok "Pillow" || miss "Pillow (python3 -m pip install --user Pillow) — grab-grid.sh needs it";
+  fi
+else miss "python3 — needed for lib/grab-grid.sh"; fi
+
+# built-ins
+have screencapture && ok "screencapture (built-in)"
+have osascript     && ok "osascript / AppleScript (built-in)"
+
+echo
+echo "── permissions (System Settings → Privacy & Security) ──"
+echo "  grant your terminal / agent:  Screen Recording  +  Accessibility"
+echo
+echo "── iPhone Mirroring channel (only if you'll drive iOS apps) ──"
+echo "  1) set up iPhone Mirroring (macOS Sequoia+)"
+echo "  2) turn ON Handoff / Universal Clipboard  (General → AirDrop & Handoff)"
+echo "     — Chinese text is pasted via the clipboard, which Handoff syncs to iOS."
+echo
+echo "── optional: hands-free payment (opt-in) ──"
+echo "  arm once to let the agent auto-enter your pay password (Keychain, local only):"
+echo "    security add-generic-password -a meituan -s ic-alipay-pay -w"
+echo "  then lib/pay-keypad.sh types it on the keypad. The agent still ASKS before"
+echo "  auto-paying and self-verifies the order. Skip this to keep paying by hand."
+echo
+echo "Done. Drop this folder into ~/.claude/skills/ to use as a Claude Code skill:"
+echo "  ln -s \"\$PWD\" ~/.claude/skills/inner-coordinates"
