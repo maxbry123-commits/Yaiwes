@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 4005311,
+  "bundle_sha256": "476191d4c371cb339b80e0158bc9506ef65e290be950c6f381d124d7ca51bb9b",
+  "extracted_tree": {
+    "bytes": 6149728,
+    "files": 579,
+    "sha256": "76722457bdec2573807229a57a20470ec6fe316f82fdafc16e027a45218ed0c9"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 4005311,
+      "name": "sandpack.bundle.zip.part-0001",
+      "sha256": "476191d4c371cb339b80e0158bc9506ef65e290be950c6f381d124d7ca51bb9b"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "sandpack",
+  "source_bytes": 6149728,
+  "source_commit": "7d60a4334980eef304d53b1c3df371ed6dbcf491",
+  "source_files": 579,
+  "source_ref": "main",
+  "source_repo": "codesandbox/sandpack",
+  "source_tree": {
+    "bytes": 6149728,
+    "files": 579,
+    "sha256": "76722457bdec2573807229a57a20470ec6fe316f82fdafc16e027a45218ed0c9"
+  }
+}
