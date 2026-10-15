@@ -1,13 +1,26 @@
 {
- "schema": "yaiwes.core.manual-nolfs-import.v1",
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
  "source_repo": "qdrant/qdrant",
  "source_commit": "016542aa5deb6c66380bb137badf73d54f742bde",
- "imported_at": "2026-10-15T04:47:29.802741-05:00",
- "method": "shallow clone depth=1 sin LFS (punteros LFS se dejan como punteros); index git directo; sin _archives",
- "files": 2446,
- "lfs_pointers_left_as_pointers": [
+ "slug": "qdrant",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 2445,
+  "sha256": "bca3b500a98b746e1a374b8aa729207e0170ea16c8d85444ca730011b443c954"
+ },
+ "extracted_tree": {
+  "files": 2445,
+  "sha256": "bca3b500a98b746e1a374b8aa729207e0170ea16c8d85444ca730011b443c954"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [
   "tests/e2e_tests/test_data/storage.tar.xz"
  ],
- "excluded": {},
- "skipped_symlinks_submodules": []
+ "gitattributes_lfs_removed": [
+  ".gitattributes (líneas filter=lfs quitadas)"
+ ],
+ "excluded_non_lfs": {},
+ "skipped_symlinks": [],
+ "no_lfs": true
 }
