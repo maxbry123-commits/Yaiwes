@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 7484300,
+  "bundle_sha256": "696c93ed3cad44e9e206daf892a7cd119711c1a05b811e71e5e436e9a3b8c373",
+  "extracted_tree": {
+    "bytes": 16975015,
+    "files": 1398,
+    "sha256": "135ef5a3a07bc2fcde61cb4ae0790bcfd17a9c9a61d350f444c8b1a4e1b385f2"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 7484300,
+      "name": "manim.bundle.zip.part-0001",
+      "sha256": "696c93ed3cad44e9e206daf892a7cd119711c1a05b811e71e5e436e9a3b8c373"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "docs/source/conduct.md"
+  ],
+  "skipped_special_count": 1,
+  "slug": "manim",
+  "source_bytes": 16975015,
+  "source_commit": "622520d34190062f32d68af066c80f1c937fc8bf",
+  "source_files": 1398,
+  "source_ref": "main",
+  "source_repo": "ManimCommunity/manim",
+  "source_tree": {
+    "bytes": 16975015,
+    "files": 1398,
+    "sha256": "135ef5a3a07bc2fcde61cb4ae0790bcfd17a9c9a61d350f444c8b1a4e1b385f2"
+  }
+}
