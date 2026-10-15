@@ -1,40 +1,24 @@
 {
-  "bundle_bytes": 16063845,
-  "bundle_sha256": "655cb58c0871961e7d56730539f7f6f66b310d0fbc64d11c8e5cca38f238ba3f",
-  "extracted_tree": {
-    "bytes": 56819086,
-    "files": 5870,
-    "sha256": "021b8aece164d4f98224f94b79e3ec15cf9541f681aae2fe29da3ef40ced3e5a"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 12582912,
-      "name": "weaviate.bundle.zip.part-0001",
-      "sha256": "b2aa5b8678171981e34fd025e3a22817dc0d778ff66069e23a21a9346f539ba4"
-    },
-    {
-      "bytes": 3480933,
-      "name": "weaviate.bundle.zip.part-0002",
-      "sha256": "a186fa56a07016777b8db351c09e3b83fa65cec5da4c6177968cc8f211c0239f"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [],
-  "skipped_special_count": 0,
-  "slug": "weaviate",
-  "source_bytes": 56819086,
-  "source_commit": "69fd5307a49b1e3119915bc4621f17654773b429",
-  "source_files": 5870,
-  "source_ref": "main",
-  "source_repo": "weaviate/weaviate",
-  "source_tree": {
-    "bytes": 56819086,
-    "files": 5870,
-    "sha256": "021b8aece164d4f98224f94b79e3ec15cf9541f681aae2fe29da3ef40ced3e5a"
-  }
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
+ "source_repo": "weaviate/weaviate",
+ "source_commit": "69fd5307a49b1e3119915bc4621f17654773b429",
+ "slug": "weaviate",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 5869,
+  "sha256": "aa7f0dc5d05db4462a0c7ac930c14d67b3cd42c21cfe41ce9d9c37529de58c04"
+ },
+ "extracted_tree": {
+  "files": 5869,
+  "sha256": "aa7f0dc5d05db4462a0c7ac930c14d67b3cd42c21cfe41ce9d9c37529de58c04"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [],
+ "gitattributes_lfs_removed": [
+  "test/benchmark/.gitattributes (archivo eliminado: solo tenía reglas LFS)"
+ ],
+ "excluded_non_lfs": {},
+ "skipped_symlinks": [],
+ "no_lfs": true
 }
