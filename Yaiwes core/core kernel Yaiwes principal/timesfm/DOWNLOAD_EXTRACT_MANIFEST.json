@@ -1,35 +1,24 @@
 {
-  "bundle_bytes": 2945261,
-  "bundle_sha256": "9939c135b9223bca968ee4da323346d95145642bb667c497174144234d456abf",
-  "extracted_tree": {
-    "bytes": 4455664,
-    "files": 156,
-    "sha256": "9e1cf1f025063ec37f60826d2bbb1b88dc4bfd727254421c1d57d3a2be6d3f23"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 2945261,
-      "name": "timesfm.bundle.zip.part-0001",
-      "sha256": "9939c135b9223bca968ee4da323346d95145642bb667c497174144234d456abf"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [],
-  "skipped_special_count": 0,
-  "slug": "timesfm",
-  "source_bytes": 4455664,
-  "source_commit": "e51928e27119cb17bebc005be2696b75e0a9e688",
-  "source_files": 156,
-  "source_ref": "master",
-  "source_repo": "google-research/timesfm",
-  "source_tree": {
-    "bytes": 4455664,
-    "files": 156,
-    "sha256": "9e1cf1f025063ec37f60826d2bbb1b88dc4bfd727254421c1d57d3a2be6d3f23"
-  }
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
+ "source_repo": "google-research/timesfm",
+ "source_commit": "e51928e27119cb17bebc005be2696b75e0a9e688",
+ "slug": "timesfm",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 155,
+  "sha256": "5105dc90e5c57b7dbca52381f077a7884e6b76ecbd57f3f305c50f92a70aa3cf"
+ },
+ "extracted_tree": {
+  "files": 155,
+  "sha256": "5105dc90e5c57b7dbca52381f077a7884e6b76ecbd57f3f305c50f92a70aa3cf"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [],
+ "gitattributes_lfs_removed": [
+  ".gitattributes (archivo eliminado: solo tenía reglas LFS)"
+ ],
+ "excluded_non_lfs": {},
+ "skipped_symlinks": [],
+ "no_lfs": true
 }
