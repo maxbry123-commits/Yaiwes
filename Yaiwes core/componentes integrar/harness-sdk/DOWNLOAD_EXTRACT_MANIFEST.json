@@ -1,0 +1,52 @@
+{
+  "bundle_bytes": 30103299,
+  "bundle_sha256": "8757950f79498f3c3612b87c4adb854970dd718246096384876d255f2351a05f",
+  "extracted_tree": {
+    "bytes": 52478010,
+    "files": 3278,
+    "sha256": "f361afcc3a913b30264b07133393db723518debb0c4c0a27de7bbf5aad7ab534"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "harness-sdk.bundle.zip.part-0001",
+      "sha256": "89ccf993f9adf0ed1cef7ade18ce40d6957cfbbcf99d52a639dc619478af04e0"
+    },
+    {
+      "bytes": 12582912,
+      "name": "harness-sdk.bundle.zip.part-0002",
+      "sha256": "f204896a5964cf1179532e8e9a84bebe49af7f1988b8b3f6d11ed598a6eb4666"
+    },
+    {
+      "bytes": 4937475,
+      "name": "harness-sdk.bundle.zip.part-0003",
+      "sha256": "4a781ccbb314519228526c27093138cbe7995cfe572a7b7c6537203d0719d0e9"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".claude/references",
+    ".claude/skills",
+    ".kiro/references",
+    ".kiro/skills",
+    "site/src/content/docs/api/python/_generated",
+    "site/src/content/docs/api/typescript/_generated"
+  ],
+  "skipped_special_count": 6,
+  "slug": "harness-sdk",
+  "source_bytes": 52478010,
+  "source_commit": "43ccafa08d6be42801459d109b66a67924696af3",
+  "source_files": 3278,
+  "source_ref": "main",
+  "source_repo": "strands-agents/harness-sdk",
+  "source_tree": {
+    "bytes": 52478010,
+    "files": 3278,
+    "sha256": "f361afcc3a913b30264b07133393db723518debb0c4c0a27de7bbf5aad7ab534"
+  }
+}
