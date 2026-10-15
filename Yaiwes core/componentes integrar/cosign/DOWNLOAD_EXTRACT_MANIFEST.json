@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1286527,
+  "bundle_sha256": "a0a50f56e800d90be136c15bac32e72250b049146ed90e3566297cf80633057b",
+  "extracted_tree": {
+    "bytes": 4110036,
+    "files": 483,
+    "sha256": "c608b3bd80615709245eee566c7705bd3ac5f3a114395e53b6473d8b48bb1a8a"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1286527,
+      "name": "cosign.bundle.zip.part-0001",
+      "sha256": "a0a50f56e800d90be136c15bac32e72250b049146ed90e3566297cf80633057b"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "cosign",
+  "source_bytes": 4110036,
+  "source_commit": "63d9aa14a70c03e73c7b2a2a9a6501566194f5f4",
+  "source_files": 483,
+  "source_ref": "main",
+  "source_repo": "sigstore/cosign",
+  "source_tree": {
+    "bytes": 4110036,
+    "files": 483,
+    "sha256": "c608b3bd80615709245eee566c7705bd3ac5f3a114395e53b6473d8b48bb1a8a"
+  }
+}
