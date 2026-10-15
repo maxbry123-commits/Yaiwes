@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1563661,
+  "bundle_sha256": "4e3e1b1eeab708a03c870ac1e250bcf8eaecf24815af33a5bded51ae2af3300c",
+  "extracted_tree": {
+    "bytes": 6056799,
+    "files": 356,
+    "sha256": "a33f4123cf0bd2891cd2797d53bdf1851bfaa60ac66afeba9185afb8646c4e56"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1563661,
+      "name": "redis-vl-python.bundle.zip.part-0001",
+      "sha256": "4e3e1b1eeab708a03c870ac1e250bcf8eaecf24815af33a5bded51ae2af3300c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "redis-vl-python",
+  "source_bytes": 6056799,
+  "source_commit": "fe583d5839758f84b13dc6ed0a42eb0ece7242d3",
+  "source_files": 356,
+  "source_ref": "main",
+  "source_repo": "redis/redis-vl-python",
+  "source_tree": {
+    "bytes": 6056799,
+    "files": 356,
+    "sha256": "a33f4123cf0bd2891cd2797d53bdf1851bfaa60ac66afeba9185afb8646c4e56"
+  }
+}

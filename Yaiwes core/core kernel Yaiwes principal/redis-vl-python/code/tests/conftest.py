@@ -1,0 +1,881 @@
+import hashlib
+import logging
+import os
+import re
+import subprocess
+from contextlib import contextmanager, suppress
+from datetime import datetime, timezone
+
+import pytest
+from redis.exceptions import ResponseError
+from testcontainers.compose import DockerCompose
+
+from redisvl.index.index import AsyncSearchIndex, SearchIndex
+from redisvl.redis.connection import RedisConnectionFactory, is_version_gte
+from redisvl.redis.utils import array_to_buffer
+from redisvl.types import SyncRedisClient
+from redisvl.utils.vectorize import HFTextVectorizer
+
+logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="session")
+def worker_id(request):
+    """
+    Get the worker ID for the current test.
+
+    In pytest-xdist, the config has "workerid" in workerinput.
+    This fixture abstracts that logic to provide a consistent worker_id
+    across all tests.
+    """
+    workerinput = getattr(request.config, "workerinput", {})
+    return workerinput.get("workerid", "master")
+
+
+@pytest.fixture
+def redis_test_name(worker_id, request):
+    """Build a per-test Redis resource name stable within a test function."""
+    node_hash = hashlib.sha1(request.node.nodeid.encode("utf-8")).hexdigest()[:10]
+
+    def make_name(base: str) -> str:
+        slug = re.sub(r"[^0-9A-Za-z]+", "_", base).strip("_").lower()
+        return f"{slug or 'redis_resource'}_{worker_id}_{node_hash}"
+
+    return make_name
+
+
+@pytest.fixture(autouse=True)
+def set_tokenizers_parallelism():
+    """Disable tokenizers parallelism in tests to avoid deadlocks"""
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def redis_container(worker_id):
+    """
+    If using xdist, create a unique Compose project for each xdist worker by
+    setting COMPOSE_PROJECT_NAME. That prevents collisions on container/volume
+    names.
+    """
+    # Set the Compose project name so containers do not clash across workers
+    os.environ["COMPOSE_PROJECT_NAME"] = f"redis_test_{worker_id}"
+    os.environ.setdefault("REDIS_IMAGE", "redis:8.4")
+
+    compose = DockerCompose(
+        context="tests",
+        compose_file_name="docker-compose.yml",
+        pull=True,
+    )
+    compose.start()
+
+    yield compose
+
+    compose.stop()
+
+
+@pytest.fixture(scope="session")
+def redis_cluster_container(worker_id):
+    project_name = f"redis_test_cluster_{worker_id}"
+    # Use cwd if not running in GitHub Actions
+    pwd = os.getcwd()
+    compose_file = os.path.join(
+        os.environ.get("GITHUB_WORKSPACE", pwd), "tests", "cluster-compose.yml"
+    )
+    os.environ["COMPOSE_PROJECT_NAME"] = (
+        project_name  # For docker compose to pick it up if needed
+    )
+    # Cluster tests use a pinned Redis 8 image for consistency.
+    os.environ.setdefault("REDIS_IMAGE", "redis:8.4")
+
+    # The DockerCompose helper isn't working with multiple services because the
+    # subprocess command returns non-zero exit codes even on successful
+    # completion. Here, we run the commands manually.
+
+    # First attempt the docker-compose up command and handle its errors directly
+    docker_cmd = [
+        "docker",
+        "compose",
+        "-f",
+        compose_file,
+        "-p",  # Explicitly pass project name
+        project_name,
+        "up",
+        "--wait",  # Wait for healthchecks
+        "-d",  # Detach
+    ]
+
+    try:
+        result = subprocess.run(
+            docker_cmd,
+            capture_output=True,
+            check=False,  # Don't raise exception, we'll handle it ourselves
+        )
+
+        if result.returncode != 0:
+            logger.error(f"Docker Compose up failed with exit code {result.returncode}")
+            if result.stdout:
+                logger.error(
+                    f"STDOUT: {result.stdout.decode('utf-8', errors='replace')}"
+                )
+            if result.stderr:
+                logger.error(
+                    f"STDERR: {result.stderr.decode('utf-8', errors='replace')}"
+                )
+
+            # Try to get logs for more details
+            logger.info("Attempting to fetch container logs...")
+            try:
+                logs_result = subprocess.run(
+                    [
+                        "docker",
+                        "compose",
+                        "-f",
+                        compose_file,
+                        "-p",
+                        project_name,
+                        "logs",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                logger.info("Docker Compose logs:\n%s", logs_result.stdout)
+                if logs_result.stderr:
+                    logger.error("Docker Compose logs stderr: \n%s", logs_result.stderr)
+            except Exception as log_e:
+                logger.error(f"Failed to get Docker Compose logs: {repr(log_e)}")
+
+            # Now raise the exception with the original result
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                docker_cmd,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+
+        # If we get here, setup was successful
+        yield
+    finally:
+        # Always clean up
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    compose_file,
+                    "-p",
+                    project_name,
+                    "down",
+                    "-v",  # Remove volumes
+                ],
+                check=False,  # Don't raise on cleanup failure
+                capture_output=True,
+            )
+        except Exception as e:
+            logger.error(f"Error during cleanup: {repr(e)}")
+
+
+@pytest.fixture(scope="session")
+def redis_url(redis_container):
+    """
+    Use the `DockerCompose` fixture to get host/port of the 'redis' service
+    on container port 6379 (mapped to an ephemeral port on the host).
+    """
+    host, port = redis_container.get_service_host_and_port("redis", 6379)
+    return f"redis://{host}:{port}"
+
+
+@pytest.fixture(scope="session")
+def redis_cluster_url(redis_cluster_container):
+    # Hard-coded due to Docker issues
+    return "redis://localhost:7001"
+
+
+@pytest.fixture
+async def async_client(redis_url):
+    """
+    An async Redis client that uses the dynamic `redis_url`.
+    """
+    async with await RedisConnectionFactory._get_aredis_connection(redis_url) as client:
+        yield client
+
+
+@pytest.fixture
+def client(redis_url):
+    """
+    A sync Redis client that uses the dynamic `redis_url`.
+    """
+    conn = RedisConnectionFactory.get_redis_connection(redis_url=redis_url)
+    yield conn
+
+
+class _AclUser:
+    """A temporary ACL user, plus the RedisVL connections opened as them.
+
+    `username` and `password` are public so a test can hand them to anything
+    that takes connection kwargs, such as an extension constructor, instead of
+    going through `connect()`.
+    """
+
+    def __init__(self, username: str, password: str, redis_url: str):
+        self.username = username
+        self.password = password
+        self._redis_url = redis_url
+        self._clients: list[SyncRedisClient] = []
+
+    def connect(self, **kwargs):
+        """Open a RedisVL connection authenticated as this user."""
+        conn = RedisConnectionFactory.get_redis_connection(
+            redis_url=self._redis_url,
+            username=self.username,
+            password=self.password,
+            **kwargs,
+        )
+        self._clients.append(conn)
+        return conn
+
+    def close_all(self) -> None:
+        for conn in self._clients:
+            with suppress(Exception):
+                conn.close()
+
+
+@pytest.fixture
+def acl_user(client, redis_url, redis_test_name):
+    """Create a temporary ACL user, yielding a handle that connects as them.
+
+    The returned factory takes a required `name` and the ACL rules to apply, in
+    the order Redis applies them: rules are evaluated left to right, so
+    `+@all -@admin` and `-@admin +@all` do not mean the same thing. `on` and a
+    password are supplied here, so callers pass only key patterns, channel
+    patterns and command rules::
+
+        with acl_user("~*", "&*", "+@read", "+@write", name="read_write") as user:
+            restricted = user.connect()
+
+    Rules are applied after `reset`, because `ACL SETUSER` is additive and
+    usernames are derived from the test's node id -- without it, a run whose
+    teardown was skipped by a crash would layer new rules onto a stale user.
+
+    ACL users are server-global, so a leaked one outlives the test and its
+    worker; the user is dropped before the connections it authenticated. Redis
+    Software manages ACLs through its own control plane and does not support the
+    `>password` syntax used here, so tests built on this fixture only run
+    against Redis Open Source -- they skip elsewhere.
+    """
+
+    @contextmanager
+    def _make_acl_user(*rules: str, name: str):
+        username = redis_test_name(name)
+        password = "test-acl-password"
+        try:
+            client.execute_command(
+                "ACL", "SETUSER", username, "reset", "on", f">{password}", *rules
+            )
+        except ResponseError as e:
+            pytest.skip(f"Deployment does not support ACL SETUSER: {e}")
+        user = _AclUser(username, password, redis_url)
+        try:
+            yield user
+        finally:
+            try:
+                client.execute_command("ACL", "DELUSER", username)
+            finally:
+                user.close_all()
+
+    return _make_acl_user
+
+
+@pytest.fixture
+def cluster_client(redis_cluster_url):
+    """
+    A sync Redis client that uses the dynamic `redis_cluster_url`.
+    """
+    conn = RedisConnectionFactory.get_redis_cluster_connection(
+        redis_url=redis_cluster_url
+    )
+    yield conn
+
+
+@pytest.fixture(scope="session")
+def hf_vectorizer():
+    return HFTextVectorizer(
+        model="sentence-transformers/all-mpnet-base-v2",
+        token=os.getenv("HF_TOKEN"),
+        cache_folder=os.getenv("SENTENCE_TRANSFORMERS_HOME"),
+    )
+
+
+@pytest.fixture(scope="session")
+def hf_vectorizer_float16():
+    return HFTextVectorizer(dtype="float16")
+
+
+@pytest.fixture(scope="session")
+def hf_vectorizer_with_model():
+    return HFTextVectorizer("sentence-transformers/all-mpnet-base-v2")
+
+
+@pytest.fixture
+def sample_datetimes():
+    return {
+        "low": datetime(2025, 1, 16, 13).astimezone(timezone.utc),
+        "mid": datetime(2025, 2, 16, 13).astimezone(timezone.utc),
+        "high": datetime(2025, 3, 16, 13).astimezone(timezone.utc),
+    }
+
+
+@pytest.fixture
+def sample_data(sample_datetimes):
+    return [
+        {
+            "user": "john",
+            "age": 18,
+            "job": "engineer",
+            "description": "engineers conduct trains that ride on train tracks",
+            "last_updated": sample_datetimes["low"].timestamp(),
+            "credit_score": "high",
+            "location": "-122.4194,37.7749",
+            "user_embedding": [0.1, 0.1, 0.5],
+        },
+        {
+            "user": "mary",
+            "age": 14,
+            "job": "doctor",
+            "description": "a medical professional who treats diseases and helps people stay healthy",
+            "last_updated": sample_datetimes["low"].timestamp(),
+            "credit_score": "low",
+            "location": "-122.4194,37.7749",
+            "user_embedding": [0.1, 0.1, 0.5],
+        },
+        {
+            "user": "nancy",
+            "age": 94,
+            "job": "doctor",
+            "description": "a research scientist specializing in cancers and diseases of the lungs",
+            "last_updated": sample_datetimes["mid"].timestamp(),
+            "credit_score": "high",
+            "location": "-122.4194,37.7749",
+            "user_embedding": [0.7, 0.1, 0.5],
+        },
+        {
+            "user": "tyler",
+            "age": 100,
+            "job": "engineer",
+            "description": "a software developer with expertise in mathematics and computer science",
+            "last_updated": sample_datetimes["mid"].timestamp(),
+            "credit_score": "high",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [0.1, 0.4, 0.5],
+        },
+        {
+            "user": "tim",
+            "age": 12,
+            "job": "dermatologist",
+            "description": "a medical professional specializing in diseases of the skin",
+            "last_updated": sample_datetimes["mid"].timestamp(),
+            "credit_score": "high",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [0.4, 0.4, 0.5],
+        },
+        {
+            "user": "taimur",
+            "age": 15,
+            "job": "CEO",
+            "description": "high stress, but financially rewarding position at the head of a company",
+            "last_updated": sample_datetimes["high"].timestamp(),
+            "credit_score": "low",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [0.6, 0.1, 0.5],
+        },
+        {
+            "user": "joe",
+            "age": 35,
+            "job": "dentist",
+            "description": "like the tooth fairy because they'll take your teeth, but you have to pay them!",
+            "last_updated": sample_datetimes["high"].timestamp(),
+            "credit_score": "medium",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [-0.1, -0.1, -0.5],
+        },
+    ]
+
+
+@pytest.fixture
+def multi_vector_data(sample_datetimes):
+    return [
+        {
+            "user": "john",
+            "age": 18,
+            "job": "engineer",
+            "description": "engineers conduct trains that ride on train tracks",
+            "last_updated": sample_datetimes["low"].timestamp(),
+            "credit_score": "high",
+            "location": "-122.4194,37.7749",
+            "user_embedding": [0.1, 0.1, 0.5],
+            "image_embedding": [0.1, 0.1, 0.1, 0.1, 0.1],
+            "audio_embedding": [34, 18.5, -6.0, -12, 115, 96.5],
+        },
+        {
+            "user": "mary",
+            "age": 14,
+            "job": "doctor",
+            "description": "a medical professional who treats diseases and helps people stay healthy",
+            "last_updated": sample_datetimes["low"].timestamp(),
+            "credit_score": "low",
+            "location": "-122.4194,37.7749",
+            "user_embedding": [0.1, 0.1, 0.5],
+            "image_embedding": [0.1, 0.2, 0.3, 0.4, 0.5],
+            "audio_embedding": [0.0, -1.06, 4.55, -1.93, 0.0, 1.53],
+        },
+        {
+            "user": "nancy",
+            "age": 94,
+            "job": "doctor",
+            "description": "a research scientist specializing in cancers and diseases of the lungs",
+            "last_updated": sample_datetimes["mid"].timestamp(),
+            "credit_score": "high",
+            "location": "-122.4194,37.7749",
+            "user_embedding": [0.7, 0.1, 0.5],
+            "image_embedding": [0.1, 0.1, 0.3, 0.3, 0.5],
+            "audio_embedding": [2.75, -0.33, -3.01, -0.52, 5.59, -2.30],
+        },
+        {
+            "user": "tyler",
+            "age": 100,
+            "job": "engineer",
+            "description": "a software developer with expertise in mathematics and computer science",
+            "last_updated": sample_datetimes["mid"].timestamp(),
+            "credit_score": "high",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [0.1, 0.4, 0.5],
+            "image_embedding": [-0.1, -0.2, -0.3, -0.4, -0.5],
+            "audio_embedding": [1.11, -6.73, 5.41, 1.04, 3.92, 0.73],
+        },
+        {
+            "user": "tim",
+            "age": 12,
+            "job": "dermatologist",
+            "description": "a medical professional specializing in diseases of the skin",
+            "last_updated": sample_datetimes["mid"].timestamp(),
+            "credit_score": "high",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [0.4, 0.4, 0.5],
+            "image_embedding": [-0.1, 0.0, 0.6, 0.0, -0.9],
+            "audio_embedding": [0.03, -2.67, -2.08, 4.57, -2.33, 0.0],
+        },
+        {
+            "user": "taimur",
+            "age": 15,
+            "job": "CEO",
+            "description": "high stress, but financially rewarding position at the head of a company",
+            "last_updated": sample_datetimes["high"].timestamp(),
+            "credit_score": "low",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [0.6, 0.1, 0.5],
+            "image_embedding": [1.1, 1.2, -0.3, -4.1, 5.0],
+            "audio_embedding": [0.68, 0.26, 2.08, 2.96, 0.01, 5.13],
+        },
+        {
+            "user": "joe",
+            "age": 35,
+            "job": "dentist",
+            "description": "like the tooth fairy because they'll take your teeth, but you have to pay them!",
+            "last_updated": sample_datetimes["high"].timestamp(),
+            "credit_score": "medium",
+            "location": "-110.0839,37.3861",
+            "user_embedding": [-0.1, -0.1, -0.5],
+            "image_embedding": [-0.8, 2.0, 3.1, 1.5, -1.6],
+            "audio_embedding": [0.91, 7.10, -2.14, -0.52, -6.08, -5.53],
+        },
+    ]
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-api-tests",
+        action="store_true",
+        default=False,
+        help="Run tests that require API keys",
+    )
+    parser.addoption(
+        "--run-cluster-tests",
+        action="store_true",
+        default=False,
+        help="Run tests that require a Redis cluster",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "requires_api_keys: mark test as requiring API keys"
+    )
+    config.addinivalue_line(
+        "markers", "requires_cluster: mark test as requiring a Redis cluster"
+    )
+    config.addinivalue_line(
+        "markers",
+        "requires_hf: mark test as requiring HuggingFace/sentence-transformers",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    # Check each flag independently
+    run_api_tests = config.getoption("--run-api-tests")
+    run_cluster_tests = config.getoption("--run-cluster-tests")
+
+    # Create skip markers
+    skip_api = pytest.mark.skip(
+        reason="Skipping test because API keys are not provided. Use --run-api-tests to run these tests."
+    )
+    skip_cluster = pytest.mark.skip(
+        reason="Skipping test because Redis cluster is not available. Use --run-cluster-tests to run these tests."
+    )
+
+    # Apply skip markers independently based on flags
+    for item in items:
+        if item.get_closest_marker("requires_api_keys") and not run_api_tests:
+            item.add_marker(skip_api)
+        if item.get_closest_marker("requires_cluster") and not run_cluster_tests:
+            item.add_marker(skip_cluster)
+
+
+@pytest.fixture
+def flat_index(sample_data, redis_url, redis_test_name):
+    """
+    A fixture that uses the "flag" algorithm for its vector field.
+    """
+
+    # construct a search index from the schema
+    index_name = redis_test_name("user_index")
+    index_prefix = redis_test_name("v1")
+    index = SearchIndex.from_dict(
+        {
+            "index": {
+                "name": index_name,
+                "prefix": index_prefix,
+                "storage_type": "hash",
+            },
+            "fields": [
+                {"name": "description", "type": "text"},
+                {"name": "credit_score", "type": "tag"},
+                {"name": "job", "type": "text"},
+                {"name": "age", "type": "numeric"},
+                {"name": "last_updated", "type": "numeric"},
+                {"name": "location", "type": "geo"},
+                {
+                    "name": "user_embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "algorithm": "flat",
+                        "datatype": "float32",
+                    },
+                },
+            ],
+        },
+        redis_url=redis_url,
+    )
+
+    # create the index (no data yet)
+    index.create(overwrite=True, drop=True)
+
+    # Prepare and load the data
+    def hash_preprocess(item: dict) -> dict:
+        return {
+            **item,
+            "user_embedding": array_to_buffer(item["user_embedding"], "float32"),
+        }
+
+    index.load(sample_data, preprocess=hash_preprocess)
+
+    # run the test
+    yield index
+
+    # clean up
+    index.delete(drop=True)
+
+
+@pytest.fixture
+async def async_flat_index(sample_data, redis_url, redis_test_name):
+    """
+    A fixture that uses the "flag" algorithm for its vector field.
+    """
+
+    # construct a search index from the schema
+    index_name = redis_test_name("user_index")
+    index_prefix = redis_test_name("v1")
+    index = AsyncSearchIndex.from_dict(
+        {
+            "index": {
+                "name": index_name,
+                "prefix": index_prefix,
+                "storage_type": "hash",
+            },
+            "fields": [
+                {"name": "description", "type": "text"},
+                {"name": "credit_score", "type": "tag"},
+                {"name": "job", "type": "text"},
+                {"name": "age", "type": "numeric"},
+                {"name": "last_updated", "type": "numeric"},
+                {"name": "location", "type": "geo"},
+                {
+                    "name": "user_embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "algorithm": "flat",
+                        "datatype": "float32",
+                    },
+                },
+            ],
+        },
+        redis_url=redis_url,
+    )
+
+    # create the index (no data yet)
+    await index.create(overwrite=True, drop=True)
+
+    # Prepare and load the data
+    def hash_preprocess(item: dict) -> dict:
+        return {
+            **item,
+            "user_embedding": array_to_buffer(item["user_embedding"], "float32"),
+        }
+
+    await index.load(sample_data, preprocess=hash_preprocess)
+
+    # run the test
+    yield index
+
+    # clean up
+    await index.delete(drop=True)
+
+
+@pytest.fixture
+async def async_hnsw_index(sample_data, redis_url, redis_test_name):
+    """
+    A fixture that uses the "hnsw" algorithm for its vector field.
+    """
+
+    index_name = redis_test_name("user_index")
+    index_prefix = redis_test_name("v1")
+    index = AsyncSearchIndex.from_dict(
+        {
+            "index": {
+                "name": index_name,
+                "prefix": index_prefix,
+                "storage_type": "hash",
+            },
+            "fields": [
+                {"name": "description", "type": "text"},
+                {"name": "credit_score", "type": "tag"},
+                {"name": "job", "type": "text"},
+                {"name": "age", "type": "numeric"},
+                {"name": "last_updated", "type": "numeric"},
+                {"name": "location", "type": "geo"},
+                {
+                    "name": "user_embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "algorithm": "hnsw",
+                        "datatype": "float32",
+                    },
+                },
+            ],
+        },
+        redis_url=redis_url,
+    )
+
+    # create the index (no data yet)
+    await index.create(overwrite=True, drop=True)
+
+    # Prepare and load the data
+    def hash_preprocess(item: dict) -> dict:
+        return {
+            **item,
+            "user_embedding": array_to_buffer(item["user_embedding"], "float32"),
+        }
+
+    await index.load(sample_data, preprocess=hash_preprocess)
+
+    # run the test
+    yield index
+
+    # clean up
+    await index.delete(drop=True)
+
+
+@pytest.fixture
+def hnsw_index(sample_data, redis_url, redis_test_name):
+    """
+    A fixture that uses the "hnsw" algorithm for its vector field.
+    """
+
+    index_name = redis_test_name("user_index")
+    index_prefix = redis_test_name("v1")
+    index = SearchIndex.from_dict(
+        {
+            "index": {
+                "name": index_name,
+                "prefix": index_prefix,
+                "storage_type": "hash",
+            },
+            "fields": [
+                {"name": "description", "type": "text"},
+                {"name": "credit_score", "type": "tag"},
+                {"name": "job", "type": "text"},
+                {"name": "age", "type": "numeric"},
+                {"name": "last_updated", "type": "numeric"},
+                {"name": "location", "type": "geo"},
+                {
+                    "name": "user_embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "algorithm": "hnsw",
+                        "datatype": "float32",
+                    },
+                },
+            ],
+        },
+        redis_url=redis_url,
+    )
+
+    # create the index (no data yet)
+    index.create(overwrite=True, drop=True)
+
+    # Prepare and load the data
+    def hash_preprocess(item: dict) -> dict:
+        return {
+            **item,
+            "user_embedding": array_to_buffer(item["user_embedding"], "float32"),
+        }
+
+    index.load(sample_data, preprocess=hash_preprocess)
+
+    # run the test
+    yield index
+
+    # clean up
+    index.delete(drop=True)
+
+
+# MCP server test helpers
+def mcp_binding_index(server, index_id=None):
+    """Return a started MCP server's resolved index for the given binding.
+
+    Test-only replacement for the removed ``get_index`` convenience: it routes
+    through ``resolve_binding`` so it preserves the same ``index is required`` /
+    ``has not been started`` errors the real tools see.
+    """
+    return server.resolve_binding(index_id).index
+
+
+def mcp_binding_vectorizer(server, index_id=None):
+    """Return a started MCP server's resolved vectorizer for the given binding.
+
+    Test-only replacement for the removed ``get_vectorizer`` convenience,
+    mirroring its "vectorizer is not configured" error when none is set.
+    """
+    runtime = server.resolve_binding(index_id)
+    if runtime.vectorizer is None:
+        raise RuntimeError("MCP server vectorizer is not configured")
+    return runtime.vectorizer
+
+
+# Version checking utilities
+def get_redis_version(client):
+    """Get Redis version from client info."""
+    return client.info()["redis_version"]
+
+
+async def get_redis_version_async(client):
+    """Get Redis version from async client info."""
+    info = await client.info()
+    return info["redis_version"]
+
+
+def has_redis_search_module(client):
+    """Check if Redis Search module is available."""
+    try:
+        # Try to list indices - this is a Redis Search command
+        client.execute_command("FT._LIST")
+        return True
+    except Exception:
+        return False
+
+
+async def has_redis_search_module_async(client):
+    """Check if Redis Search module is available (async)."""
+    try:
+        # Try to list indices - this is a Redis Search command
+        await client.execute_command("FT._LIST")
+        return True
+    except Exception:
+        return False
+
+
+def skip_if_redis_version_below(client, min_version: str, message: str = None):
+    """
+    Skip test if Redis version is below minimum required.
+
+    Args:
+        client: Redis client instance
+        min_version: Minimum required Redis version
+        message: Custom skip message
+    """
+    redis_version = get_redis_version(client)
+    if not is_version_gte(redis_version, min_version):
+        skip_msg = message or f"Redis version {redis_version} < {min_version} required"
+        pytest.skip(skip_msg)
+
+
+async def skip_if_redis_version_below_async(
+    client, min_version: str, message: str = None
+):
+    """
+    Skip test if Redis version is below minimum required (async version).
+
+    Args:
+        client: Async Redis client instance
+        min_version: Minimum required Redis version
+        message: Custom skip message
+    """
+    redis_version = await get_redis_version_async(client)
+    if not is_version_gte(redis_version, min_version):
+        skip_msg = message or f"Redis version {redis_version} < {min_version} required"
+        pytest.skip(skip_msg)
+
+
+def skip_if_no_redis_search(client, message: str = None):
+    """
+    Skip test if Redis Search module is not available.
+
+    Args:
+        client: Redis client instance
+        message: Custom skip message
+    """
+    if not has_redis_search_module(client):
+        skip_msg = message or "Redis Search module not available"
+        pytest.skip(skip_msg)
+
+
+async def skip_if_no_redis_search_async(client, message: str = None):
+    """
+    Skip test if Redis Search module is not available (async version).
+
+    Args:
+        client: Async Redis client instance
+        message: Custom skip message
+    """
+    if not await has_redis_search_module_async(client):
+        skip_msg = message or "Redis Search module not available"
+        pytest.skip(skip_msg)

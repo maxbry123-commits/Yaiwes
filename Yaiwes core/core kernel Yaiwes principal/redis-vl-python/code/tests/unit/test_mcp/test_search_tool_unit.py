@@ -1,0 +1,1053 @@
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from conftest import _schema
+
+from redisvl.mcp.config import MCPConfig
+from redisvl.mcp.errors import MCPErrorCode, RedisVLMCPError
+from redisvl.mcp.runtime import BindingRuntime
+from redisvl.mcp.tools.search import (
+    _build_fallback_hybrid_kwargs,
+    _build_search_tool_description,
+    _embed_query,
+    _validate_request,
+    register_search_tool,
+    search_records,
+)
+from redisvl.query import VectorQuery
+from redisvl.query.filter import Tag
+from redisvl.schema import IndexSchema
+
+
+def _config_with_search(
+    search_type: str,
+    params: dict[str, Any] | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
+    *,
+    include_vectorizer: bool = True,
+) -> MCPConfig:
+    runtime_config = {
+        "text_field_name": "content",
+        "vector_field_name": "embedding",
+        "default_embed_text_field": "content",
+        "default_limit": 2,
+        "max_limit": 5,
+    }
+    if runtime_overrides:
+        runtime_config.update(runtime_overrides)
+
+    binding = {
+        "redis_name": "docs-index",
+        "search": {"type": search_type, "params": params or {}},
+        "runtime": runtime_config,
+    }
+    if include_vectorizer:
+        binding["vectorizer"] = {"class": "FakeVectorizer", "model": "test-model"}
+
+    return MCPConfig.model_validate(
+        {
+            "server": {"redis_url": "redis://localhost:6379"},
+            "indexes": {"knowledge": binding},
+        }
+    )
+
+
+class FakeVectorizer:
+    async def embed(self, text: str):
+        return [0.1, 0.2, 0.3]
+
+
+class FakeIndex:
+    def __init__(self):
+        self.schema = _schema()
+        self.query_calls = []
+
+    async def query(self, query):
+        self.query_calls.append(query)
+        return []
+
+
+class FakeServer:
+    def __init__(
+        self,
+        *,
+        search_type: str = "vector",
+        search_params: dict[str, Any] | None = None,
+        runtime_overrides: dict[str, Any] | None = None,
+        include_vectorizer: bool = True,
+    ):
+        self.config = _config_with_search(
+            search_type,
+            search_params,
+            runtime_overrides,
+            include_vectorizer=include_vectorizer,
+        )
+        self.mcp_settings = SimpleNamespace(tool_search_description=None)
+        self.index = FakeIndex()
+        self.vectorizer = FakeVectorizer() if include_vectorizer else None
+        self.registered_tools = []
+        self.native_hybrid_supported = False
+        self.resolved_index_ids: list[str | None] = []
+
+    def resolve_binding(self, index_id=None):
+        self.resolved_index_ids.append(index_id)
+        if index_id is not None and index_id != "knowledge":
+            raise RedisVLMCPError(
+                f"Unknown index '{index_id}'; available: knowledge",
+                code=MCPErrorCode.INVALID_REQUEST,
+                retryable=False,
+            )
+        return BindingRuntime(
+            binding_id="knowledge",
+            binding=self.config.indexes["knowledge"],
+            index=self.index,
+            schema=self.index.schema,
+            vectorizer=self.vectorizer,
+            supports_native_hybrid_search=self.native_hybrid_supported,
+            effective_read_only=False,
+        )
+
+    async def run_guarded(self, operation_name, awaitable, *, timeout_seconds=None):
+        return await awaitable
+
+    async def supports_native_hybrid_search(self):
+        return self.native_hybrid_supported
+
+    def tool(self, name=None, description=None, **kwargs):
+        def decorator(fn):
+            self.registered_tools.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "fn": fn,
+                }
+            )
+            return fn
+
+        return decorator
+
+
+class FakeQuery:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.mark.asyncio
+async def test_embed_query_falls_back_to_sync_embed_when_aembed_is_not_implemented():
+    class FallbackVectorizer:
+        async def aembed(self, text: str):
+            raise NotImplementedError
+
+        def embed(self, text: str):
+            return [0.4, 0.5, 0.6]
+
+    embedding = await _embed_query(FallbackVectorizer(), "science")
+
+    assert embedding == [0.4, 0.5, 0.6]
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_blank_query():
+    server = FakeServer()
+
+    with pytest.raises(RedisVLMCPError) as exc_info:
+        await search_records(server, query="   ")
+
+    assert exc_info.value.code == MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_invalid_limit_and_offset():
+    server = FakeServer()
+
+    with pytest.raises(RedisVLMCPError) as limit_exc:
+        await search_records(server, query="science", limit=0)
+
+    with pytest.raises(RedisVLMCPError) as offset_exc:
+        await search_records(server, query="science", offset=-1)
+
+    assert limit_exc.value.code == MCPErrorCode.INVALID_REQUEST
+    assert offset_exc.value.code == MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_result_windows_larger_than_runtime_cap():
+    server = FakeServer(runtime_overrides={"max_limit": 3, "max_result_window": 3})
+
+    with pytest.raises(
+        RedisVLMCPError, match="offset \\+ limit must be less than or equal to 3"
+    ) as exc_info:
+        await search_records(server, query="science", offset=2, limit=2)
+
+    assert exc_info.value.code == MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_search_records_allows_result_window_boundary_and_default_limit(
+    monkeypatch,
+):
+    server = FakeServer(runtime_overrides={"max_limit": 4, "max_result_window": 4})
+    built_queries = []
+
+    class FakeVectorQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return []
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.VectorQuery", FakeVectorQuery)
+    server.index.query = fake_query
+
+    await search_records(server, query="science", offset=2)
+
+    assert built_queries[0]["num_results"] == 4
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_unknown_or_vector_return_fields():
+    server = FakeServer()
+
+    with pytest.raises(RedisVLMCPError) as unknown_exc:
+        await search_records(server, query="science", return_fields=["missing"])
+
+    with pytest.raises(RedisVLMCPError) as vector_exc:
+        await search_records(server, query="science", return_fields=["embedding"])
+
+    assert unknown_exc.value.code == MCPErrorCode.INVALID_REQUEST
+    assert vector_exc.value.code == MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_an_empty_return_fields_list():
+    server = FakeServer()
+
+    # An empty list is not "no projection" -- it reaches Redis as an absent
+    # RETURN clause, which widens the response to every field including the
+    # vector. Rejecting it keeps `[]` from quietly meaning the opposite of what
+    # it reads like.
+    with pytest.raises(RedisVLMCPError, match="return_fields must not be empty") as exc:
+        await search_records(server, query="science", return_fields=[])
+
+    assert exc.value.code == MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (
+            {
+                "id": "doc:broken",
+                "content": "science doc",
+                "category": "science",
+            },
+            "missing expected score field",
+        ),
+        (
+            {
+                "content": "science doc",
+                "category": "science",
+                "vector_distance": "0.93",
+            },
+            "missing id",
+        ),
+    ],
+)
+async def test_search_records_treats_malformed_backend_results_as_internal_errors(
+    result, message
+):
+    server = FakeServer(search_type="vector")
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [result]
+
+    server.index.query = fake_query
+
+    with pytest.raises(RedisVLMCPError, match=message) as exc_info:
+        await search_records(server, query="science")
+
+    assert exc_info.value.code == MCPErrorCode.INTERNAL_ERROR
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_search_records_builds_vector_query_and_normalizes_results(monkeypatch):
+    server = FakeServer(
+        search_type="vector",
+        search_params={"normalize_vector_distance": False, "ef_runtime": 42},
+    )
+    built_queries = []
+
+    class FakeVectorQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [
+            {
+                "id": "doc:1",
+                "content": "science doc",
+                "category": "science",
+                "score": "user score",
+                "vector_distance": "0.93",
+            }
+        ]
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.VectorQuery", FakeVectorQuery)
+    server.index.query = fake_query
+
+    response = await search_records(server, query="science")
+
+    assert built_queries[0]["vector"] == [0.1, 0.2, 0.3]
+    assert built_queries[0]["vector_field_name"] == "embedding"
+    assert built_queries[0]["return_fields"] == ["content", "category", "rating"]
+    assert built_queries[0]["num_results"] == 2
+    assert built_queries[0]["normalize_vector_distance"] is False
+    assert built_queries[0]["ef_runtime"] == 42
+    assert response == {
+        "index": "knowledge",
+        "search_type": "vector",
+        "offset": 0,
+        "limit": 2,
+        "results": [
+            {
+                "id": "doc:1",
+                "score": 0.93,
+                "score_type": "vector_distance",
+                "record": {
+                    "content": "science doc",
+                    "category": "science",
+                },
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_records_builds_fulltext_query(monkeypatch):
+    server = FakeServer(
+        search_type="fulltext",
+        search_params={
+            "text_scorer": "BM25STD.NORM",
+            "stopwords": None,
+            "text_weights": {"medical": 2.5},
+        },
+        runtime_overrides={
+            "vector_field_name": None,
+            "default_embed_text_field": None,
+        },
+        include_vectorizer=False,
+    )
+    built_queries = []
+
+    class FakeTextQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [
+            {
+                "id": "doc:2",
+                "score": "schema score",
+                "content": "medical science",
+                "category": "health",
+                "__score": "1.5",
+                "hybrid_score": "keep me",
+            }
+        ]
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.TextQuery", FakeTextQuery)
+    server.index.query = fake_query
+
+    response = await search_records(
+        server,
+        query="medical science",
+        limit=1,
+        return_fields=["content", "category"],
+    )
+
+    assert built_queries[0]["text"] == "medical science"
+    assert built_queries[0]["text_field_name"] == "content"
+    assert built_queries[0]["num_results"] == 1
+    assert built_queries[0]["text_scorer"] == "BM25STD.NORM"
+    assert built_queries[0]["stopwords"] is None
+    assert built_queries[0]["text_weights"] == {"medical": 2.5}
+    assert response["search_type"] == "fulltext"
+    assert response["results"][0]["score"] == 1.5
+    assert response["results"][0]["score_type"] == "text_score"
+    assert "score" not in response["results"][0]["record"]
+    assert "hybrid_score" not in response["results"][0]["record"]
+
+
+@pytest.mark.asyncio
+async def test_search_records_fulltext_does_not_touch_vectorizer_when_unconfigured(
+    monkeypatch,
+):
+    server = FakeServer(
+        search_type="fulltext",
+        runtime_overrides={
+            "vector_field_name": None,
+            "default_embed_text_field": None,
+        },
+        include_vectorizer=False,
+    )
+    built_queries = []
+
+    class FakeTextQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [{"id": "doc:2", "__score": "1.5", "content": "medical science"}]
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.TextQuery", FakeTextQuery)
+    server.index.query = fake_query
+
+    response = await search_records(server, query="medical science")
+
+    assert built_queries[0]["return_fields"] == ["content", "category", "rating"]
+    assert response["results"][0]["record"]["content"] == "medical science"
+
+
+@pytest.mark.asyncio
+async def test_search_records_builds_hybrid_query_for_native_runtime(monkeypatch):
+    server = FakeServer(
+        search_type="hybrid",
+        search_params={
+            "text_scorer": "TFIDF",
+            "stopwords": None,
+            "text_weights": {"hybrid": 2.0},
+            "vector_search_method": "KNN",
+            "knn_ef_runtime": 77,
+            "combination_method": "LINEAR",
+            "linear_text_weight": 0.2,
+        },
+    )
+    server.native_hybrid_supported = True
+    built_queries = []
+
+    class FakePostProcessingConfig:
+        def __init__(self):
+            self.apply_calls = []
+
+        def apply(self, **kwargs):
+            self.apply_calls.append(kwargs)
+
+    class FakeHybridQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            self.postprocessing_config = FakePostProcessingConfig()
+            built_queries.append(("native", kwargs, self.postprocessing_config))
+            super().__init__(**kwargs)
+
+    class FakeAggregateHybridQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(("fallback", kwargs))
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [
+            {
+                "id": "doc:3",
+                "content": "hybrid doc",
+                "vector_distance": "preserve me",
+                "hybrid_score": "2.5",
+            }
+        ]
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.HybridQuery", FakeHybridQuery)
+    monkeypatch.setattr(
+        "redisvl.mcp.tools.search.AggregateHybridQuery", FakeAggregateHybridQuery
+    )
+    server.index.query = fake_query
+
+    response = await search_records(server, query="hybrid")
+
+    assert built_queries[0][0] == "native"
+    assert built_queries[0][1]["vector"] == [0.1, 0.2, 0.3]
+    assert built_queries[0][1]["text_scorer"] == "TFIDF"
+    assert built_queries[0][1]["stopwords"] is None
+    assert built_queries[0][1]["text_weights"] == {"hybrid": 2.0}
+    assert built_queries[0][1]["vector_search_method"] == "KNN"
+    assert built_queries[0][1]["knn_ef_runtime"] == 77
+    assert built_queries[0][1]["combination_method"] == "LINEAR"
+    assert built_queries[0][1]["linear_alpha"] == 0.2
+    assert built_queries[0][2].apply_calls == [{"__key": "@__key"}]
+    assert response["search_type"] == "hybrid"
+    assert response["results"][0]["score_type"] == "hybrid_score"
+    assert response["results"][0]["score"] == 2.5
+    assert "vector_distance" not in response["results"][0]["record"]
+
+
+@pytest.mark.asyncio
+async def test_search_records_avoids_linear_defaults_for_rrf_native_hybrid_query(
+    monkeypatch,
+):
+    server = FakeServer(
+        search_type="hybrid",
+        search_params={
+            "combination_method": "RRF",
+            "rrf_window": 50,
+        },
+    )
+    server.native_hybrid_supported = True
+    built_queries = []
+
+    class FakePostProcessingConfig:
+        def __init__(self):
+            self.apply_calls = []
+
+        def apply(self, **kwargs):
+            self.apply_calls.append(kwargs)
+
+    class FakeHybridQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            self.postprocessing_config = FakePostProcessingConfig()
+            built_queries.append(("native", kwargs, self.postprocessing_config))
+            super().__init__(**kwargs)
+
+    class FakeAggregateHybridQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(("fallback", kwargs))
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [
+            {
+                "id": "doc:rrf",
+                "content": "hybrid doc",
+                "hybrid_score": "1.2",
+            }
+        ]
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.HybridQuery", FakeHybridQuery)
+    monkeypatch.setattr(
+        "redisvl.mcp.tools.search.AggregateHybridQuery", FakeAggregateHybridQuery
+    )
+    server.index.query = fake_query
+
+    response = await search_records(server, query="hybrid")
+
+    assert built_queries[0][0] == "native"
+    assert built_queries[0][1]["combination_method"] == "RRF"
+    assert built_queries[0][1]["rrf_window"] == 50
+    assert "linear_alpha" not in built_queries[0][1]
+    assert "linear_text_weight" not in built_queries[0][1]
+    assert built_queries[0][2].apply_calls == [{"__key": "@__key"}]
+    assert response["search_type"] == "hybrid"
+    assert response["results"][0]["score_type"] == "hybrid_score"
+    assert response["results"][0]["score"] == 1.2
+
+
+@pytest.mark.asyncio
+async def test_search_records_builds_hybrid_query_for_fallback_runtime(monkeypatch):
+    server = FakeServer(
+        search_type="hybrid",
+        search_params={
+            "text_scorer": "TFIDF",
+            "stopwords": None,
+            "text_weights": {"hybrid": 2.0},
+            "combination_method": "LINEAR",
+            "linear_text_weight": 0.2,
+        },
+    )
+    built_queries = []
+
+    class FakeHybridQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(("native", kwargs))
+            super().__init__(**kwargs)
+
+    class FakeAggregateHybridQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(("fallback", kwargs))
+            super().__init__(**kwargs)
+
+    async def fake_query(query):
+        server.index.query_calls.append(query)
+        return [
+            {
+                "id": "doc:4",
+                "content": "fallback hybrid",
+                "hybrid_score": "0.7",
+            }
+        ]
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.HybridQuery", FakeHybridQuery)
+    monkeypatch.setattr(
+        "redisvl.mcp.tools.search.AggregateHybridQuery", FakeAggregateHybridQuery
+    )
+    server.index.query = fake_query
+
+    response = await search_records(server, query="hybrid")
+
+    assert built_queries[0][0] == "fallback"
+    assert built_queries[0][1]["text_scorer"] == "TFIDF"
+    assert built_queries[0][1]["stopwords"] is None
+    assert built_queries[0][1]["text_weights"] == {"hybrid": 2.0}
+    assert built_queries[0][1]["alpha"] == pytest.approx(0.8)
+    assert built_queries[0][1]["return_fields"] == [
+        "__key",
+        "content",
+        "category",
+        "rating",
+    ]
+    assert response["search_type"] == "hybrid"
+    assert response["results"][0]["score"] == 0.7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("search_type", "schema_field_name", "supports_native"),
+    [
+        ("vector", "id", False),
+        ("vector", "__key", False),
+        ("vector", "key", False),
+        ("vector", "score", False),
+        ("vector", "vector_distance", False),
+        ("vector", "text_score", False),
+        ("fulltext", "__score", False),
+        ("hybrid", "hybrid_score", True),
+        ("hybrid", "vector_similarity", False),
+    ],
+)
+async def test_validate_search_rejects_reserved_score_metadata_field_names(
+    search_type,
+    schema_field_name,
+    supports_native,
+):
+    config = _config_with_search(search_type)
+    schema = IndexSchema.from_dict(
+        {
+            "index": {
+                "name": "docs-index",
+                "prefix": "doc",
+                "storage_type": "hash",
+            },
+            "fields": [
+                {"name": "content", "type": "text"},
+                {"name": "category", "type": "tag"},
+                {"name": "rating", "type": "numeric"},
+                {"name": schema_field_name, "type": "text"},
+                {
+                    "name": "embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "algorithm": "flat",
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "datatype": "float32",
+                    },
+                },
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="MCP-reserved score metadata names"):
+        config.indexes["knowledge"].validate_search(
+            schema=schema,
+            supports_native_hybrid_search=supports_native,
+        )
+
+
+def test_build_fallback_hybrid_kwargs_drops_only_fallback_unsupported_params():
+    kwargs = _build_fallback_hybrid_kwargs(
+        query="hybrid",
+        embedding=[0.1, 0.2, 0.3],
+        runtime=SimpleNamespace(
+            text_field_name="content",
+            vector_field_name="embedding",
+        ),
+        filter_expression=None,
+        return_fields=["content"],
+        num_results=3,
+        search_params={
+            "text_scorer": "TFIDF",
+            "stopwords": None,
+            "text_weights": {"hybrid": 2.0},
+            "combination_method": "LINEAR",
+            "linear_text_weight": 0.2,
+            "vector_search_method": "KNN",
+            "knn_ef_runtime": 77,
+        },
+    )
+
+    assert kwargs["text_scorer"] == "TFIDF"
+    assert kwargs["stopwords"] is None
+    assert kwargs["text_weights"] == {"hybrid": 2.0}
+    assert kwargs["alpha"] == pytest.approx(0.8)
+    assert "combination_method" not in kwargs
+    assert "linear_text_weight" not in kwargs
+    assert "vector_search_method" not in kwargs
+    assert "knn_ef_runtime" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_native_only_hybrid_runtime_params(monkeypatch):
+    server = FakeServer(
+        search_type="hybrid",
+        search_params={
+            "combination_method": "RRF",
+            "rrf_window": 50,
+        },
+    )
+
+    with pytest.raises(ValueError, match="native hybrid search support"):
+        server.config.indexes["knowledge"].validate_search(
+            schema=_schema(),
+            supports_native_hybrid_search=False,
+        )
+
+
+def test_register_search_tool_uses_default_and_override_descriptions():
+    default_server = FakeServer()
+    register_search_tool(default_server, default_server.index.schema)
+
+    assert default_server.registered_tools[0]["name"] == "search-records"
+    assert "Search records" in default_server.registered_tools[0]["description"]
+    assert (
+        "Object filter fields: content(text), category(tag), rating(numeric)."
+        in default_server.registered_tools[0]["description"]
+    )
+    assert (
+        "Object filter exists support: content, category, rating, embedding."
+        in default_server.registered_tools[0]["description"]
+    )
+    assert (
+        "Allowed return_fields: content, category, rating."
+        in default_server.registered_tools[0]["description"]
+    )
+    assert "query" in default_server.registered_tools[0]["fn"].__annotations__
+    assert "search_type" not in default_server.registered_tools[0]["fn"].__annotations__
+
+    custom_server = FakeServer()
+    custom_server.mcp_settings.tool_search_description = "Custom search description"
+    register_search_tool(custom_server, custom_server.index.schema)
+
+    assert custom_server.registered_tools[0]["description"] == (
+        "Custom search description "
+        "Object filter fields: content(text), category(tag), rating(numeric). "
+        "Object filter exists support: content, category, rating, embedding. "
+        "Allowed return_fields: content, category, rating."
+    )
+
+
+def test_build_search_tool_description_preserves_schema_order_and_excludes_vectors():
+    description = _build_search_tool_description(_schema())
+
+    assert (
+        "Object filter fields: content(text), category(tag), rating(numeric)."
+        in description
+    )
+    assert (
+        "Object filter exists support: content, category, rating, embedding."
+        in description
+    )
+    assert "Allowed return_fields: content, category, rating." in description
+    assert "embedding" not in description.split("Allowed return_fields: ", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_search_records_defaults_to_sole_binding_when_index_omitted(monkeypatch):
+    server = FakeServer()
+
+    async def fake_query(query):
+        return []
+
+    server.index.query = fake_query
+
+    response = await search_records(server, query="science")
+
+    assert server.resolved_index_ids == [None]
+    assert response["index"] == "knowledge"
+
+
+@pytest.mark.asyncio
+async def test_search_records_routes_to_named_index(monkeypatch):
+    server = FakeServer()
+
+    async def fake_query(query):
+        return []
+
+    server.index.query = fake_query
+
+    response = await search_records(server, query="science", index="knowledge")
+
+    assert server.resolved_index_ids == ["knowledge"]
+    assert response["index"] == "knowledge"
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_unknown_index():
+    server = FakeServer()
+
+    with pytest.raises(RedisVLMCPError) as exc_info:
+        await search_records(server, query="science", index="missing")
+
+    assert exc_info.value.code == MCPErrorCode.INVALID_REQUEST
+    assert server.resolved_index_ids == ["missing"]
+
+
+def test_register_search_tool_wrapper_exposes_index_param():
+    server = FakeServer()
+    register_search_tool(server, server.index.schema)
+
+    annotations = server.registered_tools[0]["fn"].__annotations__
+    assert "index" in annotations
+
+
+def test_build_search_tool_description_appends_routing_note_when_schema_is_ambiguous():
+    description = _build_search_tool_description(None)
+
+    assert "list-indexes" in description
+    assert "`index`" in description
+    # Per-field hints are omitted because the index is ambiguous.
+    assert "Object filter fields" not in description
+
+
+def test_build_search_tool_description_distinguishes_typed_and_exists_support():
+    schema = IndexSchema.from_dict(
+        {
+            "index": {
+                "name": "docs-index",
+                "prefix": "doc",
+                "storage_type": "hash",
+            },
+            "fields": [
+                {"name": "content", "type": "text"},
+                {"name": "category", "type": "tag"},
+                {"name": "rating", "type": "numeric"},
+                {"name": "location", "type": "geo"},
+                {
+                    "name": "embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "algorithm": "flat",
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "datatype": "float32",
+                    },
+                },
+            ],
+        }
+    )
+
+    description = _build_search_tool_description(schema)
+
+    assert "location(geo)" not in description
+    assert "embedding(vector)" not in description
+    assert (
+        "Object filter exists support: content, category, rating, location, embedding."
+        in description
+    )
+    assert "Allowed return_fields: content, category, rating, location." in description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search_type", ["vector", "fulltext"])
+async def test_default_projection_always_produces_a_return_clause(
+    monkeypatch, search_type
+):
+    """A query with no RETURN clause returns every stored field, vector included.
+
+    The default projection is every *non-vector* field, so on an index with no
+    other fields it is empty -- and an empty `return_fields` is falsy, which makes
+    RedisVL omit RETURN entirely. `VectorQuery` self-adds `vector_distance` so it
+    is safe; `TextQuery` does not, which is why config validation refuses to point
+    `text_field_name` at a vector field. This pins the resulting invariant: no
+    search path may build a query without a RETURN clause.
+    """
+    server = FakeServer(search_type=search_type)
+    built = []
+
+    monkeypatch.setattr(
+        "redisvl.mcp.tools.search.VectorQuery",
+        lambda **kw: built.append(kw) or FakeQuery(**kw),
+    )
+    monkeypatch.setattr(
+        "redisvl.mcp.tools.search.TextQuery",
+        lambda **kw: built.append(kw) or FakeQuery(**kw),
+    )
+
+    await search_records(server, query="science")
+
+    assert built, "no query was built"
+    # Non-empty is what makes RedisVL emit RETURN; empty would silently widen the
+    # response to every field.
+    assert built[0]["return_fields"], "empty projection would omit RETURN entirely"
+
+
+def test_empty_default_projection_still_yields_a_return_clause():
+    """The one case where a falsy `return_fields` legitimately reaches a query.
+
+    `None` and `[]` are kept distinct at the request boundary -- the branch is
+    `is None`, so an explicit `[]` is rejected rather than read as "omitted". But
+    the *default* projection is every non-vector field, so an index with only a
+    vector field resolves it to `[]`, and RedisVL reads a falsy `return_fields`
+    as "no projection" and omits RETURN.
+
+    That is safe here only because `VectorQuery` adds `vector_distance` to its own
+    return fields, so a RETURN clause is emitted anyway. This pins that
+    dependency: if it ever stops holding, an index like this would start
+    returning every stored field, embedding included. Fulltext and hybrid cannot
+    reach this state at all, because `text_field_name` is required to be a
+    non-vector field and therefore always lands in the projection.
+    """
+    vector_only = IndexSchema.from_dict(
+        {
+            "index": {"name": "vec-only", "prefix": "v", "storage_type": "hash"},
+            "fields": [
+                {
+                    "name": "embedding",
+                    "type": "vector",
+                    "attrs": {
+                        "algorithm": "flat",
+                        "dims": 3,
+                        "distance_metric": "cosine",
+                        "datatype": "float32",
+                    },
+                }
+            ],
+        }
+    )
+    runtime = SimpleNamespace(default_limit=2, max_limit=5, max_result_window=100)
+
+    _, fields = _validate_request(
+        query="science",
+        limit=None,
+        offset=0,
+        return_fields=None,
+        runtime=runtime,
+        schema=vector_only,
+    )
+
+    # The default projection really is empty here, so this is not passing for
+    # some other reason.
+    assert fields == []
+
+    rendered = str(
+        VectorQuery(
+            vector=[0.1, 0.2, 0.3],
+            vector_field_name="embedding",
+            return_fields=fields,
+            num_results=2,
+        )
+    )
+
+    assert "RETURN" in rendered
+    # And what it returns is the score, not the embedding.
+    assert "embedding" not in rendered.split("RETURN", 1)[1]
+
+
+# --------------------------------------------------------------------------
+# Server-supplied narrowing: `limit_cap` and `locked_filter`
+#
+# Both are passed in-process rather than by the model. They are exercised here
+# at the `search_records` boundary so the contract holds regardless of which
+# caller supplies them.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_records_rejects_an_explicit_limit_above_the_cap():
+    server = FakeServer()
+
+    with pytest.raises(RedisVLMCPError, match="less than or equal to 2") as exc:
+        await search_records(server, query="science", limit=3, limit_cap=2)
+
+    assert exc.value.code == MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_search_records_caps_an_omitted_limit_instead_of_rejecting(monkeypatch):
+    """The binding default must not sail past the cap just because it is implicit."""
+    # default_limit is 2 and the cap is 1, so a cap applied only to explicit
+    # limits would let this request through at 2.
+    server = FakeServer()
+    built_queries = []
+
+    class FakeVectorQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.VectorQuery", FakeVectorQuery)
+
+    await search_records(server, query="science", limit_cap=1)
+
+    # No exception: the caller never named a number, so there is nothing to
+    # reject -- but the window is still bounded by the cap.
+    assert built_queries[0]["num_results"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_records_leaves_the_limit_alone_when_no_cap_is_supplied(
+    monkeypatch,
+):
+    server = FakeServer()
+    built_queries = []
+
+    class FakeVectorQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.VectorQuery", FakeVectorQuery)
+
+    await search_records(server, query="science", limit=3)
+
+    assert built_queries[0]["num_results"] == 3
+
+
+@pytest.mark.asyncio
+async def test_search_records_ands_a_locked_filter_under_the_caller_filter(monkeypatch):
+    server = FakeServer()
+    built_queries = []
+
+    class FakeVectorQuery(FakeQuery):
+        def __init__(self, **kwargs):
+            built_queries.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("redisvl.mcp.tools.search.VectorQuery", FakeVectorQuery)
+
+    await search_records(
+        server,
+        query="science",
+        filter={"field": "rating", "op": "gte", "value": 4},
+        locked_filter=Tag("category") == "resolved",
+    )
+
+    rendered = str(built_queries[0]["filter_expression"])
+    # Both clauses survive, and the caller's is nested rather than replacing the
+    # lock.
+    assert "@category:{resolved}" in rendered
+    assert "@rating:[4 +inf]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_records_refuses_a_raw_string_filter_under_a_locked_filter():
+    server = FakeServer()
+
+    with pytest.raises(RedisVLMCPError) as exc:
+        await search_records(
+            server,
+            query="science",
+            filter="@category:{open}",
+            locked_filter=Tag("category") == "resolved",
+        )
+
+    # Strings bypass the DSL's field validation and cannot be safely composed.
+    assert exc.value.code == MCPErrorCode.INVALID_FILTER
