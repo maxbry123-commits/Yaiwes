@@ -1,0 +1,7 @@
+
+
+# Generated actuator plots are reviewed as rendered images rather than XML.
+docs/source/_static/actuators/*.png binary linguist-generated
+
+*.bat text eol=crlf
+*.sh text eol=lf
