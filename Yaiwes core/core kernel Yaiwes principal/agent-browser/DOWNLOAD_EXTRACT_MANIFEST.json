@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 2683507,
+  "bundle_sha256": "094f124e922aa78041d2f5a7d0236335a1ea4f4f676cbb87afcb0fa0248760fa",
+  "extracted_tree": {
+    "bytes": 10876447,
+    "files": 482,
+    "sha256": "033ee3117e572cafb46aa31a8c65b20daea46423e6e87a9e26fa13b0bdf14dbf"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2683507,
+      "name": "agent-browser.bundle.zip.part-0001",
+      "sha256": "094f124e922aa78041d2f5a7d0236335a1ea4f4f676cbb87afcb0fa0248760fa"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "agent-browser",
+  "source_bytes": 10876447,
+  "source_commit": "dac13bb87468fe9d74a040d862720f6cc17a9565",
+  "source_files": 482,
+  "source_ref": "main",
+  "source_repo": "vercel-labs/agent-browser",
+  "source_tree": {
+    "bytes": 10876447,
+    "files": 482,
+    "sha256": "033ee3117e572cafb46aa31a8c65b20daea46423e6e87a9e26fa13b0bdf14dbf"
+  }
+}
