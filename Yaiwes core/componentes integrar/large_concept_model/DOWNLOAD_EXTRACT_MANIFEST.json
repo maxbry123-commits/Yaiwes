@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 599174,
+  "bundle_sha256": "fc0dfbfd4ebbb9f30d04f3a9d03ac0ed0e3bdac3d1ebb69ad002721b6107ea2e",
+  "extracted_tree": {
+    "bytes": 1798992,
+    "files": 171,
+    "sha256": "6a09d11b82f5b343fe3f67e63c10122ad4fb65c7f9a55a477fcb8871532a97c5"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 599174,
+      "name": "large_concept_model.bundle.zip.part-0001",
+      "sha256": "fc0dfbfd4ebbb9f30d04f3a9d03ac0ed0e3bdac3d1ebb69ad002721b6107ea2e"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "large_concept_model",
+  "source_bytes": 1798992,
+  "source_commit": "fd7db8022113ae2d2ff1219d9a4cb4def897e3ff",
+  "source_files": 171,
+  "source_ref": "main",
+  "source_repo": "facebookresearch/large_concept_model",
+  "source_tree": {
+    "bytes": 1798992,
+    "files": 171,
+    "sha256": "6a09d11b82f5b343fe3f67e63c10122ad4fb65c7f9a55a477fcb8871532a97c5"
+  }
+}
