@@ -1,0 +1,45 @@
+{
+  "bundle_bytes": 26823410,
+  "bundle_sha256": "73542ffc5f2d46b5a658243f6484556e7319320f503cf38e4516f8f5e3e96cff",
+  "extracted_tree": {
+    "bytes": 39254381,
+    "files": 766,
+    "sha256": "835dc73ab81f54381340ed2468b609b323a8e19decaac2169c49d19c993ae267"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "gateway.bundle.zip.part-0001",
+      "sha256": "da4312919216f08427eff79a6eac7c3fff627c40aebf62aecaa8f25daad301e8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "gateway.bundle.zip.part-0002",
+      "sha256": "382a434d85632b953990177b40da93bc436c6192774048d83cb3c0729e5c04f0"
+    },
+    {
+      "bytes": 1657586,
+      "name": "gateway.bundle.zip.part-0003",
+      "sha256": "ab3441edc4c93dcc88ea9e0886f767a08258c4d95ffdcf5b227e831cbec5505f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "gateway",
+  "source_bytes": 39254381,
+  "source_commit": "669825cbe89ee51569918b8f78a9db486fd69dd4",
+  "source_files": 766,
+  "source_ref": "main",
+  "source_repo": "Portkey-AI/gateway",
+  "source_tree": {
+    "bytes": 39254381,
+    "files": 766,
+    "sha256": "835dc73ab81f54381340ed2468b609b323a8e19decaac2169c49d19c993ae267"
+  }
+}
