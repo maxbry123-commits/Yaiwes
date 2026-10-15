@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1503156,
+  "bundle_sha256": "731b93da7b6f54c41fbf3ef0c474479bd8d9505c3ed1fce190b6fd266e0a99fe",
+  "extracted_tree": {
+    "bytes": 2060150,
+    "files": 182,
+    "sha256": "5c6d16a317475d9aa01a478fceb1101e4b89db40bf565f8290525048b20ee7af"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1503156,
+      "name": "dramatiq.bundle.zip.part-0001",
+      "sha256": "731b93da7b6f54c41fbf3ef0c474479bd8d9505c3ed1fce190b6fd266e0a99fe"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "dramatiq",
+  "source_bytes": 2060150,
+  "source_commit": "08d711a7611077e3d07ce1006349bc9342ada6e8",
+  "source_files": 182,
+  "source_ref": "master",
+  "source_repo": "Bogdanp/dramatiq",
+  "source_tree": {
+    "bytes": 2060150,
+    "files": 182,
+    "sha256": "5c6d16a317475d9aa01a478fceb1101e4b89db40bf565f8290525048b20ee7af"
+  }
+}
