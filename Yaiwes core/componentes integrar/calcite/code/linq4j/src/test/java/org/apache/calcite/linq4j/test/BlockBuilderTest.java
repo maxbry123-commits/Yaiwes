@@ -1,0 +1,367 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to you under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.calcite.linq4j.test;
+
+import org.apache.calcite.linq4j.tree.BinaryExpression;
+import org.apache.calcite.linq4j.tree.BlockBuilder;
+import org.apache.calcite.linq4j.tree.Expression;
+import org.apache.calcite.linq4j.tree.ExpressionType;
+import org.apache.calcite.linq4j.tree.Expressions;
+import org.apache.calcite.linq4j.tree.OptimizeShuttle;
+import org.apache.calcite.linq4j.tree.ParameterExpression;
+import org.apache.calcite.linq4j.tree.Shuttle;
+
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.lang.reflect.Method;
+import java.util.function.Function;
+
+import static org.apache.calcite.linq4j.test.BlockBuilderBase.FOUR;
+import static org.apache.calcite.linq4j.test.BlockBuilderBase.ONE;
+import static org.apache.calcite.linq4j.test.BlockBuilderBase.TWO;
+
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasToString;
+
+/**
+ * Tests BlockBuilder.
+ */
+class BlockBuilderTest {
+  BlockBuilder b;
+
+  @BeforeEach
+  public void prepareBuilder() {
+    b = new BlockBuilder(true);
+  }
+
+  @Test void testReuseExpressionsFromUpperLevel() {
+    Expression x = b.append("x", Expressions.add(ONE, TWO));
+    BlockBuilder nested = new BlockBuilder(true, b);
+    Expression y = nested.append("y", Expressions.add(ONE, TWO));
+    nested.add(Expressions.return_(null, Expressions.add(y, y)));
+    b.add(nested.toBlock());
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 + 2;\n"
+            + "  {\n"
+            + "    return x + x;\n"
+            + "  }\n"
+            + "}\n"));
+  }
+
+  /** Unit test for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7728">[CALCITE-7728]
+   * Linq4j can simplify expressions without regards for 'safety'</a>.
+   *
+   * <p>A local variable that is never read is removed, unless computing its
+   * value may raise a runtime error that the program is expected to raise. */
+  @Test void testUnusedDeclarationThatMayThrow() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    b.append("x", Expressions.divide(ONE, i));
+    b.add(Expressions.return_(null, TWO));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 / i;\n"
+            + "  return 2;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7729">[CALCITE-7729]
+   * Linq4j BlockBuilder.optimize can optimize away expressions that
+   * throw</a>. */
+  @Test void testDeclarationUsedOnlyInBranchThatFoldsAway() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    final Expression x = b.append("x", Expressions.divide(ONE, i));
+    b.add(
+        Expressions.return_(null,
+            Expressions.condition(Expressions.constant(true), TWO, x)));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 / i;\n"
+            + "  return 2;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7729">[CALCITE-7729]
+   * Linq4j BlockBuilder.optimize can optimize away expressions that
+   * throw</a>. */
+  @Test void testDeclarationUsedInBranchThatSurvives() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    final ParameterExpression c = Expressions.parameter(boolean.class, "c");
+    final Expression x = b.append("x", Expressions.divide(ONE, i));
+    b.add(Expressions.return_(null, Expressions.condition(c, TWO, x)));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 / i;\n"
+            + "  return c ? 2 : x;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7729">[CALCITE-7729]
+   * Linq4j BlockBuilder.optimize can optimize away expressions that
+   * throw</a>.
+   *
+   * <p>Nested conditionals: "x" is read in a branch of an inner conditional,
+   * which is itself in a branch. */
+  @Test void testNestedConditionalBranch() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    final ParameterExpression c = Expressions.parameter(boolean.class, "c");
+    final ParameterExpression d = Expressions.parameter(boolean.class, "d");
+    final Expression x = b.append("x", Expressions.divide(ONE, i));
+    b.add(
+        Expressions.return_(null,
+            Expressions.condition(c,
+                Expressions.condition(d, TWO, x), ONE)));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 / i;\n"
+            + "  return c ? (d ? 2 : x) : 1;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7729">[CALCITE-7729]
+   * Linq4j BlockBuilder.optimize can optimize away expressions that
+   * throw</a>.
+   *
+   * <p>Nested conditionals: "x" is read in the condition of an inner
+   * conditional, so it is evaluated only if the outer condition holds. */
+  @Test void testNestedConditionalCondition() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    final ParameterExpression c = Expressions.parameter(boolean.class, "c");
+    final Expression x = b.append("x", Expressions.divide(ONE, i));
+    b.add(
+        Expressions.return_(null,
+            Expressions.condition(c,
+                Expressions.condition(
+                    Expressions.greaterThan(x, ONE), TWO, ONE),
+                ONE)));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 / i;\n"
+            + "  return c ? (x > 1 ? 2 : 1) : 1;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7729">[CALCITE-7729]
+   * Linq4j BlockBuilder.optimize can optimize away expressions that
+   * throw</a>. */
+  @Test void testDeclarationUsedOnlyInWhileBody() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    final ParameterExpression c = Expressions.parameter(boolean.class, "c");
+    final ParameterExpression y = Expressions.parameter(int.class, "y");
+    final Expression x = b.append("x", Expressions.divide(ONE, i));
+    b.add(Expressions.declare(0, y, ONE));
+    b.add(
+        Expressions.while_(c,
+            Expressions.statement(Expressions.assign(y, x))));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = 1 / i;\n"
+            + "  int y = 1;\n"
+            + "  while (c) {\n"
+            + "    y = x;\n"
+            + "  }\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7729">[CALCITE-7729]
+   * Linq4j BlockBuilder.optimize can optimize away expressions that
+   * throw</a>. */
+  @Test void testPureDeclarationIsInlinedIntoBranch() {
+    // Test with expression that does not throw
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    final ParameterExpression c = Expressions.parameter(boolean.class, "c");
+    final Expression x = b.append("x", Expressions.add(ONE, i));
+    b.add(Expressions.return_(null, Expressions.condition(c, TWO, x)));
+    assertThat(b.toBlock(), hasToString("{\n  return c ? 2 : 1 + i;\n}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7728">[CALCITE-7728]
+   * Linq4j can simplify expressions without regards for 'safety'</a>.
+   *
+   * <p>Indexing an array may raise {@link ArrayIndexOutOfBoundsException} or
+   * {@link NullPointerException}. */
+  @Test void testUnusedDeclarationThatIndexesArray() {
+    final ParameterExpression a = Expressions.parameter(int[].class, "a");
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    b.append("x", Expressions.arrayIndex(a, i));
+    b.add(Expressions.return_(null, TWO));
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final int x = a[i];\n"
+            + "  return 2;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7728">[CALCITE-7728]
+   * Linq4j can simplify expressions without regards for 'safety'</a>.
+   */
+  @Test void testUnusedDeclarationThatCasts() {
+    final ParameterExpression o = Expressions.parameter(Object.class, "o");
+    b.append("x", Expressions.convert_(o, String.class));
+    b.add(Expressions.return_(null, TWO));
+    // Cast may throw, cannot be removed
+    assertThat(b.toBlock(),
+        hasToString("{\n"
+            + "  final String x = (String) o;\n"
+            + "  return 2;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7728">[CALCITE-7728]
+   * Linq4j can simplify expressions without regards for 'safety'</a>.
+   */
+  @Test void testUnusedDeclarationThatWidens() {
+    final ParameterExpression str = Expressions.parameter(String.class, "str");
+    b.append("x", Expressions.convert_(str, Object.class));
+    // Cast to Object cannot throw, it can be removed
+    b.add(Expressions.return_(null, TWO));
+    assertThat(b.toBlock(), hasToString("{\n  return 2;\n}\n"));
+  }
+
+  @Test void testUnusedDeclarationThatCannotThrow() {
+    final ParameterExpression i = Expressions.parameter(int.class, "i");
+    b.append("x", Expressions.add(ONE, i));
+    b.add(Expressions.return_(null, TWO));
+    assertThat(b.toBlock(), hasToString("{\n  return 2;\n}\n"));
+  }
+
+  @Test void testTestCustomOptimizer() {
+    BlockBuilder b = new BlockBuilder() {
+      @Override protected Shuttle createOptimizeShuttle() {
+        return new OptimizeShuttle() {
+          @Override public Expression visit(BinaryExpression binary,
+              Expression expression0, Expression expression1) {
+            if (binary.getNodeType() == ExpressionType.Add
+                && ONE.equals(expression0) && TWO.equals(expression1)) {
+              return FOUR;
+            }
+            return super.visit(binary, expression0, expression1);
+          }
+        };
+      }
+    };
+    b.add(Expressions.return_(null, Expressions.add(ONE, TWO)));
+    assertThat(b.toBlock(), hasToString("{\n  return 4;\n}\n"));
+  }
+
+  private BlockBuilder appendBlockWithSameVariable(
+      @Nullable Expression initializer1, @Nullable Expression initializer2) {
+    BlockBuilder outer = new BlockBuilder();
+    ParameterExpression outerX = Expressions.parameter(int.class, "x");
+    outer.add(Expressions.declare(0, outerX, initializer1));
+    outer.add(Expressions.statement(Expressions.assign(outerX, Expressions.constant(1))));
+
+    BlockBuilder inner = new BlockBuilder();
+    ParameterExpression innerX = Expressions.parameter(int.class, "x");
+    inner.add(Expressions.declare(0, innerX, initializer2));
+    inner.add(Expressions.statement(Expressions.assign(innerX, Expressions.constant(42))));
+    inner.add(Expressions.return_(null, innerX));
+    outer.append("x", inner.toBlock());
+    return outer;
+  }
+
+  @Test void testRenameVariablesWithEmptyInitializer() {
+    BlockBuilder outer = appendBlockWithSameVariable(null, null);
+
+    assertThat("x in the second block should be renamed to avoid name clash",
+        Expressions.toString(outer.toBlock()),
+        is("{\n"
+            + "  int x;\n"
+            + "  x = 1;\n"
+            + "  int x0;\n"
+            + "  x0 = 42;\n"
+            + "}\n"));
+  }
+
+  @Test void testRenameVariablesWithInitializer() {
+    BlockBuilder outer =
+        appendBlockWithSameVariable(Expressions.constant(7),
+            Expressions.constant(8));
+
+    assertThat("x in the second block should be renamed to avoid name clash",
+        Expressions.toString(outer.toBlock()),
+        is("{\n"
+            + "  int x = 7;\n"
+            + "  x = 1;\n"
+            + "  int x0 = 8;\n"
+            + "  x0 = 42;\n"
+            + "}\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-2413">[CALCITE-2413]
+   * RexToLixTranslator does not generate correct declaration of Methods with
+   * generic return types</a>. */
+  @Test void genericMethodCall() throws NoSuchMethodException {
+    BlockBuilder bb = new BlockBuilder();
+    bb.append("_i",
+        Expressions.call(
+            Expressions.new_(Identity.class),
+            Identity.class.getMethod("apply", Object.class),
+            Expressions.constant("test")));
+
+    assertThat(
+        Expressions.toString(bb.toBlock()), is("{\n"
+            + "  final Object _i = new org.apache.calcite.linq4j.test.BlockBuilderTest.Identity()"
+            + ".apply(\"test\");\n"
+            + "}\n"));
+
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-2611">[CALCITE-2611]
+   * Linq4j code generation failure if one side of an OR contains
+   * UNKNOWN</a>. */
+  @Test void testOptimizeBoxedFalseEqNull() {
+    BlockBuilder outer = new BlockBuilder();
+    outer.append(
+        Expressions.equal(
+            OptimizeShuttle.BOXED_FALSE_EXPR,
+            Expressions.constant(null)));
+
+    assertThat("Expected to optimize Boolean.FALSE = null to false",
+        Expressions.toString(outer.toBlock()),
+        is("{\n"
+            + "  return false;\n"
+            + "}\n"));
+  }
+
+  /**
+   * Class with generics to validate if {@link Expressions#call(Method, Expression...)} works.
+   *
+   * @param <I> result type
+   */
+  static class Identity<I> implements Function<I, I> {
+    @Override public I apply(I i) {
+      return i;
+    }
+  }
+
+}

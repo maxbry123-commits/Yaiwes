@@ -1,0 +1,159 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to you under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.calcite.rel;
+
+import org.apache.calcite.rel.core.Collect;
+import org.apache.calcite.rel.core.Combine;
+import org.apache.calcite.rel.core.ConditionalCorrelate;
+import org.apache.calcite.rel.core.Sample;
+import org.apache.calcite.rel.core.Snapshot;
+import org.apache.calcite.rel.core.SortExchange;
+import org.apache.calcite.rel.core.TableFunctionScan;
+import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.core.TableSpool;
+import org.apache.calcite.rel.core.Uncollect;
+import org.apache.calcite.rel.core.Window;
+import org.apache.calcite.rel.logical.LogicalAggregate;
+import org.apache.calcite.rel.logical.LogicalAsofJoin;
+import org.apache.calcite.rel.logical.LogicalCalc;
+import org.apache.calcite.rel.logical.LogicalCorrelate;
+import org.apache.calcite.rel.logical.LogicalExchange;
+import org.apache.calcite.rel.logical.LogicalFilter;
+import org.apache.calcite.rel.logical.LogicalIntersect;
+import org.apache.calcite.rel.logical.LogicalJoin;
+import org.apache.calcite.rel.logical.LogicalMatch;
+import org.apache.calcite.rel.logical.LogicalMinus;
+import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.logical.LogicalRepeatUnion;
+import org.apache.calcite.rel.logical.LogicalSort;
+import org.apache.calcite.rel.logical.LogicalTableModify;
+import org.apache.calcite.rel.logical.LogicalUnion;
+import org.apache.calcite.rel.logical.LogicalValues;
+
+/**
+ * Visits all the relations in a homogeneous way: always redirects calls to
+ * {@code accept(RelNode)}.
+ */
+public class RelHomogeneousShuttle extends RelShuttleImpl {
+  @Override public RelNode visit(LogicalAggregate aggregate) {
+    return visit((RelNode) aggregate);
+  }
+
+  @Override public RelNode visit(LogicalMatch match) {
+    return visit((RelNode) match);
+  }
+
+  @Override public RelNode visit(TableScan scan) {
+    return visit((RelNode) scan);
+  }
+
+  @Override public RelNode visit(TableFunctionScan scan) {
+    return visit((RelNode) scan);
+  }
+
+  @Override public RelNode visit(LogicalValues values) {
+    return visit((RelNode) values);
+  }
+
+  @Override public RelNode visit(LogicalFilter filter) {
+    return visit((RelNode) filter);
+  }
+
+  @Override public RelNode visit(LogicalProject project) {
+    return visit((RelNode) project);
+  }
+
+  @Override public RelNode visit(LogicalJoin join) {
+    return visit((RelNode) join);
+  }
+
+  @Override public RelNode visit(LogicalAsofJoin asofJoin) {
+    return visit((RelNode) asofJoin);
+  }
+
+  @Override public RelNode visit(LogicalCorrelate correlate) {
+    return visit((RelNode) correlate);
+  }
+
+  @Override public RelNode visit(LogicalUnion union) {
+    return visit((RelNode) union);
+  }
+
+  @Override public RelNode visit(LogicalIntersect intersect) {
+    return visit((RelNode) intersect);
+  }
+
+  @Override public RelNode visit(LogicalMinus minus) {
+    return visit((RelNode) minus);
+  }
+
+  @Override public RelNode visit(LogicalSort sort) {
+    return visit((RelNode) sort);
+  }
+
+  @Override public RelNode visit(LogicalExchange exchange) {
+    return visit((RelNode) exchange);
+  }
+
+  @Override public RelNode visit(LogicalCalc calc) {
+    return visit((RelNode) calc);
+  }
+
+  @Override public RelNode visit(LogicalTableModify modify) {
+    return visit((RelNode) modify);
+  }
+
+  @Override public RelNode visit(LogicalRepeatUnion repeatUnion) {
+    return visit((RelNode) repeatUnion);
+  }
+
+  @Override public RelNode visit(Window window) {
+    return visit((RelNode) window);
+  }
+
+  @Override public RelNode visit(Snapshot snapshot) {
+    return visit((RelNode) snapshot);
+  }
+
+  @Override public RelNode visit(Collect collect) {
+    return visit((RelNode) collect);
+  }
+
+  @Override public RelNode visit(Sample sample) {
+    return visit((RelNode) sample);
+  }
+
+  @Override public RelNode visit(Uncollect uncollect) {
+    return visit((RelNode) uncollect);
+  }
+
+  @Override public RelNode visit(Combine combine) {
+    return visit((RelNode) combine);
+  }
+
+  @Override public RelNode visit(ConditionalCorrelate conditionalCorrelate) {
+    return visit((RelNode) conditionalCorrelate);
+  }
+
+  @Override public RelNode visit(SortExchange sortExchange) {
+    return visit((RelNode) sortExchange);
+  }
+
+  @Override public RelNode visit(TableSpool tableSpool) {
+    return visit((RelNode) tableSpool);
+  }
+}

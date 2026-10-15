@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 9866087,
+  "bundle_sha256": "b8195da62f4b02cd2c7d7d58fc4ceb3ec544950c28452383fa5398605457092f",
+  "extracted_tree": {
+    "bytes": 36200678,
+    "files": 3305,
+    "sha256": "70403779ffc9051663ac8335bdc752927ec78d40e4a176e9d335820e786c2a5b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 9866087,
+      "name": "calcite.bundle.zip.part-0001",
+      "sha256": "b8195da62f4b02cd2c7d7d58fc4ceb3ec544950c28452383fa5398605457092f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "calcite",
+  "source_bytes": 36200678,
+  "source_commit": "6602a58e7cb94ab686d9fc287602852e00d4fa95",
+  "source_files": 3305,
+  "source_ref": "main",
+  "source_repo": "apache/calcite",
+  "source_tree": {
+    "bytes": 36200678,
+    "files": 3305,
+    "sha256": "70403779ffc9051663ac8335bdc752927ec78d40e4a176e9d335820e786c2a5b"
+  }
+}
