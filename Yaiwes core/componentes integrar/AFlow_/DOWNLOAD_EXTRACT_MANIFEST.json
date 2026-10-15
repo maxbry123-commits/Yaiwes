@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1414734,
+  "bundle_sha256": "c8ca6337532d6fbdcc42df1de3c75cec289af241b99c77c870016354522ba42d",
+  "extracted_tree": {
+    "bytes": 1945305,
+    "files": 43,
+    "sha256": "d149ee989a372070c9664f86af2abf730413f02e1285872e985a7955d96d1a1b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1414734,
+      "name": "AFlow_.bundle.zip.part-0001",
+      "sha256": "c8ca6337532d6fbdcc42df1de3c75cec289af241b99c77c870016354522ba42d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "AFlow_",
+  "source_bytes": 1945305,
+  "source_commit": "b957def9bc91f7fd31b1e942f6b564a3c1fe789e",
+  "source_files": 43,
+  "source_ref": "main",
+  "source_repo": "XiangJinyu/AFlow_",
+  "source_tree": {
+    "bytes": 1945305,
+    "files": 43,
+    "sha256": "d149ee989a372070c9664f86af2abf730413f02e1285872e985a7955d96d1a1b"
+  }
+}
