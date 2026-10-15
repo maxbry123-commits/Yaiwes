@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 3175498,
+  "bundle_sha256": "640df7f5ae4042247f07b9eeb065827e8415d1ac3070502adb91e6c8d9ba08bb",
+  "extracted_tree": {
+    "bytes": 9150541,
+    "files": 100,
+    "sha256": "5bb55ffc7258c9e9f4d0512ef792f6768f7eb56c7832206080ac0cfc1c740a1d"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 3175498,
+      "name": "apscheduler.bundle.zip.part-0001",
+      "sha256": "640df7f5ae4042247f07b9eeb065827e8415d1ac3070502adb91e6c8d9ba08bb"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "apscheduler",
+  "source_bytes": 9150541,
+  "source_commit": "bdaceb12792f104f25798dee2850d45f9e7d83f8",
+  "source_files": 100,
+  "source_ref": "master",
+  "source_repo": "agronholm/apscheduler",
+  "source_tree": {
+    "bytes": 9150541,
+    "files": 100,
+    "sha256": "5bb55ffc7258c9e9f4d0512ef792f6768f7eb56c7832206080ac0cfc1c740a1d"
+  }
+}
