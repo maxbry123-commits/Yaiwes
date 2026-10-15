@@ -1,0 +1,66 @@
+{
+  "bundle_bytes": 65222502,
+  "bundle_sha256": "93cd52373cfdb83e660ef4550c2f7a3fcb5ba7eb1b40ea369f4327f89075edff",
+  "extracted_tree": {
+    "bytes": 276787040,
+    "files": 31444,
+    "sha256": "f36cd1f3ce5659d7c16ac251a2b099addca3e6717b2cf62caca64c6a47440ce6"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "kubernetes.bundle.zip.part-0001",
+      "sha256": "a37199033264a54937e300f4b1073fa1fe92abfa7a8839b50de1346806cbe970"
+    },
+    {
+      "bytes": 12582912,
+      "name": "kubernetes.bundle.zip.part-0002",
+      "sha256": "ab9746a7d397def85e9b993408d5690cb7e0a7ad8c320c641e6f890e6a33f729"
+    },
+    {
+      "bytes": 12582912,
+      "name": "kubernetes.bundle.zip.part-0003",
+      "sha256": "844a01899971f4d7860e1a92dd2d71031317d6e3b7d3ca0f5992e84f3b4eac2f"
+    },
+    {
+      "bytes": 12582912,
+      "name": "kubernetes.bundle.zip.part-0004",
+      "sha256": "476204e8781b34a1c53c85d8d5e184ff8d35a90a95f53b806899dfd62a996086"
+    },
+    {
+      "bytes": 12582912,
+      "name": "kubernetes.bundle.zip.part-0005",
+      "sha256": "8adb9c83ce979c400e2927e95e944e2a44bfbead166aa82a0cc66406365171d8"
+    },
+    {
+      "bytes": 2307942,
+      "name": "kubernetes.bundle.zip.part-0006",
+      "sha256": "9787314fce6f780b88705889fc4fa46c48065015c7d37e114254e236ebcc644c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "CHANGELOG.md",
+    "Makefile",
+    "cluster/gce/cos",
+    "cluster/gce/custom",
+    "cluster/gce/ubuntu"
+  ],
+  "skipped_special_count": 5,
+  "slug": "kubernetes",
+  "source_bytes": 276787040,
+  "source_commit": "cbfc0564b409b82c6ec0cf76e2d15860dd13b31b",
+  "source_files": 31444,
+  "source_ref": "master",
+  "source_repo": "kubernetes/kubernetes",
+  "source_tree": {
+    "bytes": 276787040,
+    "files": 31444,
+    "sha256": "f36cd1f3ce5659d7c16ac251a2b099addca3e6717b2cf62caca64c6a47440ce6"
+  }
+}
