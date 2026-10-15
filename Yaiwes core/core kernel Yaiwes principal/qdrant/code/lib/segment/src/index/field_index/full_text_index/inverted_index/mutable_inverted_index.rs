@@ -1,0 +1,441 @@
+use std::collections::HashMap;
+
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::PointOffsetType;
+use common::universal_io::UserData;
+use itertools::Either;
+
+use super::posting_list::PostingList;
+use super::postings_iterator::{intersect_postings_iterator, merge_postings_iterator};
+use super::{Document, InvertedIndex, ParsedQuery, TokenId, TokenSet};
+use crate::common::operation_error::OperationResult;
+
+#[cfg_attr(test, derive(Clone))]
+pub struct MutableInvertedIndex {
+    pub(super) postings: Vec<PostingList>,
+    pub vocab: HashMap<String, TokenId>,
+    pub(super) point_to_tokens: Vec<Option<TokenSet>>,
+
+    /// Optional additional structure to store positional information of tokens in the documents.
+    ///
+    /// Must be enabled explicitly.
+    pub point_to_doc: Option<Vec<Option<Document>>>,
+
+    /// Per-point token counts, including repetitions, used as document lengths in BM25.
+    /// `None` when length recording is disabled.
+    pub point_to_doc_len: Option<Vec<u32>>,
+
+    /// Total token count across live points.
+    /// Divide by `points_count` to get the average document length for BM25.
+    pub total_tokens: u64,
+    /// Points this index counts as documents: those with at least one indexed
+    /// token. A value that tokenizes to nothing is indexed, and matches
+    /// nothing, but is not a document, which is also how the on-disk build
+    /// treats it (it lands in the "no tokens" mask).
+    pub(super) points_count: usize,
+}
+
+impl MutableInvertedIndex {
+    /// Create a new inverted index with or without positional information.
+    pub fn new(with_positions: bool, with_doc_len: bool) -> Self {
+        Self {
+            postings: Vec::new(),
+            vocab: HashMap::new(),
+            point_to_tokens: Vec::new(),
+            point_to_doc: with_positions.then_some(Vec::new()),
+            point_to_doc_len: with_doc_len.then_some(Vec::new()),
+            total_tokens: 0,
+            points_count: 0,
+        }
+    }
+
+    fn get_tokens(&self, idx: PointOffsetType) -> Option<&TokenSet> {
+        self.point_to_tokens.get(idx as usize)?.as_ref()
+    }
+
+    fn get_document(&self, idx: PointOffsetType) -> Option<&Document> {
+        self.point_to_doc.as_ref()?.get(idx as usize)?.as_ref()
+    }
+
+    /// Whether this index records document lengths. Keyed off the data rather
+    /// than the config, so a caller cannot measure a length it cannot store.
+    pub fn records_doc_len(&self) -> bool {
+        self.point_to_doc_len.is_some()
+    }
+
+    /// Record a point's length, replacing any previous value so an overwrite
+    /// does not double-count in `total_tokens`. The only writer, so that every
+    /// path agrees on what a record without a length means: `None` zeroes the
+    /// slot rather than leaving a stale value behind.
+    pub(super) fn set_doc_len(&mut self, point_id: PointOffsetType, doc_len: Option<u32>) {
+        let Some(point_to_doc_len) = self.point_to_doc_len.as_mut() else {
+            return;
+        };
+        let needed = point_id as usize + 1;
+        if point_to_doc_len.len() < needed {
+            point_to_doc_len.resize(needed, 0);
+        }
+        let doc_len = doc_len.unwrap_or(0);
+        let slot = &mut point_to_doc_len[point_id as usize];
+        self.total_tokens = self.total_tokens.saturating_sub(u64::from(*slot)) + u64::from(doc_len);
+        *slot = doc_len;
+    }
+
+    /// Iterate over point ids whose documents contain all given tokens
+    fn filter_has_all(&self, tokens: TokenSet) -> impl Iterator<Item = PointOffsetType> + '_ {
+        let postings_opt: Option<Vec<_>> = tokens
+            .tokens()
+            .iter()
+            .map(|&token_id| {
+                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
+                // dictionary. Posting list entry can be None but it exists.
+
+                self.postings.get(token_id as usize)
+            })
+            .collect();
+
+        let Some(postings) = postings_opt else {
+            // There are unseen tokens -> no matches
+            return Either::Left(std::iter::empty());
+        };
+        if postings.is_empty() {
+            // Empty request -> no matches
+            return Either::Left(std::iter::empty());
+        }
+
+        Either::Right(intersect_postings_iterator(postings))
+    }
+
+    fn filter_has_any(&self, tokens: TokenSet) -> impl Iterator<Item = PointOffsetType> + '_ {
+        let postings_opt: Vec<_> = tokens
+            .tokens()
+            .iter()
+            .filter_map(|&token_id| {
+                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
+                // dictionary. Posting list entry can be None but it exists.
+                self.postings.get(token_id as usize)
+            })
+            .collect();
+
+        if postings_opt.is_empty() {
+            // Empty request -> no matches
+            return Either::Left(std::iter::empty());
+        }
+
+        Either::Right(merge_postings_iterator(postings_opt))
+    }
+
+    pub fn filter_has_phrase(
+        &self,
+        phrase: Document,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+        let Some(point_to_doc) = self.point_to_doc.as_ref() else {
+            // Return empty iterator when not enabled
+            return Box::new(std::iter::empty());
+        };
+
+        let iter = self
+            .filter_has_all(phrase.to_token_set())
+            .filter(move |id| {
+                let doc = point_to_doc[*id as usize]
+                    .as_ref()
+                    .expect("if it passed the intersection filter, it must exist");
+
+                doc.has_phrase(&phrase)
+            });
+
+        Box::new(iter)
+    }
+
+    /// Index a point from its string tokens: register them in the vocabulary,
+    /// store the ordered document when positions are enabled, then index the
+    /// token set.
+    ///
+    /// Shared by the write path and read-only live reload so the two cannot
+    /// drift apart. Positions are keyed off `point_to_doc` rather than the
+    /// config flag, so an index built without them never pays for the clone.
+    pub fn index_str_tokens(
+        &mut self,
+        point_id: PointOffsetType,
+        str_tokens: impl IntoIterator<Item = impl AsRef<str>>,
+        doc_len: Option<u32>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let tokens = self.register_tokens(str_tokens);
+        self.set_doc_len(point_id, doc_len);
+
+        // If positions are enabled, store the ordered document for phrase matching
+        if self.point_to_doc.is_some() {
+            self.index_document(point_id, Document::new(tokens.clone()), hw_counter)?;
+        }
+
+        self.index_tokens(point_id, TokenSet::from_iter(tokens), hw_counter)
+    }
+}
+
+impl InvertedIndex for MutableInvertedIndex {
+    fn get_vocab_mut(&mut self) -> &mut HashMap<String, TokenId> {
+        &mut self.vocab
+    }
+
+    fn index_tokens(
+        &mut self,
+        point_id: PointOffsetType,
+        tokens: TokenSet,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        // Counted as a transition rather than incremented, so that re-indexing
+        // a point cannot count it twice, and so that a document rewritten to
+        // nothing stops being one.
+        let was_document = self
+            .point_to_tokens
+            .get(point_id as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|tokens| !tokens.is_empty());
+        match (was_document, tokens.is_empty()) {
+            (false, false) => self.points_count += 1,
+            (true, true) => self.points_count -= 1,
+            _ => {}
+        }
+
+        if self.point_to_tokens.len() <= point_id as usize {
+            let new_len = point_id as usize + 1;
+            self.point_to_tokens.resize_with(new_len, Default::default);
+        }
+
+        for token_id in tokens.tokens() {
+            let token_idx_usize = *token_id as usize;
+
+            if self.postings.len() <= token_idx_usize {
+                let new_len = token_idx_usize + 1;
+                self.postings.resize_with(new_len, Default::default);
+            }
+
+            self.postings
+                .get_mut(token_idx_usize)
+                .expect("posting must exist")
+                .insert(point_id);
+        }
+        self.point_to_tokens[point_id as usize] = Some(tokens);
+
+        Ok(())
+    }
+
+    fn index_document(
+        &mut self,
+        point_id: PointOffsetType,
+        ordered_document: Document,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let Some(point_to_doc) = &mut self.point_to_doc else {
+            // Phrase matching is not enabled
+            return Ok(());
+        };
+
+        // Ensure container has enough capacity
+        if point_id as usize >= point_to_doc.len() {
+            let new_len = point_id as usize + 1;
+            point_to_doc.resize_with(new_len, Default::default);
+        }
+
+        // Store the ordered document
+        point_to_doc[point_id as usize] = Some(ordered_document);
+
+        Ok(())
+    }
+
+    fn remove(&mut self, point_id: PointOffsetType) -> bool {
+        if point_id as usize >= self.point_to_tokens.len() {
+            return false; // Already removed or never actually existed
+        }
+
+        let Some(removed_token_set) = self.point_to_tokens[point_id as usize].take() else {
+            return false;
+        };
+
+        if let Some(point_to_doc) = &mut self.point_to_doc {
+            point_to_doc[point_id as usize] = None;
+        }
+
+        if let Some(doc_len) = self
+            .point_to_doc_len
+            .as_mut()
+            .and_then(|lens| lens.get_mut(point_id as usize))
+        {
+            self.total_tokens = self.total_tokens.saturating_sub(u64::from(*doc_len));
+            *doc_len = 0;
+        }
+
+        // Symmetric with `index_tokens`: a point that held no tokens was never
+        // counted, so removing it must not decrement.
+        if !removed_token_set.is_empty() {
+            self.points_count -= 1;
+        }
+
+        for removed_token in removed_token_set.tokens() {
+            // unwrap safety: posting list exists and contains the point idx
+            let posting = self.postings.get_mut(*removed_token as usize).unwrap();
+            posting.remove(point_id);
+        }
+
+        true
+    }
+
+    fn filter(
+        &self,
+        query: ParsedQuery,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+        match query {
+            ParsedQuery::AllTokens(tokens) => Ok(Box::new(self.filter_has_all(tokens))),
+            ParsedQuery::Phrase(phrase) => Ok(Box::new(self.filter_has_phrase(phrase))),
+            ParsedQuery::AnyTokens(tokens) => Ok(Box::new(self.filter_has_any(tokens))),
+        }
+    }
+
+    fn get_posting_len(
+        &self,
+        token_id: TokenId,
+        _: &HardwareCounterCell,
+    ) -> OperationResult<Option<usize>> {
+        Ok(self.postings.get(token_id as usize).map(|x| x.len()))
+    }
+
+    fn for_each_vocab_with_postings_len(
+        &self,
+        mut f: impl FnMut(&str, usize) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        self.vocab.iter().try_for_each(|(token, &posting_idx)| {
+            if let Some(postings) = self.postings.get(posting_idx as usize) {
+                f(token.as_str(), postings.len())?;
+            }
+            Ok(())
+        })
+    }
+
+    fn check_match(
+        &self,
+        parsed_query: &ParsedQuery,
+        point_id: PointOffsetType,
+    ) -> OperationResult<bool> {
+        let matched = match parsed_query {
+            ParsedQuery::AllTokens(query) => {
+                let Some(doc) = self.get_tokens(point_id) else {
+                    return Ok(false);
+                };
+
+                // Check that all tokens are in document
+                doc.has_subset(query)
+            }
+            ParsedQuery::Phrase(document) => {
+                let Some(doc) = self.get_document(point_id) else {
+                    return Ok(false);
+                };
+
+                // Check that all tokens are in document, in order
+                doc.has_phrase(document)
+            }
+            ParsedQuery::AnyTokens(query) => {
+                let Some(doc) = self.get_tokens(point_id) else {
+                    return Ok(false);
+                };
+
+                // Check that at least one token is in document
+                doc.has_any(query)
+            }
+        };
+        Ok(matched)
+    }
+
+    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+        self.get_tokens(point_id).is_none_or(|x| x.is_empty())
+    }
+
+    fn values_count(&self, point_id: PointOffsetType) -> usize {
+        // Maybe we want number of documents in the future?
+        self.get_tokens(point_id).map(|x| x.len()).unwrap_or(0)
+    }
+
+    fn points_count(&self) -> usize {
+        self.points_count
+    }
+
+    fn doc_len_batch(
+        &self,
+        point_ids: &[PointOffsetType],
+        _hw_counter: &HardwareCounterCell,
+        mut f: impl FnMut(usize, Option<u32>),
+    ) -> OperationResult<()> {
+        let lens = self.point_to_doc_len.as_deref();
+        for (index, &point_id) in point_ids.iter().enumerate() {
+            f(
+                index,
+                lens.and_then(|lens| lens.get(point_id as usize).copied()),
+            );
+        }
+        Ok(())
+    }
+
+    /// Free: the running counter is maintained by `set_doc_len` and `remove`.
+    fn total_tokens(&self) -> Option<u64> {
+        self.records_doc_len().then_some(self.total_tokens)
+    }
+
+    fn for_each_token_id<'a, U: UserData>(
+        &self,
+        tokens: impl Iterator<Item = (U, &'a str)>,
+        _: &HardwareCounterCell,
+        mut f: impl FnMut(U, Option<TokenId>),
+    ) -> OperationResult<()> {
+        tokens.for_each(|(user_data, token)| f(user_data, self.vocab.get(token).copied()));
+        Ok(())
+    }
+}
+
+impl MutableInvertedIndex {
+    /// Approximate RAM usage in bytes.
+    pub fn ram_usage_bytes(&self) -> usize {
+        let Self {
+            postings,
+            vocab,
+            point_to_tokens,
+            point_to_doc,
+            point_to_doc_len,
+            total_tokens: _,
+            points_count: _,
+        } = self;
+
+        let postings_bytes: usize = postings.capacity() * std::mem::size_of::<PostingList>()
+            + postings.iter().map(|p| p.heap_bytes()).sum::<usize>();
+        let hashmap_entry_overhead = std::mem::size_of::<u64>() + std::mem::size_of::<usize>();
+        let vocab_base_bytes = vocab.capacity()
+            * (std::mem::size_of::<String>()
+                + std::mem::size_of::<TokenId>()
+                + hashmap_entry_overhead);
+        // String heap data
+        let vocab_heap_bytes: usize = vocab.keys().map(|s| s.capacity()).sum();
+        let doc_len_bytes = point_to_doc_len
+            .as_ref()
+            .map(|lens| lens.capacity() * std::mem::size_of::<u32>())
+            .unwrap_or(0);
+        // TokenSet wraps Vec<TokenId> — account for heap allocation
+        let ptt_bytes: usize = point_to_tokens.capacity() * std::mem::size_of::<Option<TokenSet>>()
+            + point_to_tokens
+                .iter()
+                .filter_map(|opt| opt.as_ref())
+                .map(|ts| ts.heap_bytes())
+                .sum::<usize>();
+        // Document wraps Vec<TokenId> — account for heap allocation
+        let ptd_bytes: usize = point_to_doc
+            .as_ref()
+            .map(|v| {
+                v.capacity() * std::mem::size_of::<Option<Document>>()
+                    + v.iter()
+                        .filter_map(|opt| opt.as_ref())
+                        .map(|doc| doc.heap_bytes())
+                        .sum::<usize>()
+            })
+            .unwrap_or(0);
+        postings_bytes + vocab_base_bytes + vocab_heap_bytes + ptt_bytes + ptd_bytes + doc_len_bytes
+    }
+}

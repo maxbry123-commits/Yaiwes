@@ -1,0 +1,13 @@
+{
+ "schema": "yaiwes.core.manual-nolfs-import.v1",
+ "source_repo": "qdrant/qdrant",
+ "source_commit": "016542aa5deb6c66380bb137badf73d54f742bde",
+ "imported_at": "2026-10-15T04:47:29.802741-05:00",
+ "method": "shallow clone depth=1 sin LFS (punteros LFS se dejan como punteros); index git directo; sin _archives",
+ "files": 2446,
+ "lfs_pointers_left_as_pointers": [
+  "tests/e2e_tests/test_data/storage.tar.xz"
+ ],
+ "excluded": {},
+ "skipped_symlinks_submodules": []
+}

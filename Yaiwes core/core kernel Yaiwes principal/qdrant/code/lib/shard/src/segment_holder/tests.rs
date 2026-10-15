@@ -1,0 +1,3067 @@
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use common::flags::{FeatureFlags, init_feature_flags};
+use rand::RngExt;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, VectorInternal};
+use segment::json_path::JsonPath;
+use segment::payload_json;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
+use segment::types::{Distance, PayloadContainer};
+use serde_json::Value;
+use tempfile::Builder;
+
+use super::*;
+use crate::fixtures::*;
+use crate::segment_holder::locked::LockedSegmentHolder;
+
+#[test]
+fn test_add_and_swap() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let segment1 = build_segment_1(dir.path());
+    let segment2 = build_segment_2(dir.path());
+
+    let mut holder = SegmentHolder::default();
+
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    assert_ne!(sid1, sid2);
+
+    let segment3 = build_simple_segment(dir.path(), 4, Distance::Dot).unwrap();
+
+    let (_sid3, replaced_segments) = holder.swap_new(segment3, &[sid1, sid2]);
+    replaced_segments
+        .into_iter()
+        .for_each(|s| s.drop_data().unwrap());
+}
+
+#[test]
+fn test_apply_to_appendable() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let appendable_segment = build_segment_1(dir.path());
+
+    let mut immutable_segment = build_segment_2(dir.path());
+    immutable_segment.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let appendable_id = holder.add_new(appendable_segment);
+    let immutable_id = holder.add_new(immutable_segment);
+
+    let point_ids = [1.into(), 2.into(), 11.into(), 12.into()];
+    let mut updated_in_place = Vec::new();
+    let mut moved_to_appendable = Vec::new();
+
+    holder
+        .apply_points_with_conditional_move(
+            100,
+            &point_ids,
+            |point_id, segment| {
+                updated_in_place.push(point_id);
+                assert!(segment.has_point(point_id, common::types::DeferredBehavior::WithDeferred));
+                Ok(true)
+            },
+            |point_id, _, _, _| {
+                moved_to_appendable.push(point_id);
+            },
+            None,
+            &HardwareCounterCell::new(),
+        )
+        .unwrap();
+
+    // All points were updated
+    assert_eq!(
+        point_ids.len(),
+        updated_in_place.len() + moved_to_appendable.len()
+    );
+
+    let appendable_segment = holder.get(appendable_id).unwrap().get();
+    let appendable_segment = appendable_segment.read();
+
+    let immutable_segment = holder.get(immutable_id).unwrap().get();
+    let immutable_segment = immutable_segment.read();
+
+    // All points were moved from immutable into appendable segment
+    for point_id in point_ids {
+        assert!(
+            appendable_segment.has_point(point_id, common::types::DeferredBehavior::WithDeferred)
+        );
+    }
+
+    assert!(!immutable_segment.has_point(11.into(), common::types::DeferredBehavior::WithDeferred));
+    assert!(!immutable_segment.has_point(12.into(), common::types::DeferredBehavior::WithDeferred));
+}
+
+/// Test applying points and conditionally moving them if operation versions are off
+///
+/// More specifically, this tests the move is still applied correctly even if segments already
+/// have a newer version. That very situation can happen when replaying the WAL after a crash
+/// where only some of the segments have been flushed properly.
+///
+/// Before <https://github.com/qdrant/qdrant/pull/4060> the copy and delete operation to move a
+/// point to another segment may only be partially executed if an operation ID was given that
+/// is older than the current segment version. It resulted in missing points. This test asserts
+/// this cannot happen anymore.
+#[rstest::rstest]
+#[case::segments_older(false, false)]
+#[case::non_appendable_newer_appendable_older(true, false)]
+#[case::non_appendable_older_appendable_newer(false, true)]
+#[case::segments_newer(true, true)]
+fn test_apply_and_move_old_versions(
+    #[case] segment_1_high_version: bool,
+    #[case] segment_2_high_version: bool,
+) {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut segment1 = build_segment_1(dir.path());
+    let mut segment2 = build_segment_2(dir.path());
+
+    let hw_counter = HardwareCounterCell::new();
+
+    // Insert operation 100 with point 123 and 456 into segment 1, and 789 into segment 2
+    segment1
+        .upsert_point(
+            100,
+            123.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 1.0, 2.0, 3.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    segment1
+        .upsert_point(
+            100,
+            456.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 1.0, 2.0, 3.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    segment2
+        .upsert_point(
+            100,
+            789.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 1.0, 2.0, 3.0]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    // Bump segment version of segment 1 and/or 2 to a high value
+    // Here we insert a random point to achieve this, normally this could happen on restart if
+    // segments are not all flushed at the same time
+    if segment_1_high_version {
+        segment1
+            .upsert_point(
+                99999,
+                99999.into(),
+                segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+    }
+    if segment_2_high_version {
+        segment2
+            .upsert_point(
+                99999,
+                99999.into(),
+                segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+    }
+
+    // Segment 1 is non-appendable, segment 2 is appendable
+    segment1.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    // Update point 123, 456 and 789 in the non-appendable segment to move it to segment 2
+    let op_num = 101;
+    let mut processed_points: Vec<PointIdType> = vec![];
+    let mut processed_points2: Vec<PointIdType> = vec![];
+    holder
+        .apply_points_with_conditional_move(
+            op_num,
+            &[123.into(), 456.into(), 789.into()],
+            |point_id, segment| {
+                processed_points.push(point_id);
+                assert!(segment.has_point(point_id, common::types::DeferredBehavior::WithDeferred));
+                Ok(true)
+            },
+            |point_id, _, _, _| processed_points2.push(point_id),
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+    assert_eq!(3, processed_points.len() + processed_points2.len());
+
+    let locked_segment_1 = holder.get(sid1).unwrap().get();
+    let read_segment_1 = locked_segment_1.read();
+    let locked_segment_2 = holder.get(sid2).unwrap().get();
+    let read_segment_2 = locked_segment_2.read();
+
+    for i in &processed_points2 {
+        assert!(read_segment_2.has_point(*i, common::types::DeferredBehavior::WithDeferred));
+    }
+
+    // Point 123 and 456 should have moved from segment 1 into 2
+    assert!(!read_segment_1.has_point(123.into(), common::types::DeferredBehavior::WithDeferred));
+    assert!(!read_segment_1.has_point(456.into(), common::types::DeferredBehavior::WithDeferred));
+    assert!(!read_segment_1.has_point(789.into(), common::types::DeferredBehavior::WithDeferred));
+    assert!(read_segment_2.has_point(123.into(), common::types::DeferredBehavior::WithDeferred));
+    assert!(read_segment_2.has_point(456.into(), common::types::DeferredBehavior::WithDeferred));
+    assert!(read_segment_2.has_point(789.into(), common::types::DeferredBehavior::WithDeferred));
+}
+
+#[test]
+fn test_cow_operation() {
+    const PAYLOAD_KEY: &str = "test-value";
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let segment1 = build_segment_1(dir.path());
+    let mut segment2 = build_segment_1(dir.path());
+
+    let hw_counter = HardwareCounterCell::new();
+
+    segment2
+        .upsert_point(
+            100,
+            123.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 1.0, 2.0, 3.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    let mut payload = Payload::default();
+    payload.0.insert(PAYLOAD_KEY.to_string(), 42.into());
+    segment2
+        .set_full_payload(100, 123.into(), &payload, &hw_counter)
+        .unwrap();
+    segment2.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    {
+        let locked_segment_1 = holder.get(sid1).unwrap().get();
+        let read_segment_1 = locked_segment_1.read();
+        assert!(
+            !read_segment_1.has_point(123.into(), common::types::DeferredBehavior::WithDeferred)
+        );
+
+        let locked_segment_2 = holder.get(sid2).unwrap().get();
+        let read_segment_2 = locked_segment_2.read();
+        assert!(
+            read_segment_2.has_point(123.into(), common::types::DeferredBehavior::WithDeferred)
+        );
+        let vector = read_segment_2
+            .vector(DEFAULT_VECTOR_NAME, 123.into(), &hw_counter)
+            .unwrap()
+            .unwrap();
+        assert_ne!(vector, VectorInternal::Dense(vec![9.0; 4]));
+        assert_eq!(
+            read_segment_2
+                .payload(123.into(), &hw_counter)
+                .unwrap()
+                .get_value(&JsonPath::from_str(PAYLOAD_KEY).unwrap())[0],
+            &Value::from(42)
+        );
+    }
+
+    holder
+        .apply_points_with_conditional_move(
+            1010,
+            &[123.into()],
+            |_, _| unreachable!(),
+            |_point_id, _raw_vectors, vectors, payload| {
+                vectors.insert(
+                    DEFAULT_VECTOR_NAME.to_owned(),
+                    VectorInternal::Dense(vec![9.0; 4]),
+                );
+                payload.0.insert(PAYLOAD_KEY.to_string(), 2.into());
+            },
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    let locked_segment_1 = holder.get(sid1).unwrap().get();
+    let read_segment_1 = locked_segment_1.read();
+
+    assert!(read_segment_1.has_point(123.into(), common::types::DeferredBehavior::WithDeferred));
+
+    let new_vector = read_segment_1
+        .vector(DEFAULT_VECTOR_NAME, 123.into(), &hw_counter)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_vector, VectorInternal::Dense(vec![9.0; 4]));
+    let new_payload_value = read_segment_1.payload(123.into(), &hw_counter).unwrap();
+    assert_eq!(
+        new_payload_value.get_value(&JsonPath::from_str(PAYLOAD_KEY).unwrap())[0],
+        &Value::from(2)
+    );
+}
+
+/// A CoW move into an append-only destination must allocate exactly one
+/// internal slot: raw vectors, updated vectors and payload travel in one
+/// fused write (`upsert_moved_point`), not one clone per part.
+#[test]
+fn test_cow_move_append_only_single_slot() {
+    use segment::id_tracker::IdTrackerRead as _;
+
+    const PAYLOAD_KEY: &str = "test-value";
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut destination = empty_segment(dir.path());
+    destination.append_only_mutations = true;
+    let destination_id_tracker = destination.id_tracker.clone();
+
+    let mut source = build_segment_1(dir.path());
+    let hw_counter = HardwareCounterCell::new();
+    source
+        .upsert_point(
+            100,
+            123.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 1.0, 2.0, 3.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    source.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let dst_sid = holder.add_new(destination);
+    holder.add_new(source);
+
+    holder
+        .apply_points_with_conditional_move(
+            1010,
+            &[123.into()],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_point_id, _raw_vectors, vectors, payload| {
+                vectors.insert(
+                    DEFAULT_VECTOR_NAME.to_owned(),
+                    VectorInternal::Dense(vec![9.0; 4]),
+                );
+                payload.0.insert(PAYLOAD_KEY.to_string(), 2.into());
+            },
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    // The moved point occupies exactly one slot in the destination, with the
+    // overlaid vector and payload.
+    assert_eq!(destination_id_tracker.borrow().total_point_count(), 1);
+    let locked_destination = holder.get(dst_sid).unwrap().get();
+    let read_destination = locked_destination.read();
+    assert_eq!(
+        read_destination
+            .vector(DEFAULT_VECTOR_NAME, 123.into(), &hw_counter)
+            .unwrap(),
+        Some(VectorInternal::Dense(vec![9.0; 4])),
+    );
+    assert_eq!(
+        read_destination
+            .payload(123.into(), &hw_counter)
+            .unwrap()
+            .get_value(&JsonPath::from_str(PAYLOAD_KEY).unwrap())[0],
+        &Value::from(2)
+    );
+}
+
+/// TurboQuant-as-datatype vectors must survive repeated CoW moves between
+/// segments without degrading.
+///
+/// The CoW arm of [`SegmentHolder::apply_points_with_conditional_move`] reads
+/// the point's vectors decoded to `f32` and re-inserts them with
+/// `upsert_point`, so a TQ-datatype vector is dequantized and requantized on
+/// every move. TurboQuant requantization is not idempotent — for Dot/L2 the
+/// stored per-vector scale factor picks up the centroid-norm bias on every
+/// cycle — so each move degrades the vector a little further beyond the
+/// initial (expected, one-off) quantization loss.
+///
+/// This test ping-pongs one point between two TQ segments, and asserts the
+/// decoded vector never drifts from its first-generation value (the read-back
+/// right after initial ingestion). The holder classifies segments as
+/// (non-)appendable once, at insertion, so each round uses a fresh holder with
+/// the segment roles swapped instead of flipping flags under a live holder.
+#[test]
+fn test_cow_move_does_not_degrade_turbo_vectors() {
+    use segment::data_types::vectors::only_default_vector;
+    use segment::types::{Indexes, VectorDataConfig, VectorStorageDatatype, VectorStorageType};
+
+    const DIM: usize = 128;
+    const ROUNDTRIPS: u64 = 32;
+
+    let config = SegmentConfig {
+        vector_data: HashMap::from([(
+            DEFAULT_VECTOR_NAME.to_owned(),
+            VectorDataConfig {
+                size: DIM,
+                distance: Distance::Dot,
+                storage_type: VectorStorageType::ChunkedMmap,
+                index: Indexes::Plain {},
+                quantization_config: None,
+                multivector_config: None,
+                datatype: Some(VectorStorageDatatype::Turbo4),
+            },
+        )]),
+        sparse_vector_data: Default::default(),
+        payload_storage_type: Default::default(),
+        id_tracker_memory: None,
+    };
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (mut segment_a, _) = build_segment(dir.path(), &config, None, true).unwrap();
+    let (segment_b, _) = build_segment(dir.path(), &config, None, true).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
+    let point_id: PointIdType = 7.into();
+    let original: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.37).sin()).collect();
+    segment_a
+        .upsert_point(100, point_id, only_default_vector(&original), &hw_counter)
+        .unwrap();
+
+    let read_dense = |segment: &dyn SegmentEntry| -> Vec<f32> {
+        match segment
+            .vector(DEFAULT_VECTOR_NAME, point_id, &hw_counter)
+            .unwrap()
+            .unwrap()
+        {
+            VectorInternal::Dense(vector) => vector,
+            VectorInternal::Sparse(_) | VectorInternal::MultiDense(_) => {
+                panic!("expected a dense vector")
+            }
+        }
+    };
+
+    // First-generation read-back: the original vector after its initial
+    // (expected, one-off) quantization. Moves must preserve it exactly.
+    let first_generation = read_dense(&segment_a);
+
+    let segment_a = Arc::new(RwLock::new(segment_a));
+    let segment_b = Arc::new(RwLock::new(segment_b));
+
+    // L2 distance of each round's read-back from the first generation.
+    let mut drift = Vec::new();
+    for round in 0..ROUNDTRIPS {
+        let (source, destination) = if round % 2 == 0 {
+            (&segment_a, &segment_b)
+        } else {
+            (&segment_b, &segment_a)
+        };
+
+        // The segment holding the point is non-appendable and the other one is
+        // the only appendable destination, so the call must take the CoW-move
+        // arm.
+        source.write().appendable_flag = false;
+        destination.write().appendable_flag = true;
+        let mut holder = SegmentHolder::default();
+        holder.add_new_locked(LockedSegment::Original(source.clone()));
+        holder.add_new_locked(LockedSegment::Original(destination.clone()));
+
+        holder
+            .apply_points_with_conditional_move(
+                101 + round,
+                &[point_id],
+                |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+                |_, _, _, _| {}, // no-op: a pure move
+                None,
+                &hw_counter,
+            )
+            .unwrap();
+
+        let source = source.read();
+        let destination = destination.read();
+        assert!(!source.has_point(point_id, DeferredBehavior::WithDeferred));
+        assert!(destination.has_point(point_id, DeferredBehavior::WithDeferred));
+
+        let read_back = read_dense(&*destination);
+        drift.push(
+            first_generation
+                .iter()
+                .zip(&read_back)
+                .map(|(&a, &b)| (a - b).powi(2))
+                .sum::<f32>()
+                .sqrt(),
+        );
+    }
+
+    assert!(
+        drift.iter().all(|&distance| distance == 0.0),
+        "TurboQuant vector degraded across CoW moves; L2 distance from the \
+         first-generation read-back after each move: {drift:?}",
+    );
+}
+
+/// A CoW move where the operation overlays one named vector must re-encode
+/// only that name: the untouched sibling TQ vector travels as verbatim bytes
+/// (bit-identical read-back), and the overlaid name reads back exactly like a
+/// fresh direct ingest of the same data.
+#[test]
+fn test_cow_move_overlay_preserves_untouched_turbo_vector() {
+    use segment::types::{Indexes, VectorDataConfig, VectorStorageDatatype, VectorStorageType};
+
+    const DIM: usize = 128;
+    const KEEP: &str = "keep";
+    const REPLACE: &str = "replace";
+
+    let vector_config = VectorDataConfig {
+        size: DIM,
+        distance: Distance::Dot,
+        storage_type: VectorStorageType::ChunkedMmap,
+        index: Indexes::Plain {},
+        quantization_config: None,
+        multivector_config: None,
+        datatype: Some(VectorStorageDatatype::Turbo4),
+    };
+    let config = SegmentConfig {
+        vector_data: HashMap::from([
+            (KEEP.to_owned(), vector_config.clone()),
+            (REPLACE.to_owned(), vector_config),
+        ]),
+        sparse_vector_data: Default::default(),
+        payload_storage_type: Default::default(),
+        id_tracker_memory: None,
+    };
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (mut source, _) = build_segment(dir.path(), &config, None, true).unwrap();
+    let (destination, _) = build_segment(dir.path(), &config, None, true).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
+    let point_id: PointIdType = 7.into();
+    let keep_vec: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.37).sin()).collect();
+    let old_replace: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.11).cos()).collect();
+    let fresh_replace: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.73).sin()).collect();
+
+    source
+        .upsert_point(
+            100,
+            point_id,
+            NamedVectors::from_pairs([
+                (KEEP.to_owned(), keep_vec.clone()),
+                (REPLACE.to_owned(), old_replace.clone()),
+            ]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let read_dense = |segment: &dyn SegmentEntry, name: &str| -> Vec<f32> {
+        match segment
+            .vector(name, point_id, &hw_counter)
+            .unwrap()
+            .unwrap()
+        {
+            VectorInternal::Dense(vector) => vector,
+            VectorInternal::Sparse(_) | VectorInternal::MultiDense(_) => {
+                panic!("expected a dense vector")
+            }
+        }
+    };
+
+    // First-generation read-back of the untouched name: must survive the move
+    // bit-identically.
+    let first_generation_keep = read_dense(&source, KEEP);
+
+    // Oracle for the overlaid name: a fresh direct ingest into a same-config
+    // segment (TQ encoding is deterministic for equal configs).
+    let (mut oracle, _) = build_segment(dir.path(), &config, None, true).unwrap();
+    oracle
+        .upsert_point(
+            100,
+            point_id,
+            NamedVectors::from_pairs([
+                (KEEP.to_owned(), keep_vec.clone()),
+                (REPLACE.to_owned(), fresh_replace.clone()),
+            ]),
+            &hw_counter,
+        )
+        .unwrap();
+    let expected_replace = read_dense(&oracle, REPLACE);
+
+    // Same pattern as test_cow_move_does_not_degrade_turbo_vectors: keep own
+    // Arc handles so the read-back guard derefs to &Segment (→ &dyn SegmentEntry).
+    source.appendable_flag = false;
+    let source = Arc::new(RwLock::new(source));
+    let destination = Arc::new(RwLock::new(destination));
+    let mut holder = SegmentHolder::default();
+    holder.add_new_locked(LockedSegment::Original(source.clone()));
+    holder.add_new_locked(LockedSegment::Original(destination.clone()));
+
+    holder
+        .apply_points_with_conditional_move(
+            101,
+            &[point_id],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, _raw_vectors, updated_vectors, _| {
+                updated_vectors.insert(
+                    REPLACE.to_owned(),
+                    VectorInternal::Dense(fresh_replace.clone()),
+                );
+            },
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    let destination = destination.read();
+    assert!(destination.has_point(point_id, DeferredBehavior::WithDeferred));
+
+    assert_eq!(
+        read_dense(&*destination, KEEP),
+        first_generation_keep,
+        "untouched named vector must travel as verbatim bytes",
+    );
+    assert_eq!(
+        read_dense(&*destination, REPLACE),
+        expected_replace,
+        "overlaid named vector must equal a fresh direct ingest",
+    );
+}
+
+/// A CoW move where the operation deletes one named vector must drop exactly
+/// that name at the destination while the surviving TQ vector travels as
+/// verbatim bytes (bit-identical read-back).
+#[test]
+fn test_cow_move_delete_name_preserves_survivor() {
+    use segment::types::{Indexes, VectorDataConfig, VectorStorageDatatype, VectorStorageType};
+
+    const DIM: usize = 128;
+    const KEEP: &str = "keep";
+    const DROP: &str = "drop";
+
+    let vector_config = VectorDataConfig {
+        size: DIM,
+        distance: Distance::Dot,
+        storage_type: VectorStorageType::ChunkedMmap,
+        index: Indexes::Plain {},
+        quantization_config: None,
+        multivector_config: None,
+        datatype: Some(VectorStorageDatatype::Turbo4),
+    };
+    let config = SegmentConfig {
+        vector_data: HashMap::from([
+            (KEEP.to_owned(), vector_config.clone()),
+            (DROP.to_owned(), vector_config),
+        ]),
+        sparse_vector_data: Default::default(),
+        payload_storage_type: Default::default(),
+        id_tracker_memory: None,
+    };
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (mut source, _) = build_segment(dir.path(), &config, None, true).unwrap();
+    let (destination, _) = build_segment(dir.path(), &config, None, true).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
+    let point_id: PointIdType = 7.into();
+    let keep_vec: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.37).sin()).collect();
+    let drop_vec: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.11).cos()).collect();
+
+    source
+        .upsert_point(
+            100,
+            point_id,
+            NamedVectors::from_pairs([
+                (KEEP.to_owned(), keep_vec.clone()),
+                (DROP.to_owned(), drop_vec.clone()),
+            ]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let read_dense = |segment: &dyn SegmentEntry, name: &str| -> Vec<f32> {
+        match segment
+            .vector(name, point_id, &hw_counter)
+            .unwrap()
+            .unwrap()
+        {
+            VectorInternal::Dense(vector) => vector,
+            VectorInternal::Sparse(_) | VectorInternal::MultiDense(_) => {
+                panic!("expected a dense vector")
+            }
+        }
+    };
+    let first_generation_keep = read_dense(&source, KEEP);
+
+    // Own Arc handles, as in test_cow_move_does_not_degrade_turbo_vectors.
+    source.appendable_flag = false;
+    let source = Arc::new(RwLock::new(source));
+    let destination = Arc::new(RwLock::new(destination));
+    let mut holder = SegmentHolder::default();
+    holder.add_new_locked(LockedSegment::Original(source.clone()));
+    holder.add_new_locked(LockedSegment::Original(destination.clone()));
+
+    holder
+        .apply_points_with_conditional_move(
+            101,
+            &[point_id],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, raw_vectors, _, _| {
+                raw_vectors.retain(|(name, _)| name != DROP);
+            },
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    let destination = destination.read();
+    assert!(destination.has_point(point_id, DeferredBehavior::WithDeferred));
+
+    assert_eq!(
+        read_dense(&*destination, KEEP),
+        first_generation_keep,
+        "surviving named vector must travel as verbatim bytes",
+    );
+    assert!(
+        destination
+            .vector(DROP, point_id, &hw_counter)
+            .unwrap()
+            .is_none(),
+        "deleted named vector must not exist at the destination",
+    );
+}
+
+/// A CoW move between segments whose vector configs differ only in segment
+/// role fields (storage type, index, quantization) must succeed — that is the
+/// normal shape of a move out of an optimizer-built segment into an appendable
+/// one. Only encoding-relevant fields (size, distance, datatype, multivector
+/// config) must match for raw bytes to be portable.
+///
+/// Regression test: the CoW arm's config guard compared full
+/// `VectorDataConfig` structs and panicked (debug builds) on every move out of
+/// an optimized segment.
+#[test]
+fn test_cow_move_allows_role_config_differences() {
+    use segment::types::{Indexes, VectorDataConfig, VectorStorageType};
+
+    const DIM: usize = 128;
+
+    let make_config = |storage_type: VectorStorageType| SegmentConfig {
+        vector_data: HashMap::from([(
+            DEFAULT_VECTOR_NAME.to_owned(),
+            VectorDataConfig {
+                size: DIM,
+                distance: Distance::Dot,
+                storage_type,
+                index: Indexes::Plain {},
+                quantization_config: None,
+                multivector_config: None,
+                datatype: None,
+            },
+        )]),
+        sparse_vector_data: Default::default(),
+        payload_storage_type: Default::default(),
+        id_tracker_memory: None,
+    };
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    // Source and destination differ in storage type only; the byte encoding
+    // (f32 dense) is identical on both sides.
+    let (mut source, _) = build_segment(
+        dir.path(),
+        &make_config(VectorStorageType::InRamChunkedMmap),
+        None,
+        true,
+    )
+    .unwrap();
+    let (destination, _) = build_segment(
+        dir.path(),
+        &make_config(VectorStorageType::ChunkedMmap),
+        None,
+        true,
+    )
+    .unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
+    let point_id: PointIdType = 7.into();
+    let original: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.37).sin()).collect();
+    source
+        .upsert_point(
+            100,
+            point_id,
+            segment::data_types::vectors::only_default_vector(&original),
+            &hw_counter,
+        )
+        .unwrap();
+
+    // Own Arc handles, as in test_cow_move_does_not_degrade_turbo_vectors.
+    source.appendable_flag = false;
+    let source = Arc::new(RwLock::new(source));
+    let destination = Arc::new(RwLock::new(destination));
+    let mut holder = SegmentHolder::default();
+    holder.add_new_locked(LockedSegment::Original(source.clone()));
+    holder.add_new_locked(LockedSegment::Original(destination.clone()));
+
+    holder
+        .apply_points_with_conditional_move(
+            101,
+            &[point_id],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, _, _, _| {}, // no-op: a pure move
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    let destination = destination.read();
+    assert!(destination.has_point(point_id, DeferredBehavior::WithDeferred));
+    match destination
+        .vector(DEFAULT_VECTOR_NAME, point_id, &hw_counter)
+        .unwrap()
+        .unwrap()
+    {
+        VectorInternal::Dense(vector) => assert_eq!(
+            vector, original,
+            "f32 dense vector must travel losslessly across role-config differences",
+        ),
+        VectorInternal::Sparse(_) | VectorInternal::MultiDense(_) => {
+            panic!("expected a dense vector")
+        }
+    }
+}
+
+#[test]
+fn test_points_deduplication() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut segment1 = build_segment_1(dir.path());
+    let mut segment2 = build_segment_1(dir.path());
+
+    let hw_counter = HardwareCounterCell::new();
+
+    segment1
+        .set_payload(100, 1.into(), &payload_json! {}, &None, &hw_counter)
+        .unwrap();
+    segment1
+        .set_payload(100, 2.into(), &payload_json! {}, &None, &hw_counter)
+        .unwrap();
+
+    segment2
+        .set_payload(200, 4.into(), &payload_json! {}, &None, &hw_counter)
+        .unwrap();
+    segment2
+        .set_payload(200, 5.into(), &payload_json! {}, &None, &hw_counter)
+        .unwrap();
+
+    let mut holder = SegmentHolder::default();
+
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    let res = deduplicate_points_sync(&holder).unwrap();
+
+    assert_eq!(5, res);
+
+    assert!(
+        holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(1.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(2.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        !holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(1.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        !holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(2.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+
+    assert!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(4.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(5.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        !holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(4.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        !holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(5.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+}
+
+/// Unit test for a specific bug we caught before.
+///
+/// See: <https://github.com/qdrant/qdrant/pull/5585>
+#[test]
+fn test_points_deduplication_bug() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut segment1 = empty_segment(dir.path());
+    let mut segment2 = empty_segment(dir.path());
+
+    let hw_counter = HardwareCounterCell::new();
+
+    segment1
+        .upsert_point(
+            2,
+            10.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0; 4]),
+            &hw_counter,
+        )
+        .unwrap();
+    segment2
+        .upsert_point(
+            3,
+            10.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0; 4]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    segment1
+        .upsert_point(
+            1,
+            11.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0; 4]),
+            &hw_counter,
+        )
+        .unwrap();
+    segment2
+        .upsert_point(
+            2,
+            11.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0; 4]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let mut holder = SegmentHolder::default();
+
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    let duplicate_count = holder
+        .find_duplicated_points()
+        .values()
+        .map(|ids| ids.len())
+        .sum::<usize>();
+    assert_eq!(2, duplicate_count);
+
+    let removed_count = deduplicate_points_sync(&holder).unwrap();
+    assert_eq!(2, removed_count);
+
+    assert!(
+        !holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(10.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(10.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+
+    assert!(
+        !holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(11.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(11.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+
+    assert_eq!(
+        holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .available_point_count(),
+        0,
+    );
+    assert_eq!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .available_point_count(),
+        2,
+    );
+}
+
+#[test]
+fn test_points_deduplication_randomized() {
+    const POINT_COUNT: usize = 1000;
+
+    let mut rand = rand::rng();
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let vector = segment::data_types::vectors::only_default_vector(&[0.0; 4]);
+
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut segments = [
+        empty_segment(dir.path()),
+        empty_segment(dir.path()),
+        empty_segment(dir.path()),
+        empty_segment(dir.path()),
+        empty_segment(dir.path()),
+    ];
+
+    // Insert points into all segments with random versions
+    let mut highest_point_version = HashMap::new();
+    for id in 0..POINT_COUNT {
+        let mut max_version = 0;
+        let point_id = PointIdType::from(id as u64);
+
+        for segment in &mut segments {
+            let version = rand.random_range(1..10);
+            segment
+                .upsert_point(version, point_id, vector.clone(), &hw_counter)
+                .unwrap();
+            max_version = version.max(max_version);
+        }
+
+        highest_point_version.insert(id, max_version);
+    }
+
+    // Put segments into holder
+    let mut holder = SegmentHolder::default();
+    let segment_ids = segments
+        .into_iter()
+        .map(|segment| holder.add_new(segment))
+        .collect::<Vec<_>>();
+
+    let duplicate_count = holder
+        .find_duplicated_points()
+        .values()
+        .map(|ids| ids.len())
+        .sum::<usize>();
+    assert_eq!(POINT_COUNT * (segment_ids.len() - 1), duplicate_count);
+
+    let removed_count = deduplicate_points_sync(&holder).unwrap();
+    assert_eq!(POINT_COUNT * (segment_ids.len() - 1), removed_count);
+
+    // Assert points after deduplication
+    for id in 0..POINT_COUNT {
+        let point_id = PointIdType::from(id as u64);
+        let max_version = highest_point_version[&id];
+
+        let found_versions = segment_ids
+            .iter()
+            .filter_map(|segment_id| {
+                holder
+                    .get(*segment_id)
+                    .unwrap()
+                    .get()
+                    .read()
+                    .point_version(point_id)
+            })
+            .collect::<Vec<_>>();
+
+        // We must have exactly one version, and it must be the highest we inserted
+        assert_eq!(
+            found_versions.len(),
+            1,
+            "point version must be maximum known version",
+        );
+        assert_eq!(
+            found_versions[0], max_version,
+            "point version must be maximum known version",
+        );
+    }
+}
+
+/// Base test without deferred points
+#[test]
+fn test_find_points_to_update_and_delete() {
+    use std::collections::HashSet;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]);
+
+    // Segment 1: point 1 (v1), point 2 (v2), point 3 (v5), point 6 (v7)
+    let mut segment1 = empty_segment(dir.path());
+    segment1
+        .upsert_point(1, 1.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(2, 2.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(5, 3.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(7, 6.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    // Segment 2: point 2 (v3), point 3 (v4), point 4 (v6), point 6 (v7)
+    let mut segment2 = empty_segment(dir.path());
+    segment2
+        .upsert_point(3, 2.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment2
+        .upsert_point(4, 3.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment2
+        .upsert_point(6, 4.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment2
+        .upsert_point(7, 6.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    // Query for points 1, 2, 3, 4, 5, 6
+    let ids: Vec<PointIdType> = vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into(), 6.into()];
+    let (to_update, to_delete) = holder.find_points_to_update_and_delete(&ids);
+
+    let update_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_update
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    let delete_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_delete
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    let update_1 = update_set(&sid1);
+    let update_2 = update_set(&sid2);
+    let delete_1 = delete_set(&sid1);
+    let delete_2 = delete_set(&sid2);
+
+    // Point 1 (v1): only in segment1 → update in seg1
+    assert!(update_1.contains(&1.into()));
+
+    // Point 2: seg1 v2, seg2 v3 → seg2 newer → update in seg2, delete from seg1
+    assert!(update_2.contains(&2.into()));
+    assert!(!update_1.contains(&2.into()));
+    assert!(delete_1.contains(&2.into()));
+
+    // Point 3: seg1 v5, seg2 v4 → seg1 newer → update in seg1, delete from seg2
+    assert!(update_1.contains(&3.into()));
+    assert!(!update_2.contains(&3.into()));
+    assert!(delete_2.contains(&3.into()));
+
+    // Point 4 (v6): only in segment2 → update in seg2
+    assert!(update_2.contains(&4.into()));
+    assert!(!update_1.contains(&4.into()));
+
+    // Point 5: not in any segment → absent from both maps
+    assert!(!update_1.contains(&5.into()));
+    assert!(!update_2.contains(&5.into()));
+    assert!(!delete_1.contains(&5.into()));
+    assert!(!delete_2.contains(&5.into()));
+
+    // Point 6: same version (v7) in both segments → both in to_update, neither in to_delete
+    assert!(update_1.contains(&6.into()));
+    assert!(update_2.contains(&6.into()));
+    assert!(!delete_1.contains(&6.into()));
+    assert!(!delete_2.contains(&6.into()));
+}
+
+/// Test that deferred points are properly handled by `find_points_to_update_and_delete`.
+///
+/// The logic keeps the latest non-deferred version and only keeps a deferred
+/// version if it is strictly newer than all non-deferred versions.
+#[test]
+fn test_find_points_to_update_and_delete_with_deferred() {
+    use std::collections::HashSet;
+
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]);
+
+    // Segment 1 (normal): points 3, 4, 5 at version 10
+    let mut segment1 = empty_segment(dir.path());
+    segment1
+        .upsert_point(10, 3.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(10, 4.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(10, 5.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    // Segment 2 (with deferred): points 1-5 at version 6
+    //   Points 1, 2, 3: NOT deferred
+    //   Points 4, 5: deferred
+    let segment2 = build_segment_with_deferred_1(dir.path());
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    let ids: Vec<PointIdType> = vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()];
+    let (to_update, to_delete) = holder.find_points_to_update_and_delete(&ids);
+
+    let update_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_update
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    let delete_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_delete
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    let update_1 = update_set(&sid1);
+    let update_2 = update_set(&sid2);
+    let delete_1 = delete_set(&sid1);
+    let delete_2 = delete_set(&sid2);
+
+    // Point 1 (seg2 v6, not deferred): only in seg2 → update seg2
+    assert!(update_2.contains(&1.into()));
+    assert!(!update_1.contains(&1.into()));
+
+    // Point 2 (seg2 v6, not deferred): only in seg2 → update seg2
+    assert!(update_2.contains(&2.into()));
+    assert!(!update_1.contains(&2.into()));
+
+    // Point 3: seg1 v10 (non-deferred) vs seg2 v6 (non-deferred) → seg1 newer → update seg1, delete seg2
+    assert!(update_1.contains(&3.into()));
+    assert!(!update_2.contains(&3.into()));
+    assert!(delete_2.contains(&3.into()));
+
+    // Point 4: seg1 v10 (non-deferred) vs seg2 v6 (deferred)
+    // seg1 v10 is latest → update seg1
+    // seg2 v6 is deferred → never deleted (optimizer handles it)
+    assert!(update_1.contains(&4.into()));
+    assert!(!update_2.contains(&4.into()));
+    assert!(!delete_2.contains(&4.into()));
+
+    // Point 5: seg1 v10 (non-deferred) vs seg2 v6 (deferred) → same as point 4
+    assert!(update_1.contains(&5.into()));
+    assert!(!update_2.contains(&5.into()));
+    assert!(!delete_2.contains(&5.into()));
+
+    // No deletes at all — seg1 always had the latest, seg2 deferred copies are left alone
+    assert!(delete_1.is_empty());
+    assert!(!delete_2.contains(&4.into()));
+    assert!(!delete_2.contains(&5.into()));
+}
+
+/// Test that a deferred-only point (no non-deferred copy anywhere) is kept for update.
+#[test]
+fn test_find_points_to_update_and_delete_with_deferred_only() {
+    use std::collections::HashSet;
+
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    // Segment with deferred: points 1-5 at version 6
+    //   Points 1, 2, 3: NOT deferred
+    //   Points 4, 5: deferred
+    let segment = build_segment_with_deferred_1(dir.path());
+
+    let mut holder = SegmentHolder::default();
+    let sid = holder.add_new(segment);
+
+    // Query only deferred points — no non-deferred copy exists for these in any segment
+    let ids: Vec<PointIdType> = vec![4.into(), 5.into()];
+    let (to_update, to_delete) = holder.find_points_to_update_and_delete(&ids);
+
+    let update_set: HashSet<PointIdType> = to_update
+        .get(&sid)
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_default();
+    let delete_set: HashSet<PointIdType> = to_delete
+        .get(&sid)
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_default();
+
+    // Points 4 and 5 are deferred but have no non-deferred copy → should be kept for update
+    assert!(update_set.contains(&4.into()));
+    assert!(update_set.contains(&5.into()));
+    assert!(delete_set.is_empty());
+}
+
+/// Test that a deferred point with a strictly higher version than all non-deferred copies
+/// is kept for update alongside the latest non-deferred copy.
+#[test]
+fn test_find_points_to_update_and_delete_with_deferred_winning() {
+    use std::collections::HashSet;
+
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]);
+
+    // Segment 1 (normal): points 4, 5 at version 3 (lower than deferred v6)
+    let mut segment1 = empty_segment(dir.path());
+    segment1
+        .upsert_point(3, 4.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(3, 5.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    // Segment 2 (with deferred): points 1-5 at version 6
+    //   Points 4, 5: deferred (version 6 > non-deferred version 3)
+    let segment2 = build_segment_with_deferred_1(dir.path());
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+
+    let ids: Vec<PointIdType> = vec![4.into(), 5.into()];
+    let (to_update, to_delete) = holder.find_points_to_update_and_delete(&ids);
+
+    let update_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_update
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    let delete_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_delete
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    let update_1 = update_set(&sid1);
+    let update_2 = update_set(&sid2);
+    let delete_1 = delete_set(&sid1);
+    let delete_2 = delete_set(&sid2);
+
+    // Point 4: seg1 v3 (non-deferred) vs seg2 v6 (deferred)
+    // seg2 v6 is latest → update seg2
+    // seg1 v3 is older non-deferred but best is deferred → keep seg1 (don't discard
+    // the non-deferred copy in favor of a deferred one)
+    assert!(!update_1.contains(&4.into()));
+    assert!(update_2.contains(&4.into()));
+    assert!(!delete_1.contains(&4.into()));
+
+    // Point 5: same situation as point 4
+    assert!(!update_1.contains(&5.into()));
+    assert!(update_2.contains(&5.into()));
+    assert!(!delete_1.contains(&5.into()));
+
+    // No deletes at all — deferred copies never deleted, non-deferred kept as safety net
+    assert!(delete_2.is_empty());
+}
+
+/// Test that stale non-deferred copies are deleted even when a same-version
+/// non-deferred copy is discovered after a deferred copy at the latest version.
+///
+/// Scenario (3 segments, point P):
+///   seg1: v5 non-deferred (older, should be deleted)
+///   seg2: v10 deferred (latest version)
+///   seg3: v10 non-deferred (latest version, makes it safe to delete seg1)
+///
+/// This is order-independent: regardless of which segment is visited first,
+/// seg1's stale copy must be deleted.
+#[test]
+fn test_find_points_to_update_and_delete_with_deferred_three_segments() {
+    use std::collections::HashSet;
+
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]);
+
+    // Segment 1 (normal): point 4 at version 5 (older non-deferred)
+    let mut segment1 = empty_segment(dir.path());
+    segment1
+        .upsert_point(5, 4.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    // Segment 2 (with deferred): point 4 at version 6 (deferred)
+    let segment2 = build_segment_with_deferred_1(dir.path());
+
+    // Segment 3 (normal): point 4 at version 6 (non-deferred, same as deferred)
+    let mut segment3 = empty_segment(dir.path());
+    segment3
+        .upsert_point(6, 4.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+    let sid3 = holder.add_new(segment3);
+
+    let ids: Vec<PointIdType> = vec![4.into()];
+    let (to_update, to_delete) = holder.find_points_to_update_and_delete(&ids);
+
+    let update_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_update
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    let delete_set = |sid: &SegmentId| -> HashSet<PointIdType> {
+        to_delete
+            .get(sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    // Latest version (v6) in seg2 (deferred) and seg3 (non-deferred) → both updated
+    assert!(!update_set(&sid1).contains(&4.into()));
+    assert!(update_set(&sid2).contains(&4.into()));
+    assert!(update_set(&sid3).contains(&4.into()));
+
+    // Seg1 v5 non-deferred is older and latest has a non-deferred copy (seg3) → deleted
+    assert!(delete_set(&sid1).contains(&4.into()));
+    // Deferred copies are never deleted
+    assert!(!delete_set(&sid2).contains(&4.into()));
+    assert!(!delete_set(&sid3).contains(&4.into()));
+}
+
+/// Test deduplication with deferred points.
+///
+/// Exercises all deduplication rules:
+/// - Non-deferred duplicate with lower version is removed when latest has non-deferred
+/// - Deferred points are never removed
+/// - Older non-deferred copies are kept when the latest version is deferred-only
+/// - Multiple deferred copies are reduced to one
+#[test]
+fn test_points_deduplication_with_deferred() {
+    use crate::fixtures::empty_segment_with_deferred;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0; 4]);
+
+    // Segment 1 (normal, no deferred):
+    //   Point 3 at v10, Point 4 at v10, Point 5 at v3, Point 6 at v8
+    let mut segment1 = empty_segment(dir.path());
+    segment1
+        .upsert_point(10, 3.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(10, 4.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(3, 5.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(8, 6.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+
+    // Segment 2 (with deferred, internal IDs >= 3 are deferred):
+    //   Insert order: point 1, 2, 3 (non-deferred), then 4, 5, 6 (deferred)
+    //   All at version 6
+    let mut segment2 = empty_segment_with_deferred(dir.path(), 3);
+    for id in 1..=6u64 {
+        segment2
+            .upsert_point(6, id.into(), vec4.clone(), &hw_counter)
+            .unwrap();
+    }
+    // Verify deferred status
+    assert!(!segment2.point_is_deferred(1.into()));
+    assert!(!segment2.point_is_deferred(2.into()));
+    assert!(!segment2.point_is_deferred(3.into()));
+    assert!(segment2.point_is_deferred(4.into()));
+    assert!(segment2.point_is_deferred(5.into()));
+    assert!(segment2.point_is_deferred(6.into()));
+
+    // Segment 3 (also with deferred, internal IDs >= 3) — to test multiple deferred copies:
+    //   To get point 6 deferred, we need 3 dummy points first to push internal IDs up.
+    let mut segment3 = empty_segment_with_deferred(dir.path(), 3);
+    // Insert dummy points to push internal IDs up
+    segment3
+        .upsert_point(1, 100.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment3
+        .upsert_point(1, 101.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    segment3
+        .upsert_point(1, 102.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    // Now internal_id 3 → deferred
+    segment3
+        .upsert_point(9, 6.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    assert!(segment3.point_is_deferred(6.into()));
+
+    let mut holder = SegmentHolder::default();
+    let sid1 = holder.add_new(segment1);
+    let sid2 = holder.add_new(segment2);
+    let sid3 = holder.add_new(segment3);
+
+    let duplicates = holder.find_duplicated_points();
+
+    let removed_from = |sid: SegmentId| -> HashSet<PointIdType> {
+        duplicates
+            .get(&sid)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    let rem1 = removed_from(sid1);
+    let rem2 = removed_from(sid2);
+    let rem3 = removed_from(sid3);
+
+    // Point 1: only in seg2 (non-deferred, v6) → no dedup
+    assert!(!rem2.contains(&1.into()));
+
+    // Point 2: only in seg2 (non-deferred, v6) → no dedup
+    assert!(!rem2.contains(&2.into()));
+
+    // Point 3: seg1 v10 (non-deferred) vs seg2 v6 (non-deferred)
+    //   Latest v10 has non-deferred → remove older non-deferred from seg2
+    assert!(!rem1.contains(&3.into()));
+    assert!(rem2.contains(&3.into()));
+
+    // Point 4: seg1 v10 (non-deferred) vs seg2 v6 (deferred)
+    //   Latest v10 has non-deferred (seg1) → seg1 kept as winner
+    //   Seg2 is deferred → never removed
+    assert!(!rem1.contains(&4.into()));
+    assert!(!rem2.contains(&4.into()));
+
+    // Point 5: seg1 v3 (non-deferred) vs seg2 v6 (deferred)
+    //   Latest v6 is deferred-only → keep older non-deferred (seg1)
+    //   Seg2 is deferred → never removed
+    assert!(!rem1.contains(&5.into()));
+    assert!(!rem2.contains(&5.into()));
+
+    // Point 6: seg1 v8 (non-deferred) vs seg2 v6 (deferred) vs seg3 v9 (deferred)
+    //   Latest v9 is deferred-only → keep older non-deferred (seg1)
+    //   Two deferred copies (seg2, seg3) → keep one, remove the other
+    assert!(!rem1.contains(&6.into()));
+    let deferred_6_removed =
+        usize::from(rem2.contains(&6.into())) + usize::from(rem3.contains(&6.into()));
+    assert_eq!(
+        deferred_6_removed, 1,
+        "exactly one of the two deferred copies of point 6 should be removed"
+    );
+
+    // Now run actual dedup and verify it completes
+    let removed_count = deduplicate_points_sync(&holder).unwrap();
+    // Point 3 from seg2 + 1 deferred copy of point 6 = 2
+    assert_eq!(removed_count, 2);
+
+    // After dedup: point 3 should only be in seg1
+    assert!(
+        holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(3.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        !holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(3.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+
+    // Points 4 and 5 should still be in both seg1 and seg2
+    assert!(
+        holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(4.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(4.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid1)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(5.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+    assert!(
+        holder
+            .get(sid2)
+            .unwrap()
+            .get()
+            .read()
+            .has_point(5.into(), common::types::DeferredBehavior::WithDeferred)
+    );
+}
+
+/// Randomized test for deduplication with a mix of normal and deferred segments.
+///
+/// Verifies invariants after deduplication:
+/// - Each point has at most one deferred copy remaining
+/// - If a non-deferred copy was removed, a non-deferred copy with >= version remains
+/// - Deferred copies are never removed (only extra deferred duplicates are)
+/// - If the latest version is deferred-only, older non-deferred copies are preserved
+#[test]
+fn test_points_deduplication_with_deferred_randomized() {
+    use crate::fixtures::empty_segment_with_deferred;
+
+    const POINT_COUNT: u64 = 200;
+    const SEGMENT_COUNT: usize = 5;
+
+    let mut rng = rand::rng();
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0; 4]);
+    let hw_counter = HardwareCounterCell::new();
+
+    // Create segments: first 3 normal, last 2 with deferred points.
+    // Deferred internal ID = 3 → internal IDs >= 3 are deferred.
+    let segments: Vec<_> = (0..SEGMENT_COUNT)
+        .map(|i| {
+            if i < 3 {
+                empty_segment(dir.path())
+            } else {
+                empty_segment_with_deferred(dir.path(), 3)
+            }
+        })
+        .collect();
+
+    // Track what we inserted: point_id → [(segment_idx, version)]
+    let mut point_versions: HashMap<u64, Vec<(usize, u64)>> = HashMap::new();
+
+    // Wrap in a mutable vec to insert points
+    let mut segments = segments;
+    for id in 0..POINT_COUNT {
+        let point_id = PointIdType::from(id);
+        // Insert into a random subset of segments (at least 1, to ensure the point exists)
+        let insert_count = rng.random_range(1..=SEGMENT_COUNT);
+        let mut segment_indices: Vec<usize> = (0..SEGMENT_COUNT).collect();
+        // Shuffle and take first insert_count
+        for i in (1..segment_indices.len()).rev() {
+            let j = rng.random_range(0..=i);
+            segment_indices.swap(i, j);
+        }
+        segment_indices.truncate(insert_count);
+
+        for &seg_idx in &segment_indices {
+            let version = rng.random_range(1..20u64);
+            segments[seg_idx]
+                .upsert_point(version, point_id, vec4.clone(), &hw_counter)
+                .unwrap();
+            point_versions
+                .entry(id)
+                .or_default()
+                .push((seg_idx, version));
+        }
+    }
+
+    // Record deferred status before putting into holder
+    let mut is_deferred: HashMap<(u64, usize), bool> = HashMap::new();
+    for id in 0..POINT_COUNT {
+        let point_id = PointIdType::from(id);
+        for (seg_idx, segment) in segments.iter().enumerate() {
+            if segment.has_point(point_id, common::types::DeferredBehavior::WithDeferred) {
+                is_deferred.insert((id, seg_idx), segment.point_is_deferred(point_id));
+            }
+        }
+    }
+
+    // Put segments into holder
+    let mut holder = SegmentHolder::default();
+    let segment_ids: Vec<_> = segments
+        .into_iter()
+        .map(|segment| holder.add_new(segment))
+        .collect();
+
+    // Record versions before dedup
+    let mut versions_before: HashMap<(u64, usize), Option<u64>> = HashMap::new();
+    for id in 0..POINT_COUNT {
+        let point_id = PointIdType::from(id);
+        for (seg_idx, &sid) in segment_ids.iter().enumerate() {
+            let seg = holder.get(sid).unwrap().get();
+            let seg = seg.read();
+            versions_before.insert((id, seg_idx), seg.point_version(point_id));
+        }
+    }
+
+    // Run dedup
+    let duplicates = holder.find_duplicated_points();
+
+    // Collect what will be removed: (point_id, segment_idx)
+    let mut to_remove: HashSet<(u64, usize)> = HashSet::new();
+    for (&sid, point_ids) in &duplicates {
+        let seg_idx = segment_ids.iter().position(|&s| s == sid).unwrap();
+        for &point_id in point_ids {
+            if let PointIdType::NumId(num) = point_id {
+                to_remove.insert((num, seg_idx));
+            }
+        }
+    }
+
+    // Verify invariants
+    for id in 0..POINT_COUNT {
+        // Collect all copies of this point
+        let copies: Vec<(usize, u64, bool)> = (0..SEGMENT_COUNT)
+            .filter_map(|seg_idx| {
+                versions_before
+                    .get(&(id, seg_idx))
+                    .and_then(|v| *v)
+                    .map(|version| {
+                        let deferred = *is_deferred.get(&(id, seg_idx)).unwrap_or(&false);
+                        (seg_idx, version, deferred)
+                    })
+            })
+            .collect();
+
+        if copies.len() <= 1 {
+            continue; // No duplicates possible
+        }
+
+        let max_version = copies.iter().map(|c| c.1).max().unwrap();
+        let latest_has_non_deferred = copies.iter().any(|c| c.1 == max_version && !c.2);
+
+        // Copies remaining after dedup
+        let remaining: Vec<_> = copies
+            .iter()
+            .filter(|(seg_idx, _, _)| !to_remove.contains(&(id, *seg_idx)))
+            .collect();
+
+        // Invariant 1: At most one deferred copy remains
+        let remaining_deferred = remaining.iter().filter(|c| c.2).count();
+        assert!(
+            remaining_deferred <= 1,
+            "Point {id}: {remaining_deferred} deferred copies remain, expected at most 1"
+        );
+
+        // Invariant 2: Deferred copies in the removal set must be extra duplicates
+        // (there must be another deferred copy remaining)
+        for &(seg_idx, _, deferred) in &copies {
+            if deferred && to_remove.contains(&(id, seg_idx)) {
+                assert_eq!(
+                    remaining_deferred, 1,
+                    "Point {id}: deferred copy removed from seg {seg_idx} but no deferred copy remains"
+                );
+            }
+        }
+
+        // Invariant 3: If latest has non-deferred, exactly one non-deferred copy remains
+        if latest_has_non_deferred {
+            let remaining_non_deferred: Vec<_> = remaining.iter().filter(|c| !c.2).collect();
+            assert_eq!(
+                remaining_non_deferred.len(),
+                1,
+                "Point {id}: expected exactly 1 non-deferred copy when latest has non-deferred, got {}",
+                remaining_non_deferred.len()
+            );
+            // And it should have the latest version
+            assert_eq!(
+                remaining_non_deferred[0].1, max_version,
+                "Point {id}: remaining non-deferred copy should have latest version"
+            );
+        }
+
+        // Invariant 4: If latest is deferred-only, all non-deferred copies should remain
+        if !latest_has_non_deferred {
+            let original_non_deferred = copies.iter().filter(|c| !c.2).count();
+            let remaining_non_deferred = remaining.iter().filter(|c| !c.2).count();
+            assert_eq!(
+                remaining_non_deferred, original_non_deferred,
+                "Point {id}: when latest is deferred-only, all non-deferred copies should be preserved"
+            );
+        }
+
+        // Invariant 5: At least one copy remains
+        assert!(
+            !remaining.is_empty(),
+            "Point {id}: all copies were removed!"
+        );
+    }
+
+    // Actually apply the dedup and verify it succeeds
+    let removed_count = deduplicate_points_sync(&holder).unwrap();
+    assert_eq!(
+        removed_count,
+        to_remove.len(),
+        "deduplicate_points_sync removed a different count than find_duplicated_points reported"
+    );
+}
+
+fn deduplicate_points_sync(holder: &SegmentHolder) -> OperationResult<usize> {
+    let mut removed_points = 0;
+
+    for task in holder.deduplicate_points_tasks() {
+        removed_points += task()?;
+    }
+
+    Ok(removed_points)
+}
+
+#[test]
+fn test_double_proxies() {
+    let hw_counter = HardwareCounterCell::disposable();
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let segment1 = build_segment_1(dir.path());
+
+    let mut holder = SegmentHolder::default();
+
+    let locked_segment1 = LockedSegment::from(segment1);
+
+    let _sid1 = holder.add_new_locked(locked_segment1.clone());
+
+    let holder = LockedSegmentHolder::new(holder);
+
+    let before_segment_ids = holder
+        .read()
+        .iter()
+        .map(|(id, _)| id)
+        .collect::<HashSet<_>>();
+
+    let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+    let payload_schema_file = dir.path().join("payload.schema");
+    let schema: Arc<SaveOnDisk<PayloadIndexSchema>> =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_schema_file).unwrap());
+
+    let (inner_proxies, inner_tmp_segment, inner_segments_lock) =
+        SegmentHolder::proxy_all_segments(
+            holder.upgradable_read(),
+            segments_dir.path(),
+            None,
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+
+    // check inner proxy contains points
+    let points = inner_proxies[0]
+        .1
+        .get()
+        .read()
+        .read_range(Some(1.into()), None);
+    assert_eq!(&points, &[1.into(), 2.into(), 3.into(), 4.into(), 5.into()]);
+
+    // Writing to inner proxy segment
+    inner_proxies[0]
+        .1
+        .get()
+        .write()
+        .delete_point(10, 1.into(), &hw_counter)
+        .unwrap();
+
+    let (outer_proxies, outer_tmp_segment, outer_segments_lock) =
+        SegmentHolder::proxy_all_segments(
+            inner_segments_lock,
+            segments_dir.path(),
+            None,
+            schema,
+            None,
+        )
+        .unwrap();
+
+    let mut has_point = false;
+    for (_proxy_id, proxy) in &outer_proxies {
+        let proxy_read = proxy.get().read();
+
+        if proxy_read.has_point(2.into(), common::types::DeferredBehavior::WithDeferred) {
+            has_point = true;
+            let payload = proxy_read.payload(2.into(), &hw_counter).unwrap();
+
+            assert!(
+                payload.0.get("color").is_some(),
+                "Payload should be readable in double proxy"
+            );
+            drop(proxy_read);
+
+            proxy
+                .get()
+                .write()
+                .delete_point(11, 2.into(), &hw_counter)
+                .unwrap();
+
+            break;
+        }
+    }
+
+    assert!(has_point, "Point should be present in double proxy");
+
+    // Unproxy once
+    let outer_proxy_ids: Vec<_> = outer_proxies.iter().map(|(id, _)| *id).collect();
+    SegmentHolder::unproxy_all_segments(
+        &holder,
+        outer_segments_lock,
+        &outer_proxy_ids,
+        outer_tmp_segment,
+    )
+    .unwrap();
+
+    // Release the outer proxies before unproxying the inner ones. One of them wraps the inner
+    // temporary segment, which the unproxy below removes: it can only drop its data once this
+    // holds no reference to it anymore, and blocks for `DROP_DATA_TIMEOUT` if it does.
+    drop(outer_proxies);
+
+    // Unproxy twice
+    let inner_proxy_ids: Vec<_> = inner_proxies.iter().map(|(id, _)| *id).collect();
+    SegmentHolder::unproxy_all_segments(
+        &holder,
+        holder.upgradable_read(),
+        &inner_proxy_ids,
+        inner_tmp_segment,
+    )
+    .unwrap();
+
+    let after_segment_ids = holder
+        .read()
+        .iter()
+        .map(|(id, _)| id)
+        .collect::<HashSet<_>>();
+
+    // Check that we have one new segment
+    let diff: HashSet<_> = after_segment_ids.difference(&before_segment_ids).collect();
+    assert_eq!(
+        diff.len(),
+        0,
+        "There should be no new segment after unproxying"
+    );
+
+    let has_point_1 = locked_segment1
+        .get()
+        .read()
+        .has_point(1.into(), common::types::DeferredBehavior::WithDeferred); // Deleted in inner proxy
+    let has_point_2 = locked_segment1
+        .get()
+        .read()
+        .has_point(2.into(), common::types::DeferredBehavior::WithDeferred); // Deleted in outer proxy
+    let has_point_3 = locked_segment1
+        .get()
+        .read()
+        .has_point(3.into(), common::types::DeferredBehavior::WithDeferred); // Not deleted
+
+    assert!(!has_point_1, "Point 1 should be deleted");
+    assert!(!has_point_2, "Point 2 should be deleted");
+    assert!(has_point_3, "Point 3 should be present");
+}
+
+/// Test that CoW skips deleting the source point when the destination copy is deferred.
+///
+/// When a point is moved from a non-appendable segment to an appendable segment with a
+/// deferred threshold, the point may become deferred in the destination (vectors not yet
+/// fully materialized). In that case, the source must NOT be deleted to avoid data loss.
+#[test]
+fn test_cow_skips_delete_when_destination_is_deferred() {
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]);
+
+    // Appendable segment with deferred threshold: points 1-5, deferred_internal_id = 3
+    // Any new point gets internal_id >= 5, which is >= 3, so it will be deferred.
+    let appendable = build_segment_with_deferred_1(dir.path());
+
+    // Non-appendable segment with point 100 at version 10
+    let mut non_appendable = empty_segment(dir.path());
+    non_appendable
+        .upsert_point(10, 100.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    non_appendable.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let sid_non_app = holder.add_new(non_appendable);
+    let sid_app = holder.add_new(appendable);
+
+    holder
+        .apply_points_with_conditional_move(
+            20,
+            &[100.into()],
+            |_, _| unreachable!("point is in non-appendable, should take CoW path"),
+            |_, _, _, _| {},
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    let non_app = holder.get(sid_non_app).unwrap().get();
+    let non_app = non_app.read();
+    let app = holder.get(sid_app).unwrap().get();
+    let app = app.read();
+
+    // Point 100 was upserted into the appendable segment and became deferred
+    assert!(
+        app.point_is_deferred(100.into()),
+        "Point 100 should be deferred in the destination"
+    );
+    assert!(
+        app.point_version(100.into()).is_some(),
+        "Point 100 should exist in the destination"
+    );
+
+    // Source should NOT be deleted because the destination copy is deferred
+    assert!(
+        non_app.point_version(100.into()).is_some(),
+        "Point 100 should still exist in the source (delete skipped for deferred destination)"
+    );
+}
+
+/// A post-flush action that does not complete keeps its ack pin in effect across flushes,
+/// capping the returned WAL acknowledge until it finally completes.
+#[test]
+fn test_post_flush_action_retry_keeps_ack_pin() {
+    use std::sync::atomic::AtomicUsize;
+
+    const ACK_PIN: SeqNumberType = 5;
+    const WATERLINE: SeqNumberType = 100;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut holder = SegmentHolder::default();
+    holder.add_new(empty_segment(dir.path()));
+    // Make the durable waterline observably higher than the ack pin so the cap is visible.
+    holder.bump_max_segment_version_overwrite(WATERLINE);
+
+    // An action that must run three times: Retry, Retry, then Done.
+    let runs = Arc::new(AtomicUsize::new(0));
+    let runs_in_action = Arc::clone(&runs);
+    holder.register_post_flush_action(0, ACK_PIN, move || {
+        let previous = runs_in_action.fetch_add(1, Ordering::SeqCst);
+        if previous < 2 {
+            Ok(PostFlushOutcome::Retry)
+        } else {
+            Ok(PostFlushOutcome::Done)
+        }
+    });
+
+    // While the action is pending, the ack pin caps the returned version.
+    let version = holder.flush_all(FlushMode::Sync, true).unwrap();
+    assert_eq!(version, ACK_PIN, "ack pin must cap the WAL acknowledge");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // Still pending after the second retry: the pin remains in effect.
+    let version = holder.flush_all(FlushMode::Sync, true).unwrap();
+    assert_eq!(version, ACK_PIN);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+    // The third flush completes the action, lifting the cap.
+    let version = holder.flush_all(FlushMode::Sync, true).unwrap();
+    assert_eq!(
+        version, WATERLINE,
+        "cap is lifted once the action completes"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+
+    // The completed action is gone and is not run again.
+    let version = holder.flush_all(FlushMode::Sync, true).unwrap();
+    assert_eq!(version, WATERLINE);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+}
+
+/// While an action is being run it is briefly removed from the queue, but its ack pin must stay
+/// visible to `pending_post_flush_ack_cap` so a concurrent flush cannot over-acknowledge the WAL.
+#[test]
+fn test_post_flush_action_in_flight_pin_stays_visible() {
+    const ACK_PIN: SeqNumberType = 5;
+    const WATERLINE: SeqNumberType = 100;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut holder = SegmentHolder::default();
+    holder.add_new(empty_segment(dir.path()));
+    holder.bump_max_segment_version_overwrite(WATERLINE);
+    let holder = Arc::new(holder);
+
+    // From inside the action (when it is out of the queue) observe the cap a concurrent flush
+    // would see.
+    let observed = Arc::new(Mutex::new(None));
+    let observed_in_action = Arc::clone(&observed);
+    let holder_in_action = Arc::clone(&holder);
+    holder.register_post_flush_action(0, ACK_PIN, move || {
+        *observed_in_action.lock() = Some(holder_in_action.pending_post_flush_ack_cap());
+        Ok(PostFlushOutcome::Done)
+    });
+
+    let version = holder.flush_all(FlushMode::Sync, true).unwrap();
+
+    assert_eq!(
+        *observed.lock(),
+        Some(Some(ACK_PIN)),
+        "in-flight action's ack pin must remain visible while it runs",
+    );
+    // Once it completed, the cap is lifted.
+    assert_eq!(version, WATERLINE);
+    assert_eq!(holder.pending_post_flush_ack_cap(), None);
+}
+
+/// A post-flush action that fails hard (not retryable) is dropped and surfaces its error; a
+/// later flush is then unaffected.
+#[test]
+fn test_post_flush_action_hard_failure_is_dropped() {
+    const WATERLINE: SeqNumberType = 100;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut holder = SegmentHolder::default();
+    holder.add_new(empty_segment(dir.path()));
+    holder.bump_max_segment_version_overwrite(WATERLINE);
+
+    holder.register_post_flush_action(0, 5, move || Err(OperationError::service_error("boom")));
+
+    // The flush surfaces the action's error.
+    let err = holder.flush_all(FlushMode::Sync, true).unwrap_err();
+    assert!(format!("{err}").contains("boom"));
+
+    // The failed action is gone, so the next flush is clean and uncapped.
+    let version = holder.flush_all(FlushMode::Sync, true).unwrap();
+    assert_eq!(version, WATERLINE);
+}
+
+/// Test that CoW deletes the source point when the destination copy is NOT deferred.
+///
+/// This is the standard CoW behavior: after successfully moving a point to the appendable
+/// segment, the old copy in the non-appendable segment is deleted.
+#[test]
+fn test_cow_deletes_source_when_destination_is_not_deferred() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let vec4 = segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]);
+
+    // Regular appendable segment (no deferred threshold)
+    let appendable = empty_segment(dir.path());
+
+    // Non-appendable segment with point 100 at version 10
+    let mut non_appendable = empty_segment(dir.path());
+    non_appendable
+        .upsert_point(10, 100.into(), vec4.clone(), &hw_counter)
+        .unwrap();
+    non_appendable.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let sid_non_app = holder.add_new(non_appendable);
+    let sid_app = holder.add_new(appendable);
+
+    holder
+        .apply_points_with_conditional_move(
+            20,
+            &[100.into()],
+            |_, _| unreachable!("point is in non-appendable, should take CoW path"),
+            |_, _, _, _| {},
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+
+    let non_app = holder.get(sid_non_app).unwrap().get();
+    let non_app = non_app.read();
+    let app = holder.get(sid_app).unwrap().get();
+    let app = app.read();
+
+    // Point 100 should exist in the appendable segment, not deferred
+    assert!(
+        app.has_point(100.into(), common::types::DeferredBehavior::WithDeferred),
+        "Point 100 should exist in the destination"
+    );
+
+    // Source should be deleted (standard CoW behavior)
+    assert!(
+        non_app.point_version(100.into()).is_none(),
+        "Point 100 should be deleted from the source"
+    );
+}
+
+/// Segment size as seen by the size cap.
+fn segment_size(holder: &SegmentHolder, segment_id: SegmentId) -> usize {
+    holder
+        .get(segment_id)
+        .unwrap()
+        .get()
+        .read()
+        .max_available_vectors_size_in_bytes()
+        .unwrap()
+}
+
+#[test]
+fn test_has_appendable_segment_with_capacity() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut holder = SegmentHolder::default();
+    assert!(
+        !holder.has_appendable_segment_with_capacity(None),
+        "Empty holder should have no capacity",
+    );
+
+    let segment_id = holder.add_new(build_segment_1(dir.path()));
+    let size = segment_size(&holder, segment_id);
+    assert!(size > 0, "Segment should have non-zero size");
+
+    assert!(holder.has_appendable_segment_with_capacity(None));
+    assert!(!holder.has_appendable_segment_with_capacity(NonZeroUsize::new(size)));
+    assert!(holder.has_appendable_segment_with_capacity(NonZeroUsize::new(size + 1)));
+
+    // A segment busy under a write lock cannot be measured and stays eligible
+    let locked_segment = holder.get(segment_id).unwrap().get();
+    let _write_guard = locked_segment.write();
+    assert!(holder.has_appendable_segment_with_capacity(NonZeroUsize::new(1)));
+}
+
+#[test]
+fn test_cow_move_prefers_appendable_segment_below_size_cap() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let mut source = build_segment_2(dir.path());
+    source.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    // The full segment is added first, `aloha_random_write` would pick it without the steering
+    let full_id = holder.add_new(build_segment_1(dir.path()));
+    let free_id = holder.add_new(empty_segment(dir.path()));
+    holder.add_new(source);
+
+    // Cap at the full segment's size, the strict comparison makes it ineligible
+    let full_size = segment_size(&holder, full_id);
+    assert!(full_size > 0, "Segment should have non-zero size");
+
+    let hw_counter = HardwareCounterCell::new();
+    holder
+        .apply_points_with_conditional_move(
+            100,
+            &[11.into()],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, _, _, _| {},
+            NonZeroUsize::new(full_size),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let free_segment = holder.get(free_id).unwrap().get();
+    assert!(
+        free_segment
+            .read()
+            .has_point(11.into(), common::types::DeferredBehavior::WithDeferred),
+        "Moved point should land in the segment below the cap",
+    );
+
+    let full_segment = holder.get(full_id).unwrap().get();
+    assert!(
+        !full_segment
+            .read()
+            .has_point(11.into(), common::types::DeferredBehavior::WithDeferred),
+        "Segment at the cap should not receive the point",
+    );
+}
+
+/// A deferred staging segment at the cap still takes the move when it is the only appendable
+/// segment, and the point stays visible through the retained source.
+#[test]
+fn test_cow_move_into_capped_deferred_staging_segment_keeps_point_visible() {
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let staging = build_segment_with_deferred_1(dir.path());
+
+    let mut source = empty_segment(dir.path());
+    source
+        .upsert_point(
+            10,
+            100.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    source.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let source_id = holder.add_new(source);
+    let staging_id = holder.add_new(staging);
+
+    assert!(
+        holder
+            .get(staging_id)
+            .unwrap()
+            .get()
+            .read()
+            .has_deferred_points(),
+        "Staging segment should hold deferred points",
+    );
+
+    // The staging segment is the only appendable one and it is at the cap,
+    // so the fallback picks it anyway
+    let staging_size = segment_size(&holder, staging_id);
+    assert!(staging_size > 0, "Segment should have non-zero size");
+
+    holder
+        .apply_points_with_conditional_move(
+            20,
+            &[100.into()],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, _, _, _| {},
+            NonZeroUsize::new(staging_size),
+            &hw_counter,
+        )
+        .expect("Staging segment at the cap should still accept the move");
+
+    let staging_segment = holder.get(staging_id).unwrap().get();
+    let staging_segment = staging_segment.read();
+    let source_segment = holder.get(source_id).unwrap().get();
+    let source_segment = source_segment.read();
+
+    assert!(
+        staging_segment.point_version(100.into()).is_some(),
+        "Moved point should be in the staging segment",
+    );
+    assert!(
+        staging_segment.point_is_deferred(100.into()),
+        "Point past the deferred offset should land deferred",
+    );
+    assert!(
+        source_segment.point_version(100.into()).is_some(),
+        "Source should be kept while the destination copy is deferred",
+    );
+}
+
+/// With a segment below the cap available, the move goes there instead of the full deferred
+/// staging segment.
+#[test]
+fn test_cow_move_prefers_uncapped_segment_over_full_deferred_staging_segment() {
+    use crate::fixtures::build_segment_with_deferred_1;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    // The staging segment is added first, `aloha_random_write` would pick it without the steering
+    let mut holder = SegmentHolder::default();
+    let staging_id = holder.add_new(build_segment_with_deferred_1(dir.path()));
+    let fresh_id = holder.add_new(empty_segment(dir.path()));
+
+    let mut source = empty_segment(dir.path());
+    source
+        .upsert_point(
+            10,
+            100.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    source.appendable_flag = false;
+    let source_id = holder.add_new(source);
+
+    let staging_size = segment_size(&holder, staging_id);
+    assert!(staging_size > 0, "Segment should have non-zero size");
+
+    holder
+        .apply_points_with_conditional_move(
+            20,
+            &[100.into()],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, _, _, _| {},
+            NonZeroUsize::new(staging_size),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let fresh_segment = holder.get(fresh_id).unwrap().get();
+    let fresh_segment = fresh_segment.read();
+    assert!(
+        fresh_segment.point_version(100.into()).is_some(),
+        "Moved point should land in the segment below the cap",
+    );
+    assert!(
+        !fresh_segment.point_is_deferred(100.into()),
+        "Point should be immediately visible, the fresh segment has no deferred offset",
+    );
+
+    let staging_segment = holder.get(staging_id).unwrap().get();
+    let staging_segment = staging_segment.read();
+    assert!(
+        staging_segment.point_version(100.into()).is_none(),
+        "Full staging segment should not receive the move",
+    );
+    assert!(
+        staging_segment.has_deferred_points(),
+        "Deferred backlog should be left intact",
+    );
+
+    let source_segment = holder.get(source_id).unwrap().get();
+    let source_segment = source_segment.read();
+    assert!(
+        source_segment.point_version(100.into()).is_none(),
+        "Source copy should be deleted, the destination copy is visible",
+    );
+}
+
+/// A flush pass takes only the holder read lock, so it can start between the phases of one
+/// update operation and capture a segment holding half of it. Neither that segment nor the
+/// acknowledged version may claim the operation: the segment would look fully persisted at
+/// `version == persisted_version`, every later pass would skip it, and the WAL entry that could
+/// replay the rest would be acknowledged away (#10402).
+#[test]
+fn test_flush_all_does_not_claim_an_unfinished_operation() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    // First phase of operation 10.
+    let mut segment = empty_segment(dir.path());
+    segment
+        .upsert_point(
+            10,
+            1.into(),
+            segment::data_types::vectors::only_default_vector(&[1.0, 0.0, 0.0, 0.0]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let mut holder = SegmentHolder::default();
+    holder.add_new(segment);
+
+    // Operation 10 has not finished applying, so the last finished operation is 9.
+    assert_eq!(
+        holder
+            .flush_all_up_to(FlushMode::Sync, false, Some(9))
+            .unwrap(),
+        9,
+        "the acknowledged version must leave the unfinished operation replayable",
+    );
+
+    // The segment stays unsaved, so the rest of the operation is flushed once it is applied.
+    assert_eq!(holder.flush_all(FlushMode::Sync, false).unwrap(), 10);
+}
+
+/// A copy-on-write dependency is retired once the flush pass has persisted it. A clamped pass
+/// persists only up to the last fully applied operation, so an edge registered past that bound
+/// must survive it: dropping it would let the next pass flush the source before the destination,
+/// and a crash in between leaves the move without a durable pre-image to replay.
+#[test]
+fn test_flush_up_to_keeps_cow_dependency_past_the_bound() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut source = empty_segment(dir.path());
+    source
+        .upsert_point(
+            10,
+            100.into(),
+            segment::data_types::vectors::only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
+            &hw_counter,
+        )
+        .unwrap();
+    source.appendable_flag = false;
+
+    let mut holder = SegmentHolder::default();
+    let source_id = holder.add_new(source);
+    holder.add_new(empty_segment(dir.path()));
+
+    // Operation 20 moves the point out of the non-appendable segment, recording the dependency.
+    holder
+        .apply_points_with_conditional_move(
+            20,
+            &[100.into()],
+            |_, _| unreachable!("the point's segment is non-appendable, it must be moved"),
+            |_, _, _, _| {},
+            None,
+            &hw_counter,
+        )
+        .unwrap();
+    assert_eq!(
+        holder
+            .flush_dependency
+            .lock()
+            .dependencies_of(&source_id)
+            .count(),
+        1,
+        "the move should record a copy-on-write dependency",
+    );
+
+    // Operation 20 has not finished applying, so the pass persists no further than 19.
+    assert_eq!(
+        holder
+            .flush_all_up_to(FlushMode::Sync, false, Some(19))
+            .unwrap(),
+        19,
+    );
+    assert_eq!(
+        holder
+            .flush_dependency
+            .lock()
+            .dependencies_of(&source_id)
+            .count(),
+        1,
+        "the dependency of an operation past the bound is not persisted yet, it must be kept",
+    );
+
+    // Once the operation is applied, an unclamped pass persists the move and retires the edge.
+    assert_eq!(holder.flush_all(FlushMode::Sync, false).unwrap(), 20);
+    assert_eq!(
+        holder
+            .flush_dependency
+            .lock()
+            .dependencies_of(&source_id)
+            .count(),
+        0,
+        "the dependency is persisted, it must be retired",
+    );
+}
+
+/// A proxy segment must not hold back acknowledging the WAL. Flushing persists its buffered
+/// changes into the pending changes log, so the version returned by `flush_all` — which is what
+/// gets acknowledged in the WAL — advances past operations that only live in the proxy.
+#[test]
+fn test_proxy_segment_does_not_hold_back_wal_ack() {
+    use crate::proxy_segment::ProxySegment;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut holder = SegmentHolder::default();
+
+    // Wrap a segment at version 6 in a proxy, as the optimizer and snapshots do
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let proxy_segment = ProxySegment::new(wrapped_segment.clone());
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+
+    // All segment state is persisted after a flush, the full version can be acknowledged
+    let version = holder.flush_all(FlushMode::Sync, false).unwrap();
+    assert_eq!(version, 6);
+
+    // Buffer a point delete in the proxy; it is in memory only, so it caps the acknowledgeable
+    // version until it is persisted
+    holder
+        .get(proxy_id)
+        .unwrap()
+        .get()
+        .write()
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+
+    // Flushing persists the buffered delete into the pending changes log of the wrapped
+    // segment, so the WAL can be acknowledged up to and including the delete operation even
+    // though the wrapped segment itself never saw it
+    let version = holder.flush_all(FlushMode::Sync, false).unwrap();
+    assert_eq!(
+        version, 100,
+        "flushed proxy segment must not hold back the WAL acknowledge",
+    );
+
+    // The wrapped segment on disk is still at its own version; the difference is covered by the
+    // pending changes log
+    assert_eq!(wrapped_segment.get().read().version(), 6);
+}
+
+/// Unwrapping a proxy puts the wrapped segment back into the holder, so everything the proxy
+/// buffered must be propagated into it first — otherwise the changes are only visible again
+/// after a restart replays the pending changes log.
+#[test]
+fn test_unwrap_proxy_propagates_pending_changes() {
+    use crate::optimize::unwrap_proxy;
+    use crate::proxy_segment::ProxySegment;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut holder = SegmentHolder::default();
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let proxy_segment = ProxySegment::new(wrapped_segment.clone());
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+    let holder = LockedSegmentHolder::new(holder);
+
+    {
+        let segments = holder.read();
+        segments
+            .get(proxy_id)
+            .unwrap()
+            .get()
+            .write()
+            .delete_point(100, 2.into(), &hw_counter)
+            .unwrap();
+    }
+    assert!(
+        wrapped_segment
+            .get()
+            .read()
+            .has_point(2.into(), DeferredBehavior::VisibleOnly)
+    );
+
+    unwrap_proxy(&holder, &[proxy_id]).unwrap();
+
+    let segments = holder.read();
+    assert!(matches!(
+        segments.get(proxy_id).unwrap(),
+        LockedSegment::Original(_),
+    ));
+    assert!(
+        !wrapped_segment
+            .get()
+            .read()
+            .has_point(2.into(), DeferredBehavior::VisibleOnly),
+        "unwrapping must propagate the buffered delete into the wrapped segment",
+    );
+}
+
+/// Unwrapping a proxy whose buffered changes cannot be propagated must not report success: the
+/// WAL acknowledge already passed those operations, so the caller has to know they are only
+/// recoverable from the pending changes log on the next restart.
+#[test]
+fn test_unwrap_proxy_reports_failed_propagation() {
+    use segment::data_types::vector_name_config::{DenseVectorConfig, VectorNameConfig};
+    use segment::segment_constructor::get_vector_storage_path;
+
+    use crate::optimize::unwrap_proxy;
+    use crate::proxy_segment::ProxySegment;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let wrapped_segment_dir = wrapped_segment.get().read().data_path();
+
+    let mut proxy_segment = ProxySegment::new(wrapped_segment.clone());
+    proxy_segment
+        .create_vector_name(
+            100,
+            "v2",
+            &VectorNameConfig::dense(DenseVectorConfig {
+                size: 8,
+                distance: Distance::Dot,
+                multivector_config: None,
+                datatype: None,
+            }),
+        )
+        .unwrap();
+    proxy_segment.flush(false).unwrap();
+
+    // A plain file where the new vector's storage directory has to go, so propagating the
+    // buffered create into the wrapped segment fails
+    fs_err::write(
+        get_vector_storage_path(&wrapped_segment_dir, "v2"),
+        b"not a directory",
+    )
+    .unwrap();
+
+    let mut holder = SegmentHolder::default();
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+    let holder = LockedSegmentHolder::new(holder);
+
+    let result = unwrap_proxy(&holder, &[proxy_id]);
+
+    assert!(
+        !wrapped_segment
+            .get()
+            .read()
+            .vector_names()
+            .iter()
+            .any(|name| name == "v2"),
+        "test setup must make the propagation fail",
+    );
+    assert!(
+        result.is_err(),
+        "unwrap_proxy must not report success when propagation failed",
+    );
+}
+
+/// Like `test_flush_all_does_not_claim_an_unfinished_operation`, but the segment holding the first
+/// phase of the operation is a proxy: its pending changes log must not claim the unfinished
+/// operation either, or the WAL acknowledge moves past an operation another segment still holds
+/// half of.
+#[test]
+fn test_flush_all_up_to_does_not_claim_unfinished_operation_through_proxy() {
+    use crate::proxy_segment::ProxySegment;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let proxy_segment = ProxySegment::new(wrapped_segment.clone());
+
+    let mut holder = SegmentHolder::default();
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+
+    holder
+        .get(proxy_id)
+        .unwrap()
+        .get()
+        .write()
+        .delete_point(10, 1.into(), &hw_counter)
+        .unwrap();
+
+    let acknowledged = holder
+        .flush_all_up_to(FlushMode::Sync, false, Some(9))
+        .unwrap();
+    assert!(
+        acknowledged <= 9,
+        "acknowledged version {acknowledged} must leave the unfinished operation 10 replayable",
+    );
+
+    assert_eq!(holder.flush_all(FlushMode::Sync, false).unwrap(), 10);
+}
+
+/// What `proxy_all_segments_and_apply` does for a shard snapshot, with `operation` run on every
+/// proxied segment's wrapped segment while the holder is still proxied.
+fn snapshot_all_segments_with(
+    holder: &LockedSegmentHolder,
+    segments_dir: &Path,
+    schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    mut operation: impl FnMut(&SegmentHolder, &RwLock<dyn SegmentEntry>) -> OperationResult<()>,
+) -> OperationResult<()> {
+    let segments_lock = holder.upgradable_read();
+    let (proxies, tmp_segment_id, segments_lock) =
+        SegmentHolder::proxy_all_segments(segments_lock, segments_dir, None, schema, None)?;
+    segments_lock.flush_all_up_to(FlushMode::Sync, true, None)?;
+    for (_, proxy) in &proxies {
+        let LockedSegment::Proxy(proxy) = proxy else {
+            continue;
+        };
+        let wrapped = proxy.read().wrapped_segment.clone();
+        operation(&segments_lock, wrapped.get())?;
+    }
+    let proxy_ids: Vec<_> = proxies.iter().map(|(segment_id, _)| *segment_id).collect();
+    SegmentHolder::unproxy_all_segments(holder, segments_lock, &proxy_ids, tmp_segment_id)
+}
+
+fn delete_through_proxies(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    point_id: PointIdType,
+    hw_counter: &HardwareCounterCell,
+) -> OperationResult<()> {
+    for (_, segment) in segments.iter() {
+        if let LockedSegment::Proxy(proxy) = segment {
+            proxy.write().delete_point(op_num, point_id, hw_counter)?;
+        }
+    }
+    Ok(())
+}
+
+/// Snapshotting proxies every segment, and a proxy persists the changes buffered meanwhile into
+/// its pending changes log. That log must not be visible from the wrapped segment, otherwise it is
+/// packed and restoring replays e.g. CoW deletes whose upserts only live in the temp segment.
+/// Once unproxied and flushed, that log must be removed, as `unwrap_proxy` does for optimizer
+/// proxies; otherwise every snapshot leaves a log behind until the next restart. Until then it is
+/// not listed either: a snapshot gets its changes from the wrapped segment, which it flushes first.
+#[test]
+fn test_snapshot_proxies_clean_up_pending_changes_logs() {
+    use common::tar_ext;
+    use common::tar_unpack::tar_unpack_file;
+    use segment::pending_changes::{
+        PersistedProxyChanges, list_pending_changes_log_files, recover_pending_changes,
+    };
+    use segment::segment_constructor::load_segment;
+    use segment::types::SnapshotFormat;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let segment = build_segment_1(dir.path());
+    let segment_path = segment.segment_path.clone();
+    let segment_uuid = segment.segment_uuid();
+    let mut holder = SegmentHolder::default();
+    holder.add_new(segment);
+    let holder = LockedSegmentHolder::new(holder);
+    let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+    let schema =
+        Arc::new(SaveOnDisk::load_or_init_default(dir.path().join("payload.schema")).unwrap());
+
+    snapshot_all_segments_with(
+        &holder,
+        segments_dir.path(),
+        schema.clone(),
+        |segments, wrapped| {
+            delete_through_proxies(segments, 100, 1.into(), &hw_counter)?;
+            segments.flush_all(FlushMode::Sync, true)?;
+            assert_eq!(list_pending_changes_log_files(&segment_path).len(), 1);
+            assert!(
+                wrapped
+                    .read()
+                    .visible_pending_changes_log_files()
+                    .is_empty()
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(list_pending_changes_log_files(&segment_path).len(), 1);
+    let segment = holder.read().iter().next().unwrap().1.clone();
+    assert!(
+        segment
+            .get()
+            .read()
+            .visible_pending_changes_log_files()
+            .is_empty()
+    );
+
+    // Snapshot again while the log awaits removal, the delete it holds must survive a restore
+    let snapshot_file = Builder::new().suffix(".snapshot.tar").tempfile().unwrap();
+    let tar = tar_ext::BuilderExt::new_seekable_owned(
+        fs_err::File::create(snapshot_file.path()).unwrap(),
+    );
+    let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
+    snapshot_all_segments_with(&holder, segments_dir.path(), schema, |_, wrapped| {
+        wrapped
+            .read()
+            .take_snapshot(temp_dir.path(), &tar, SnapshotFormat::Streamable, None)
+    })
+    .unwrap();
+    tar.blocking_finish().unwrap();
+
+    let unpacked = Builder::new().prefix("unpacked").tempdir().unwrap();
+    tar_unpack_file(snapshot_file.path(), unpacked.path()).unwrap();
+    let restored_path = unpacked.path().join(segment_uuid.to_string());
+    Segment::restore_snapshot_in_place(&restored_path).unwrap();
+    let mut restored = load_segment(
+        &restored_path,
+        uuid::Uuid::nil(),
+        None,
+        &AtomicBool::new(false),
+        false,
+    )
+    .unwrap();
+    recover_pending_changes(&mut restored, PersistedProxyChanges::Replay).unwrap();
+    assert!(!restored.has_point(1.into(), DeferredBehavior::VisibleOnly));
+    assert!(restored.has_point(2.into(), DeferredBehavior::VisibleOnly));
+
+    holder.read().flush_all(FlushMode::Sync, true).unwrap();
+    assert!(
+        list_pending_changes_log_files(&segment_path).is_empty(),
+        "pending changes logs of snapshot proxies must be removed once the wrapped segment flushed",
+    );
+}
+
+/// With nested proxies, a proxy lists its own log and the logs of the layers below it, never the
+/// logs of the layers wrapping it.
+#[test]
+fn test_nested_proxies_pending_changes_logs() {
+    use segment::entry::SnapshotEntry as _;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let segment = build_segment_1(dir.path());
+    let mut holder = SegmentHolder::default();
+    let segment_id = holder.add_new(segment);
+    let holder = LockedSegmentHolder::new(holder);
+    let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+    let schema =
+        Arc::new(SaveOnDisk::load_or_init_default(dir.path().join("payload.schema")).unwrap());
+
+    let proxy_at = |segments: &SegmentHolder| match segments.get(segment_id) {
+        Some(LockedSegment::Proxy(proxy)) => proxy.clone(),
+        _ => panic!("segment {segment_id} must be proxied"),
+    };
+
+    // Inner proxy layer, persisting a delete into its log
+    let (_, _, segments_lock) = SegmentHolder::proxy_all_segments(
+        holder.upgradable_read(),
+        segments_dir.path(),
+        None,
+        schema.clone(),
+        None,
+    )
+    .unwrap();
+    delete_through_proxies(&segments_lock, 100, 1.into(), &hw_counter).unwrap();
+    segments_lock.flush_all(FlushMode::Sync, true).unwrap();
+    let inner = proxy_at(&segments_lock);
+    let inner_log = inner.read().pending_changes_log_path().to_path_buf();
+
+    // Outer proxy layer wrapping the inner one, persisting another delete into its own log
+    let (_, _, segments_lock) =
+        SegmentHolder::proxy_all_segments(segments_lock, segments_dir.path(), None, schema, None)
+            .unwrap();
+    delete_through_proxies(&segments_lock, 101, 2.into(), &hw_counter).unwrap();
+    segments_lock.flush_all(FlushMode::Sync, true).unwrap();
+    let outer = proxy_at(&segments_lock);
+    let outer_log = outer.read().pending_changes_log_path().to_path_buf();
+    assert_ne!(inner_log, outer_log);
+    assert!(inner_log.is_file() && outer_log.is_file());
+
+    // Each layer lists its own log and the ones below, not the ones above
+    assert_eq!(
+        inner.read().visible_pending_changes_log_files(),
+        vec![inner_log.clone()],
+    );
+    assert_eq!(
+        outer.read().visible_pending_changes_log_files(),
+        vec![inner_log.clone(), outer_log.clone()],
+    );
+}
+
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    pub(crate) static BETWEEN_UNPROXY_PHASES_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test hook run by `SegmentHolder::unproxy_segments` between its two propagation phases, on the
+/// calling thread only. Stands in for an update landing while phase 1 runs without the updates
+/// lock.
+pub(crate) fn between_unproxy_phases_hook() {
+    BETWEEN_UNPROXY_PHASES_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+/// Phase 1 of `unproxy_segments` runs without the updates lock, so changes keep landing on the
+/// proxy and phase 2 has a delta of its own. That delta is held by the proxy alone: it never
+/// reached the pending changes log, and the other segments make the operation durable, so the WAL
+/// is acknowledged past it. Phase 2 must therefore fail closed like phase 1, see
+/// `test_unwrap_proxy_reports_failed_propagation`, or the change is recoverable from nowhere.
+#[test]
+fn unproxy_phase_two_propagation_failure_keeps_change_recoverable() {
+    use segment::data_types::vector_name_config::{DenseVectorConfig, VectorNameConfig};
+    use segment::pending_changes::list_pending_changes_log_files;
+    use segment::segment_constructor::get_vector_storage_path;
+
+    use crate::optimize::unwrap_proxy;
+    use crate::proxy_segment::ProxySegment;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let vector_config = VectorNameConfig::dense(DenseVectorConfig {
+        size: 4,
+        distance: Distance::Dot,
+        multivector_config: None,
+        datatype: None,
+    });
+
+    let wrapped = LockedSegment::new(build_segment_1(dir.path()));
+    let wrapped_dir = wrapped.get().read().data_path();
+    let other = LockedSegment::new(build_segment_2(dir.path()));
+
+    let mut holder = SegmentHolder::default();
+    let proxy_id = holder.add_new_locked(LockedSegment::from(ProxySegment::new(wrapped.clone())));
+    let _other_id = holder.add_new_locked(other.clone());
+    let holder = LockedSegmentHolder::new(holder);
+
+    let LockedSegment::Proxy(proxy) = holder.read().get(proxy_id).unwrap().clone() else {
+        panic!("segment must be a proxy");
+    };
+
+    // Operation 100 creates a new named vector on every segment. It lands while phase 1 already
+    // ran, so only phase 2 sees it for the proxied segment — where it is made to fail.
+    let hook_config = vector_config.clone();
+    BETWEEN_UNPROXY_PHASES_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs_err::write(
+                get_vector_storage_path(&wrapped_dir, "v2"),
+                b"not a directory",
+            )
+            .unwrap();
+            proxy
+                .write()
+                .create_vector_name(100, "v2", &hook_config)
+                .unwrap();
+        }));
+    });
+
+    other
+        .get()
+        .write()
+        .create_vector_name(100, "v2", &vector_config)
+        .unwrap();
+
+    let result = unwrap_proxy(&holder, &[proxy_id]);
+    BETWEEN_UNPROXY_PHASES_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+    assert!(
+        result.is_err(),
+        "a phase 2 propagation failure must be reported, like the same failure in phase 1",
+    );
+
+    let has_vector = wrapped
+        .get()
+        .read()
+        .vector_names()
+        .iter()
+        .any(|name| name == "v2");
+    assert!(
+        !has_vector,
+        "test setup must make the phase 2 propagation fail",
+    );
+
+    assert!(
+        matches!(holder.read().get(proxy_id), Some(LockedSegment::Proxy(_))),
+        "the proxy must stay installed, it is the only thing still holding the change",
+    );
+
+    // The other segment makes operation 100 durable, so a flush acknowledges the WAL past it. That
+    // is safe only because the proxy is still here: flushing persists the change it kept into its
+    // pending changes log, from where a restart replays it.
+    let acknowledged = holder.read().flush_all(FlushMode::Sync, false).unwrap();
+    assert!(
+        !list_pending_changes_log_files(&wrapped.get().read().data_path()).is_empty(),
+        "WAL acknowledged {acknowledged}, so operation 100 must be persisted in the pending \
+         changes log",
+    );
+}

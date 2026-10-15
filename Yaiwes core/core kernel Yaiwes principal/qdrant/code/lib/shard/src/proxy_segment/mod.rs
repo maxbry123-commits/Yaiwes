@@ -1,0 +1,306 @@
+pub mod segment_entry;
+pub mod snapshot_entry;
+
+#[cfg(test)]
+mod tests;
+
+use std::borrow::Cow;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+
+use common::bitvec::BitVec;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::PointOffsetType;
+use segment::common::operation_error::OperationResult;
+use segment::pending_changes::PendingChanges;
+pub use segment::pending_changes::{
+    DeletedPoints, IntendedVector, ProxyChanges, ProxyDeletedPoint, ProxyIndexChange,
+    ProxyIndexChanges, ProxyVectorNameChanges,
+};
+use segment::types::*;
+
+use crate::locked_segment::LockedSegment;
+
+/// This object is a wrapper around read-only segment.
+///
+/// It could be used to provide all read and write operations while wrapped segment is being optimized (i.e. not available for writing)
+/// It writes all changed records into a temporary `write_segment` and keeps track on changed points
+#[derive(Debug)]
+pub struct ProxySegment {
+    pub wrapped_segment: LockedSegment,
+    /// Internal mask of deleted points, specific to the wrapped segment
+    /// Present if the wrapped segment is a plain segment
+    /// Used for faster deletion checks
+    deleted_mask: Option<BitVec>,
+    /// Pending point deletes, payload index changes and vector name changes buffered by this
+    /// proxy, along with their persistence into the pending changes log file inside the wrapped
+    /// segment's directory.
+    pending_changes: PendingChanges,
+    deleted_deferred_count: usize,
+    wrapped_config: SegmentConfig,
+
+    /// Version of the last change in this proxy, considering point deletes and payload index
+    /// changes. Defaults to the version of the wrapped segment.
+    version: SeqNumberType,
+}
+
+/// A freshly built [`ProxySegment`] whose `deleted_mask` has not been synced yet.
+///
+/// `deleted_mask` is a snapshot of the wrapped segment's deleted bitvec. That snapshot is only
+/// valid once the wrapped segment is frozen under the segment-holder write lock: a proxy is built
+/// while only a read/upgradable-read lock is held, so an upsert or delete can still land on the
+/// not-yet-frozen wrapped segment afterwards. An upsert landing in that window extends the wrapped
+/// segment's point count past the snapshot; the scored search path then treats every offset beyond
+/// `deleted_mask` as deleted (`NotDeletedChecker` defaults out-of-range to deleted), silently
+/// dropping a live point from filtered KNN even though scroll/count/retrieve still see it.
+///
+/// To make this impossible to get wrong, [`ProxySegment::new`] hands back this type rather than a
+/// usable `ProxySegment`. The only way to obtain a `ProxySegment` is [`Self::finalize`], which
+/// reads the mask exactly once — so it cannot be forgotten, nor done twice. Call `finalize` once
+/// the holder write lock is held (wrapped segment frozen) and before the proxy goes live.
+#[must_use = "an UnsyncedProxySegment must be turned into a ProxySegment via `.finalize()`"]
+#[derive(Debug)]
+pub struct UnsyncedProxySegment(ProxySegment);
+
+impl UnsyncedProxySegment {
+    /// Build a proxy wrapping `segment`.
+    ///
+    /// `deleted_mask` is deliberately left empty here: it snapshots the wrapped segment's deleted
+    /// bitvec, but that snapshot is only valid once the wrapped segment is frozen under the
+    /// segment-holder write lock (see the type-level docs). The mask is read exactly once, later,
+    /// by [`Self::finalize`] — which is also the only way to turn this into a usable
+    /// [`ProxySegment`], so the sync cannot be forgotten nor done twice.
+    ///
+    /// Opens the pending changes log for this proxy layer inside the wrapped segment's
+    /// directory, under a freshly minted, uniquely named log file. Wrapping a segment that
+    /// already is a proxy uses the next layer up, writing to its own dedicated log file. This
+    /// never reuses a log file left behind by an earlier proxy at the same level that propagated
+    /// its changes into the segment before unwrapping; that file is left untouched.
+    pub fn new(segment: LockedSegment) -> OperationResult<Self> {
+        let (wrapped_config, version, data_path) = {
+            let read_segment = segment.get().read();
+            (
+                read_segment.config().clone(),
+                read_segment.version(),
+                read_segment.data_path(),
+            )
+        };
+
+        // Each proxy layer writes its pending changes to a dedicated log file; wrapping another
+        // proxy means this proxy is one layer further up
+        let pending_changes_level = match &segment {
+            LockedSegment::Original(_) => 0,
+            LockedSegment::Proxy(proxy_segment) => {
+                log::debug!("Double proxy segment creation");
+                proxy_segment.read().pending_changes.level() + 1
+            }
+        };
+
+        let pending_changes = PendingChanges::new(&data_path, pending_changes_level)?;
+
+        Ok(UnsyncedProxySegment(ProxySegment {
+            wrapped_segment: segment,
+            // Synced only in `finalize`, once the wrapped segment is frozen.
+            deleted_mask: None,
+            pending_changes,
+            deleted_deferred_count: 0,
+            wrapped_config,
+            version,
+        }))
+    }
+
+    /// Sync `deleted_mask` from the now-frozen wrapped segment and return the usable proxy.
+    ///
+    /// Must be called once the segment-holder write lock is held, so the wrapped segment can no
+    /// longer change and the mask covers its full, final point range. The fresh read also captures
+    /// any deletes that raced in, closing the ghost direction too.
+    pub fn finalize(mut self) -> ProxySegment {
+        self.0.sync_deleted_mask();
+        self.0
+    }
+
+    /// The wrapped (soon-to-be-frozen) segment. Exposed for invariant checks before finalizing.
+    pub fn wrapped_segment(&self) -> &LockedSegment {
+        &self.0.wrapped_segment
+    }
+
+    /// See [`ProxySegment::replicate_field_indexes`].
+    pub fn replicate_field_indexes(
+        &self,
+        op_num: SeqNumberType,
+        hw_counter: &HardwareCounterCell,
+        segment_to_update: &LockedSegment,
+    ) -> OperationResult<()> {
+        self.0
+            .replicate_field_indexes(op_num, hw_counter, segment_to_update)
+    }
+}
+
+impl ProxySegment {
+    /// Build a proxy wrapping `segment` and immediately sync its `deleted_mask`.
+    ///
+    /// Test-only convenience that collapses the two-phase [`UnsyncedProxySegment::new`] +
+    /// [`UnsyncedProxySegment::finalize`] construction into one call. Production code must use the
+    /// two-phase form so the mask is synced under the segment-holder write lock; see
+    /// [`UnsyncedProxySegment`].
+    #[cfg(feature = "testing")]
+    pub fn new(segment: LockedSegment) -> Self {
+        UnsyncedProxySegment::new(segment)
+            .expect("failed to open proxy segment pending changes")
+            .finalize()
+    }
+
+    /// Read the wrapped segment's deleted bitvec into `deleted_mask`.
+    ///
+    /// Only called from [`UnsyncedProxySegment::finalize`]; see that type for why the timing
+    /// (after the wrapped segment is frozen) matters.
+    fn sync_deleted_mask(&mut self) {
+        match &self.wrapped_segment {
+            LockedSegment::Original(raw_segment) => {
+                self.deleted_mask = Some(raw_segment.read().get_deleted_points_bitvec());
+            }
+            LockedSegment::Proxy(_) => {
+                // A double proxy has no own deleted bitvec to sync.
+            }
+        }
+    }
+
+    /// Ensure that write segment have same indexes as wrapped segment
+    pub fn replicate_field_indexes(
+        &self,
+        op_num: SeqNumberType,
+        hw_counter: &HardwareCounterCell,
+        segment_to_update: &LockedSegment,
+    ) -> OperationResult<()> {
+        let existing_indexes = segment_to_update.get().read().get_indexed_fields();
+        let expected_indexes = self.wrapped_segment.get().read().get_indexed_fields();
+
+        // Add missing indexes
+        for (expected_field, expected_schema) in &expected_indexes {
+            let existing_schema = existing_indexes.get(expected_field);
+
+            if existing_schema != Some(expected_schema) {
+                if existing_schema.is_some() {
+                    segment_to_update
+                        .get()
+                        .write()
+                        .delete_field_index(op_num, expected_field)?;
+                }
+                segment_to_update.get().write().create_field_index(
+                    op_num,
+                    expected_field,
+                    Some(expected_schema),
+                    hw_counter,
+                )?;
+            }
+        }
+
+        // Remove extra indexes
+        for existing_field in existing_indexes.keys() {
+            if !expected_indexes.contains_key(existing_field) {
+                segment_to_update
+                    .get()
+                    .write()
+                    .delete_field_index(op_num, existing_field)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Updates the deleted mask with the given point offset
+    /// Ensures that the mask is resized if necessary and returns false
+    /// if either the mask or the point offset is missing (mask is not applicable)
+    fn set_deleted_offset(&mut self, point_offset: Option<PointOffsetType>) -> bool {
+        match (&mut self.deleted_mask, point_offset) {
+            (Some(deleted_mask), Some(point_offset)) => {
+                if deleted_mask.len() <= point_offset as usize {
+                    deleted_mask.resize(point_offset as usize + 1, false);
+                }
+                deleted_mask.set(point_offset as usize, true);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Build a filter that excludes the given deleted points. Accepts
+    /// `Option<Cow<Filter>>` so that a filter already owned by the caller
+    /// (e.g. from [`ProxyVectorNameChanges::redact_filter`]) is reused
+    /// without an extra clone.
+    fn add_deleted_points_condition_to_filter(
+        filter: Option<Cow<'_, Filter>>,
+        deleted_points: impl IntoIterator<Item = PointIdType>,
+    ) -> Filter {
+        let wrapper_condition = Condition::HasId(HasIdCondition::from_iter(deleted_points));
+        match filter {
+            None => Filter::new_must_not(wrapper_condition),
+            Some(f) => {
+                let mut new_filter = f.into_owned();
+                let new_must_not = match new_filter.must_not {
+                    None => Some(vec![wrapper_condition]),
+                    Some(mut conditions) => {
+                        conditions.push(wrapper_condition);
+                        Some(conditions)
+                    }
+                };
+                new_filter.must_not = new_must_not;
+                new_filter
+            }
+        }
+    }
+
+    /// Propagate changes in this proxy to the wrapped segment
+    ///
+    /// This propagates:
+    /// - delete (or moved) points
+    /// - deleted payload indexes
+    /// - created payload indexes
+    /// - vector name changes
+    ///
+    /// Required before making the wrapped segment available in the shard holder. If the wrapped
+    /// segment is thrown away, propagating is not needed.
+    ///
+    /// The buffered changes are cleared once they have all been applied, so reads fall through to
+    /// the wrapped segment for them and a second call only propagates what was registered since.
+    /// If propagating fails nothing is cleared, and a retry applies everything again; that is
+    /// safe because all operations are version gated.
+    ///
+    /// The pending changes log file is left in place here. `unwarp_proxy` is responsible for
+    /// removing it.
+    pub fn propagate_to_wrapped(&mut self) -> OperationResult<()> {
+        let changes = self.pending_changes.changes();
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Lock ordering is important here and must match the flush function to prevent a
+        // deadlock: the caller holds this proxy's write lock, the wrapped segment is locked
+        // second. The write lock on the wrapped segment is only taken for the duration of the
+        // propagation itself.
+        {
+            let wrapped_segment = self.wrapped_segment.get();
+            let mut wrapped_segment = wrapped_segment.write();
+            // Propagation into the wrapped segment must always run to completion
+            changes.propagate(&mut *wrapped_segment, &AtomicBool::new(false))?;
+        }
+
+        self.pending_changes.clear_changes();
+        self.deleted_deferred_count = 0;
+
+        // Note: We do not clear the deleted mask here, as it provides
+        // no performance advantage and does not affect the correctness of search.
+        // Points are still marked as deleted in two places, which is fine
+
+        Ok(())
+    }
+
+    pub fn pending_changes_log_path(&self) -> &Path {
+        self.pending_changes.log_path()
+    }
+
+    /// All changes buffered by this proxy, not yet propagated to the wrapped segment.
+    pub fn changes(&self) -> &ProxyChanges {
+        self.pending_changes.changes()
+    }
+}
