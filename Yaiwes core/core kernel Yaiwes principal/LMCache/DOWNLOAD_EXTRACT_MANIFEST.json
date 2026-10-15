@@ -1,0 +1,42 @@
+{
+  "bundle_bytes": 10969523,
+  "bundle_sha256": "d77297b41f04eb1dd5c1ffd37651489773a2acddc1b2b71c6bfa63a088ee9c28",
+  "extracted_tree": {
+    "bytes": 29687749,
+    "files": 2713,
+    "sha256": "4551574449a879c7ce458ca39c28d9169f503d72959d41367824c8965808e7b8"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 10969523,
+      "name": "LMCache.bundle.zip.part-0001",
+      "sha256": "d77297b41f04eb1dd5c1ffd37651489773a2acddc1b2b71c6bfa63a088ee9c28"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "CLAUDE.md",
+    "docs/design/tools/controller_benchmark/README.md",
+    "docs/design/tools/transfer_channel_benchmark/README.md",
+    "docs/design/usage_telemetry/README.md",
+    "docs/design/v1/mp_observability/README.md",
+    "lmcache/v1/distributed/bitmap_ops/README.md"
+  ],
+  "skipped_special_count": 6,
+  "slug": "LMCache",
+  "source_bytes": 29687749,
+  "source_commit": "ab970803f120a150caea9357742fc9f33b147a26",
+  "source_files": 2713,
+  "source_ref": "dev",
+  "source_repo": "LMCache/LMCache",
+  "source_tree": {
+    "bytes": 29687749,
+    "files": 2713,
+    "sha256": "4551574449a879c7ce458ca39c28d9169f503d72959d41367824c8965808e7b8"
+  }
+}
