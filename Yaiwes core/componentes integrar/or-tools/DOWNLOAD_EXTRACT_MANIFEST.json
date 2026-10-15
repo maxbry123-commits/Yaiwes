@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 25029483,
+  "bundle_sha256": "a1db96636b943741082194f636136282159ae6f29886b14d1eaacb4e582e92d8",
+  "extracted_tree": {
+    "bytes": 132853946,
+    "files": 4842,
+    "sha256": "912180129ccd354c483c903a50549e180aea390c1a54bfc18c38a4ff0ef9cd47"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "or-tools.bundle.zip.part-0001",
+      "sha256": "07034629d93d4a597d20d186a7d10b179ccd5baed886552e68b82870719206e1"
+    },
+    {
+      "bytes": 12446571,
+      "name": "or-tools.bundle.zip.part-0002",
+      "sha256": "47ed8a81773b85638d796bdd477d9d22a5691f664de6e751e245912cf74cde90"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "or-tools",
+  "source_bytes": 132853946,
+  "source_commit": "100f66e6242ab8bf8d32feb8f3bf086db66ae2b5",
+  "source_files": 4842,
+  "source_ref": "stable",
+  "source_repo": "google/or-tools",
+  "source_tree": {
+    "bytes": 132853946,
+    "files": 4842,
+    "sha256": "912180129ccd354c483c903a50549e180aea390c1a54bfc18c38a4ff0ef9cd47"
+  }
+}
