@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 138328,
+  "bundle_sha256": "b74a7940d6a35d2e543af661daff55f4257f0be2472fbb435ad4a83597dc57ac",
+  "extracted_tree": {
+    "bytes": 405301,
+    "files": 102,
+    "sha256": "f1cabdea504e64bf16e8990e3d97a75b67ef1b58f9352824c01a00cd05734f51"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 138328,
+      "name": "pluggy.bundle.zip.part-0001",
+      "sha256": "b74a7940d6a35d2e543af661daff55f4257f0be2472fbb435ad4a83597dc57ac"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "pluggy",
+  "source_bytes": 405301,
+  "source_commit": "21c7e1672941a0cd9e3c555bf5e5007f1fbe3dc5",
+  "source_files": 102,
+  "source_ref": "main",
+  "source_repo": "pytest-dev/pluggy",
+  "source_tree": {
+    "bytes": 405301,
+    "files": 102,
+    "sha256": "f1cabdea504e64bf16e8990e3d97a75b67ef1b58f9352824c01a00cd05734f51"
+  }
+}
