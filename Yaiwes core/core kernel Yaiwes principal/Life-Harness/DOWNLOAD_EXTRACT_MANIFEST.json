@@ -1,0 +1,100 @@
+{
+  "bundle_bytes": 171759541,
+  "bundle_sha256": "81beefdf2a37d008583abbe9bd306850962184e7ac1f22c0874c3ec81da4509c",
+  "extracted_tree": {
+    "bytes": 366344116,
+    "files": 2235,
+    "sha256": "ab087f0542526ddb799a56aff0ef80f3f3bb6d31d7fee4169416d129448cbe72"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0001",
+      "sha256": "457f21870e14407026a83b1c6f2b93ef5005f31a5ef7527072e9e0960557c9b2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0002",
+      "sha256": "5afb2763e3532521a7c2088ba1bf65893c592edf358e068ae2ae88753ebe3148"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0003",
+      "sha256": "4b697ddc9098170526ca0c60ecc62e0e1303b6ba0679688bde7cb729e88950b1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0004",
+      "sha256": "e14218b287979d3609c8b16ee5aa882e1563341109181db0afb8aa6e202cea45"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0005",
+      "sha256": "352de175c81130ec1a4139770465c85b1227e2c986c69fafa536631ef6b3a7cc"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0006",
+      "sha256": "6d8276de8893f767a0c2a0d5d5daf52cefe014c2106d1606d64bee48ceb20faa"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0007",
+      "sha256": "cbe36489aa4e82e9ca229cab4bc88d968b8c867a6abd094cb8b522bc9e4501af"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0008",
+      "sha256": "06a55f90f84b6cf85db76fc607b538ee9340f84c2048fa30f6f1b19e9ed4b428"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0009",
+      "sha256": "845ad5a606fc75129d2f112404cff5aa9d4c53a084d0f3c19d6ec3db7ba4c862"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0010",
+      "sha256": "2f703d33fa0f54af71ad9aa75faf401cde6b95d75618846ec7b2b7b15c51cad8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0011",
+      "sha256": "eb87a8901fbf4dae5ba7340a90d170847a3c4b4a60d9195cc00e11dcfa479e80"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0012",
+      "sha256": "ae322aef82034d10a07bb48e21d45a25c66baa84e1956f6644de2063467bb230"
+    },
+    {
+      "bytes": 12582912,
+      "name": "Life-Harness.bundle.zip.part-0013",
+      "sha256": "5bf306067a1d15f4e944e81a26297d7ccf1cc05c0b1afeae3ea879ceb7f6b4b9"
+    },
+    {
+      "bytes": 8181685,
+      "name": "Life-Harness.bundle.zip.part-0014",
+      "sha256": "fde74d948e50fb55d02b4e35da5cea0296c03ccd21f3bbf0665ea6f26ea224f8"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "Life-Harness",
+  "source_bytes": 366344116,
+  "source_commit": "4844bbb09e78e3d4c86eeb44309e6d61a31881fa",
+  "source_files": 2235,
+  "source_ref": "main",
+  "source_repo": "Tianshi-Xu/Life-Harness",
+  "source_tree": {
+    "bytes": 366344116,
+    "files": 2235,
+    "sha256": "ab087f0542526ddb799a56aff0ef80f3f3bb6d31d7fee4169416d129448cbe72"
+  }
+}
