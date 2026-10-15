@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 647430,
+  "bundle_sha256": "7f7296cfad68e781b52e235c316175757b275fd48f1a342b61aee707e810d940",
+  "extracted_tree": {
+    "bytes": 1300401,
+    "files": 138,
+    "sha256": "84a7631203327c63a4cb5be8acfaba076827371fadba13d389b97391fbbce113"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 647430,
+      "name": "huey.bundle.zip.part-0001",
+      "sha256": "7f7296cfad68e781b52e235c316175757b275fd48f1a342b61aee707e810d940"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "huey",
+  "source_bytes": 1300401,
+  "source_commit": "c5afa051a9663be479669e687c7460bdbbfd204d",
+  "source_files": 138,
+  "source_ref": "master",
+  "source_repo": "coleifer/huey",
+  "source_tree": {
+    "bytes": 1300401,
+    "files": 138,
+    "sha256": "84a7631203327c63a4cb5be8acfaba076827371fadba13d389b97391fbbce113"
+  }
+}
