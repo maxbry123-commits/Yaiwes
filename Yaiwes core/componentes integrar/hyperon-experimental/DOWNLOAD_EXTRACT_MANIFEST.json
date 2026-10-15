@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 615459,
+  "bundle_sha256": "8816177eb0de7dd3be9d166630cdf50bbc6f8f673649162747fe721a43fae5c7",
+  "extracted_tree": {
+    "bytes": 2349214,
+    "files": 295,
+    "sha256": "461e507b5a968d7ded223f32f6020e374d3b38b7e07f9ebf0a6a23a6badf6ac9"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 615459,
+      "name": "hyperon-experimental.bundle.zip.part-0001",
+      "sha256": "8816177eb0de7dd3be9d166630cdf50bbc6f8f673649162747fe721a43fae5c7"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".dockerignore"
+  ],
+  "skipped_special_count": 1,
+  "slug": "hyperon-experimental",
+  "source_bytes": 2349214,
+  "source_commit": "3f76dc460da6961f57f69f6c3e550c59c74ada83",
+  "source_files": 295,
+  "source_ref": "main",
+  "source_repo": "trueagi-io/hyperon-experimental",
+  "source_tree": {
+    "bytes": 2349214,
+    "files": 295,
+    "sha256": "461e507b5a968d7ded223f32f6020e374d3b38b7e07f9ebf0a6a23a6badf6ac9"
+  }
+}
