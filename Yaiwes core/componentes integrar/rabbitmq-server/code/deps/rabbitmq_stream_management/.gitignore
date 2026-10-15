@@ -1,0 +1,14 @@
+.eunit
+.concrete/DEV_MODE
+
+*.jar
+
+*.class
+*.dat
+*.dump
+*.iml
+*.ipr
+*.iws
+
+node_modules
+package-lock.json

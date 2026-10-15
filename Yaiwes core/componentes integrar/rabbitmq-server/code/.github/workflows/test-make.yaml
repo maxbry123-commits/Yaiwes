@@ -1,0 +1,101 @@
+name: Test (make)
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - deps/**
+    - scripts/**
+    - Makefile
+    - plugins.mk
+    - rabbitmq-components.mk
+    - .github/workflows/test-make.yaml
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-xref:
+    name: Build and Xref
+    strategy:
+      fail-fast: false
+      matrix:
+        erlang_version:
+        - '27'
+        - '28'
+        - '29'
+        elixir_version:
+        - '1.20'
+    # @todo Add macOS and Windows.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - name: CHECKOUT REPOSITORY
+      uses: actions/checkout@v6
+      with:
+        fetch-tags: true
+
+    - name: SETUP OTP & ELIXIR
+      uses: erlef/setup-beam@v1
+      with:
+        otp-version: ${{ matrix.erlang_version }}
+        elixir-version: ${{ matrix.elixir_version }}
+        hexpm-mirrors: |
+          https://builds.hex.pm
+          https://cdn.jsdelivr.net/hex
+
+    - name: SANITY CHECK (rabbit)
+      run: make -C deps/rabbit parallel-ct-sanity-check
+
+    - name: SANITY CHECK (rabbitmq_mqtt)
+      run: make -C deps/rabbitmq_mqtt parallel-ct-sanity-check
+
+    - name: BUILD
+      run: make
+
+    - name: XREF
+      run: make xref
+
+  test:
+    name: Test
+    strategy:
+      fail-fast: false
+      matrix:
+        erlang_version:
+        - '29'
+        elixir_version:
+        - '1.20'
+    uses: ./.github/workflows/test-make-tests.yaml
+    with:
+      erlang_version: ${{ matrix.erlang_version }}
+      elixir_version: ${{ matrix.elixir_version }}
+      mixed_clusters: false
+
+  test-mixed-clusters:
+    name: Test mixed clusters
+    strategy:
+      fail-fast: false
+      matrix:
+        erlang_version:
+        - '28'
+        elixir_version:
+        - '1.19'
+    uses: ./.github/workflows/test-make-tests.yaml
+    with:
+      erlang_version: ${{ matrix.erlang_version }}
+      elixir_version: ${{ matrix.elixir_version }}
+      mixed_clusters: true
+
+  type-check:
+    name: Type check
+    strategy:
+      fail-fast: false
+      matrix:
+        erlang_version: # Latest OTP
+        - '29'
+        elixir_version: # Latest Elixir
+        - '1.20'
+    uses: ./.github/workflows/test-make-type-check.yaml
+    with:
+      erlang_version: ${{ matrix.erlang_version }}
+      elixir_version: ${{ matrix.elixir_version }}

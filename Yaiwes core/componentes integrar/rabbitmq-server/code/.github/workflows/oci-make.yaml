@@ -1,0 +1,156 @@
+# When changing the OTP version, make sure to update all references:
+# - the default in workflow_dispatch
+# - otp_version in both jobs
+#
+#
+name: OCI (make)
+on:
+  pull_request:
+    paths:
+      - deps/**
+      - scripts/**
+      - Makefile
+      - plugins.mk
+      - rabbitmq-components.mk
+      - packaging/**
+      - .github/workflows/oci-make.yaml
+  workflow_run:
+    workflows: [Peer Discovery AWS Integration Test]
+    types:
+      - requested
+  workflow_dispatch:
+    inputs:
+      otp_version:
+        # a tag of the erlang image, see https://hub.docker.com/_/erlang for available tags
+        # also used in the setup-beam step (same tag should work for both)
+        description: OTP version (eg. `26`, `26.2.5.6`)
+        default: 28
+      build_arm:
+        description: Build for ARM64 as well?
+        type: boolean
+        default: false
+env:
+  REGISTRY_IMAGE: pivotalrabbitmq/rabbitmq
+  # For pull_request events github.sha is an ephemeral merge commit, not the branch HEAD.
+  # For workflow_run events github.sha is the default branch HEAD, not the triggering branch HEAD.
+  # Use the actual branch HEAD SHA in both cases.
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+  VERSION: 4.3.0+${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-package-generic-unix:
+    strategy:
+      matrix:
+        otp_version:
+        - ${{ github.event.inputs.otp_version || '28' }}
+    runs-on: ubuntu-latest
+    outputs:
+      # When dependabot, or a user from a fork, creates PRs, secrets are not injected, and the OCI workflow can't push the image
+      # This check acts as a gate keeper
+      authorized: ${{ steps.authorized.outputs.authorized }}
+    steps:
+      - name: CHECK IF IMAGE WILL PUSH
+        id: authorized
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_PASSWORD }}" ]; then
+            echo "authorized=true" | tee -a $GITHUB_OUTPUT
+          else
+            echo "authorized=false" | tee -a $GITHUB_OUTPUT
+          fi
+      - name: Checkout
+        if: steps.authorized.outputs.authorized == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - name: Configure Erlang
+        if: steps.authorized.outputs.authorized == 'true'
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: ${{ matrix.otp_version }}
+          elixir-version: latest
+      - name: make package-generic-unix
+        if: steps.authorized.outputs.authorized == 'true'
+        run: |
+          make package-generic-unix PROJECT_VERSION=${{ env.VERSION }}
+      - name: Upload package-generic-unix
+        if: steps.authorized.outputs.authorized == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-generic-unix-otp${{ matrix.otp_version }}
+          path: PACKAGES/rabbitmq-server-*.tar.xz
+
+  build-and-push:
+    strategy:
+      fail-fast: false
+      matrix:
+        otp_version:
+        - ${{ github.event.inputs.otp_version || '28' }}
+    needs: build-package-generic-unix
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-package-generic-unix.outputs.authorized == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - name: Download package-generic-unix
+        uses: actions/download-artifact@v8
+        with:
+          name: package-generic-unix-otp${{ matrix.otp_version }}
+          path: PACKAGES
+      - name: Rename package-generic-unix
+        run: |
+          cp \
+            PACKAGES/rabbitmq-server-generic-unix-*.tar.xz \
+            packaging/docker-image/package-generic-unix.tar.xz
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          flavor: |
+            suffix=-otp${{ matrix.otp_version }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=sha-${{ env.HEAD_SHA }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.HEAD_SHA }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          push: true
+          context: packaging/docker-image
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ github.event.inputs.build_arm && 'linux/amd64, linux/arm64' || 'linux/amd64' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.otp_version }}
+          cache-from: type=gha,scope=${{ matrix.otp_version }}
+          build-args: |
+            OTP_VERSION=${{ matrix.otp_version }}
+            RABBITMQ_VERSION=${{ env.VERSION }}
+      - name: Summarize published images
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            printf '### Published images\n\n```shell\n'
+            while IFS= read -r image; do
+              if [ -n "$image" ]; then
+                printf 'docker pull docker.io/%s\n' "$image"
+              fi
+            done <<< "$IMAGE_TAGS"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"

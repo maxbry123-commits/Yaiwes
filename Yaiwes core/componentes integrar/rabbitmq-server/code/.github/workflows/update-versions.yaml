@@ -1,0 +1,43 @@
+name: Update Versions and Validate Compatibility
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-tags: true
+      - uses: carvel-dev/setup-action@efbf2625e8469080d87175c02690634d4b0ad476 # v2.2.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          only: ytt
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: ${{ github.workspace }}/.github/scripts/update-versions.sh
+      - run: ${{ github.workspace }}/.github/scripts/validate-compatibility.sh
+      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: '[skip ci] Update discussion template versions'
+          title: '[skip ci] Update discussion template versions'
+          body: |
+            Automated update of RabbitMQ and Erlang versions in the discussion questions template.
+
+            This PR updates:
+            - `.github/versions.json` - Version tracking file
+            - `.github/DISCUSSION_TEMPLATE/questions.yml` - Discussion template (generated from template)
+
+            **RabbitMQ versions**: Last 2 minor versions (all patches)
+            **Erlang versions**: Last 3 major versions (by minor, formatted as X.Y.x)
+          branch: auto-update-versions-${{ github.run_number }}
+          delete-branch: true
+          assignees: lukebakken,michaelklishin

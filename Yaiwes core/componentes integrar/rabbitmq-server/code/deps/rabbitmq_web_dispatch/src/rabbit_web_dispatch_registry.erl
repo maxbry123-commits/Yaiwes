@@ -1,0 +1,245 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(rabbit_web_dispatch_registry).
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+
+-behaviour(gen_server).
+
+-export([start_link/0]).
+-export([add/5, remove/1, set_fallback/2, lookup/2, list_all/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3]).
+-export([list/1]).
+
+-import(rabbit_misc, [pget/2]).
+
+-define(ETS, rabbitmq_web_dispatch).
+
+%% This gen_server is merely to serialise modifications to the dispatch
+%% table for listeners.
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%% A failed registration exits the caller, not the registry: the registry
+%% owns the dispatch table for every plugin on the node, and losing it would
+%% break contexts that have nothing to do with the failed one.
+-spec add(atom(), [{atom(), any()}], fun(), any(), {string(), string()}) -> ok.
+add(Name, Listener, Selector, Handler, Link) ->
+    case gen_server:call(?MODULE, {add, Name, Listener, Selector, Handler, Link},
+                         ?GEN_SERVER_CALL_TIMEOUT) of
+        ok ->
+            ok;
+        {error, Class, Reason, Stacktrace} ->
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+remove(Name) ->
+    gen_server:call(?MODULE, {remove, Name}, ?GEN_SERVER_CALL_TIMEOUT).
+
+%% @todo This needs to be dispatch instead of a fun too.
+%% But I'm not sure what code is using this.
+set_fallback(Listener, FallbackHandler) ->
+    gen_server:call(?MODULE, {set_fallback, Listener, FallbackHandler},
+                    infinity).
+
+lookup(Listener, Req) ->
+    case lookup_dispatch(Listener) of
+        {ok, {Selectors, Fallback}} ->
+            try match_request(Selectors, Req) of
+                not_found -> {ok, Fallback};
+                Dispatch  -> {ok, Dispatch}
+            catch
+                _:Reason -> {error, {lookup_failure, Reason}}
+            end;
+        Err ->
+            Err
+    end.
+
+%% This is called in a somewhat obfuscated manner in
+%% rabbit_mgmt_external_stats:rabbit_web_dispatch_registry_list_all()
+list_all() ->
+    gen_server:call(?MODULE, list_all, ?GEN_SERVER_CALL_TIMEOUT).
+
+%% Callback Methods
+
+init([]) ->
+    ?ETS = ets:new(?ETS, [named_table, public]),
+    {ok, undefined}.
+
+handle_call({add, Name, Listener, Selector, Handler, Link}, _From, undefined) ->
+    Reply = try
+                add_context(Name, Listener, Selector, Handler, Link)
+            catch
+                Class:Reason:Stacktrace -> {error, Class, Reason, Stacktrace}
+            end,
+    {reply, Reply, undefined};
+
+handle_call({remove, Name}, _From,
+            undefined) ->
+    case listener_by_name(Name) of
+        {error, not_found} ->
+            ?LOG_WARNING("HTTP listener registry could not find context ~tp",
+                               [Name]),
+            {reply, ok, undefined};
+        {ok, Listener} ->
+            {ok, {Selectors, Fallback}} = lookup_dispatch(Listener),
+            Selectors1 = lists:keydelete(Name, 1, Selectors),
+            set_dispatch(Listener, Selectors1, Fallback),
+            case Selectors1 of
+                [] -> rabbit_web_dispatch_sup:stop_listener(Listener),
+                      listener_stopped(Listener);
+                _  -> ok
+            end,
+            {reply, ok, undefined}
+    end;
+
+handle_call({set_fallback, Listener, FallbackHandler}, _From,
+            undefined) ->
+    {ok, {Selectors, _OldFallback}} = lookup_dispatch(Listener),
+    set_dispatch(Listener, Selectors, FallbackHandler),
+    {reply, ok, undefined};
+
+handle_call(list_all, _From, undefined) ->
+    {reply, list(), undefined};
+
+handle_call(Req, _From, State) ->
+    ?LOG_ERROR("Unexpected call to ~tp: ~tp", [?MODULE, Req]),
+    {stop, unknown_request, State}.
+
+handle_cast(_, State) ->
+    {noreply, State}.
+
+handle_info(_, State) ->
+    {noreply, State}.
+
+terminate(_, _) ->
+    true = ets:delete(?ETS),
+    ok.
+
+code_change(_, State, _) ->
+    {ok, State}.
+
+%%---------------------------------------------------------------------------
+
+%% Internal Methods
+
+add_context(Name, Listener, Selector, Handler, Link = {_, Desc}) ->
+    Continue = case rabbit_web_dispatch_sup:ensure_listener(Listener) of
+                   new      -> set_dispatch(
+                                 Listener, [],
+                                 listing_fallback_handler(Listener)),
+                               listener_started(Listener),
+                               true;
+                   existing -> true;
+                   ignore   -> false;
+                   {error, {listener_address_in_use, _}} ->
+                       exit({listener_address_in_use, {Desc, Listener}});
+                   {error, {no_port_given, _}} ->
+                       exit({no_port_given, {Desc, Listener}})
+               end,
+    case Continue of
+        true  -> case lookup_dispatch(Listener) of
+                     {ok, {Selectors, Fallback}} ->
+                         Selector2 = lists:keystore(
+                                       Name, 1, Selectors,
+                                       {Name, Selector, Handler, Link}),
+                         set_dispatch(Listener, Selector2, Fallback);
+                     {error, {different, Desc2, Listener2}} ->
+                         exit({incompatible_listeners,
+                               {Desc, Listener}, {Desc2, Listener2}});
+                     %% The socket is already open under a different registry
+                     %% key. Two listeners reach this by spelling one address
+                     %% differently, for example as a string and as a tuple, or
+                     %% by one of them using the wildcard address the other one
+                     %% resolved to.
+                     {error, {no_record_for_listener, _}} ->
+                         exit({listener_address_in_use, {Desc, Listener}})
+                 end;
+        false -> ok
+    end,
+    ok.
+
+listener_started(Listener) ->
+    [rabbit_networking:tcp_listener_started(Protocol, Listener, IPAddress, Port)
+     || {Protocol, IPAddress, Port} <- listener_info(Listener)],
+    ok.
+
+listener_stopped(Listener) ->
+    [rabbit_networking:tcp_listener_stopped(Protocol, Listener, IPAddress, Port)
+     || {Protocol, IPAddress, Port} <- listener_info(Listener)],
+    ok.
+
+listener_info(Listener) ->
+    Protocol = case pget(protocol, Listener) of
+                   undefined ->
+                       case pget(ssl, Listener) of
+                           true -> https;
+                           _    -> http
+                       end;
+                   P ->
+                       P
+               end,
+    Port = pget(port, Listener),
+    [{Protocol, IPAddress, Port}
+     || IPAddress <- rabbit_networking:listener_ip_addresses(Listener)].
+
+%% A listener is identified by the address it was configured with, not by its
+%% port alone: two listeners can share a port on different interfaces.
+-spec listener_key([{atom(), any()}]) ->
+    {any(), rabbit_networking:ip_port() | undefined}.
+listener_key(Listener) ->
+    {pget(ip, Listener), pget(port, Listener)}.
+
+lookup_dispatch(Lsnr) ->
+    case ets:lookup(?ETS, listener_key(Lsnr)) of
+        [{_, Lsnr, S, F}]   -> {ok, {S, F}};
+        [{_, Lsnr2, S, _F}] -> {error, {different, first_desc(S), Lsnr2}};
+        []                  -> {error, {no_record_for_listener, Lsnr}}
+    end.
+
+first_desc([{_N, _S, _H, {_, Desc}} | _]) -> Desc.
+
+set_dispatch(Listener, Selectors, Fallback) ->
+    ets:insert(?ETS, {listener_key(Listener), Listener, Selectors, Fallback}).
+
+match_request([], _) ->
+    not_found;
+match_request([{_Name, Selector, Dispatch, _Link}|Rest], Req) ->
+    case Selector(Req) of
+        true  -> Dispatch;
+        false -> match_request(Rest, Req)
+    end.
+
+list() ->
+    [{Path, Desc, Listener} ||
+        {_P, Listener, Selectors, _F} <- ets:tab2list(?ETS),
+        {_N, _S, _H, {Path, Desc}} <- Selectors].
+
+-spec listener_by_name(atom()) -> {ok, term()} | {error, not_found}.
+listener_by_name(Name) ->
+    case [L || {_P, L, S, _F} <- ets:tab2list(?ETS), contains_name(Name, S)] of
+        [Listener] -> {ok, Listener};
+        []         -> {error, not_found}
+    end.
+
+contains_name(Name, Selectors) ->
+    lists:member(Name, [N || {N, _S, _H, _L} <- Selectors]).
+
+list(Listener) ->
+    {ok, {Selectors, _Fallback}} = lookup_dispatch(Listener),
+    [{Path, Desc} || {_N, _S, _H, {Path, Desc}} <- Selectors].
+
+%%---------------------------------------------------------------------------
+
+listing_fallback_handler(Listener) ->
+    cowboy_router:compile([{'_', [
+        {"/", rabbit_web_dispatch_listing_handler, Listener}
+    ]}]).
