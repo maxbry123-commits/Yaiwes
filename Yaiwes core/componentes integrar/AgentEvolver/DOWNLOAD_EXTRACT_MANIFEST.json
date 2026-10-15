@@ -1,0 +1,45 @@
+{
+  "bundle_bytes": 29701631,
+  "bundle_sha256": "9cb2aeb5955a1a07d30fcc503d28c450327003f6d67b7ecf95a3e1897df670dd",
+  "extracted_tree": {
+    "bytes": 33812478,
+    "files": 379,
+    "sha256": "b2582b0d17cfc6cf5575b779d578bac1d62fe67e335e2c535298f7adcc2dbdf4"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "AgentEvolver.bundle.zip.part-0001",
+      "sha256": "12a4896ad7d158ea35d1c9c6464e8b763c633092f5a10f14143d03781fb089a2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "AgentEvolver.bundle.zip.part-0002",
+      "sha256": "a2c978a51221383200b0619f8fc61f53b61f0180d19b160efb00351b1d5bdfb9"
+    },
+    {
+      "bytes": 4535807,
+      "name": "AgentEvolver.bundle.zip.part-0003",
+      "sha256": "7170430aaec03c1180d59ecf784edaa228d1cb832a4a005b7984725d3f11e514"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "AgentEvolver",
+  "source_bytes": 33812478,
+  "source_commit": "a5a8db8689d6493b028107dcb4c27415441581dc",
+  "source_files": 379,
+  "source_ref": "main",
+  "source_repo": "modelscope/AgentEvolver",
+  "source_tree": {
+    "bytes": 33812478,
+    "files": 379,
+    "sha256": "b2582b0d17cfc6cf5575b779d578bac1d62fe67e335e2c535298f7adcc2dbdf4"
+  }
+}
