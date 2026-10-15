@@ -1,0 +1,50 @@
+{
+  "bundle_bytes": 49349708,
+  "bundle_sha256": "957ae395e72d7de9b73ac6c461fa3055c669ac2eb7554ecfb9cb4344d8f1507c",
+  "extracted_tree": {
+    "bytes": 52346808,
+    "files": 576,
+    "sha256": "3e5b09eea76c146fc0c8a220a40bb71456f54df24fc27ec70024413f60948c56"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "MetaClaw.bundle.zip.part-0001",
+      "sha256": "e1d880ef8bdbeaeff8834db2d9fcce74ab17eb8e22c715aa2037a9c65a7d6d70"
+    },
+    {
+      "bytes": 12582912,
+      "name": "MetaClaw.bundle.zip.part-0002",
+      "sha256": "15a609433763228d60644c3183278534ce8a09b7dae8b4103bc5a781dcabdc1a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "MetaClaw.bundle.zip.part-0003",
+      "sha256": "292cd4d707b7dc737f3ba50da160c67004640957c57374854341d2f1a5e7c05e"
+    },
+    {
+      "bytes": 11600972,
+      "name": "MetaClaw.bundle.zip.part-0004",
+      "sha256": "29b244e53fb1d5bea36441e7918243ea664ad71f3d43576a664e5b485527ebf5"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "MetaClaw",
+  "source_bytes": 52346808,
+  "source_commit": "922caf3a1cd093fb316e95183a8acc8aa47b3b21",
+  "source_files": 576,
+  "source_ref": "main",
+  "source_repo": "aiming-lab/MetaClaw",
+  "source_tree": {
+    "bytes": 52346808,
+    "files": 576,
+    "sha256": "3e5b09eea76c146fc0c8a220a40bb71456f54df24fc27ec70024413f60948c56"
+  }
+}
