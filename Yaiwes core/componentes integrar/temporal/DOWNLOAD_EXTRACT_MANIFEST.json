@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 9888898,
+  "bundle_sha256": "599b919f928009ae9a63a850f004d1e6a5e372111dadf90f8af8263fe138174d",
+  "extracted_tree": {
+    "bytes": 42454994,
+    "files": 3992,
+    "sha256": "e0f97c4489410f7b890b9d5cf5a3d03a73bd2e6aa5f583d2df71059101fb5444"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 9888898,
+      "name": "temporal.bundle.zip.part-0001",
+      "sha256": "599b919f928009ae9a63a850f004d1e6a5e372111dadf90f8af8263fe138174d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "config/development.yaml",
+    "schema/elasticsearch/visibility/index_template_v7.json"
+  ],
+  "skipped_special_count": 2,
+  "slug": "temporal",
+  "source_bytes": 42454994,
+  "source_commit": "1872297dceb4f82309ef3ba0922c688212417e34",
+  "source_files": 3992,
+  "source_ref": "main",
+  "source_repo": "temporalio/temporal",
+  "source_tree": {
+    "bytes": 42454994,
+    "files": 3992,
+    "sha256": "e0f97c4489410f7b890b9d5cf5a3d03a73bd2e6aa5f583d2df71059101fb5444"
+  }
+}
