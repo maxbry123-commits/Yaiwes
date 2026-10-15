@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 22884187,
+  "bundle_sha256": "a214130c3fb26bebbfb83b1b939a84c6716433c3922bf548f71cec03ca988aa8",
+  "extracted_tree": {
+    "bytes": 32420897,
+    "files": 202,
+    "sha256": "7a6b3255feadff6ec7c0bc41ac09b9eb2cae5ab20dc5f7d7bdd643cc03465a77"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "semantic-router.bundle.zip.part-0001",
+      "sha256": "9c05a544477dd8d5520132c06c50cfc4370ac452d335240cabd449707631f53f"
+    },
+    {
+      "bytes": 10301275,
+      "name": "semantic-router.bundle.zip.part-0002",
+      "sha256": "8c309af88ad61cdddc888d67d3614a879990ab95b0d616d7854342a5a2ac43a1"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "semantic-router",
+  "source_bytes": 32420897,
+  "source_commit": "88fb4dcdc1044f060da82f0b52e829e085bc1407",
+  "source_files": 202,
+  "source_ref": "main",
+  "source_repo": "aurelio-labs/semantic-router",
+  "source_tree": {
+    "bytes": 32420897,
+    "files": 202,
+    "sha256": "7a6b3255feadff6ec7c0bc41ac09b9eb2cae5ab20dc5f7d7bdd643cc03465a77"
+  }
+}
