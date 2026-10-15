@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 3109336,
+  "bundle_sha256": "4c85dc626612bc0aa91b7d5b6d315561fb2fa2a41c114c139084c40a809ec532",
+  "extracted_tree": {
+    "bytes": 10344780,
+    "files": 975,
+    "sha256": "df5ed982401fa9b8a1aa383e03867fda8f1660a97bc518f43cedbe0a71e06d60"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 3109336,
+      "name": "networkx.bundle.zip.part-0001",
+      "sha256": "4c85dc626612bc0aa91b7d5b6d315561fb2fa2a41c114c139084c40a809ec532"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "benchmarks/pyproject.toml"
+  ],
+  "skipped_special_count": 1,
+  "slug": "networkx",
+  "source_bytes": 10344780,
+  "source_commit": "6da4704cbf32ba6f50f6d9c46cc0a071e3a87985",
+  "source_files": 975,
+  "source_ref": "main",
+  "source_repo": "networkx/networkx",
+  "source_tree": {
+    "bytes": 10344780,
+    "files": 975,
+    "sha256": "df5ed982401fa9b8a1aa383e03867fda8f1660a97bc518f43cedbe0a71e06d60"
+  }
+}
