@@ -1,0 +1,50 @@
+{
+  "bundle_bytes": 45116627,
+  "bundle_sha256": "6907ecf7212845cfe834fd5a94846e29ad93d310f6921d5c9959cc16b146786b",
+  "extracted_tree": {
+    "bytes": 213303172,
+    "files": 1386,
+    "sha256": "78815f0d14470a0c0c3919a7c8f2d723f8f0ebbf3110b7d04473eb24b8d600ad"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "spaun1.0.bundle.zip.part-0001",
+      "sha256": "3b7e58563d6ae5a664557734e15ea9ede34194f3dddf170a5721f90b9ae35011"
+    },
+    {
+      "bytes": 12582912,
+      "name": "spaun1.0.bundle.zip.part-0002",
+      "sha256": "a1dd8df128faf6115505fe4af18ad7dcbb52457ec5193c72b7c0a9b7c97ead33"
+    },
+    {
+      "bytes": 12582912,
+      "name": "spaun1.0.bundle.zip.part-0003",
+      "sha256": "15853091abfd63d9157cc33ebd9bda97d514b17bfea2be6c2fdd81b843dc7550"
+    },
+    {
+      "bytes": 7367891,
+      "name": "spaun1.0.bundle.zip.part-0004",
+      "sha256": "554405fb4cd94bbe666e8ebb29c28c38fed0c373c41c21772d4e23aff8d7ab67"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "spaun1.0",
+  "source_bytes": 213303172,
+  "source_commit": "247c30e2065dbf134890828046fcbaa9ff7a0434",
+  "source_files": 1386,
+  "source_ref": "master",
+  "source_repo": "ctn-archive/spaun1.0",
+  "source_tree": {
+    "bytes": 213303172,
+    "files": 1386,
+    "sha256": "78815f0d14470a0c0c3919a7c8f2d723f8f0ebbf3110b7d04473eb24b8d600ad"
+  }
+}
