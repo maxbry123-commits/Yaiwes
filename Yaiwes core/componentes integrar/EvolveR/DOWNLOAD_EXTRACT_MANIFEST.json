@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 6022029,
+  "bundle_sha256": "a75b65e472896adff54d5f386cacb6250546b1fe47dd70872d7f9c43b77f00cd",
+  "extracted_tree": {
+    "bytes": 14649157,
+    "files": 665,
+    "sha256": "a23e6e09bb6901237b9447be23c21d25c9d05843bcf6ba0ef5296cc5a38f8a31"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 6022029,
+      "name": "EvolveR.bundle.zip.part-0001",
+      "sha256": "a75b65e472896adff54d5f386cacb6250546b1fe47dd70872d7f9c43b77f00cd"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "EvolveR",
+  "source_bytes": 14649157,
+  "source_commit": "63834b727ee6e7af3410657de36eb845814249ba",
+  "source_files": 665,
+  "source_ref": "main",
+  "source_repo": "KnowledgeXLab/EvolveR",
+  "source_tree": {
+    "bytes": 14649157,
+    "files": 665,
+    "sha256": "a23e6e09bb6901237b9447be23c21d25c9d05843bcf6ba0ef5296cc5a38f8a31"
+  }
+}
