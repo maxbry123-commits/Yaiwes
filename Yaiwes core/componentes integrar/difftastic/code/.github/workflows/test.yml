@@ -1,0 +1,165 @@
+on: [push, pull_request]
+
+name: Test
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          # Operating systems available: https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+
+          # mac-14 is an M1 ARM device.
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          # Tests run under Rosetta on this ARM runner.
+          - { target: x86_64-apple-darwin, os: macos-14 }
+
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
+    env:
+      BUILD_CMD: cargo
+
+    steps:
+    - name: Checkout source code
+      # v4.2.2
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.85.0
+      with:
+        targets: ${{ matrix.job.target }}
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ matrix.job.target }}
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Install cross
+      if: matrix.job.use-cross
+      uses: taiki-e/install-action@1329c298aa20c3257846c9b2e0e55967df3e3c37 # v2
+      with:
+        tool: cross@0.2.5
+
+    - name: Overwrite build command env variable
+      if: matrix.job.use-cross
+      shell: bash
+      run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
+
+    - name: Test
+      shell: bash
+      run: $BUILD_CMD test --target ${{ matrix.job.target }}
+
+  test_mime_db:
+    name: Test with MIME database
+    runs-on: ubuntu-22.04
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # This runs tests that rely on the MIME database being present.
+      - run: cargo test -- --ignored
+
+  test_linux_latest_stable:
+    name: Test Linux (latest stable Rust)
+    runs-on: ubuntu-22.04
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo +stable test
+
+  regression_test:
+    name: Output Regression Test
+    runs-on: ubuntu-22.04
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Generate output for all sample files
+        run: ./sample_files/compare_all.sh
+      - name: Verify output is unchanged
+        run: diff -C2 sample_files/compare.result sample_files/compare.expected
+
+  package:
+    name: Check Linux Packaging
+    runs-on: ubuntu-22.04
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo package --allow-dirty
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo fmt --all -- --check
+
+  man_page:
+    name: Man page is up to date
+    runs-on: ubuntu-22.04
+    env:
+      # When bumping this version, regenerate difft.1 locally with:
+      # pandoc -s -t man difft.1.md -o difft.1
+      PANDOC_VERSION: "3.11"
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pandoc
+        run: |
+          mkdir -p ~/.local
+          curl -LsSf https://github.com/jgm/pandoc/releases/download/$PANDOC_VERSION/pandoc-$PANDOC_VERSION-linux-amd64.tar.gz | tar zxf - --strip-components=1 -C ~/.local
+      - name: Regenerate man page
+        run: ~/.local/bin/pandoc -s -t man difft.1.md -o difft.1
+      - name: Verify man page is unchanged
+        run: git diff --exit-code difft.1
+
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-22.04
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8 # v2
+        with:
+          shellcheck: false
+
+  typo-check:
+    name: Typo Check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      FORCE_COLOR: 1
+      TYPOS_VERSION: v1.51.1
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download typos
+        run: curl -LsSf https://github.com/crate-ci/typos/releases/download/$TYPOS_VERSION/typos-$TYPOS_VERSION-x86_64-unknown-linux-musl.tar.gz | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Check for typos
+        run: typos
