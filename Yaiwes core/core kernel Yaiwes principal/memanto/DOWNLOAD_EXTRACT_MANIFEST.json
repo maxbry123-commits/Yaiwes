@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 12662123,
+  "bundle_sha256": "a0121aa796bf761c29f62ad23b64dafccbe78250125b542a163d5b090228908f",
+  "extracted_tree": {
+    "bytes": 20133914,
+    "files": 985,
+    "sha256": "0dff4e521f7b02cb79ed81f7212b39cf6b8f95c9403e4dcd18f47f62c03d63bc"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "memanto.bundle.zip.part-0001",
+      "sha256": "deaae6b90741653a08b5c42306ce02fd641f9f1bb88785aaed6acb3faae33b8c"
+    },
+    {
+      "bytes": 79211,
+      "name": "memanto.bundle.zip.part-0002",
+      "sha256": "fabfc0152b11b1114404863c990fb22b14afa10014cff81c7b323255acd4ae20"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "memanto",
+  "source_bytes": 20133914,
+  "source_commit": "5a2ce85dfee1f3a514535b39255db7c5efb81364",
+  "source_files": 985,
+  "source_ref": "main",
+  "source_repo": "moorcheh-ai/memanto",
+  "source_tree": {
+    "bytes": 20133914,
+    "files": 985,
+    "sha256": "0dff4e521f7b02cb79ed81f7212b39cf6b8f95c9403e4dcd18f47f62c03d63bc"
+  }
+}
