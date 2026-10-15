@@ -1,0 +1,36 @@
+[package]
+description = "A Standalone UI for ui example"
+title = "Omni UI Documentation"
+version = "6.2.0"
+
+# That makes it browsable in UI with "experience" filter
+keywords = ["kit", "experience", "example", "ui"]
+
+[dependencies]
+"omni.example.ui" = {}
+"omni.kit.commands" = { order = -100 }
+"omni.kit.uiapp" = {}
+"omni.usd" = { order = -100 }
+
+[settings]
+rtx.spg.enabled = true # Enable RTX Sensor Processing Graphs feature
+
+# faster load time as not need for RTX
+exts."omni.kit.renderer.core".compatibilityMode = true
+
+[settings.app]
+settings.standalone_mode = true
+window.title = "Omni UI Documentation"
+
+runLoops.main.rateLimitEnabled = true
+runLoops.main.rateLimitFrequency = 60
+runLoops.main.rateLimitUseBusyLoop = false
+
+# Register extension folder from this repo in kit
+[settings.app.exts]
+folders = [
+    "${app}/../exts",
+    "${app}/../extscache",
+    "${app}/../extsUser",
+    "${app}/../extsDeprecated",
+]

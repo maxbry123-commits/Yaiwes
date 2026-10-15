@@ -1,0 +1,43 @@
+[package]
+description = "Main Omniverse Isaac Sim Application with XR VR"
+execFile = "isaac-sim.xr.vr"
+title = "Isaac Sim XR VR"
+version = "6.2.0"
+keywords = ["experience", "app", "usd", "isaacsim", "xr"] # That makes it browsable in UI with "experience" filter
+
+
+[dependencies]
+"isaacsim.exp.base" = {}
+"isaacsim.replicator.episode_recorder.ui" = {}
+"omni.kit.xr.core" = {}
+"omni.kit.xr.system.openxr" = {}
+"omni.kit.xr.system.simulatedxr" = {}
+"omni.kit.xr.ui.window.profile" = {}
+
+[dependencies."filter:platform"."linux-x86_64"]
+"isaacsim.kit.xr.teleop.bridge" = {}
+"isaacsim.replicator.teleop.ui" = {}
+
+[settings]
+rtx.spg.enabled = true # Enable RTX Sensor Processing Graphs feature
+rtx.hydra.supportMultiTickRate = false  # disable multi-tick rendering for XR VR
+rtx.rendering.perSensorTickTlas = false # disable per sensor tick tlas for XR VR
+
+[settings.app]
+name = "Isaac-Sim XR VR"
+version = "6.2.0"
+vulkan = true                       # Explicitly enable Vulkan
+enableDeveloperWarnings = false     # disable developer warnings to reduce log noise
+
+[settings.app.exts.folders]
+'++' = [
+    "${app}",
+    "${app}/../exts",
+    "${app}/../extscache",
+    "${app}/../extsUser",
+    "${app}/../extsDeprecated",
+]
+
+[settings.app.window]
+hideUi = false
+title = "Isaac Sim XR VR"

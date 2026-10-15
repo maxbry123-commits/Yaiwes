@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id = "motion_generation"
+title = "Motion Generation"
+summary = "Drive simulated robots with backend-neutral motion-generation controllers."
+kind = "collection"
+
+[[step]]
+example = "motion_generation.differential_drive"
+level = "beginner"
+
+[[step]]
+example = "motion_generation.holonomic_drive"
+level = "beginner"
+
+[[step]]
+example = "motion_generation.follow_target"
+level = "intermediate"
+
+[[step]]
+example = "motion_generation.follow_trajectory"
+level = "intermediate"
+
+[[step]]
+example = "motion_generation.pick_place_state_machine"
+level = "expert"

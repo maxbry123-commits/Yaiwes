@@ -1,0 +1,46 @@
+{
+    "OgnSampleBetweenSpheres": {
+        "version": 2,
+        "description": "Assigns uniformly sampled between two spheres",
+        "language": "Python",
+        "categoryDefinitions": "config/CategoryDefinition.json",
+        "categories": ["isaacReplicatorExamples"],
+        "icon": "icons/isaac-sim.svg",
+        "metadata": {
+            "uiName": "Sample Between Spheres"
+        },
+        "inputs": {
+            "prims": {
+                "type": "target",
+                "description": "prims to randomize",
+                "default": []
+            },
+            "execIn": {
+                "type": "execution",
+                "description": "exec",
+                "default": 0
+            },
+            "radius1": {
+                "type": "float",
+                "description": "inner sphere radius",
+                "default": 0.5
+            },
+            "radius2": {
+                "type": "float",
+                "description": "outer sphere radius",
+                "default": 1.0
+            },
+            "seed": {
+                "type": "int",
+                "description": "Random number generator seed. A negative value uses the Replicator global seed.",
+                "default": -1
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": "exec"
+            }
+        }
+    }
+}

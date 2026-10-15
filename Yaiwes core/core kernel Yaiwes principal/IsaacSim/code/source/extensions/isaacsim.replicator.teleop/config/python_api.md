@@ -1,0 +1,635 @@
+# Public API for module isaacsim.replicator.teleop:
+
+## Classes
+
+- class EndEffectorValidationResult
+  - def __init__(self)
+  - def add_error(self, message: str)
+  - def add_warning(self, message: str)
+  - def get_summary(self) -> str
+
+- class FloatingRigidBodyController
+  - def __init__(self, target_coordinate_system: CoordinateSystem = CoordinateSystem.ISAAC_SIM)
+  - def set_coordinate_system(self, target_coordinate_system: CoordinateSystem)
+  - def set_target_rotation_offsets(self, side: str, x_deg: float = DEFAULT_ROTATION_OFFSET_DEG, y_deg: float = DEFAULT_ROTATION_OFFSET_DEG, z_deg: float = DEFAULT_ROTATION_OFFSET_DEG)
+  - def set_gains(self, position_kp: float = 15.0, position_kd: float = 0.5, orientation_kp: float = 15.0, orientation_kd: float = 0.2, side: str | None = None)
+  - def set_prim_path(self, side: str, path: str | None)
+  - def get_prim_path(self, side: str) -> str | None
+  - def validate(self, side: str) -> tuple[bool, str]
+  - def configure(self, side: str) -> bool
+  - def enable(self, side: str) -> bool
+  - def disable(self, side: str)
+  - def destroy(self, side: str)
+  - def is_configured(self, side: str) -> bool
+  - def is_running(self, side: str) -> bool
+  - def set_targets(self, left_wrist_position: tuple[float, float, float] | None = None, left_wrist_orientation: tuple[float, float, float, float] | None = None, right_wrist_position: tuple[float, float, float] | None = None, right_wrist_orientation: tuple[float, float, float, float] | None = None)
+  - def apply_tracking(self)
+  - def reset_targets(self)
+  - def set_side_enabled(self, side: str, enabled: bool)
+  - [property] def is_enabled(self) -> bool
+  - [property] def left_end_effector_path(self) -> str | None
+  - [property] def right_end_effector_path(self) -> str | None
+
+- class GraspConfig
+  - name: str
+  - description: str
+  - joints: list[JointMapping]
+
+- class GraspController
+  - def __init__(self)
+  - def validate_prim(self, prim_path: str) -> GraspValidationResult
+  - def configure(self, prim_path: str, side: str, config: GraspConfig) -> bool
+  - def set_input(self, side: str, input_value: float)
+  - def set_joint_targets(self, side: str, joint_targets: dict[str, float])
+  - def remove(self, side: str)
+  - def remove_all(self)
+  - def set_side_tracking_enabled(self, side: str, enabled: bool)
+  - def is_side_tracking_enabled(self, side: str) -> bool
+  - [property] def has_any_side_tracking_enabled(self) -> bool
+  - [property] def is_enabled(self) -> bool
+  - def get_side_config(self, side: str) -> GraspConfig | None
+  - def get_side_drive_settings(self, side: str) -> tuple[str, str | None, dict[str, str]]
+  - [property] def left_prim_path(self) -> str | None
+  - [property] def right_prim_path(self) -> str | None
+
+- class GraspDriveMode(str, Enum)
+  - TRIGGER: str
+  - RETARGETED: str
+
+- class GraspRetargeterKind(str, Enum)
+  - TRIHAND: str
+
+- class GraspValidationResult
+  - is_valid: bool
+  - total_joints: int
+  - drive_joints: int
+  - mimic_joints: int
+  - controllable_joints: int
+  - errors: list[str]
+  - warnings: list[str]
+  - drive_joint_paths: list[str]
+
+- class IKMethod(Enum)
+  - DAMPED_LEAST_SQUARES: str
+  - PSEUDOINVERSE: str
+  - TRANSPOSE: str
+  - SVD: str
+  - [property] def description(self) -> str
+
+- class IKSolverType(Enum)
+  - POSITION_BASED: str
+  - VELOCITY_BASED: str
+  - LEVENBERG_MARQUARDT: str
+  - PINK: str
+  - [property] def supports_method(self) -> bool
+  - [property] def supports_gain(self) -> bool
+  - [property] def supports_pink_advanced(self) -> bool
+  - [property] def label(self) -> str
+  - [property] def description(self) -> str
+
+- class IKValidationResult
+  - valid: bool
+  - message: str
+  - articulation_path: str
+  - link_names: list[str]
+  - dof_names: list[str]
+  - num_dofs: int
+  - arm_dofs: int | None
+  - articulation_root_paths: list[str]
+  - is_fixed_base: bool | None
+  - arm_dof_names: list[str]
+  - arm_dof_indices: list[int]
+
+- class JointMapping
+  - name: str
+  - input_range: tuple[float, float]
+  - target_range: tuple[float, float]
+  - drive_stiffness: float | None
+  - drive_damping: float | None
+  - drive_max_force: float | None
+  - def compute_target(self, input_value: float) -> float
+
+- class LocomotionController
+  - DEADZONE: float
+  - DEFAULT_LINEAR_STEP: Unknown
+  - DEFAULT_ANGULAR_STEP: Unknown
+  - DEFAULT_LINEAR_SPEED: float
+  - DEFAULT_ANGULAR_SPEED: float
+  - def __init__(self)
+  - [property] def prim_path(self) -> str
+  - [property] def tracking_space_prim_path(self) -> str
+  - [property] def linear_step(self) -> float
+  - [property] def angular_step(self) -> float
+  - [property] def linear_speed(self) -> float
+  - [property] def angular_speed(self) -> float
+  - [property] def drive_mode(self) -> LocomotionDriveMode
+  - [property] def effective_drive_mode(self) -> LocomotionDriveMode
+  - [property] def is_running(self) -> bool
+  - [property] def carry_tracking_space_enabled(self) -> bool
+  - [property] def carry_tracking_space_available(self) -> bool
+  - def set_prim_path(self, path: str)
+  - def set_tracking_space_prim_path(self, path: str)
+  - def set_linear_step(self, step: float)
+  - def set_angular_step(self, step: float)
+  - def set_linear_speed(self, speed: float)
+  - def set_angular_speed(self, speed: float)
+  - def set_drive_mode(self, mode: LocomotionDriveMode | str)
+  - def set_edit_layer(self, layer: Sdf.Layer | None)
+  - def validate(self) -> tuple[bool, str]
+  - def enable(self) -> tuple[bool, str]
+  - def disable(self)
+  - def set_carry_tracking_space(self, enabled: bool) -> bool
+  - def stop_motion(self)
+  - def update(self, left_ctrl: Any, right_ctrl: Any)
+  - [property] def carries_tracking_space_implicitly(self) -> bool
+
+- class LocomotionDriveMode(str, Enum)
+  - AUTO: str
+  - TELEPORT: str
+  - VELOCITY: str
+
+- class PositionBasedIKController
+  - def __init__(self, robot: Articulation, ee_link: RigidPrim, ee_link_index: int, num_arm_dofs: int, method: str = 'damped-least-squares', scale: float = 1.0, damping: float = 0.05, vr_target_filter: float = 0.0, max_joint_step_rad: float = 0.0, min_manipulability: float = 0.001, error_scale_distance: float = 0.5)
+  - [property] def reachable(self) -> bool
+  - [property] def vr_target_filter(self) -> float
+  - [vr_target_filter.setter] def vr_target_filter(self, value: float)
+  - [property] def max_joint_step_rad(self) -> float
+  - [max_joint_step_rad.setter] def max_joint_step_rad(self, value: float)
+  - [property] def method(self) -> str
+  - [method.setter] def method(self, value: str)
+  - def set_target(self, position: tuple[float, float, float], orientation: tuple[float, float, float, float] | None)
+  - def compute(self) -> np.ndarray | None
+  - def reset(self)
+
+- class RobotIKController
+  - def __init__(self, target_coordinate_system: CoordinateSystem = CoordinateSystem.ISAAC_SIM)
+  - def set_on_status_changed(self, callback: _StatusChangedCallback | None)
+  - def set_coordinate_system(self, target_coordinate_system: CoordinateSystem)
+  - def set_articulation_path(self, side: Literal[left, right], prim_path: str | None)
+  - def set_ee_link_name(self, side: Literal[left, right], name: str)
+  - def set_ee_rotation_offsets(self, side: Literal[left, right], x_deg: float = DEFAULT_ROTATION_OFFSET_DEG, y_deg: float = DEFAULT_ROTATION_OFFSET_DEG, z_deg: float = DEFAULT_ROTATION_OFFSET_DEG)
+  - def compute_arm_dofs(self, side: Literal[left, right]) -> int | None
+  - def compute_arm_dof_names(self, side: Literal[left, right]) -> list[str] | None
+  - def get_arm_dof_indices(self, side: Literal[left, right]) -> list[int]
+  - def set_num_arm_dofs(self, side: Literal[left, right], n: int)
+  - def set_ik_method(self, side: Literal[left, right], method: IKMethod)
+  - def get_ik_method(self, side: Literal[left, right]) -> IKMethod
+  - def set_scale(self, side: Literal[left, right], scale: float)
+  - def set_damping(self, side: Literal[left, right], damping: float)
+  - def set_vr_target_filter(self, side: Literal[left, right], value: float)
+  - def set_max_joint_step(self, side: Literal[left, right], value: float)
+  - def set_solver_type(self, side: Literal[left, right], solver_type: IKSolverType) -> tuple[bool, str]
+  - def get_solver_type(self, side: Literal[left, right]) -> IKSolverType
+  - static def get_solver_availability(solver_type: IKSolverType) -> tuple[bool, str]
+  - def set_gain(self, side: Literal[left, right], value: float)
+  - def get_gain(self, side: Literal[left, right]) -> float
+  - def set_pink_task_gain(self, side: Literal[left, right], value: float)
+  - def get_pink_task_gain(self, side: Literal[left, right]) -> float
+  - def set_pink_qp_solver(self, side: Literal[left, right], solver_name: str) -> tuple[bool, str]
+  - def get_pink_qp_solver(self, side: Literal[left, right]) -> str
+  - static def get_pink_qp_solver_names() -> tuple[str, Ellipsis]
+  - static def get_pink_qp_solver_availability(solver_name: str) -> tuple[bool, str]
+  - def set_pink_posture_cost(self, side: Literal[left, right], value: float)
+  - def get_pink_posture_cost(self, side: Literal[left, right]) -> float
+  - def set_pink_lm_damping(self, side: Literal[left, right], value: float)
+  - def get_pink_lm_damping(self, side: Literal[left, right]) -> float
+  - def validate(self, side: Literal[left, right]) -> IKValidationResult
+  - def configure(self, side: Literal[left, right]) -> bool
+  - def enable(self, side: Literal[left, right]) -> bool
+  - def disable(self, side: Literal[left, right])
+  - def destroy(self, side: Literal[left, right])
+  - def is_configured(self, side: Literal[left, right]) -> bool
+  - def is_running(self, side: Literal[left, right]) -> bool
+  - def is_reachable(self, side: Literal[left, right]) -> bool
+  - def update_targets(self, left_pos: tuple[float, float, float] | None, left_orient: tuple[float, float, float, float] | None, right_pos: tuple[float, float, float] | None, right_orient: tuple[float, float, float, float] | None)
+
+- class VelocityBasedIKController
+  - def __init__(self, robot: Articulation, ee_link: RigidPrim, ee_link_index: int, num_arm_dofs: int, method: str = 'damped-least-squares', damping: float = 0.05, min_singular_value: float = 1e-05, gain: float = 5.0, max_joint_step_rad: float = 0.0)
+  - [property] def reachable(self) -> bool
+  - [property] def gain(self) -> float
+  - [gain.setter] def gain(self, value: float)
+  - [property] def max_joint_step_rad(self) -> float
+  - [max_joint_step_rad.setter] def max_joint_step_rad(self, value: float)
+  - [property] def method(self) -> str
+  - [method.setter] def method(self, value: str)
+  - [property] def damping(self) -> float
+  - [damping.setter] def damping(self, value: float)
+  - [property] def vr_target_filter(self) -> float
+  - [vr_target_filter.setter] def vr_target_filter(self, value: float)
+  - def set_target(self, position: tuple[float, float, float], orientation: tuple[float, float, float, float] | None)
+  - def compute(self) -> np.ndarray | None
+  - def reset(self)
+
+- class TeleopCapabilities
+  - debug_input: bool
+  - scripted_motion: bool
+  - live_input: bool
+  - mcap_replay: bool
+  - pink_ik: bool
+  - native_input_unavailable_reason: str
+  - pink_ik_unavailable_reason: str
+
+- class CoordinateSystem(Enum)
+  - RAW: str
+  - ISAAC_SIM: str
+
+- class MarkersManager
+  - MARKERS_SCOPE: str
+  - ORIGIN_PATH: Unknown
+  - MARKER_PATHS: dict[str, str]
+  - DEFAULT_MARKER_POSES: dict[str, tuple[tuple[float, float, float], tuple[float, float, float, float]]]
+  - FRAME_ASSET_PATH: str
+  - DEFAULT_FRAME_SCALE: float
+  - FRAME_CHILD_NAME: str
+  - SUPPORTED_BACKENDS: tuple[str, Ellipsis]
+  - def __init__(self)
+  - [property] def has_active_markers(self) -> bool
+  - [property] def layer(self) -> Sdf.Layer | None
+  - [property] def frame_scale(self) -> float
+  - [property] def backend(self) -> str
+  - def set_backend(self, backend: Literal[usd, usdrt, fabric])
+  - class def get_default_marker_pose(cls, name: str) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]
+  - def get_marker_world_pose(self, name: str) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None
+  - def clear_cached_state(self)
+  - def set_frame_scale(self, scale: float)
+  - def move_tracking_space_to(self, source_prim_path: str) -> bool
+  - def set_origin_world_pose(self, position: tuple[float, float, float], orientation: tuple[float, float, float, float]) -> bool
+  - def ensure_marker(self, name: str) -> tuple[bool, str]
+  - def remove_marker(self, name: str) -> bool
+  - def remove_all_markers(self) -> bool
+  - def update_marker_transform(self, name: str, position: tuple[float, float, float] | None = None, orientation: tuple[float, float, float, float] | None = None)
+  - def update_marker_transforms(self, left_position: tuple[float, float, float] | None = None, left_orientation: tuple[float, float, float, float] | None = None, right_position: tuple[float, float, float] | None = None, right_orientation: tuple[float, float, float, float] | None = None, head_position: tuple[float, float, float] | None = None, head_orientation: tuple[float, float, float, float] | None = None)
+  - def update_marker_world_transforms(self, left_position: tuple[float, float, float] | None = None, left_orientation: tuple[float, float, float, float] | None = None, right_position: tuple[float, float, float] | None = None, right_orientation: tuple[float, float, float, float] | None = None, head_position: tuple[float, float, float] | None = None, head_orientation: tuple[float, float, float, float] | None = None)
+  - def reset_marker_transform(self, name: str)
+  - def reset_marker_transforms(self)
+
+- class VisualCuesManager
+  - CUES_SCOPE: str
+  - SIDE_PATHS: dict[SideName, str]
+  - CYLINDER_CHILD: str
+  - MATERIAL_CHILD: str
+  - DEFAULT_REFERENCE_Z: float
+  - DEFAULT_SIZE: float
+  - DEFAULT_OPACITY: float
+  - MIN_SIZE: float
+  - MIN_OPACITY: float
+  - MAX_OPACITY: float
+  - def __init__(self)
+  - [property] def reference_z(self) -> float
+  - [property] def size(self) -> float
+  - [property] def opacity(self) -> float
+  - def set_pose_provider(self, provider: PoseProvider | None)
+  - def set_reference_z(self, value: float)
+  - def set_size(self, value: float)
+  - def set_opacity(self, value: float)
+  - def get_override_prim_path(self, side: SideName) -> str
+  - def set_override_prim_path(self, side: SideName, path: str)
+  - def is_side_active(self, side: SideName) -> bool
+  - def get_side_status(self, side: SideName) -> str
+  - def show_side(self, side: SideName) -> tuple[bool, str]
+  - def hide_side(self, side: SideName) -> bool
+  - def hide_all(self)
+  - def clear_cached_state(self)
+
+- class VisualCueSideProfile
+  - enabled: bool
+  - prim_path: str
+
+- class VisualCuesProfile
+  - reference_z: float
+  - opacity: float
+  - size: float
+  - left: VisualCueSideProfile
+  - right: VisualCueSideProfile
+
+- class TeleopControllerRecordable(Recordable)
+  - TYPE_ID: str
+  - def __init__(self)
+  - def describe_channels(self) -> dict[str, ChannelDescriptor]
+  - def on_session_open(self, stage: Any)
+  - def on_session_close(self)
+  - def sample(self) -> dict[str, Any]
+  - def apply(self, frame: Mapping[str, Any])
+  - def to_manifest(self) -> dict[str, Any]
+  - class def from_manifest(cls, entry: Mapping[str, Any]) -> TeleopControllerRecordable
+
+- class TeleopHeadRecordable(Recordable)
+  - TYPE_ID: str
+  - def __init__(self)
+  - def describe_channels(self) -> dict[str, ChannelDescriptor]
+  - def on_session_open(self, stage: Any)
+  - def on_session_close(self)
+  - def sample(self) -> dict[str, np.ndarray]
+  - def apply(self, frame: Mapping[str, Any])
+  - def to_manifest(self) -> dict[str, Any]
+  - class def from_manifest(cls, entry: Mapping[str, Any]) -> TeleopHeadRecordable
+
+- class TeleopCommand(Enum)
+  - CONNECT: str
+  - START: str
+  - STOP: str
+  - RESET: str
+  - DISCONNECT: str
+
+- class TeleopManager
+  - def __init__(self)
+  - def set_on_stage_cleanup_completed(self, callback: Callable[[], None] | None)
+  - def destroy_all_controllers(self)
+  - def set_on_command_executed(self, callback: Callable[[TeleopCommand, bool, str], None] | None)
+  - def set_on_status_changed(self, callback: Callable[[str], None] | None)
+  - def execute_command(self, command: TeleopCommand) -> tuple[bool, str]
+  - [property] def is_connected(self) -> bool
+  - def connect(self, on_status_changed: Callable[[str], None] | None = None) -> bool
+  - def connect_provider(self, provider: TeleopFrameProvider, on_status_changed: Callable[[str], None] | None = None) -> bool
+  - def disconnect(self, on_status_changed: Callable[[str], None] | None = None)
+  - [property] def input_mode(self) -> TeleopInputMode | None
+  - [property] def last_input_frame(self) -> TeleopFrame | None
+  - [property] def debug_tracking_enabled(self) -> bool
+  - def set_debug_tracking(self, enabled: bool)
+  - def set_debug_trigger(self, side: str, value: float)
+  - def set_debug_squeeze(self, side: str, value: float)
+  - def set_debug_thumbstick(self, side: str)
+  - def set_debug_button(self, side: str, button: str, pressed: bool)
+  - [property] def carry_tracking_space_enabled(self) -> bool
+  - [property] def carry_tracking_space_available(self) -> bool
+  - def set_carry_tracking_space(self, enabled: bool) -> bool
+  - def set_coordinate_system(self, system: CoordinateSystem)
+  - def disable_tracking_space(self)
+  - def set_builtin_tracking_space(self) -> tuple[bool, str]
+  - def set_tracking_space_prim_path(self, path: str) -> tuple[bool, str]
+  - [property] def tracking_space_prim_path(self) -> str
+  - [property] def xr_anchor(self) -> XrAnchorManager | None
+  - def set_xr_anchor_pos(self, pos: tuple[float, float, float])
+  - def set_xr_anchor_rotation_mode(self, mode: AnchorRotationMode)
+  - def set_xr_anchor_smoothing_time(self, seconds: float)
+  - def set_xr_anchor_fixed_height(self, fixed: bool)
+  - def set_markers_manager(self, markers_manager: MarkersManager)
+  - def set_live_tracking(self, enabled: bool)
+  - [property] def is_live_tracking(self) -> bool
+  - def get_input_world_position(self, side: str) -> tuple[float, float, float] | None
+  - def set_floating_controller(self, controller: FloatingRigidBodyController | None)
+  - def set_floating_side_assigned(self, side: str, assigned: bool)
+  - def clear_floating_side(self, side: str)
+  - def is_floating_side_assigned(self, side: str) -> bool
+  - def set_grasp_controller(self, controller: GraspController | None)
+  - def set_ik_controller(self, controller: RobotIKController | None)
+  - def set_locomotion_controller(self, controller: LocomotionController | None)
+  - def set_locomotion_tracking(self, enabled: bool)
+  - [property] def is_locomotion_tracking(self) -> bool
+  - def set_grasp_tracking(self, enabled: bool)
+  - [property] def is_grasp_tracking(self) -> bool
+  - def set_floating_tracking(self, enabled: bool)
+  - [property] def is_floating_tracking(self) -> bool
+  - def add_input_frame_observer(self, observer: Callable[[TeleopFrame], None])
+  - def remove_input_frame_observer(self, observer: Callable[[TeleopFrame], None])
+  - def add_controller_inputs_observer(self, observer: Callable[[object | None, object | None], None])
+  - def remove_controller_inputs_observer(self, observer: Callable[[object | None, object | None], None])
+  - def add_head_observer(self, observer: Callable[[object | None], None])
+  - def remove_head_observer(self, observer: Callable[[object | None], None])
+  - def destroy(self)
+
+- class LiveTeleopFrameProvider(TeleopFrameProvider)
+  - def __init__(self)
+  - [property] def input_mode(self) -> TeleopInputMode
+  - [property] def session(self) -> object | None
+  - [property] def controller_tracker(self) -> object | None
+  - def open(self)
+  - def poll(self) -> TeleopPollResult
+  - def close(self)
+
+- class McapTeleopFrameProvider(TeleopFrameProvider)
+  - def __init__(self, path: str | Path)
+  - [property] def input_mode(self) -> TeleopInputMode
+  - [property] def path(self) -> Path
+  - [property] def session(self) -> object | None
+  - [property] def controller_tracker(self) -> object | None
+  - def open(self)
+  - def poll(self) -> TeleopPollResult
+  - def close(self)
+  - def rewind(self) -> bool
+
+- class TeleopControllerState
+  - snapshot: object | None
+  - source_aim_pose: TeleopPose
+  - local_aim_pose: TeleopPose
+  - world_aim_pose: TeleopPose
+
+- class TeleopFrame
+  - sequence_id: int
+  - monotonic_time_ns: int
+  - input_mode: TeleopInputMode
+  - left: TeleopControllerState
+  - right: TeleopControllerState
+  - head: TeleopHeadState
+  - source_time_ns: int | None
+
+- class TeleopFrameProvider(ABC)
+  - [property] def input_mode(self) -> TeleopInputMode
+  - def open(self)
+  - def poll(self) -> TeleopPollResult
+  - def close(self)
+  - def rewind(self) -> bool
+
+- class TeleopHeadState
+  - snapshot: object | None
+  - source_pose: TeleopPose
+  - local_pose: TeleopPose
+  - world_pose: TeleopPose
+
+- class TeleopInputMode(str, Enum)
+  - LIVE: str
+  - DEBUG: str
+  - MCAP_REPLAY: str
+
+- class TeleopInputUnavailableError(RuntimeError)
+
+- class TeleopPollResult
+  - status: TeleopPollStatus
+  - frame: TeleopFrame | None
+  - message: str
+
+- class TeleopPollStatus(str, Enum)
+  - FRAME: str
+  - NO_DATA: str
+
+- class TeleopPose
+  - position: tuple[float, float, float] | None
+  - orientation_xyzw: tuple[float, float, float, float] | None
+  - is_valid: bool
+  - class def from_values(cls, position: tuple[float, float, float] | None, orientation_xyzw: tuple[float, float, float, float] | None) -> TeleopPose
+
+- class BimanualControllerProfile
+  - left: ControllerSideProfile
+  - right: ControllerSideProfile
+
+- class ControllerSideProfile
+  - enabled: bool
+  - settings: dict[str, Any]
+
+- class GraspControllerProfile
+  - left: GraspSideProfile
+  - right: GraspSideProfile
+
+- class GraspSideProfile
+  - enabled: bool
+  - prim_path: str
+  - config_path: str
+  - drive_mode: str
+  - retargeter_kind: str
+  - joint_aliases: dict[str, str]
+
+- class LocomotionProfile
+  - enabled: bool
+  - settings: dict[str, Any]
+
+- class TeleopProfile
+  - session: TeleopSettingsProfile
+  - floating: BimanualControllerProfile
+  - ik: BimanualControllerProfile
+  - grasp: GraspControllerProfile
+  - locomotion: LocomotionProfile
+  - visual_cues: VisualCuesProfile
+  - def to_dict(self) -> dict[str, Any]
+
+- class TeleopSettingsProfile
+  - coordinate_system: str
+  - tracking_space_enabled: bool
+  - tracking_space_path: str
+  - marker_scale: float
+  - anchor_x: float
+  - anchor_y: float
+  - anchor_z: float
+  - anchor_rotation_mode: str
+  - anchor_smoothing: float
+  - anchor_fixed_height: bool
+
+- class TeleopResolutionReport
+  - stage_state: str
+  - stage_message: str
+  - issues: list[TeleopResolverIssue]
+  - [property] def error_count(self) -> int
+  - [property] def warning_count(self) -> int
+  - [property] def ready(self) -> bool
+
+- class TeleopResolverIssue
+  - source: str
+  - severity: str
+  - message: str
+
+- class ValidationResult
+  - errors: list[str]
+  - warnings: list[str]
+  - blocks_tracking: bool
+  - [property] def is_valid(self) -> bool
+
+- class VRButton(str, Enum)
+  - LEFT_PRIMARY: str
+  - LEFT_SECONDARY: str
+  - LEFT_THUMBSTICK: str
+  - RIGHT_PRIMARY: str
+  - RIGHT_SECONDARY: str
+  - RIGHT_THUMBSTICK: str
+
+- class VRRecordingButton
+  - def __init__(self, teleop_manager: Any)
+  - [property] def is_attached(self) -> bool
+  - def attach(self)
+  - def detach(self)
+  - def destroy(self)
+
+- class AnchorRotationMode(Enum)
+  - FIXED: str
+  - FOLLOW_PRIM: str
+  - FOLLOW_PRIM_SMOOTHED: str
+
+- class XrAnchorManager
+  - DEFAULT_ANCHOR_PATH: str
+  - def __init__(self, anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.0), anchor_rot_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0), tracking_space_prim_path: str = '', rotation_mode: AnchorRotationMode = AnchorRotationMode.FIXED, smoothing_time: float = 1.0, fixed_height: bool = True, near_plane: float = 0.15)
+  - def setup(self) -> bool
+  - def cleanup(self)
+  - def reset(self)
+  - [property] def anchor_prim_path(self) -> str
+  - [property] def tracking_space_prim_path(self) -> str
+  - [property] def is_xr_profile_configured(self) -> bool
+  - def set_anchor_pos(self, pos: tuple[float, float, float])
+  - def set_anchor_rot(self, rot_xyzw: tuple[float, float, float, float])
+  - def set_tracking_space_prim_path(self, path: str)
+  - def set_rotation_mode(self, mode: AnchorRotationMode)
+  - def set_smoothing_time(self, seconds: float)
+  - def set_fixed_height(self, fixed: bool)
+  - def toggle_rotation(self)
+  - def get_world_matrix(self) -> np.ndarray
+  - def sync(self) -> bool
+  - def get_world_pose(self) -> tuple[Gf.Vec3d, Gf.Quatd]
+
+## Functions
+
+- def get_teleop_backend() -> str
+- def set_teleop_backend(backend: Literal['usd', 'usdrt', 'fabric'] | None)
+- def teleop_backend_ctx() -> Generator[None, None, None]
+- def get_builtin_grasp_config_uri(name: str) -> str
+- def get_builtin_grasp_configs() -> list[tuple[str, str]]
+- def load_grasp_config(path: str) -> tuple[GraspConfig | None, list[str]]
+- def normalize_grasp_config_path(path: str) -> str
+- def get_teleop_capabilities() -> TeleopCapabilities
+- def compute_retargeted_joint_targets() -> dict[str, float]
+- def compute_trihand_joint_values(trigger: float, squeeze: float) -> list[float]
+- def map_trihand_to_joint_targets(trihand_values: list[float], grasp_config: GraspConfig, joint_aliases: dict[str, str]) -> dict[str, float]
+- def parse_grasp_drive_mode(value: str | GraspDriveMode | None) -> GraspDriveMode
+- def parse_grasp_retargeter_kind(value: str | GraspRetargeterKind | None) -> GraspRetargeterKind | None
+- def parse_joint_aliases(value: Any) -> dict[str, str]
+- def validate_trihand_joint_aliases(grasp_config: GraspConfig | None, joint_aliases: dict[str, str] | None) -> list[str]
+- def get_floating_gripper_paths(teleop_root: str, side: str, gripper: str | Mapping[str, Any]) -> dict[str, str]
+- def get_floating_gripper_spec(name: str) -> dict[str, Any]
+- def get_supported_floating_grippers() -> tuple[str, Ellipsis]
+- async def load_floating_grippers_async(assignments: Mapping[str, str], spawn_poses: PoseMap) -> dict[str, dict[str, str]]
+- async def move_floating_grippers_to_targets_async(context: dict[str, Any], targets: PoseMap) -> MotionResult
+- async def resolve_floating_gripper_asset_path_async(asset_path: str) -> str
+- async def set_floating_gripper_grasp_async(context: Mapping[str, Any], close: bool)
+- async def setup_floating_gripper_controllers_async(assignments: Mapping[str, str], paths: Mapping[str, Mapping[str, str]], initial_poses: PoseMap) -> dict[str, Any]
+- def stop_floating_gripper_controllers(context: Mapping[str, Any])
+- def apply_cloudxr_env(values: dict[str, str])
+- def cloudxr_env_filepath(install_dir: Path | None = None) -> Path
+- def is_cloudxr_runtime_ready(install_dir: Path | None = None) -> bool
+- def load_and_apply_cloudxr_env(install_dir: Path | None = None) -> Path
+- def parse_cloudxr_env_file(path: Path) -> dict[str, str]
+- def prepare_live_cloudxr_env(install_dir: Path | None = None) -> tuple[bool, str]
+- def transform_pose(position: tuple[float, float, float], orientation: tuple[float, float, float, float] | None, target_system: CoordinateSystem) -> tuple[tuple[float, float, float], tuple[float, float, float, float] | None]
+- def transform_pose_openxr_to_isaacsim(position: tuple[float, float, float], orientation: tuple[float, float, float, float] | None = None) -> tuple[tuple[float, float, float], tuple[float, float, float, float] | None]
+- def build_teleop_recorder(output_dir: str) -> EpisodeRecorder
+- def dispatch_command(command: TeleopCommand | str)
+- def install_teleop_session_injector(teleop_manager: Any) -> Callable[[], None]
+- def get_builtin_teleop_profiles_dir() -> str
+- def get_last_teleop_profile_path() -> str
+- def load_teleop_profile(path: str) -> tuple[TeleopProfile | None, list[str]]
+- def save_teleop_profile(path: str, profile: TeleopProfile) -> tuple[bool, str]
+- def scan_teleop_profiles(directory: str) -> list[tuple[str, str]]
+- async def execute_pose_trajectory_async(trajectory: Sequence[PoseMap], apply_targets: ApplyTargetsCallback, read_poses: ReadPosesCallback, update_async: UpdateCallback) -> MotionResult
+- def interpolate_pose_targets(starts: PoseMap, targets: PoseMap, sample_count: int = 100) -> list[dict[str, Pose]]
+- def make_pose(position: Sequence[float], orientation: Sequence[float] = (1.0, 0.0, 0.0, 0.0)) -> Pose
+- async def move_debug_markers_to_world_targets_async(markers_manager: object, controlled_prims: Mapping[str, object], targets: PoseMap, update_async: UpdateCallback) -> MotionResult
+- async def move_to_pose_targets_async(starts: PoseMap, targets: PoseMap, apply_targets: ApplyTargetsCallback, read_poses: ReadPosesCallback, update_async: UpdateCallback) -> MotionResult
+- async def set_debug_grasp_async(teleop_manager: object, sides: Sequence[str], close: bool, update_async: UpdateCallback)
+- def set_debug_markers_world_poses(markers_manager: object, targets: PoseMap)
+- async def wait_for_controllers_running_async(controllers: Mapping[str, object], update_async: UpdateCallback) -> bool
+- def resolve_teleop_profile(profile: TeleopProfile) -> TeleopResolutionReport
+- def validate_floating_end_effector(prim_path: str) -> ValidationResult
+- def validate_marker_path(prim_path: str) -> ValidationResult
+- def activate_pre_session_anchor() -> bool
+- def restore_pre_session_anchor()
+
+## Variables
+
+- BUILTIN_GRASP_CONFIG_SCHEME: str
+- TRIHAND_SEMANTIC_JOINTS: tuple[str, Ellipsis]
+- OXR_TO_ISS_QUAT: tuple[float, float, float, float]
+- OXR_TO_ISS_ROTATION: np.ndarray
+- TELEOP_CMD_EVENT: str
+- TELEOP_STATUS_EVENT: str
+- MotionResult: Unknown
+- Pose: Unknown
+- SEVERITY_ERROR: str
+- SEVERITY_WARNING: str
+- STAGE_STATE_LOADING: str
+- STAGE_STATE_NO_STAGE: str
+- STAGE_STATE_READY: str

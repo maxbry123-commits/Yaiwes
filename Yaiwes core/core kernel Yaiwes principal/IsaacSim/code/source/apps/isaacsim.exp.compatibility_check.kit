@@ -1,0 +1,59 @@
+[package]
+description = "App for checking system requirements and compatibility"
+title = "Isaac Sim Compatibility Checker App"
+version = "6.2.0"
+
+# That makes it browsable in UI with "experience" filter
+keywords = ["app", "isaac-sim", "compatibility"]
+
+[dependencies]
+"isaacsim.app.compatibility_check" = { order = 9999 }
+"omni.kit.uiapp" = {}
+"omni.kit.telemetry" = {}
+"omni.ui" = {}
+
+[settings]
+rtx.spg.enabled = true # Enable RTX Sensor Processing Graphs feature
+
+[settings.app]
+name = "Isaac-Sim_Compatibility_Checker"
+version = "6.2.0"
+window.title = "Isaac Sim Compatibility Checker App"
+
+extensions.enabledCore = []
+settings.persistent = true
+settings.standalone_mode = true
+
+# controled update rate
+runLoops.main.rateLimitEnabled = true
+runLoops.main.rateLimitFrequency = 60
+runLoops.main.rateLimitUseBusyLoop = false
+
+# window size
+window.width = 500
+window.height = 545
+window.noResize = true
+
+# window center position
+window.x = -1
+window.y = -1
+
+# icon
+window._iconSize = 256
+window.iconPath = "${isaacsim.app.compatibility_check}/data/app/isaacsim.png"
+
+# window properties
+window.alwaysOnTop = false
+window.fullscreen = false
+window.noDecorations = false
+window.scaleToMonitor = true
+
+fastShutdown = true
+
+[settings.app.exts]
+folders = [
+    "${app}/../exts",
+    "${app}/../extscache",
+    "${app}/../extsUser",
+    "${app}/../extsDeprecated",
+]

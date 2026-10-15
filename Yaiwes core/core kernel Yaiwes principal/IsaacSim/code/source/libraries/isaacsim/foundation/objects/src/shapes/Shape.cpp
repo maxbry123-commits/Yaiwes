@@ -1,0 +1,171 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <isaacsim/common/string/String.hpp>
+#include <isaacsim/foundation/objects/shapes/Shape.hpp>
+
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <type_traits>
+#include <variant>
+
+namespace isaacsim
+{
+namespace foundation
+{
+namespace objects
+{
+namespace shapes
+{
+
+namespace string = isaacsim::common::string;
+
+Shape::Shape(const std::variant<std::string, std::vector<std::string>>& paths,
+             const std::string& shapeType,
+             const std::optional<ColorType>& colors,
+             bool resetXformOpProperties)
+    : Xform()
+{
+    // Get or create shape prims.
+    auto [existentPaths, nonexistentPaths] = this->resolvePaths(paths);
+    // Get shape prims.
+    if (!existentPaths.empty())
+    {
+        m_paths = std::move(existentPaths);
+        const std::vector<bool> isShape = this->isA(shapeType).flatten().get<std::vector<bool>>();
+        for (std::size_t i = 0; i < m_paths.size(); ++i)
+        {
+            if (!isShape[i])
+            {
+                throw std::runtime_error("The wrapped prim at path '" + m_paths[i] + "' is not a USD" + shapeType);
+            }
+        }
+    }
+    // Create shape prims.
+    else
+    {
+        m_paths = std::move(nonexistentPaths);
+        for (const auto& path : m_paths)
+        {
+            this->getStage().definePrim(path, shapeType);
+        }
+    }
+    // Initialize instance from arguments.
+    _initialize(resetXformOpProperties);
+    if (colors.has_value())
+    {
+        this->setDisplayColors(*colors);
+    }
+}
+
+array::Array Shape::getDisplayColors(const std::optional<array::Array>& indices)
+{
+    (void)indices;
+    return array::Array(std::vector<double>{ 0.0, 0.0, 0.0 });
+}
+
+void Shape::updateExtents()
+{
+}
+
+void Shape::setDisplayColors(const ColorType& colors, const std::optional<array::Array>& indices)
+{
+    const int64_t batchSize = _resolveIndexedSize(indices);
+    // Color tokens resolve to one RGB triple per selected prim, while numeric values are taken as given.
+    const array::Array values = std::visit(
+        [this, &indices](const auto& value) -> array::Array
+        {
+            if constexpr (std::is_same_v<std::decay_t<decltype(value)>, array::Array>)
+            {
+                return value;
+            }
+            else
+            {
+                const std::vector<std::string> tokens = _resolveStringList(value, indices);
+                std::vector<std::vector<float>> components;
+                components.reserve(tokens.size());
+                for (const std::string& token : tokens)
+                {
+                    components.push_back(string::resolveColor(token));
+                }
+                return array::Array(components);
+            }
+        },
+        colors);
+    // Array-typed attributes are not broadcast by 'setAttributeValues', so the values are laid out here: a
+    // scalar or flat input describes a single color (an RGB triple, or a grayscale value that spreads over the
+    // three channels), which a leading axis of one keeps apart from an input holding one color per prim. The
+    // primvar itself holds an array of colors per prim, hence the trailing one-element axis.
+    // TODO: Set the 'interpolation' metadata of 'primvars:displayColor' to 'constant'. USD stores it as
+    //       attribute metadata, which no stage backend exposes yet, so a prim already authored with a
+    //       per-point interpolation keeps it even though it now holds a single color.
+    const array::Array shapedValues =
+        values.ndim() <= 1 ? values.reshape(array::Shape({ int64_t{ 1 }, static_cast<int64_t>(values.size()) })) : values;
+    this->setAttributeValues("primvars:displayColor",
+                             shapedValues.broadcastTo(array::Shape({ batchSize, int64_t{ 3 } }))
+                                 .reshape(array::Shape({ batchSize, int64_t{ 1 }, int64_t{ 3 } })),
+                             indices);
+}
+
+std::vector<std::string> Shape::_resolveAxes(const std::variant<std::string, std::vector<std::string>>& axes)
+{
+    // Normalize each axis to uppercase and validate it is exactly one of "X", "Y", or "Z".
+    auto normalize = [](const std::string& axis) -> std::string
+    {
+        if (axis.size() != 1)
+        {
+            throw std::invalid_argument("Invalid axis '" + axis + "': expected a single character \"X\", \"Y\", or \"Z\"");
+        }
+        char value = static_cast<char>(std::toupper(static_cast<unsigned char>(axis[0])));
+        if (value != 'X' && value != 'Y' && value != 'Z')
+        {
+            throw std::invalid_argument("Invalid axis '" + axis + "': expected one of \"X\", \"Y\", or \"Z\"");
+        }
+        return std::string(1, value);
+    };
+
+    return std::visit(
+        [&normalize](const auto& axes) -> std::vector<std::string>
+        {
+            using T = std::decay_t<decltype(axes)>;
+            if constexpr (std::is_same_v<T, std::string>)
+            {
+                return { normalize(axes) };
+            }
+            else
+            {
+                std::vector<std::string> result;
+                result.reserve(axes.size());
+                for (const auto& axis : axes)
+                {
+                    result.push_back(normalize(axis));
+                }
+                return result;
+            }
+        },
+        axes);
+}
+
+array::Array Shape::areOfType(const std::variant<std::string, std::vector<std::string>>& paths)
+{
+    return Prim(paths).isA("Gprim");
+}
+
+} // namespace shapes
+} // namespace objects
+} // namespace foundation
+} // namespace isaacsim

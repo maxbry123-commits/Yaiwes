@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id = "physics_sensors.joint_state_sensor"
+title = "Joint State Sensor"
+summary = "Read position, velocity, and effort for every degree of freedom in an articulation."
+owners = [
+    "isaacsim.common.logging",
+    "isaacsim.foundation.objects",
+    "isaacsim.physics.entities",
+    "isaacsim.physics.manager",
+    "isaacsim.physics_engines.ovphysx",
+]
+topics = ["articulation", "physics", "robotics", "sensors", "usd"]
+
+[build]
+adapter = "none"
+
+[run]
+adapter = "python"
+path = "main.py"
+
+[requirements]
+system = ["python"]
+modules = [
+    { name = "isaacsim_common", surfaces = ["python"] },
+    { name = "isaacsim_foundation", surfaces = ["python"] },
+    { name = "isaacsim_physics", surfaces = ["python"] },
+    { name = "isaacsim_physics_engines", surfaces = ["python"] },
+]
+
+[[test]]
+name = "default"
+# The robot is fetched from the Isaac Sim asset root, so the first run pays for the download.
+timeout_seconds = 300
+stdout_contains = [
+    "Joint state of the articulation at /Articulation.",
+    "Reporting measured joint effort, not commanded actuation.",
+    "The stage is authored in meters, so the raw DOF values are already SI.",
+    "Moving at t =",
+    "Slider parked on its limit at t =",
+]
+
+
+[[test]]
+name = "unit"
+path = "test.py"
+stdout_contains = [
+    "joint_state.py unit tests passed.",
+]

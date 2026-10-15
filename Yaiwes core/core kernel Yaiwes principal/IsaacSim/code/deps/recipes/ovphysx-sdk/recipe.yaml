@@ -1,0 +1,47 @@
+context:
+  version: "0.6.3"
+
+package:
+  name: ovphysx-sdk
+  version: ${{ version }}
+
+source:
+  - if: linux and x86_64
+    then:
+      - url: https://github.com/NVIDIA-Omniverse/PhysX/releases/download/ovphysx-${{ version }}/ovphysx-linux-x86_64-${{ version }}.tar.gz
+        sha256: e112b3e7ce608f85d519d8b755632a494d0f89cf2f8afb14f31833c215e1fc37
+  - if: linux and aarch64
+    then:
+      - url: https://github.com/NVIDIA-Omniverse/PhysX/releases/download/ovphysx-${{ version }}/ovphysx-linux-aarch64-${{ version }}.tar.gz
+        sha256: 54f1a322cf049d5c10a694429dbd80192ebcb6dba60d0e728ff240f0bd821233
+  - if: win
+    then:
+      - url: https://github.com/NVIDIA-Omniverse/PhysX/releases/download/ovphysx-${{ version }}/ovphysx-windows-x86_64-${{ version }}.zip
+        sha256: baaaf6981e52b39f29d6498524fae39a2e3a17fa5225bd6db1fc0a5fe88dea92
+
+requirements:
+  build:
+    - python ==3.12.13
+
+build:
+  number: 1
+  dynamic_linking:
+    binary_relocation: false
+  script:
+    - if: win
+      then: python "%RECIPE_DIR%/install.py"
+      else: python "$RECIPE_DIR/install.py"
+
+tests:
+  - package_contents:
+      files:
+        - ovphysx/LICENSE.txt
+        - ovphysx/include/ovphysx/ovphysx.h
+        - ovphysx/lib/cmake/ovphysx/ovphysxConfig.cmake
+
+about:
+  homepage: https://nvidia-omniverse.github.io/PhysX/ovphysx/
+  license: LicenseRef-NvidiaProprietary
+  license_file: LICENSE.txt
+  repository: https://github.com/NVIDIA-Omniverse/PhysX
+  summary: Standalone OVPhysX C and C++ SDK for USD physics simulation.

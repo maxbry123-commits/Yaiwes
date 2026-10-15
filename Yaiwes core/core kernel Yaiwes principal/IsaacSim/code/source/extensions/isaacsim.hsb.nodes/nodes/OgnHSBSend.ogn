@@ -1,0 +1,70 @@
+{
+    "HSBSend": {
+        "version": 1,
+        "icon": "icons/isaac-sim.svg",
+        "description": "Send data buffers via HSB (Holoscan Sensor Bridge) using DLTensor",
+        "metadata": {
+            "uiName": "HSB Send"
+        },
+        "categoryDefinitions": "config/CategoryDefinition.json",
+        "categories": "internal",
+        "inputs": {
+            "execIn": {
+                "type": "execution",
+                "description": "Execution trigger"
+            },
+            "ipAddress": {
+                "type": "string",
+                "description": "HSB target IP address",
+                "default": "127.0.0.1"
+            },
+            "dataPlaneType": {
+                "type": "string",
+                "description": "HSB data plane: coe (IEEE 1722B Camera-over-Ethernet) or linux (RoCEv2 UDP)",
+                "default": "coe"
+            },
+            "dataPlaneId": {
+                "type": "uint",
+                "description": "HSB data plane ID",
+                "default": 0
+            },
+            "sensorId": {
+                "type": "uint",
+                "description": "HSB sensor ID",
+                "default": 0
+            },
+            "timeStamp": {
+                "type": "double",
+                "description": "Timestamp in seconds",
+                "default": 0.0
+            },
+            "data": {
+                "type": "uchar[]",
+                "description": "Buffer data to send",
+                "memoryType": "cpu",
+                "default": [],
+                "optional": true
+            },
+            "calibrationIntrinsics": {
+                "type": "double[]",
+                "description": "Stereo intrinsics packed as [L_fx, L_fy, L_cx, L_cy, R_fx, R_fy, R_cx, R_cy]. Programmed into the emulated rig EEPROM at I2C peripheral 0x51 so the live receiver (hololink::NativeVb1940Sensor) reads them via the standard I2C path. Empty = no calibration set; downstream cuVSLAM will then reject with 'Focal length must be > 0'. Driven from the USDA Camera prim via OgnHSBCameraHelper.",
+                "memoryType": "cpu",
+                "default": [],
+                "optional": true
+            },
+            "calibrationTranslation": {
+                "type": "double[3]",
+                "description": "Stereo rig translation (Tx, Ty, Tz) in meters, written verbatim to the EEPROM's T field. For Eagle hardware (physical baseline of +0.088 m along +x), the value programmed here is (-0.088, 0, 0) — the receiver reconstructs base_T_cam via Pose3d{q, calib.T}.inverse() so the sign is inverted relative to the physical baseline. Programming (+0.088, 0, 0) will silently mirror pose estimates in cuVSLAM. Programmed into the emulated rig EEPROM alongside calibrationIntrinsics.",
+                "memoryType": "cpu",
+                "default": [0.0, 0.0, 0.0],
+                "optional": true
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": "Execution output"
+            }
+        }
+    }
+}

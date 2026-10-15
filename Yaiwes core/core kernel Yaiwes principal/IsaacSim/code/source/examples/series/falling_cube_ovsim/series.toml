@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id = "falling_cube_ovsim"
+title = "Falling Cube (OV SIM API)"
+summary = "Author and simulate a falling cube locally or through a standalone OV SIM gRPC server."
+kind = "sequence"
+
+[[step]]
+example = "falling_cube_ovsim.author_cube"
+level = "beginner"
+
+[[step]]
+example = "falling_cube_ovsim.simulate_cube"
+level = "beginner"
+
+[[step]]
+example = "falling_cube_ovsim.simulate_cube_grpc"
+level = "intermediate"

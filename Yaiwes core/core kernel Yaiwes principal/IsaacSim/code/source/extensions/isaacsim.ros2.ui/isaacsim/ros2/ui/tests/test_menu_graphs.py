@@ -1,0 +1,1969 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for ROS 2 OmniGraph menu shortcuts."""
+
+import copy
+from typing import Any
+
+import isaacsim.core.experimental.utils.prim as prim_utils
+import numpy as np
+import omni.graph.core as og
+import omni.kit.app
+import omni.kit.test
+import rclpy
+import usdrt.Sdf
+from isaacsim.core.experimental.objects import Cube, GroundPlane
+from isaacsim.core.experimental.prims import XformPrim
+from isaacsim.core.experimental.utils.stage import add_reference_to_stage, define_prim, get_current_stage
+from isaacsim.test.utils import menu_click_with_retry
+from nav_msgs.msg import Odometry
+from pxr import Gf, Sdf, UsdRender
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import Image, JointState, PointCloud2
+from std_msgs.msg import Float32, Header
+from tf2_msgs.msg import TFMessage
+
+from .common import ROS2UITestCase
+
+
+class ROS2MenuTestBase(ROS2UITestCase):
+    """Base class for ROS2 OmniGraph Menu tests."""
+
+    async def setUp(self) -> None:
+        """Set up test fixtures."""
+        await super().setUp()
+        self.node = self.create_node("test_omnigraph_node")
+
+    async def setup_test_environment(
+        self, robot_path: str = "/World/test_robot", add_test_cubes: bool = False
+    ) -> tuple[Any, str, str]:
+        """Set up a standard test environment with a Nova Carter robot.
+
+        Args:
+            robot_path: Path where the robot should be placed.
+            add_test_cubes: Whether to add test cube prims to the environment.
+
+        Returns:
+            The robot prim and base_link path.
+
+        """
+        from pxr import UsdLux
+
+        # Creating environment and Carter Robot
+        stage = get_current_stage()
+        distant_light = UsdLux.DistantLight.Define(stage, "/World/DistantLight")
+        distant_light.CreateIntensityAttr(3000)
+
+        GroundPlane("/World/groundPlane")
+
+        if add_test_cubes:
+            Cube("/World/cube_1", scales=(1, 3, 1), positions=(5, 0, 0), sizes=1.0)
+            Cube("/World/cube_2", scales=(1, 3, 1), positions=(-5, 0, 0), sizes=1.0)
+            Cube("/World/cube_3", scales=(3, 1, 1), positions=(0, 5, 0), sizes=1.0)
+            Cube("/World/cube_4", scales=(3, 1, 1), positions=(0, -5, 0), sizes=1.0)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        asset_path = self._assets_root_path + "/Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd"
+        robot = add_reference_to_stage(asset_path, robot_path)
+        robot.GetVariantSet("Physics").SetVariantSelection("physx")
+        robot.GetVariantSet("Sensors").SetVariantSelection("All_Sensors")
+
+        # Create base_link in chassis_link using XformPrim
+        articulation_root_path = f"{robot_path}/chassis_link"
+        xform_path = f"{articulation_root_path}/base_link"
+        define_prim(xform_path)
+
+        XformPrim(xform_path, positions=np.array([[0.0, 0.0, 0.0]]), reset_xform_op_properties=True)
+
+        await self.wait_for_stage_loading()
+
+        return robot, xform_path, articulation_root_path
+
+    async def create_reusable_render_product(
+        self, render_product_path: str, sensor_path: str, resolution: tuple[int, int] = (320, 240)
+    ) -> UsdRender.Product:
+        stage = get_current_stage()
+        render_product = UsdRender.Product.Define(stage, render_product_path)
+        render_product.GetResolutionAttr().Set(Gf.Vec2i(resolution[0], resolution[1]))
+        render_product.GetCameraRel().SetTargets([Sdf.Path(sensor_path)])
+        await omni.kit.app.get_app().next_update_async()
+        return render_product
+
+    def assert_graph_reuses_render_product(self, graph_path: str, render_product_path: str) -> None:
+        graph = og.get_graph_by_path(graph_path)
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        nodes = graph.get_nodes()
+        node_types = {node.get_type_name() for node in nodes}
+        self.assertIn("isaacsim.core.nodes.IsaacAttachHydraTexture", node_types)
+        self.assertNotIn("isaacsim.core.nodes.IsaacCreateRenderProduct", node_types)
+
+        attach_nodes = [node for node in nodes if node.get_type_name() == "isaacsim.core.nodes.IsaacAttachHydraTexture"]
+        self.assertEqual(len(attach_nodes), 1, "Expected exactly one AttachHydraTexture node")
+        render_product_attr = attach_nodes[0].get_attribute("inputs:renderProductPrim")
+        self.assertIsNotNone(render_product_attr)
+        render_product_targets = og.Controller.get(render_product_attr)
+        self.assertTrue(render_product_targets)
+        self.assertEqual(str(render_product_targets[0]), render_product_path)
+
+    def assert_usd_connection(self, source_attr_path: str, target_attr_path: str) -> None:
+        """Assert that a USD-authored OmniGraph connection exists."""
+        stage = get_current_stage()
+        target_prim_path, target_attr_name = target_attr_path.split(".", 1)
+        target_attr = stage.GetPrimAtPath(target_prim_path).GetAttribute(target_attr_name)
+        self.assertTrue(target_attr.IsValid(), f"{target_attr_path} is not a valid attribute")
+
+        source_paths = {str(path) for path in target_attr.GetConnections()}
+        self.assertIn(source_attr_path, source_paths)
+
+
+class TestMenuROS2CameraGraph(ROS2MenuTestBase):
+    """Test ROS2 Camera OmniGraph creation from menu."""
+
+    async def test_camera_graph_creation(self) -> None:
+        """Test creation of camera graph structure via menu."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Camera Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Camera", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set the camera prim
+        camera_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        camera_prim.model.set_value("/World/test_robot/chassis_link/sensors/front_hawk/left/camera_left")
+
+        # Publish RGB as HEVC compressed images.
+        rgb_compression_dropdown = await self.find_widget_with_retry(
+            root_widget_path + "/**/ComboBox[*].identifier=='ros2_camera_rgb_compression'"
+        )
+        self.assertIsNotNone(rgb_compression_dropdown, "RGB compression dropdown not found")
+        rgb_compression_dropdown.model.get_item_value_model().set_value(2)
+
+        # Enable Depth Point Clouds
+        depth_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[8]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        depth_checkbox.model.set_value(True)
+
+        # Enable Instance Segmentation
+        instance_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[9]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        instance_checkbox.model.set_value(True)
+
+        # Enable Semantic Segmentation
+        semantic_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[10]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        semantic_checkbox.model.set_value(True)
+
+        # Enable BoundingBox2D Tight
+        bbox2d_tight_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[11]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        bbox2d_tight_checkbox.model.set_value(True)
+
+        # Enable BoundingBox2D Loose
+        bbox2d_loose_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[12]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        bbox2d_loose_checkbox.model.set_value(True)
+
+        # Enable BoundingBox3D
+        bbox3d_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[13]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        bbox3d_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[14]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify graph creation
+        graph = og.get_graph_by_path("/Graph/ROS_Camera")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu applied the UI-driven RGB-compression dropdown.
+        nodes = graph.get_nodes()
+
+        camera_helper_topics = {}
+        for node in nodes:
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2CameraHelper":
+                type_attr = node.get_attribute("inputs:type")
+                topic_attr = node.get_attribute("inputs:topicName")
+                if type_attr and topic_attr:
+                    camera_helper_topics[og.Controller.get(type_attr)] = og.Controller.get(topic_attr)
+
+        self.assertEqual(
+            camera_helper_topics.get("rgb_hevc"),
+            "/rgb/compressed",
+            "The RGB compression dropdown should configure an HEVC compressed image helper",
+        )
+
+    async def test_camera_graph_reuses_existing_render_product_from_menu(self) -> None:
+        """Test camera graph menu can reuse an existing render product without creating one."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+        camera_path = "/World/test_robot/chassis_link/sensors/front_hawk/left/camera_left"
+        render_product_path = "/Render/ReusableCameraRP"
+        render_product = await self.create_reusable_render_product(render_product_path, camera_path)
+
+        window_name = "ROS2 Camera Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Camera", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+        camera_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        render_product_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[3]/StringField[0]")
+        self.assertIsNotNone(render_product_prim, "Render product prim field not found")
+        camera_prim.model.set_value(camera_path)
+        render_product_prim.model.set_value(render_product_path)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[14]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+        await omni.kit.app.get_app().next_update_async()
+
+        self.assert_graph_reuses_render_product("/Graph/ROS_Camera", render_product_path)
+        graph = og.get_graph_by_path("/Graph/ROS_Camera")
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.ros2.bridge.ROS2CameraInfoHelper", node_types)
+        self.assertEqual(render_product.GetResolutionAttr().Get(), Gf.Vec2i(320, 240))
+        self.assertEqual([str(path) for path in render_product.GetCameraRel().GetTargets()], [camera_path])
+
+    async def test_camera_null_conditions(self) -> None:
+        """Test camera graph with null target prim."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Camera Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Camera", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Leave camera path empty (null condition)
+        camera_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        camera_prim_field.model.set_value("")
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[14]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to test (should not crash)
+        self._timeline.play()
+        await omni.kit.app.get_app().next_update_async()
+        self._timeline.stop()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify simulation completed (implicit test that no crash occurred)
+        self.assertFalse(self._timeline.is_playing())
+
+    async def test_camera_data_flow(self) -> None:
+        """Test camera data is being properly published to ROS2 topics."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment(add_test_cubes=True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Setup ROS2 Subscribers
+        self.rgb_image_data = None
+        self.depth_image_data = None
+        self.camera_info_data = None
+        self.point_cloud_data = None
+
+        rgb_topic = "/rgb"
+        depth_topic = "/depth"
+        point_cloud_topic = "/depth_pcl"
+
+        def rgb_callback(msg: Any) -> None:
+            self.rgb_image_data = msg
+
+        def depth_callback(msg: Any) -> None:
+            self.depth_image_data = msg
+
+        def point_cloud_callback(msg: Any) -> None:
+            self.point_cloud_data = msg
+
+        # Create subscribers
+        self.create_subscription(self.node, Image, rgb_topic, rgb_callback)
+        self.create_subscription(self.node, Image, depth_topic, depth_callback)
+        self.create_subscription(self.node, PointCloud2, point_cloud_topic, point_cloud_callback)
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Camera Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Camera", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Set camera path
+        camera_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        camera_prim_field.model.set_value("/World/test_robot/chassis_link/sensors/front_hawk/left/camera_left")
+
+        # Enable Depth Point Clouds
+        depth_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[8]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        depth_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[14]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation and collect data
+        self._timeline.play()
+
+        # Define helper function to procress messages
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        for topic in (rgb_topic, depth_topic, point_cloud_topic):
+            await self.wait_for_publishers_on_topic(self.node, topic, per_frame_callback=spin_ros)
+
+        # Run simulation
+        await self.simulate_until_condition(
+            lambda: self.rgb_image_data and self.depth_image_data and self.point_cloud_data,
+            max_frames=300,
+            per_frame_callback=spin_ros,
+        )
+
+        # Stop simulation
+        self._timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
+        # Validate received messages
+        # RGB Image Test
+        self.assertIsNotNone(self.rgb_image_data, "RGB image data not received")
+        if self.rgb_image_data:
+            self.assertEqual(self.rgb_image_data.encoding, "rgb8", "Unexpected RGB image encoding")
+            self.assertGreater(self.rgb_image_data.width, 0, "Invalid RGB image width")
+            self.assertGreater(self.rgb_image_data.height, 0, "Invalid RGB image height")
+            self.assertGreater(len(self.rgb_image_data.data), 0, "Empty RGB image data")
+
+        # Depth Image validation
+        self.assertIsNotNone(self.depth_image_data, "No depth image received")
+        if self.depth_image_data:
+            self.assertEqual(self.depth_image_data.encoding, "32FC1", "Unexpected depth image encoding")
+            self.assertGreater(self.depth_image_data.width, 0, "Invalid depth image width")
+            self.assertGreater(self.depth_image_data.height, 0, "Invalid depth image height")
+            self.assertGreater(len(self.depth_image_data.data), 0, "Empty depth image data")
+
+        # Point Cloud validation
+        self.assertIsNotNone(self.point_cloud_data, "No point cloud received")
+        if self.point_cloud_data:
+            from sensor_msgs_py.point_cloud2 import read_points
+
+            points_array = read_points(self.point_cloud_data)
+            self.assertGreater(len(points_array), 10, "Point cloud should have at least 10 points")
+
+            # Validate point cloud fields
+            field_names = [field.name for field in self.point_cloud_data.fields]
+            self.assertIn("x", field_names, "Point cloud missing 'x' field")
+            self.assertIn("y", field_names, "Point cloud missing 'y' field")
+            self.assertIn("z", field_names, "Point cloud missing 'z' field")
+
+
+class TestMenuROS2LidarGraph(ROS2MenuTestBase):
+    """Test ROS2 Lidar OmniGraph creation from menu."""
+
+    async def test_lidar_graph_creation(self) -> None:
+        """Test creation of RTX Lidar graph structure via menu."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Lidar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Lidar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set RTX Lidar prim
+        lidar_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        lidar_prim.model.set_value("/World/test_robot/chassis_link/sensors/XT_32/PandarXT_32_10hz")
+
+        # Enable Point Cloud
+        point_cloud_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[7]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        point_cloud_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button (index updated due to metadata UI additions)
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[9]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_LidarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu produced a lidar graph and applied the Point Cloud toggle.
+        lidar_helper_types = {
+            og.Controller.get(node.get_attribute("inputs:type"))
+            for node in graph.get_nodes()
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxLidarHelper"
+        }
+        self.assertIn("point_cloud", lidar_helper_types)
+
+    async def test_lidar_null_conditions(self) -> None:
+        """Test lidar graph with null target prim."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Lidar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Lidar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Leave lidar path empty (null condition)
+        lidar_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        lidar_prim_field.model.set_value("")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button (index updated due to metadata UI additions)
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[9]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to test (should not crash)
+        self._timeline.play()
+        await omni.kit.app.get_app().next_update_async()
+        self._timeline.stop()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify simulation completed (implicit test that no crash occurred)
+        self.assertFalse(self._timeline.is_playing())
+
+    async def test_lidar_data_flow(self) -> None:
+        """Test RTX Lidar data is being properly published to ROS2 topics with detailed data validation."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment(add_test_cubes=True)
+
+        lidar_path = "/World/test_robot/chassis_link/sensors/XT_32/PandarXT_32_10hz"
+
+        # Store actual message data for validation, not just counts
+        self.point_cloud_data = None
+        # self.laser_scan_data = None
+
+        # Define topic names for the lidar data
+        # laser_scan_topic = "/laser_scan"
+        point_cloud_topic = "/point_cloud"
+
+        # # Create callbacks to capture and validate message content
+        # def laser_scan_callback(msg):
+        #     self.laser_scan_data = msg
+
+        def point_cloud_callback(msg: Any) -> None:
+            self.point_cloud_data = msg
+
+        # Create subscribers with validation callbacks
+        self.create_subscription(self.node, PointCloud2, point_cloud_topic, point_cloud_callback)
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Lidar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Lidar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set RTX Lidar prim
+        lidar_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        lidar_prim.model.set_value(lidar_path)
+
+        # Disable LaserScan as the lidar is 3D
+        laser_scan_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[6]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        laser_scan_checkbox.model.set_value(False)
+
+        # Enable Point Cloud
+        point_cloud_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[7]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        point_cloud_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button (index updated due to metadata UI additions)
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[9]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify graph was created
+        graph = og.get_graph_by_path("/Graph/ROS_LidarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Double-check 3D lidar detection - use the actual prim path that was configured
+        lidar_prim_obj = prim_utils.get_prim_at_path(lidar_path)
+        is_3d_lidar = False
+
+        if lidar_prim_obj.IsValid():
+            # Check for elevation attributes that would indicate a 3D lidar
+            if lidar_prim_obj.HasAttribute("elevationDeg") and lidar_prim_obj.GetAttribute("elevationDeg").Get() != 0:
+                is_3d_lidar = True
+            elif lidar_prim_obj.HasAttribute("elevation") and lidar_prim_obj.GetAttribute("elevation").Get() != 0:
+                is_3d_lidar = True
+            elif lidar_prim_obj.HasAttribute("verticalFov") and lidar_prim_obj.GetAttribute("verticalFov").Get() > 0:
+                is_3d_lidar = True
+
+        # Run simulation to generate lidar data
+        self._timeline.play()
+
+        # Define helper function to process messages
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        # Run simulation
+        await self.simulate_until_condition(
+            lambda: self.point_cloud_data is not None, max_frames=300, per_frame_callback=spin_ros
+        )
+
+        # Stop simulation
+        self._timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
+        if is_3d_lidar:
+            # For 3D lidars, validate PointCloud2
+            self.assertIsNotNone(self.point_cloud_data, "No PointCloud2 message received for 3D lidar")
+
+            if self.point_cloud_data:
+                # Check point cloud data content
+                from sensor_msgs_py.point_cloud2 import read_points
+
+                # Convert ROS PointCloud2 message to numpy array
+                points_array = read_points(self.point_cloud_data)
+
+                # Validate point cloud structure and content
+                self.assertGreater(len(points_array), 10, "PointCloud should have at least 10 points")
+
+                # Print first 10 points for debugging
+                if len(points_array) > 0:
+
+                    # Check field names
+                    field_names = [field.name for field in self.point_cloud_data.fields]
+                    self.assertIn("x", field_names, "PointCloud missing 'x' field")
+                    self.assertIn("y", field_names, "PointCloud missing 'y' field")
+                    self.assertIn("z", field_names, "PointCloud missing 'z' field")
+
+    async def test_lidar_point_cloud_with_metadata(self) -> None:
+        """Test creation of RTX Lidar graph with point cloud metadata config node."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Lidar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Lidar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set RTX Lidar prim
+        lidar_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        lidar_prim.model.set_value("/World/test_robot/chassis_link/sensors/XT_32/PandarXT_32_10hz")
+
+        # Disable Laser Scan
+        laser_scan_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[6]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        laser_scan_checkbox.model.set_value(False)
+
+        # Enable Point Cloud
+        point_cloud_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[7]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        point_cloud_checkbox.model.set_value(True)
+
+        # Enable some metadata options in the left VStack (HStack[8]/VStack[0])
+        # Intensity checkbox is the first one in left VStack
+        intensity_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[8]/VStack[0]/HStack[0]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        if intensity_checkbox:
+            intensity_checkbox.model.set_value(True)
+
+        # Timestamp checkbox is the second one in left VStack
+        timestamp_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[8]/VStack[0]/HStack[1]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        if timestamp_checkbox:
+            timestamp_checkbox.model.set_value(True)
+
+        # Enable some metadata options in the right VStack (HStack[8]/VStack[1])
+        # Velocity checkbox is the second one in right VStack
+        velocity_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[8]/VStack[1]/HStack[1]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        if velocity_checkbox:
+            velocity_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[9]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_LidarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Verify essential nodes exist including the config node
+        nodes = graph.get_nodes()
+        node_types = {node.get_type_name() for node in nodes}
+
+        expected_nodes = {
+            "omni.graph.action.OnPlaybackTick",
+            "isaacsim.ros2.bridge.ROS2Context",
+            "isaacsim.core.nodes.OgnIsaacRunOneSimulationFrame",
+            "isaacsim.core.nodes.IsaacCreateRenderProduct",
+            "isaacsim.ros2.bridge.ROS2RtxLidarHelper",
+            "isaacsim.ros2.bridge.ROS2RtxLidarPointCloudConfig",  # Config node should be created
+        }
+
+        for expected in expected_nodes:
+            self.assertIn(expected, node_types, f"Missing expected node type: {expected}")
+
+        # Verify that the config node is connected to the lidar helper
+        config_node = None
+        lidar_helper_node = None
+        for node in nodes:
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxLidarPointCloudConfig":
+                config_node = node
+            elif node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxLidarHelper":
+                lidar_helper_node = node
+
+        self.assertIsNotNone(config_node, "Config node not found")
+        self.assertIsNotNone(lidar_helper_node, "Lidar helper node not found")
+
+        # Verify the connection exists between config output and helper input
+        helper_metadata_attr = lidar_helper_node.get_attribute("inputs:selectedMetadata")
+        self.assertIsNotNone(helper_metadata_attr, "selectedMetadata input attribute not found")
+
+    async def test_lidar_metadata_without_point_cloud(self) -> None:
+        """Test that metadata options are ignored when point cloud is disabled."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Lidar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Lidar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set RTX Lidar prim
+        lidar_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        lidar_prim.model.set_value("/World/test_robot/chassis_link/sensors/XT_32/PandarXT_32_10hz")
+
+        # Leave Laser Scan enabled (default)
+        # Keep Point Cloud disabled (default)
+
+        # Try to enable some metadata options (should show warning and be ignored)
+        intensity_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[8]/VStack[0]/HStack[0]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        if intensity_checkbox:
+            intensity_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[9]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_LidarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Verify that the config node is NOT created (since point cloud is disabled)
+        nodes = graph.get_nodes()
+        node_types = {node.get_type_name() for node in nodes}
+
+        # Config node should NOT be present
+        self.assertNotIn(
+            "isaacsim.ros2.bridge.ROS2RtxLidarPointCloudConfig",
+            node_types,
+            "Config node should not be created when point cloud is disabled",
+        )
+
+        # ROS2RtxLidarHelper for point cloud should also NOT be present
+        # (only laser scan helper should be present)
+        lidar_helper_count = sum(
+            1 for node in nodes if node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxLidarHelper"
+        )
+        self.assertEqual(lidar_helper_count, 1, "Only one lidar helper (for laser scan) should be created")
+
+        # Verify the laser scan helper is configured for laser_scan type
+        for node in nodes:
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxLidarHelper":
+                type_attr = node.get_attribute("inputs:type")
+                if type_attr:
+                    type_value = og.Controller.get(type_attr)
+                    self.assertEqual(type_value, "laser_scan", "Helper should be configured for laser_scan")
+
+
+class TestMenuROS2RadarGraph(ROS2MenuTestBase):
+    """Test ROS2 RTX Radar OmniGraph creation from menu."""
+
+    async def _setup_radar(self, path: str = "/World/test_radar", aux_output_level: str = "NONE") -> Any:
+        """Create an RTX Radar prim on the stage.
+
+        RTX Radar requires Motion BVH; this is defensively enabled here in case the
+        test runner does not pick up the extension.toml app args.
+
+        Args:
+            path: Path at which to create the radar prim.
+            aux_output_level: Auxiliary-data level, either ``"NONE"`` or ``"BASIC"``.
+
+        Returns:
+            Created radar object.
+
+        Raises:
+            ValueError: If ``aux_output_level`` is unsupported.
+        """
+        import carb
+
+        carb.settings.get_settings().set("/renderer/raytracingMotion/enabled", True)
+        from isaacsim.sensors.experimental.rtx import Radar
+
+        radar = Radar(path=path, aux_output_level=aux_output_level)
+        await omni.kit.app.get_app().next_update_async()
+        return radar
+
+    async def test_radar_graph_creation(self) -> None:
+        """Test creation of RTX Radar graph structure via menu."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+        radar_path = "/World/test_radar"
+        await self._setup_radar(radar_path)
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Radar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Radar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set RTX Radar prim
+        radar_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        radar_prim.model.set_value(radar_path)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button (radar dialog OK/Cancel row is HStack[7])
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[7]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_RadarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu produced a radar graph.
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.ros2.bridge.ROS2RtxRadarHelper", node_types)
+
+    async def test_radar_null_conditions(self) -> None:
+        """Test radar graph with null target prim."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Radar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Radar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Leave radar path empty (null condition)
+        radar_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        radar_prim_field.model.set_value("")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[7]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to test (should not crash)
+        self._timeline.play()
+        await omni.kit.app.get_app().next_update_async()
+        self._timeline.stop()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify simulation completed (implicit test that no crash occurred)
+        self.assertFalse(self._timeline.is_playing())
+
+    async def test_radar_with_metadata(self) -> None:
+        """Test creation of RTX Radar graph with helper metadata flags enabled.
+
+        Unlike the lidar graph (which inserts a separate PointCloudConfig node),
+        the radar helper exposes its metadata as boolean inputs directly on
+        ROS2RtxRadarHelper, so this test verifies the helper's input attributes
+        are set rather than checking for a config node.
+        """
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+        radar_path = "/World/test_radar"
+        # BASIC aux output level is required for the radial velocity channel to populate.
+        await self._setup_radar(radar_path, aux_output_level="BASIC")
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 RTX Radar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Radar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Find and set RTX Radar prim
+        radar_prim = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        radar_prim.model.set_value(radar_path)
+
+        # Enable each metadata checkbox. Metadata rows live in the inner VStack[0]
+        # (sibling to the parameter HStacks), one HStack per option. Order matches
+        # Ros2RtxRadarGraph.METADATA_OPTIONS: RadialVelocityMS, Intensity, Timestamp.
+        for row_index in range(3):
+            checkbox = await self.find_widget_with_retry(
+                root_widget_path + f"/VStack[0]/HStack[{row_index}]/HStack[0]/VStack[0]/ToolButton[0]"
+            )
+            if checkbox:
+                checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[7]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_RadarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        nodes = graph.get_nodes()
+        node_types = {node.get_type_name() for node in nodes}
+
+        expected_nodes = {
+            "omni.graph.action.OnPlaybackTick",
+            "isaacsim.ros2.bridge.ROS2Context",
+            "isaacsim.core.nodes.OgnIsaacRunOneSimulationFrame",
+            "isaacsim.core.nodes.IsaacCreateRenderProduct",
+            "isaacsim.ros2.bridge.ROS2RtxRadarHelper",
+        }
+        for expected in expected_nodes:
+            self.assertIn(expected, node_types, f"Missing expected node type: {expected}")
+
+        # Verify the radar helper has each metadata flag set to True.
+        radar_helper_node = None
+        for node in nodes:
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxRadarHelper":
+                radar_helper_node = node
+                break
+        self.assertIsNotNone(radar_helper_node, "Radar helper node not found")
+
+        for input_name in ("outputRadialVelocityMS", "outputIntensity", "outputTimestamp"):
+            attr = radar_helper_node.get_attribute(f"inputs:{input_name}")
+            self.assertIsNotNone(attr, f"Missing input attribute: inputs:{input_name}")
+            self.assertTrue(
+                og.Controller.get(attr),
+                f"inputs:{input_name} should be True after enabling the corresponding checkbox",
+            )
+
+    async def test_radar_data_flow(self) -> None:
+        """Test the RTX Radar menu graph wires the ROS 2 publisher configuration."""
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+        radar_path = "/World/test_radar"
+        await self._setup_radar(radar_path)
+
+        point_cloud_topic = "/radar_point_cloud"
+
+        # Click through the menu to create the graph.
+        window_name = "ROS2 RTX Radar Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/RTX Radar", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        radar_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[2]/StringField[0]")
+        radar_prim_field.model.set_value(radar_path)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[7]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify graph was created.
+        graph = og.get_graph_by_path("/Graph/ROS_RadarRTX")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        radar_helper_node = None
+        for node in graph.get_nodes():
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2RtxRadarHelper":
+                radar_helper_node = node
+                break
+        self.assertIsNotNone(radar_helper_node, "Radar helper node not found")
+
+        topic_attr = radar_helper_node.get_attribute("inputs:topicName")
+        frame_attr = radar_helper_node.get_attribute("inputs:frameId")
+        self.assertIsNotNone(topic_attr, "Radar helper missing topicName input")
+        self.assertIsNotNone(frame_attr, "Radar helper missing frameId input")
+        self.assertEqual(og.Controller.get(topic_attr), point_cloud_topic)
+        self.assertEqual(og.Controller.get(frame_attr), "radar")
+
+
+class TestMenuROS2JointStatesGraph(ROS2MenuTestBase):
+    """Test ROS2 Joint States OmniGraph creation from menu."""
+
+    async def test_joint_states_graph_creation(self) -> None:
+        """Test creation of Joint States graph structure via menu."""
+        # Creating environment and Carter Robot
+        robot, _base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Joint States Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Joint States", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Set Articulation Root
+        articulation_root_field = await self.find_widget_with_retry(root_widget_path + "/HStack[3]/StringField[0]")
+        articulation_root_field.model.set_value(art_root_path)
+
+        # Enable Publisher
+        publisher_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[4]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        publisher_checkbox.model.set_value(True)
+
+        # Enable Subscriber
+        subscriber_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[5]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        subscriber_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[6]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_JointStates")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive connection verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we confirm the menu creates the migrated publisher path and subscriber node.
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.sensors.physics.IsaacReadJointState", node_types)
+        self.assertIn("isaacsim.ros2.bridge.ROS2PublishJointState", node_types)
+        self.assertIn("isaacsim.ros2.bridge.ROS2SubscribeJointState", node_types)
+
+        read_joint_state = [
+            node for node in graph.get_nodes() if node.get_type_name() == "isaacsim.sensors.physics.IsaacReadJointState"
+        ][0]
+        read_joint_state_targets = og.Controller.get(read_joint_state.get_attribute("inputs:prim"))
+        self.assertEqual([str(path) for path in read_joint_state_targets], [art_root_path])
+
+        self.assert_usd_connection(
+            "/Graph/ROS_JointStates/OnPlaybackTick.outputs:tick",
+            "/Graph/ROS_JointStates/ReadJointState.inputs:execIn",
+        )
+        self.assert_usd_connection(
+            "/Graph/ROS_JointStates/ReadJointState.outputs:execOut",
+            "/Graph/ROS_JointStates/PublisherJointState.inputs:execIn",
+        )
+
+    async def test_joint_states_null_conditions(self) -> None:
+        """Test robot state graph with null target prim."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Joint States Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Joint States", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Leave robot path empty (null condition)
+        robot_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[3]/StringField[0]")
+        robot_prim_field.model.set_value("")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[6]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to test (should not crash)
+        self._timeline.play()
+        await omni.kit.app.get_app().next_update_async()
+        self._timeline.stop()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify simulation completed (implicit test that no crash occurred)
+        self.assertFalse(self._timeline.is_playing())
+
+    async def test_joint_states_data_flow(self) -> None:
+        """Test Joint States data is being properly published to ROS2 topics."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # # Brief physics initialization (reduced from 0.5s as actual data wait happens later)
+        # self._timeline.play()
+        # await omni.kit.app.get_app().next_update_async()
+
+        # self._timeline.stop()
+        # await omni.kit.app.get_app().next_update_async()
+
+        # Setup ROS2 subscribers
+        # Store actual message data for validation
+        self.joint_state_data = None
+        expected_joints = ("joint_wheel_left", "joint_wheel_right")
+
+        # Define topic names
+        joint_states_topic = "/joint_states"
+
+        # Create callback to store message data
+        def joint_states_callback(msg: Any) -> None:
+            if all(joint in msg.name for joint in expected_joints):
+                self.joint_state_data = msg
+
+        # Create subscriber
+        self.create_subscription(self.node, JointState, joint_states_topic, joint_states_callback)
+
+        # Create graph through menu
+        window_name = "ROS2 Joint States Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Joint States", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Set Articulation Root to the actual articulation root prim (chassis_link)
+        articulation_root_field = await self.find_widget_with_retry(root_widget_path + "/HStack[3]/StringField[0]")
+        articulation_root_field.model.set_value(art_root_path)
+
+        # Enable Publisher
+        publisher_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[4]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        publisher_checkbox.model.set_value(True)
+
+        # Enable Subscriber
+        subscriber_checkbox = await self.find_widget_with_retry(
+            root_widget_path + "/HStack[5]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        subscriber_checkbox.model.set_value(True)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[6]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click(human_delay_speed=50)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the joint states graph created by the menu
+        graph_path = "/Graph/ROS_JointStates"  # Standard path for joint states graph from menu
+        graph = og.get_graph_by_path(graph_path)
+        self.assertIsNotNone(graph, "ROS Joint States graph not found")
+
+        # Run simulation and collect data
+        # Note: Graph initialization happens during simulation, no need for pre-initialization wait
+        self._timeline.play()
+
+        # Define helper function to process messages
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        # Run simulation
+        await self.simulate_until_condition(
+            lambda: self.joint_state_data is not None, max_frames=300, per_frame_callback=spin_ros
+        )
+
+        # Stop simulation
+        self._timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
+        # Validate data
+        self.assertIsNotNone(self.joint_state_data, "No joint states received")
+        if self.joint_state_data:
+            # Validate joint state data content
+            self.assertGreater(len(self.joint_state_data.name), 0, "No joint names found")
+            self.assertEqual(
+                len(self.joint_state_data.name),
+                len(self.joint_state_data.position),
+                "Joint names and positions count mismatch",
+            )
+
+            # Nova Carter has specific joints we can check for
+            for joint in expected_joints:
+                self.assertIn(joint, self.joint_state_data.name, f"Expected joint '{joint}' not found")
+
+            # Store initial joint positions before sending command
+            initial_joint_positions = {}
+            for i, name in enumerate(self.joint_state_data.name):
+                initial_joint_positions[name] = self.joint_state_data.position[i]
+
+            # Test joint states subscriber functionality by publishing a command
+            # Create a command message
+            command_msg = JointState()
+            command_msg.header = Header()
+
+            # Find wheel joints
+            wheel_indices = [i for i, name in enumerate(self.joint_state_data.name) if "wheel" in name]
+            if wheel_indices:
+                command_msg.name = [self.joint_state_data.name[i] for i in wheel_indices]
+                command_msg.position = [0.0] * len(wheel_indices)  # Set to zero position
+                command_msg.velocity = [10.0] * len(wheel_indices)  # Increased velocity for more noticeable movement
+                command_msg.effort = [0.0] * len(wheel_indices)
+
+                # Create publisher
+                command_publisher = self.node.create_publisher(JointState, "/joint_command", 10)
+
+                # Clear the current joint_state_data to ensure we get a fresh one after the command
+                self.joint_state_data = None
+
+                def publish_and_spin() -> None:
+                    command_msg.header.stamp = self.node.get_clock().now().to_msg()
+                    command_publisher.publish(command_msg)
+                    spin_ros()
+
+                def wheel_joints_moved() -> bool:
+                    if self.joint_state_data is None:
+                        return False
+                    for i, name in enumerate(self.joint_state_data.name):
+                        if name in initial_joint_positions:
+                            if abs(self.joint_state_data.position[i] - initial_joint_positions[name]) > 0.01:
+                                return True
+                    return False
+
+                self._timeline.play()
+                await self.simulate_until_condition(
+                    wheel_joints_moved,
+                    max_frames=300,
+                    per_frame_callback=publish_and_spin,
+                )
+                self._timeline.stop()
+
+                self.assertIsNotNone(self.joint_state_data, "No joint states received after sending command")
+                self.assertTrue(wheel_joints_moved(), "Wheel joints did not move after sending velocity command")
+
+                if hasattr(self.joint_state_data, "velocity") and len(self.joint_state_data.velocity) > 0:
+                    wheel_velocities = {
+                        self.joint_state_data.name[i]: self.joint_state_data.velocity[i]
+                        for i in wheel_indices
+                        if i < len(self.joint_state_data.velocity)
+                    }
+                    any_wheel_moving = any(abs(v) > 0.1 for v in wheel_velocities.values())
+                    self.assertTrue(any_wheel_moving, "No wheel joints are currently moving")
+
+
+class TestMenuROS2TFGraph(ROS2MenuTestBase):
+    """Test ROS2 TF OmniGraph creation from menu."""
+
+    async def test_tf_graph_creation(self) -> None:
+        """Test creation of TF graph structure via menu."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 TF Publisher Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/TF Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Set Target Prim
+        target_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[5]/StringField[0]")
+        target_prim_field.model.set_value("/World/test_robot/chassis_link/base_link")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[8]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_TF")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu produced a TF publisher graph.
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.ros2.bridge.ROS2PublishTransformTree", node_types)
+
+    async def test_tf_null_conditions(self) -> None:
+        """Test TF graph with null target prim."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 TF Publisher Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/TF Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Leave target prim empty (null condition)
+        target_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[5]/StringField[0]")
+        target_prim_field.model.set_value("")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[8]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to test (should not crash)
+        self._timeline.play()
+        await omni.kit.app.get_app().next_update_async()
+        self._timeline.stop()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify simulation completed (implicit test that no crash occurred)
+        self.assertFalse(self._timeline.is_playing())
+
+    async def test_tf_data_flow(self) -> None:
+        """Test TF transform data is being properly published to ROS2 topics."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        self.tf_data = None
+
+        tf_topic = "/tf"
+
+        # Create callback to store message data
+        def tf_callback(msg: Any) -> None:
+            self.tf_data = msg
+
+        # Create subscriber
+        self.create_subscription(self.node, TFMessage, tf_topic, tf_callback)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 TF Publisher Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/TF Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Set Target Prim
+        target_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[5]/StringField[0]")
+        target_prim_field.model.set_value(art_root_path)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[8]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation
+        self._timeline.play()
+
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        # Run simulation
+        condition_met = await self.simulate_until_condition(
+            lambda: self.tf_data is not None, max_frames=300, per_frame_callback=spin_ros  # 10 * 0.5s at 60fps
+        )
+
+        # Stop simulation
+        self._timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
+        # Validate data
+        self.assertTrue(condition_met, "No TF message received within timeout")
+        self.assertIsNotNone(self.tf_data, "No TF message received")
+        if self.tf_data:
+            # Validate TF data content
+            self.assertGreater(len(self.tf_data.transforms), 0, "TF message should contain transforms")
+
+            # check for expected frames
+            frame_ids = set()
+            child_frame_ids = set()
+
+            for transform in self.tf_data.transforms:
+                frame_ids.add(transform.header.frame_id)
+                child_frame_ids.add(transform.child_frame_id)
+
+            # Validate a specific transform if possible
+            for transform in self.tf_data.transforms:
+                if transform.header.frame_id == "odom" and transform.child_frame_id == "base_link":
+                    # Verify translation values
+                    self.assertIsNotNone(transform.transform.translation.x, "Transform missing x translation")
+                    self.assertIsNotNone(transform.transform.translation.y, "Transform missing y translation")
+                    self.assertIsNotNone(transform.transform.translation.z, "Transform missing z translation")
+
+                    # verify rotation is valid quaternion
+                    quat = [
+                        transform.transform.rotation.x,
+                        transform.transform.rotation.y,
+                        transform.transform.rotation.z,
+                        transform.transform.rotation.w,
+                    ]
+
+                    # A valid quanterion has a sum of squares = 1
+                    quant_magnitude = sum(q * q for q in quat)
+                    self.assertAlmostEqual(quant_magnitude, 1.0, delta=0.1, msg="Invalid quaternion")
+
+
+class TestMenuROS2OdometryGraph(ROS2MenuTestBase):
+    """Test ROS2 Odometry OmniGraph creation from menu."""
+
+    async def test_odometry_graph_creation(self) -> None:
+        """Test creation of Odometry graph structure via menu."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Odometry Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Odometry Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Set Articulation Root
+        articulation_root_field = await self.find_widget_with_retry(root_widget_path + "/HStack[4]/StringField[0]")
+        articulation_root_field.model.set_value("/World/test_robot/chassis_link/base_link")
+
+        # Set Chassis Link Prim
+        chassis_link_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[5]/StringField[0]")
+        chassis_link_prim_field.model.set_value("/World/test_robot/chassis_link")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[6]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_Odometry")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu produced an odometry graph.
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.ros2.bridge.ROS2PublishOdometry", node_types)
+
+    async def test_odometry_null_conditions(self) -> None:
+        """Test odometry graph with null chassis prim."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Odometry Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Odometry Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Leave chassis and articulation root empty (null condition)
+        # Set Articulation Root
+        articulation_root_field = await self.find_widget_with_retry(root_widget_path + "/HStack[4]/StringField[0]")
+        articulation_root_field.model.set_value("")
+
+        # Set Chassis Link Prim
+        chassis_link_prim_field = await self.find_widget_with_retry(root_widget_path + "/HStack[5]/StringField[0]")
+        chassis_link_prim_field.model.set_value("")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[6]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to test (should not crash)
+        self._timeline.play()
+        await omni.kit.app.get_app().next_update_async()
+        self._timeline.stop()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Verify simulation completed (implicit test that no crash occurred)
+        self.assertFalse(self._timeline.is_playing())
+
+    async def test_odometry_data_flow(self) -> None:
+        """Test odometrydata is being properly published to ROS2 topics."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Setup ROS2 subscribers for both TF and Odometry messages
+        self.tf_data = None
+        self.odom_data = None
+
+        tf_topic = "/tf"
+        odom_topic = "/odom"
+
+        # Create callbacks to store message data
+        def tf_callback(msg: Any) -> None:
+            self.tf_data = copy.deepcopy(msg)
+
+        def odom_callback(msg: Any) -> None:
+            self.odom_data = copy.deepcopy(msg)
+
+        # Create subscribers
+        self.create_subscription(self.node, TFMessage, tf_topic, tf_callback)
+        self.create_subscription(self.node, Odometry, odom_topic, odom_callback)
+
+        # Create Odometry graph through menu
+        window_name = "ROS2 Odometry Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Odometry Publisher",
+            delays=[10, 100, 200],
+            window_name=window_name,
+            use_direct_click=False,
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Configure Odometry graph parameters
+
+        odom_root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        # Enable "Publish Robot's TF?" checkbox (critical for TF publishing)
+        publish_tf_checkbox = await self.find_widget_with_retry(
+            odom_root_widget_path + "/HStack[3]/HStack[0]/VStack[0]/ToolButton[0]"
+        )
+        if publish_tf_checkbox:
+            publish_tf_checkbox.model.set_value(True)
+
+        # Set Robot Articulation Root to the actual articulation root prim (chassis_link)
+        articulation_root_field = await self.find_widget_with_retry(odom_root_widget_path + "/HStack[4]/StringField[0]")
+        articulation_root_field.model.set_value(art_root_path)
+
+        # Set Chassis Link Prim
+        chassis_link_prim_field = await self.find_widget_with_retry(odom_root_widget_path + "/HStack[5]/StringField[0]")
+        chassis_link_prim_field.model.set_value(base_link_path)
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        odom_ok_button = await self.find_enabled_widget_with_retry(odom_root_widget_path + "/HStack[6]/Button[0]")
+        self.assertIsNotNone(odom_ok_button, "Odometry OK button not found")
+        await odom_ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph to modify it programmatically if needed
+        graph_path = "/Graph/ROS_Odometry"
+        odom_graph = og.get_graph_by_path(graph_path)
+        self.assertIsNotNone(odom_graph, "Odometry graph not found at expected path")
+
+        # Verify essential nodes exist (similar to test_odometry_graph_creation)
+        nodes = odom_graph.get_nodes()
+        node_types = {node.get_type_name() for node in nodes}
+
+        expected_nodes = {
+            "omni.graph.action.OnPlaybackTick",
+            "isaacsim.ros2.bridge.ROS2Context",
+            "isaacsim.core.nodes.IsaacReadSimulationTime",
+            "isaacsim.core.nodes.IsaacComputeOdometry",
+            "isaacsim.ros2.bridge.ROS2PublishOdometry",
+            "isaacsim.ros2.bridge.ROS2PublishTransformTree",
+        }
+
+        for expected in expected_nodes:
+            self.assertIn(expected, node_types, f"Missing expected node type: {expected}")
+
+        # Find the TF publisher node and ensure it has target prims set
+        tf_publisher = None
+        for node in nodes:
+            if "ROS2PublishTransformTree" in node.get_type_name():
+                tf_publisher = node
+                break
+
+        if tf_publisher:
+            # Set the target prims on the TF publisher to ensure the robot is published
+            target_prims_attr = tf_publisher.get_attribute("inputs:targetPrims")
+            if target_prims_attr:
+                og.Controller.set(target_prims_attr, [usdrt.Sdf.Path(art_root_path)])
+
+        # Run simulation
+        self._timeline.play()
+
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        # Run simulation
+        frame_ids = set()
+        child_frame_ids = set()
+
+        def check_base_link_received() -> bool:
+            if self.tf_data and self.odom_data:
+                frame_ids.update(transform.header.frame_id for transform in self.tf_data.transforms)
+                child_frame_ids.update(transform.child_frame_id for transform in self.tf_data.transforms)
+                return "base_link" in frame_ids or "base_link" in child_frame_ids
+            return False
+
+        await self.simulate_until_condition(check_base_link_received, max_frames=600, per_frame_callback=spin_ros)
+
+        # Validate TF data
+        self.assertIsNotNone(self.tf_data, "No TF messages received")
+        self.assertTrue("base_link" in frame_ids or "base_link" in child_frame_ids, "No base_link frame found")
+        if self.tf_data:
+            # Validate TF data content
+            self.assertGreater(len(self.tf_data.transforms), 0, "TF message should contain transforms")
+
+            # Check for expected frames
+            frame_ids = set()
+            child_frame_ids = set()
+
+            for transform in self.tf_data.transforms:
+                frame_ids.add(transform.header.frame_id)
+                child_frame_ids.add(transform.child_frame_id)
+
+            all_frames = frame_ids.union(child_frame_ids)
+
+            # Check for base_link frames
+            self.assertIn("base_link", all_frames, "No base_link frame found")
+
+        # Validate Odometry data
+        self.assertIsNotNone(self.odom_data, "No odometry messages received")
+        if self.odom_data:
+
+            # Check pose and twist data
+            self.assertIsNotNone(self.odom_data.pose.pose.position.x, "Missing position.x in odometry")
+            self.assertIsNotNone(self.odom_data.pose.pose.position.y, "Missing position.y in odometry")
+            self.assertIsNotNone(self.odom_data.pose.pose.position.z, "Missing position.z in odometry")
+
+            # Check orientation quaternion
+            quat = [
+                self.odom_data.pose.pose.orientation.x,
+                self.odom_data.pose.pose.orientation.y,
+                self.odom_data.pose.pose.orientation.z,
+                self.odom_data.pose.pose.orientation.w,
+            ]
+
+            # A valid quaternion has a sum of squares = 1 (allowing for minor numerical error)
+            quat_magnitude = sum(q * q for q in quat)
+            self.assertAlmostEqual(quat_magnitude, 1.0, delta=0.01, msg="Invalid quaternion in odometry")
+
+            # Check twist data is present
+            self.assertIsNotNone(self.odom_data.twist.twist.linear.x, "Missing linear.x velocity")
+            self.assertIsNotNone(self.odom_data.twist.twist.angular.z, "Missing angular.z velocity")
+        # Stop simulation
+        self._timeline.stop()
+
+
+class TestMenuROS2ClockGraph(ROS2MenuTestBase):
+    """Test ROS2 Clock OmniGraph creation from menu."""
+
+    async def test_clock_graph_creation(self) -> None:
+        """Test creation of Clock graph structure via menu."""
+        # Create environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Clock Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Clock", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[1]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_Clock")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu produced a clock graph.
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.ros2.bridge.ROS2PublishClock", node_types)
+
+    async def test_clock_data_flow(self) -> None:
+        """Test Clock data is being properly published to ROS2 topics with data validation."""
+        # Create environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Setup ROS2 subscribers
+        # Store actual message data for validation
+        self.clock_data = None
+        self.clock_history = []
+
+        # Define topic names
+        clock_topic = "/clock"
+
+        # Create callback to store message data
+        def clock_callback(msg: Any) -> None:
+            self.clock_data = msg
+            # Store timestamp along with clock value for debugging
+            time_value = msg.clock.sec + msg.clock.nanosec * 1e-9
+            self.clock_history.append(time_value)
+
+        # Create subscriber
+        self.create_subscription(self.node, Clock, clock_topic, clock_callback)
+
+        # Create graph through menu as required
+        window_name = "ROS2 Clock Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Clock", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[1]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get and verify the graph structure
+        graph_path = "/Graph/ROS_Clock"
+        clock_graph = og.get_graph_by_path(graph_path)
+        self.assertIsNotNone(clock_graph, "Clock graph was not created at expected path")
+
+        # Find the key nodes by type
+        sim_time_node = None
+        clock_publisher_node = None
+        playback_tick_node = None
+
+        for node in clock_graph.get_nodes():
+            node_type = node.get_type_name()
+
+            if "IsaacReadSimulationTime" in node_type:
+                sim_time_node = node
+            elif "ROS2PublishClock" in node_type:
+                clock_publisher_node = node
+            elif "OnPlaybackTick" in node_type:
+                playback_tick_node = node
+
+        self.assertIsNotNone(sim_time_node, "Simulation time node not found in graph")
+        self.assertIsNotNone(clock_publisher_node, "Clock publisher node not found in graph")
+        self.assertIsNotNone(playback_tick_node, "Playback tick node not found in graph")
+
+        reset_on_stop_attr = sim_time_node.get_attribute("inputs:resetOnStop")
+        og.Controller.set(reset_on_stop_attr, False)
+
+        tick_output_attr = playback_tick_node.get_attribute("outputs:tick")
+        clock_exec_in_attr = clock_publisher_node.get_attribute("inputs:execIn")
+
+        # Connect the attributes directly
+        if tick_output_attr and clock_exec_in_attr:
+            og.Controller.connect(tick_output_attr, clock_exec_in_attr)
+
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        def current_clock_span() -> float:
+            """Return the span after the most recent simulation-clock reset."""
+            if len(self.clock_history) < 2:
+                return 0.0
+            segment_start = 0
+            for index in range(1, len(self.clock_history)):
+                if self.clock_history[index] < self.clock_history[index - 1]:
+                    segment_start = index
+            return self.clock_history[-1] - self.clock_history[segment_start]
+
+        # Run only after the graph's publisher endpoint is visible. Discovery is
+        # asynchronous and fixed frame counts are too short on fast Windows runners.
+        self.clock_history.clear()
+        self._timeline.play()
+        await self.wait_for_publishers_on_topic(
+            self.node,
+            clock_topic,
+            timeout_sec=10.0,
+            per_frame_callback=spin_ros,
+        )
+        clock_advanced = await self.simulate_until_condition(
+            lambda: current_clock_span() > 0.5,
+            max_frames=600,
+            per_frame_callback=spin_ros,
+        )
+
+        # Stop simulation
+        self._timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
+        self.assertTrue(
+            clock_advanced,
+            f"Clock did not advance by 0.5 seconds after its most recent reset. History: {self.clock_history}",
+        )
+
+
+class TestMenuROS2GenericPublisherGraph(ROS2MenuTestBase):
+    """Test suite for menu r o s2 generic publisher graph."""
+
+    async def test_generic_publisher_graph_creation(self) -> None:
+        """Test generic publisher graph creation from menu."""
+        # Creating environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Click through the menu to create the graph
+        window_name = "ROS2 Generic Publisher Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Generic Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[2]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Get the created graph at default path
+        graph = og.get_graph_by_path("/Graph/ROS_GenericPub")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        # Exhaustive node-set verification lives in the isaacsim.ros2.nodes graph_api tests.
+        # Here we only confirm the menu produced a generic publisher graph.
+        node_types = {node.get_type_name() for node in graph.get_nodes()}
+        self.assertIn("isaacsim.ros2.bridge.ROS2Publisher", node_types)
+
+    async def test_generic_publisher_data_flow(self) -> None:
+        """Test Generic Publisher data is properly publishing RTF as Float32 to ROS2 topics."""
+        # Create environment and Carter Robot
+        robot, base_link_path, art_root_path = await self.setup_test_environment()
+
+        # Setup ROS2 subscribers
+        # Store actual message data for validation
+        self.float_data = None
+
+        # Define topic name
+        test_topic = "/test_rtf_publisher"
+
+        # Create callback to store message data
+        def float_callback(msg: Any) -> None:
+            self.float_data = msg
+            print(f"Received Float32 value: {msg.data}")
+
+        # Create subscriber for Float32
+        self.create_subscription(self.node, Float32, test_topic, float_callback)
+
+        # Create graph through menu
+        window_name = "ROS2 Generic Publisher Graph"
+        param_window = await menu_click_with_retry(
+            "Tools/Robotics/ROS 2 OmniGraphs/Generic Publisher", window_name=window_name, use_direct_click=False
+        )
+        self.assertIsNotNone(param_window, "Parameter window not found")
+
+        # Find and set the graph root prim
+        root_widget_path = f"{window_name}//Frame/VStack[0]"
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Click OK button to create the base graph
+        ok_button = await self.find_enabled_widget_with_retry(root_widget_path + "/HStack[2]/Button[0]")
+        self.assertIsNotNone(ok_button, "OK button not found")
+        await ok_button.click()
+
+        await omni.kit.app.get_app().next_update_async()
+
+        graph = og.get_graph_by_path("/Graph/ROS_GenericPub")
+        self.assertIsNotNone(graph, "Graph was not created")
+
+        nodes = graph.get_nodes()
+        publisher_node = None
+        for node in nodes:
+            if node.get_type_name() == "isaacsim.ros2.bridge.ROS2Publisher":
+                publisher_node = node
+                break
+
+        self.assertIsNotNone(publisher_node, "ROS2Publisher node not found in graph")
+
+        if publisher_node:
+            topic_name_attr = publisher_node.get_attribute("inputs:topicName")
+            if topic_name_attr:
+                og.Controller.set(topic_name_attr, test_topic)
+                print(f"Set topic name to {test_topic}")
+
+        await omni.kit.app.get_app().next_update_async()
+
+        # Run simulation to generate RTF data
+        self._timeline.play()
+
+        # Define helper function to process messages
+        def spin_ros() -> None:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        # Run simulation
+
+        print("Starting RTF Float32 Publisher data collection...")
+
+        await self.simulate_until_condition(
+            lambda: self.float_data is not None, max_frames=300, per_frame_callback=spin_ros
+        )
+
+        # Stop simulation
+        self._timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
+        # Validate data
+        self.assertIsNotNone(self.float_data, "No Float32 messages received from RTF Publisher")
+        if self.float_data:
+            # Validate Float32 data content
+            # RTF should be a positive float value representing simulation speed
+            self.assertIsInstance(self.float_data.data, float, "RTF should be a float value")
+            self.assertGreaterEqual(self.float_data.data, 0.0, "RTF should be non-negative")
+
+            print(f"Successfully received and validated RTF value: {self.float_data.data}")

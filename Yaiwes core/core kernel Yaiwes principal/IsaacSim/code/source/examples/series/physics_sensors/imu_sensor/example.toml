@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id = "physics_sensors.imu_sensor"
+title = "IMU Sensor"
+summary = "Derive orientation, angular velocity, and specific force for a mounted IMU."
+owners = [
+    "isaacsim.common.logging",
+    "isaacsim.foundation.objects",
+    "isaacsim.foundation.prims",
+    "isaacsim.physics.entities",
+    "isaacsim.physics.manager",
+    "isaacsim.physics_engines.ovphysx",
+]
+topics = ["physics", "sensors", "usd"]
+
+[build]
+adapter = "none"
+
+[run]
+adapter = "python"
+path = "main.py"
+
+[requirements]
+system = ["python"]
+modules = [
+    { name = "isaacsim_common", surfaces = ["python"] },
+    { name = "isaacsim_foundation", surfaces = ["python"] },
+    { name = "isaacsim_physics", surfaces = ["python"] },
+    { name = "isaacsim_physics_engines", surfaces = ["python"] },
+]
+
+[[test]]
+name = "default"
+stdout_contains = [
+    "IMU at /World/Body/Imu mounted on /World/Body.",
+    "Reporting specific force, the proper acceleration.",
+    "Free fall at t =",
+    "At rest at t =",
+    "sensor specific force",
+]
+
+
+[[test]]
+name = "unit"
+path = "test.py"
+stdout_contains = [
+    "imu.py unit tests passed.",
+]

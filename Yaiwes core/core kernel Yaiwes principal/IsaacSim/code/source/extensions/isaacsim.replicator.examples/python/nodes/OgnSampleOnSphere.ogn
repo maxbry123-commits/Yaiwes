@@ -1,0 +1,41 @@
+{
+    "OgnSampleOnSphere": {
+        "version": 2,
+        "description": "Assigns uniformly sampled location on a sphere.",
+        "language": "Python",
+        "categoryDefinitions": "config/CategoryDefinition.json",
+        "categories": ["isaacReplicatorExamples"],
+        "icon": "icons/isaac-sim.svg",
+        "metadata": {
+            "uiName": "Sample On Sphere"
+        },
+        "inputs": {
+            "prims": {
+                "type": "target",
+                "description": "prims to randomize",
+                "default": []
+            },
+            "execIn": {
+                "type": "execution",
+                "description": "exec",
+                "default": 0
+            },
+            "radius": {
+                "type": "float",
+                "description": "sphere radius",
+                "default": 1.0
+            },
+            "seed": {
+                "type": "int",
+                "description": "Random number generator seed. A negative value uses the Replicator global seed.",
+                "default": -1
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": "exec"
+            }
+        }
+    }
+}

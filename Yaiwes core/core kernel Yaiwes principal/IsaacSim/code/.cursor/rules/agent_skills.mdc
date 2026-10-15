@@ -1,0 +1,12 @@
+---
+description: Pointer to the agent-agnostic skills directory. All SKILL.md workflow guides live under skills/.
+alwaysApply: true
+---
+
+# Agent Skills Location
+
+Skills for this repo live under `skills/` as `SKILL.md` files.
+
+Route to skills by the `description` field in each `SKILL.md` frontmatter, which states when that skill applies. Load individual `SKILL.md` files **on demand only** — read a skill's file when the user's request matches its domain (e.g., `skills/profile-isaac-sim/SKILL.md` for performance work). Do not bulk-load all skills upfront.
+
+Read [`skills/SKILLS.md`](../../skills/SKILLS.md). Route to skills **on demand only** — read a skill's file when the user's request matches its domain (e.g., `skills/profile-isaac-sim/SKILL.md` for performance work). Do not bulk-load all skills upfront.
