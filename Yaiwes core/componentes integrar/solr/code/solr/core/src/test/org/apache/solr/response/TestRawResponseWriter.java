@@ -1,0 +1,225 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.response;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import com.fasterxml.jackson.dataformat.cbor.CBORGenerator;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.LongAdder;
+import org.apache.lucene.tests.util.TestUtil;
+import org.apache.solr.SolrTestCaseJ4;
+import org.apache.solr.client.solrj.response.JavaBinResponseParser;
+import org.apache.solr.common.util.ContentStreamBase.ByteArrayStream;
+import org.apache.solr.common.util.ContentStreamBase.StringStream;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.handler.loader.CborLoader;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+
+/** Tests the {@link RawResponseWriter} behavior, in particular when dealing with "base" writer */
+public class TestRawResponseWriter extends SolrTestCaseJ4 {
+
+  private static RawResponseWriter writerXmlBase;
+  private static RawResponseWriter writerJsonBase;
+  private static RawResponseWriter writerBinBase;
+  private static RawResponseWriter writerCborBase;
+  private static RawResponseWriter writerNoBase;
+
+  private static RawResponseWriter[] allWriters;
+
+  @BeforeClass
+  public static void setupCoreAndWriters() throws Exception {
+    // we don't directly use this core or its config, we use
+    // QueryResponseWriters' constructed programmatically,
+    // but we do use this core for managing the life cycle of the requests
+    // we spin up.
+    initCore("solrconfig.xml", "schema.xml");
+
+    writerNoBase =
+        newRawResponseWriter(
+            null); /* null base uses core's default writer (XML for this core), or JSON if no core */
+    writerXmlBase = newRawResponseWriter("xml");
+    writerJsonBase = newRawResponseWriter("json");
+    writerBinBase = newRawResponseWriter("javabin");
+    writerCborBase = newRawResponseWriter("cbor");
+
+    allWriters =
+        new RawResponseWriter[] {
+          writerXmlBase, writerJsonBase, writerBinBase, writerCborBase, writerNoBase
+        };
+  }
+
+  @AfterClass
+  public static void cleanupWriters() {
+    writerXmlBase = null;
+    writerJsonBase = null;
+    writerBinBase = null;
+    writerNoBase = null;
+    writerCborBase = null;
+    allWriters = null;
+  }
+
+  /**
+   * Regardless of base writer, the bytes in should be the same as the bytes out when response is a
+   * raw ContentStream written to an OutputStream
+   */
+  public void testRawBinaryContentStream() throws IOException {
+    SolrQueryResponse rsp = new SolrQueryResponse();
+    byte[] data = new byte[TestUtil.nextInt(random(), 10, 2048)];
+    random().nextBytes(data);
+    ByteArrayStream stream = new ByteArrayStream(data, TestUtil.randomUnicodeString(random()));
+
+    stream.setContentType(TestUtil.randomSimpleString(random()));
+    rsp.add(RawResponseWriter.CONTENT, stream);
+
+    for (RawResponseWriter writer : allWriters) {
+      assertEquals(stream.getContentType(), writer.getContentType(req(), rsp));
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      writer.write(out, req(), rsp);
+      assertArrayEquals(data, out.toByteArray());
+    }
+  }
+
+  /**
+   * Regardless of base writer, the String in should be the same as the String out when response is
+   * a raw ContentStream written to a Writer (or OutputStream)
+   */
+  public void testRawStringContentStream() throws IOException {
+    SolrQueryResponse rsp = new SolrQueryResponse();
+    String data = TestUtil.randomUnicodeString(random());
+    StringStream stream = new StringStream(data);
+
+    stream.setContentType(TestUtil.randomSimpleString(random()));
+    rsp.add(RawResponseWriter.CONTENT, stream);
+
+    for (RawResponseWriter writer : allWriters) {
+      assertEquals(stream.getContentType(), writer.getContentType(req(), rsp));
+
+      // we should have the same string if we use a Writer
+      assertEquals(data, writer.writeToString(req(), rsp));
+
+      // we should have UTF-8 Bytes if we use an OutputStream
+      ByteArrayOutputStream bout = new ByteArrayOutputStream();
+      writer.write(bout, req(), rsp);
+      assertEquals(data, bout.toString(StandardCharsets.UTF_8));
+    }
+  }
+
+  /** When no real ContentStream is specified, each base writer should be used for formatting */
+  public void testStructuredDataViaBaseWriters() throws IOException {
+    SolrQueryResponse rsp = new SolrQueryResponse();
+    // Don't send a ContentStream back, this will fall back to the configured base writer.
+    // But abuse the CONTENT key to ensure writer is also checking type
+    rsp.add(RawResponseWriter.CONTENT, "test");
+    rsp.add("foo", "bar");
+
+    // check Content-Type against each writer
+    assertEquals("application/xml; charset=UTF-8", writerNoBase.getContentType(req(), rsp));
+    assertEquals("application/xml; charset=UTF-8", writerXmlBase.getContentType(req(), rsp));
+    assertEquals("application/json; charset=UTF-8", writerJsonBase.getContentType(req(), rsp));
+    assertEquals("application/octet-stream", writerBinBase.getContentType(req(), rsp));
+    assertEquals(
+        CborResponseWriter.APPLICATION_CBOR_VALUE, writerCborBase.getContentType(req(), rsp));
+
+    // check response against each writer
+
+    // xml & none (default behavior same as XML)
+    String xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            + "<response>\n"
+            + "\n"
+            + "<str name=\"content\">test</str>\n"
+            + "<str name=\"foo\">bar</str>\n"
+            + "</response>\n";
+    assertEquals(xml, writerXmlBase.writeToString(req(), rsp));
+    ByteArrayOutputStream xmlBout = new ByteArrayOutputStream();
+    writerXmlBase.write(xmlBout, req(), rsp);
+    assertEquals(xml, xmlBout.toString(StandardCharsets.UTF_8));
+
+    assertEquals(xml, writerNoBase.writeToString(req(), rsp));
+    ByteArrayOutputStream noneBout = new ByteArrayOutputStream();
+    writerNoBase.write(noneBout, req(), rsp);
+    assertEquals(xml, noneBout.toString(StandardCharsets.UTF_8));
+
+    // json
+    String json = "{\n" + "  \"content\":\"test\",\n" + "  \"foo\":\"bar\"}\n";
+    assertJSONEquals(json, writerJsonBase.writeToString(req(), rsp));
+
+    // javabin
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    writerBinBase.write(bytes, req(), rsp);
+    JavaBinResponseParser parser = new JavaBinResponseParser();
+    NamedList<Object> out =
+        parser.processResponse(
+            new ByteArrayInputStream(bytes.toByteArray()), /* encoding irrelevant */ null);
+    assertEquals(RawResponseWriter.CONTENT, out.getName(0));
+    assertEquals("test", out.getVal(0));
+    assertEquals("foo", out.getName(1));
+    assertEquals("bar", out.getVal(1));
+
+    // cbor
+
+    byte[] cborBytes = convertJsonToCborFormat(json.getBytes(StandardCharsets.UTF_8));
+    assertEquals(25, cborBytes.length);
+    LongAdder numberOfObjectsInResponse = new LongAdder();
+    new CborLoader(null, (document) -> numberOfObjectsInResponse.increment())
+        .stream(new ByteArrayInputStream(cborBytes));
+    assertEquals(1, numberOfObjectsInResponse.intValue());
+  }
+
+  private byte[] convertJsonToCborFormat(byte[] inputJson) throws IOException {
+    ByteArrayOutputStream baos;
+    ObjectMapper jsonMapper = new ObjectMapper(new JsonFactory());
+
+    // Read JSON file as a JsonNode
+    JsonNode jsonNode = jsonMapper.readTree(inputJson);
+    // Create a CBOR ObjectMapper
+    baos = new ByteArrayOutputStream();
+
+    ObjectMapper cborMapper =
+        new ObjectMapper(CBORFactory.builder().enable(CBORGenerator.Feature.STRINGREF).build());
+    JsonGenerator jsonGenerator = cborMapper.createGenerator(baos);
+
+    jsonGenerator.writeTree(jsonNode);
+    jsonGenerator.close();
+    return baos.toByteArray();
+  }
+
+  /**
+   * Generates a new {@link RawResponseWriter} wrapping the specified baseWriter name (which must
+   * either be an implicitly defined response writer, or one explicitly configured in
+   * solrconfig.xml)
+   *
+   * @param baseWriter null or the name of a valid base writer
+   */
+  private static RawResponseWriter newRawResponseWriter(String baseWriter) {
+    RawResponseWriter writer = new RawResponseWriter();
+    NamedList<String> initArgs = new NamedList<>();
+    if (null != baseWriter) {
+      initArgs.add("base", baseWriter);
+    }
+    writer.init(initArgs);
+    return writer;
+  }
+}

@@ -1,0 +1,144 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.solr.s3;
+
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakLingering;
+import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.tests.util.QuickPatchThreadsFilter;
+import org.apache.solr.SolrIgnoredThreadsFilter;
+import org.apache.solr.cloud.api.collections.AbstractIncrementalBackupTest;
+import org.apache.solr.util.LogLevel;
+import org.junit.BeforeClass;
+import org.junit.ClassRule;
+import software.amazon.awssdk.regions.Region;
+
+// Backups do checksum validation against a footer value not present in 'SimpleText'
+@LuceneTestCase.Nightly
+@LuceneTestCase.SuppressCodecs({"SimpleText"})
+@ThreadLeakLingering(linger = 10)
+@ThreadLeakFilters(
+    filters = {
+      SolrIgnoredThreadsFilter.class,
+      QuickPatchThreadsFilter.class,
+      S3MockTestcontainersThreadFilter.class
+    })
+@LogLevel(
+    value =
+        "org.apache.solr.cloud=DEBUG;org.apache.solr.cloud.api.collections=DEBUG;org.apache.solr.cloud.overseer=DEBUG")
+public class S3IncrementalBackupTest extends AbstractIncrementalBackupTest {
+
+  private static final String BUCKET_NAME = S3IncrementalBackupTest.class.getSimpleName();
+
+  @ClassRule
+  public static final S3MockContainerRule s3MockContainer = new S3MockContainerRule(BUCKET_NAME);
+
+  public static final String SOLR_XML =
+      "<solr>\n"
+          + "\n"
+          + "  <str name=\"shareSchema\">${shareSchema:false}</str>\n"
+          + "  <str name=\"configSetBaseDir\">${configSetBaseDir:configsets}</str>\n"
+          + "  <str name=\"coreRootDirectory\">${coreRootDirectory:.}</str>\n"
+          + "\n"
+          + "  <shardHandlerFactory name=\"shardHandlerFactory\" class=\"HttpShardHandlerFactory\">\n"
+          + "    <str name=\"urlScheme\">${urlScheme:}</str>\n"
+          + "    <int name=\"socketTimeout\">${socketTimeout:90000}</int>\n"
+          + "    <int name=\"connTimeout\">${connTimeout:15000}</int>\n"
+          + "  </shardHandlerFactory>\n"
+          + "\n"
+          + "  <solrcloud>\n"
+          + "    <str name=\"host\">127.0.0.1</str>\n"
+          + "    <int name=\"hostPort\">${hostPort:8983}</int>\n"
+          + "    <int name=\"zkClientTimeout\">${solr.zookeeper.client.timeout:30000}</int>\n"
+          + "    <int name=\"leaderVoteWait\">10000</int>\n"
+          + "    <int name=\"distribUpdateConnTimeout\">${distribUpdateConnTimeout:45000}</int>\n"
+          + "    <int name=\"distribUpdateSoTimeout\">${distribUpdateSoTimeout:340000}</int>\n"
+          + "  </solrcloud>\n"
+          + "  \n"
+          + "  <backup>\n"
+          + "    <repository name=\"errorBackupRepository\" class=\""
+          + ErrorThrowingTrackingBackupRepository.class.getName()
+          + "\"> \n"
+          + "      <str name=\"delegateRepoName\">s3</str>\n"
+          + "      <str name=\"hostPort\">${hostPort:8983}</str>\n"
+          + "    </repository>\n"
+          + "    <repository name=\"trackingBackupRepository\" class=\"org.apache.solr.core.TrackingBackupRepository\"> \n"
+          + "      <str name=\"delegateRepoName\">s3</str>\n"
+          + "    </repository>\n"
+          + "    <repository name=\"s3\" class=\"org.apache.solr.s3.S3BackupRepository\"> \n"
+          + "      <str name=\"s3.bucket.name\">BUCKET</str>\n"
+          + "      <str name=\"s3.region\">REGION</str>\n"
+          + "      <str name=\"s3.endpoint\">ENDPOINT</str>\n"
+          + "    </repository>\n"
+          + "  </backup>\n"
+          + "  \n"
+          + "</solr>\n";
+
+  @BeforeClass
+  public static void ensureCompatibleLocale() {
+    // TODO: Find incompatible locales
+  }
+
+  @BeforeClass
+  public static void setupClass() throws Exception {
+    System.setProperty("aws.accessKeyId", "foo");
+    System.setProperty("aws.secretAccessKey", "bar");
+    // Enable parallel backup/restore for cloud storage tests
+    System.setProperty("solr.backup.maxparalleluploads", "2");
+    System.setProperty("solr.backup.maxparalleldownloads", "2");
+    String retryMode;
+    switch (random().nextInt(3)) {
+      case 0:
+        retryMode = "legacy";
+        break;
+      case 1:
+        retryMode = "standard";
+        break;
+      default:
+        retryMode = "adaptive";
+        break;
+    }
+    System.setProperty("aws.retryMode", retryMode);
+
+    AbstractS3ClientTest.setS3ConfFile();
+
+    configureCluster(NUM_NODES) // nodes
+        .addConfig("conf1", getFile("conf/solrconfig.xml").getParent())
+        .withSolrXml(
+            SOLR_XML
+                // Only a single node will have a bad bucket name, all else should succeed.
+                // The bad node will be added later
+                .replace("BAD_BUCKET_ALL_BUT_ONE", "non-existent")
+                .replace("BAD_BUCKET_ONE", BUCKET_NAME)
+                .replace("BAD_BUCKET", BUCKET_NAME)
+                .replace("BUCKET", BUCKET_NAME)
+                .replace("REGION", Region.US_EAST_1.id())
+                .replace("ENDPOINT", s3MockContainer.getHttpEndpoint()))
+        .configure();
+  }
+
+  @Override
+  public String getCollectionNamePrefix() {
+    return "backuprestore";
+  }
+
+  @Override
+  public String getBackupLocation() {
+    return "/";
+  }
+}

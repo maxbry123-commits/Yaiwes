@@ -1,0 +1,216 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.handler.admin;
+
+import static org.apache.solr.core.CoreContainer.ALLOW_PATHS_SYSPROP;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.solr.SolrTestCaseJ4;
+import org.apache.solr.client.solrj.SolrClient;
+import org.apache.solr.client.solrj.SolrRequest;
+import org.apache.solr.client.solrj.SolrRequest.SolrRequestType;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.request.GenericSolrRequest;
+import org.apache.solr.client.solrj.response.InputStreamResponseParser;
+import org.apache.solr.client.solrj.response.ResponseParser;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.ContentStreamBase;
+import org.apache.solr.common.util.EnvUtils;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.request.SolrQueryRequestBase;
+import org.apache.solr.request.SolrRequestHandler;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.util.ExternalPaths;
+import org.apache.solr.util.SolrJettyTestRule;
+import org.junit.BeforeClass;
+import org.junit.ClassRule;
+
+public class ShowFileRequestHandlerTest extends SolrTestCaseJ4 {
+
+  @ClassRule public static SolrJettyTestRule solrTestRule = new SolrJettyTestRule();
+
+  @BeforeClass
+  public static void beforeTest() throws Exception {
+    EnvUtils.setProperty(
+        ALLOW_PATHS_SYSPROP, ExternalPaths.SERVER_HOME.toAbsolutePath().toString());
+    solrTestRule.startSolr();
+    solrTestRule.newCollection().withConfigSet(ExternalPaths.DEFAULT_CONFIGSET).create();
+  }
+
+  private GenericSolrRequest createShowFileRequest(SolrParams params) {
+    return new GenericSolrRequest(
+            SolrRequest.METHOD.GET, "/admin/file", SolrRequestType.ADMIN, params)
+        .setRequiresCollection(true);
+  }
+
+  public void test404ViaHttp() {
+    SolrClient client = solrTestRule.getSolrClient();
+    var request = createShowFileRequest(params("file", "does-not-exist-404.txt"));
+    SolrException e = expectThrows(SolrException.class, () -> request.process(client));
+    assertEquals(404, e.code());
+  }
+
+  public void test404Locally() {
+    try (SolrCore core = solrTestRule.getCoreContainer().getCore("collection1")) {
+      SolrQueryResponse rsp = new SolrQueryResponse();
+      SolrQueryRequest req =
+          new SolrQueryRequestBase(core, params("file", "does-not-exist-404.txt"));
+      core.execute(core.getRequestHandler("/admin/file"), req, rsp);
+      assertNotNull("no exception in response", rsp.getException());
+      assertTrue(
+          "wrong type of exception: " + rsp.getException().getClass(),
+          rsp.getException() instanceof SolrException);
+      assertEquals(404, ((SolrException) rsp.getException()).code());
+    }
+  }
+
+  public void testDirList() throws SolrServerException, IOException {
+    SolrClient client = solrTestRule.getSolrClient();
+    var request = createShowFileRequest(new ModifiableSolrParams());
+    var resp = request.process(client);
+    assertTrue(((NamedList) resp.getResponse().get("files")).size() > 0); // some files
+  }
+
+  public void testGetRawFile() throws SolrServerException, IOException {
+    SolrClient client = solrTestRule.getSolrClient();
+    var request = createShowFileRequest(params("file", "managed-schema.xml"));
+    final AtomicBoolean readFile = new AtomicBoolean();
+    request.setResponseParser(
+        new ResponseParser() {
+          @Override
+          public String getWriterType() {
+            // unfortunately this gets put onto params wt=mock, but it apparently has no effect
+            return "mock";
+          }
+
+          @Override
+          public NamedList<Object> processResponse(InputStream body, String encoding)
+              throws IOException {
+            if (body.read() >= 0) readFile.set(true);
+            return null;
+          }
+
+          @Override
+          public Set<String> getContentTypes() {
+            return Set.of(); // don't enforce
+          }
+        });
+
+    client.request(request); // runs request
+    // request.process(client); but we don't have a NamedList response
+    assertTrue(readFile.get());
+  }
+
+  public void testContentTypeHtmlBecomesTextPlain() {
+    try (SolrCore core = solrTestRule.getCoreContainer().getCore("collection1")) {
+      SolrRequestHandler handler = core.getRequestHandler("/admin/file");
+      SolrQueryRequest req =
+          new SolrQueryRequestBase(
+              core, params("file", "managed-schema.xml", "contentType", "text/html"));
+      SolrQueryResponse rsp = new SolrQueryResponse();
+      handler.handleRequest(req, rsp);
+      ContentStreamBase.FileStream content =
+          (ContentStreamBase.FileStream) rsp.getValues().get("content");
+      assertEquals("text/plain", content.getContentType());
+    }
+  }
+
+  public void testIllegalContentType() throws SolrServerException, IOException {
+    SolrClient client = solrTestRule.getSolrClient();
+    var request =
+        createShowFileRequest(params("file", "managed-schema", "contentType", "not/known"));
+    request.setResponseParser(new InputStreamResponseParser("xml"));
+    NamedList<Object> response = client.request(request);
+    closeResponseStream(response);
+    assertEquals(response.get("responseStatus"), 404);
+  }
+
+  public void testAbsoluteFilename() throws SolrServerException, IOException {
+    SolrClient client = solrTestRule.getSolrClient();
+    final var request =
+        createShowFileRequest(
+            params("file", "/etc/passwd", "contentType", "text/plain; charset=utf-8"));
+    request.setResponseParser(new InputStreamResponseParser("xml"));
+    NamedList<Object> response = client.request(request);
+    closeResponseStream(response);
+    assertEquals(response.get("responseStatus"), 404);
+  }
+
+  public void testEscapeConfDir() throws SolrServerException, IOException {
+    SolrClient client = solrTestRule.getSolrClient();
+    final var request =
+        createShowFileRequest(
+            params("file", "../../solr.xml", "contentType", "application/xml; charset=utf-8"));
+    request.setResponseParser(new InputStreamResponseParser("xml"));
+    NamedList<Object> response = client.request(request);
+    closeResponseStream(response);
+    assertEquals(response.get("responseStatus"), 400);
+  }
+
+  public void testPathTraversalFilename() throws SolrServerException, IOException {
+    SolrClient client = solrTestRule.getSolrClient();
+    final var request =
+        createShowFileRequest(
+            params(
+                "file",
+                "../../../../../../etc/passwd",
+                "contentType",
+                "text/plain; charset=utf-8"));
+    request.setResponseParser(new InputStreamResponseParser("xml"));
+    NamedList<Object> response = client.request(request);
+    closeResponseStream(response);
+    assertEquals(response.get("responseStatus"), 400);
+  }
+
+  public void testGetSafeContentType() {
+    // Valid content types are returned as is
+    assertEquals("application/json", ShowFileRequestHandler.getSafeContentType("application/json"));
+    assertEquals("text/csv", ShowFileRequestHandler.getSafeContentType("text/csv"));
+
+    // HTML gets rewritten as "safe" plaintext
+    assertEquals("text/plain", ShowFileRequestHandler.getSafeContentType("text/html"));
+    assertEquals("text/plain", ShowFileRequestHandler.getSafeContentType("application/xhtml+xml"));
+
+    // Content-type with charset
+    assertEquals(
+        "text/csv ; charset=utf-8",
+        ShowFileRequestHandler.getSafeContentType("text/csv ; charset=utf-8"));
+    assertEquals(
+        "text/xml;charset=utf-8",
+        ShowFileRequestHandler.getSafeContentType("text/xml;charset=utf-8"));
+
+    // Null
+    assertNull(ShowFileRequestHandler.getSafeContentType(null));
+
+    // Non-known content types are rejected with 400 error
+    expectThrows(SolrException.class, () -> ShowFileRequestHandler.getSafeContentType("foo/bar"));
+  }
+
+  private void closeResponseStream(NamedList<Object> response) throws IOException {
+    InputStream stream = (InputStream) response.get("stream");
+    if (stream != null) {
+      stream.close();
+    }
+  }
+}

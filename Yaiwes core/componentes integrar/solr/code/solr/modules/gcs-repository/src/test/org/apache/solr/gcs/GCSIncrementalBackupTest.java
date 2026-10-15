@@ -1,0 +1,98 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.solr.gcs;
+
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakLingering;
+import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.solr.cloud.api.collections.AbstractIncrementalBackupTest;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+
+@LuceneTestCase.Nightly
+@ThreadLeakLingering(linger = 10)
+@LuceneTestCase.SuppressCodecs({
+  "SimpleText"
+}) // Backups do checksum validation against a footer value not present in 'SimpleText'
+public class GCSIncrementalBackupTest extends AbstractIncrementalBackupTest {
+  public static final String SOLR_XML =
+      "<solr>\n"
+          + "\n"
+          + "  <str name=\"shareSchema\">${shareSchema:false}</str>\n"
+          + "  <str name=\"configSetBaseDir\">${configSetBaseDir:configsets}</str>\n"
+          + "  <str name=\"coreRootDirectory\">${coreRootDirectory:.}</str>\n"
+          + "\n"
+          + "  <shardHandlerFactory name=\"shardHandlerFactory\" class=\"HttpShardHandlerFactory\">\n"
+          + "    <str name=\"urlScheme\">${urlScheme:}</str>\n"
+          + "    <int name=\"socketTimeout\">${socketTimeout:90000}</int>\n"
+          + "    <int name=\"connTimeout\">${connTimeout:15000}</int>\n"
+          + "  </shardHandlerFactory>\n"
+          + "\n"
+          + "  <solrcloud>\n"
+          + "    <str name=\"host\">127.0.0.1</str>\n"
+          + "    <int name=\"hostPort\">${hostPort:8983}</int>\n"
+          + "    <int name=\"zkClientTimeout\">${solr.zookeeper.client.timeout:30000}</int>\n"
+          + "    <int name=\"leaderVoteWait\">10000</int>\n"
+          + "    <int name=\"distribUpdateConnTimeout\">${distribUpdateConnTimeout:45000}</int>\n"
+          + "    <int name=\"distribUpdateSoTimeout\">${distribUpdateSoTimeout:340000}</int>\n"
+          + "  </solrcloud>\n"
+          + "  \n"
+          + "  <backup>\n"
+          + "    <repository name=\"errorBackupRepository\" class=\""
+          + ErrorThrowingTrackingBackupRepository.class.getName()
+          + "\"> \n"
+          + "      <str name=\"delegateRepoName\">localfs</str>\n"
+          + "      <str name=\"hostPort\">${hostPort:8983}</str>\n"
+          + "    </repository>\n"
+          + "    <repository name=\"trackingBackupRepository\" class=\"org.apache.solr.core.TrackingBackupRepository\"> \n"
+          + "      <str name=\"delegateRepoName\">localfs</str>\n"
+          + "    </repository>\n"
+          + "    <repository name=\"localfs\" class=\"org.apache.solr.gcs.LocalStorageGCSBackupRepository\"> \n"
+          + "      <str name=\"gcsBucket\">someBucketName</str>\n"
+          + "      <str name=\"location\">backup1</str>\n"
+          + "    </repository>\n"
+          + "  </backup>\n"
+          + "  \n"
+          + "</solr>\n";
+
+  @BeforeClass
+  public static void setupClass() throws Exception {
+    // Enable parallel backup/restore for cloud storage tests
+    System.setProperty("solr.backup.maxparalleluploads", "2");
+    System.setProperty("solr.backup.maxparalleldownloads", "2");
+
+    configureCluster(NUM_NODES) // nodes
+        .addConfig("conf1", getFile("conf/solrconfig.xml").getParent())
+        .withSolrXml(SOLR_XML)
+        .configure();
+  }
+
+  @AfterClass
+  public static void tearDownClass() {
+    LocalStorageGCSBackupRepository.clearStashedStorage();
+  }
+
+  @Override
+  public String getCollectionNamePrefix() {
+    return "backuprestore";
+  }
+
+  @Override
+  public String getBackupLocation() {
+    return "backup1";
+  }
+}

@@ -1,0 +1,321 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import groovy.xml.XmlSlurper
+import org.eclipse.jgit.storage.file.FileRepositoryBuilder
+
+buildscript {
+  apply from: rootProject.file('build-tools/build-infra/declare-repositories.gradle'), to: delegate
+
+  dependencies {
+    classpath libs.eclipse.jgit.jgit
+  }
+}
+
+// Configure rat dependencies for use in the custom task.
+configure(rootProject) {
+  configurations {
+    ratDeps {
+      exclude group: 'commons-logging', module: 'commons-logging'
+      exclude group: 'commons-cli', module: 'commons-cli'
+    }
+  }
+
+  dependencies {
+    ratDeps libs.apache.rat.rat
+    ratDeps libs.slf4j.simple
+  }
+}
+
+/**
+ * Reads all file paths from the git index (DirCache) once and caches the result.
+ * Returns null if this is not a git repository or the index cannot be read.
+ * Paths use forward slashes and are relative to the repository root.
+ */
+Set<String> loadGitTrackedFiles() {
+  if (rootProject.ext.has('ratGitIndexLoaded')) return rootProject.ext.ratGitTrackedFiles
+  rootProject.ext.ratGitIndexLoaded = true
+  rootProject.ext.ratGitTrackedFiles = null
+
+  def dotGit = new File(rootProject.projectDir, ".git")
+  if (!dotGit.isDirectory()) {
+    return null // not a git repository
+  }
+
+  def repository = null
+  try {
+    repository = new FileRepositoryBuilder()
+        .setWorkTree(rootProject.projectDir)
+        .setMustExist(true)
+        .build()
+    def tracked = new HashSet<String>()
+    def dirCache = repository.readDirCache()
+    for (int i = 0; i < dirCache.getEntryCount(); i++) {
+      tracked.add(dirCache.getEntry(i).getPathString())
+    }
+    rootProject.ext.ratGitTrackedFiles = tracked
+    return tracked
+  } catch (Exception e) {
+    logger.warn("WARNING: Could not read git index for RAT check: ${e.message}")
+    return null
+  } finally {
+    if (repository != null) repository.close()
+  }
+}
+
+/**
+ * Returns the set of git-tracked file paths relative to the given project directory,
+ * or null if git tracking is unavailable.
+ */
+Set<String> gitTrackedFiles(File dir) {
+  def allFiles = loadGitTrackedFiles()
+  if (allFiles == null) return null
+
+  def prefix = rootProject.projectDir.toPath().relativize(dir.toPath())
+      .toString().replace('\\', '/')
+  if (prefix.isEmpty()) return allFiles
+
+  prefix += "/"
+  def result = new HashSet<String>()
+  for (String path : allFiles) {
+    if (path.startsWith(prefix)) {
+      result.add(path.substring(prefix.length()))
+    }
+  }
+  return result
+}
+
+// Configure the rat validation task and all scanned directories.
+allprojects {
+  tasks.register("rat", RatTask) {
+    group = 'Verification'
+    description = 'Runs Apache Rat checks.'
+
+    ratClasspath.from(rootProject.configurations.ratDeps)
+    ratConfig.set(rootProject.layout.projectDirectory.file("gradle/validation/rat-config.xml"))
+
+    def defaultScanFileTree = project.fileTree(projectDir, {
+      def trackedFiles = gitTrackedFiles(projectDir)
+      if (trackedFiles != null) {
+        // Git checkout: only scan files in the git index — naturally excludes build
+        // output, gitignored files, and untracked files without explicit patterns.
+        include { f -> f.isDirectory() || trackedFiles.contains(f.relativePath.pathString) }
+
+        // The following are excluded from the source release, thus no header needed
+        exclude "dev-docs"
+        exclude "**/AGENTS.md"
+        exclude "**/.*" // e.g. .gradle, .github, .gitignore, etc.
+        exclude "**/.*/**" // contents nested inside dot-directories, e.g. .gradle/**
+      } else {
+        // Source release (no git): scan everything, exclude generated/ignored paths manually.
+        include "**"
+
+        exclude "**/.gradle" // gradle will create this dir (possibly nested, e.g. in included builds)
+        exclude "**/.gradle/**"
+      }
+
+      exclude project.layout.buildDirectory.get().asFile.name
+
+      // Don't check any of the subprojects - they have their own rat tasks.
+      exclude subprojects.collect {
+        projectDir.toPath().relativize(it.projectDir.toPath()).toString().replace('\\', '/')
+      }
+
+      // Binary and media types — no text-based headers possible.
+      exclude "**/*.png"
+      exclude "**/*.jpg"
+      exclude "**/*.gif"
+      exclude "**/*.svg"
+      exclude "**/*.ico"
+      exclude "**/*.bin"
+      exclude "**/*.pem"
+      exclude "**/*.pdf"
+
+      // Structured-data and config files that intentionally carry no license.
+      exclude "**/*.json"
+      exclude "**/*.jsonl"
+      exclude "**/*.csv"
+
+      exclude "**/*gradle.lockfile"
+
+      exclude "**/*.txt"
+
+      // Solr core marker file; often empty
+      exclude "**/core.properties"
+
+      // Conditionally apply module-specific patterns.
+      switch (project.path) {
+        case ":":
+          // Composite included builds: skip build artifacts, src is already covered by "**".
+          exclude "build-tools/*/build"
+          // Non-subproject build output.
+          exclude "buildSrc/build"
+          exclude "dev-tools/solr-missing-doclet/build"
+          // IDE project files.
+          exclude "gradle/ide/eclipse"
+          exclude "gradle/validation/ecj-lint/ecj.javadocs.prefs"
+          // Generated/vendored build-tool resources.
+          exclude "gradle/documentation"
+          exclude "gradle/wrapper"
+          // rat-config.xml contains license-text data in its body, which confuses RAT's own detection.
+          exclude "gradle/validation/rat-config.xml"
+          // Kotlin JS dependency store.
+          exclude "kotlin-js-store"
+
+          exclude "dev-tools/scripts/cloud.sh"
+          exclude "dev-tools/scripts/README.md"
+          exclude "dev-tools/scripts/create_line_file_docs.py"
+
+          // Exclude new CHANGELOG and version-summary for each release
+          exclude "CHANGELOG.md"
+          exclude "changelog"
+
+          // solr/ui is a registered subproject with its own rat task, but it may be disabled
+          exclude "ui"
+
+          break
+
+        case ":solr":
+          exclude "licenses"
+          break
+
+        case ":solr:benchmark":
+          // this was generated, not hand-authored
+          exclude "jfr-profile.jfc"
+          break
+
+        case ":solr:modules:clustering":
+          exclude "src/test-files/META-INF/services/*"
+          break
+
+        case ":solr:modules:s3-repository":
+          exclude "src/test-files/s3.conf" // empty file
+          break
+
+        case ":solr:documentation":
+          exclude "src/markdown/*.md"
+          break
+
+        case ":solr:core":
+          exclude "src/test-files/**/*.aff"
+          exclude "src/test-files/**/*.dic"
+          exclude "src/test-files/**/*.conf"
+          exclude "src/test-files/**/external_eff"
+          exclude "src/test-files/**/*.incl"
+          exclude "src/test-files/**/*-snippet-*.xml"
+          break
+
+        case ":solr:server":
+          // Vendored (or adapted) from the Jetty distribution; not Solr's own IP.
+          exclude "etc/jetty*.xml"
+          exclude "etc/webdefault.xml"
+          exclude "modules"
+          break
+
+        case ":solr:solr-ref-guide":
+          exclude "ui-src/**"
+          break
+
+        case ":solr:docker":
+          // Deliberately malformed XML used to test the docker image's handling of a broken log4j2 config.
+          exclude "tests/cases/test_log4j/bogus-log4j2.xml"
+          break
+
+        case ":solr:example":
+          // films.xml is third-party (Freebase) data, like films/README.md.
+          exclude "films/films.xml"
+          // films/README.md documents third-party (Freebase) data and intentionally has no
+          // header, so it serves as the RAT detection canary.
+          ratCanaryPath.set("/films/README.md")
+          break
+
+        case ":solr:solrj":
+          exclude "src/test-files/**/*.xml"
+          break
+      }
+    })
+    inputFileTrees.add(defaultScanFileTree)
+
+    // RAT is noisy, even when there's no problem.  So log at DEBUG
+    logging.captureStandardOutput(LogLevel.DEBUG)
+  }
+}
+
+/**
+ * An Apache RAT adapter that validates whether files contain acceptable licenses.
+ */
+class RatTask extends DefaultTask {
+  @InputFiles
+  final ListProperty<ConfigurableFileTree> inputFileTrees = project.objects.listProperty(
+      ConfigurableFileTree)
+
+  @OutputFile
+  final RegularFileProperty xmlReport = project.objects.fileProperty().convention(
+      project.layout.buildDirectory.file("rat/rat-report.xml"))
+
+  @InputFiles
+  final ConfigurableFileCollection ratClasspath = project.objects.fileCollection()
+
+  @InputFile
+  final RegularFileProperty ratConfig = project.objects.fileProperty()
+
+  /** Path (as reported by RAT, with leading /) of a file with no header used to verify detection. */
+  @Input
+  @Optional
+  final Property<String> ratCanaryPath = project.objects.property(String)
+
+  @TaskAction
+  def execute() {
+    // RAT's Ant task has shared static state; synchronize to prevent parallel-execution interference.
+    synchronized (RatTask.class) { doRat() }
+  }
+
+  private void doRat() {
+    ant.taskdef(resource: 'org/apache/rat/anttasks/antlib.xml', classpath: ratClasspath.asPath)
+
+    File reportFile = xmlReport.get().asFile
+    reportFile.parentFile.mkdirs()
+
+    ant.report(outputStyle: 'xml', outputFile: reportFile.absolutePath) {
+      // Pass all gradle file trees to the ant task (Gradle's internal adapters are used).
+      inputFileTrees.get().each {fileTree ->
+        fileTree.addToAntBuilder(ant, 'resources', FileCollection.AntType.ResourceCollection)
+      }
+      config {
+        fileset(file: ratConfig.get().asFile.absolutePath)
+      }
+    }
+
+    def ratXml = new XmlSlurper().parse(reportFile)
+    def violations = ratXml.resource
+        .findAll { it.license.any { lic -> lic.@approval.text() == 'false' } }
+        .collect { resource ->
+          def licName = resource.license.find { lic -> lic.@approval.text() == 'false' }.@name.text()
+          "${resource.@name.text()}  ${licName}"
+        }
+    if (ratCanaryPath.present) {
+      def canary = ratCanaryPath.get()
+      def hit = violations.find { it.startsWith(canary) }
+      if (hit == null) {
+        throw new GradleException("RAT self-test failed: '${canary}' was not flagged — is license detection broken?")
+      }
+      violations.remove(hit)
+    }
+    violations.each { logger.error(it.toString()) }
+    project.failOrWarn("validation.rat.failOnError", "Detected license header issues", violations)
+  }
+}

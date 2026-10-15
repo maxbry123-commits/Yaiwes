@@ -1,0 +1,72 @@
+{
+  "bundle_bytes": 97464135,
+  "bundle_sha256": "6011d7d7141b522eec41bb308e11e299a58c1d5b329dca07d245ee47c3a9ef89",
+  "extracted_tree": {
+    "bytes": 150814118,
+    "files": 8816,
+    "sha256": "64d59c566c5ed71d963981652c6dc03269cc691587bac2a0340022850e260866"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0001",
+      "sha256": "33ec1bc792a19366e8d9def1e378cc4eed6dc1ea21f5e8e4b5779b09d0d0b6bf"
+    },
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0002",
+      "sha256": "b6259670a5b327c36a05e1f38c5f977eb162c473d56832b3533ecfaf0d3aa552"
+    },
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0003",
+      "sha256": "5fcedd2deb6b86f01d73e288191085530ea3d80ff6de5d5de74f6d575bc89347"
+    },
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0004",
+      "sha256": "1e31cd1f7b7b0a6a3652eb38bcb7bef5649aa87083322ed79f8df919adfdd666"
+    },
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0005",
+      "sha256": "a5ee31fec6727178870039488e015db9467879c8d9a85b345f12cd2d6229079b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0006",
+      "sha256": "f7b813f3740db7337924a8db4165c5b306618d4d2881eed1021c5d787d52df96"
+    },
+    {
+      "bytes": 12582912,
+      "name": "solr.bundle.zip.part-0007",
+      "sha256": "a1af186889949ac5772e0fa2d957753afcc53cad2a11ba0a94207314915e4de5"
+    },
+    {
+      "bytes": 9383751,
+      "name": "solr.bundle.zip.part-0008",
+      "sha256": "b0586e5ba1e6cecb4adb28f845d268161055ccda837a35275dfa003482d4b27d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "solr/solr-ref-guide/modules/indexing-guide/examples/stemdict.txt"
+  ],
+  "skipped_special_count": 1,
+  "slug": "solr",
+  "source_bytes": 150814118,
+  "source_commit": "7767d36d29fd76331dfef1f02b690eba2ed040c6",
+  "source_files": 8816,
+  "source_ref": "main",
+  "source_repo": "apache/solr",
+  "source_tree": {
+    "bytes": 150814118,
+    "files": 8816,
+    "sha256": "64d59c566c5ed71d963981652c6dc03269cc691587bac2a0340022850e260866"
+  }
+}

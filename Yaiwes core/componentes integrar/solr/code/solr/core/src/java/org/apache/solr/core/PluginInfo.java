@@ -1,0 +1,260 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.core;
+
+import static java.util.Arrays.asList;
+import static java.util.Collections.unmodifiableList;
+import static java.util.Collections.unmodifiableMap;
+import static org.apache.solr.common.params.CoreAdminParams.NAME;
+import static org.apache.solr.schema.FieldType.CLASS_NAME;
+
+import com.google.common.annotations.VisibleForTesting;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.apache.solr.common.ConfigNode;
+import org.apache.solr.common.MapWriter;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.util.DOMConfigNode;
+import org.w3c.dom.Node;
+
+/** An Object which represents a Plugin of any type */
+public class PluginInfo implements MapWriter {
+  public final String name, className, type, pkgName;
+  public final ClassName cName;
+  public final NamedList<Object> initArgs;
+  public final Map<String, String> attributes;
+  public final List<PluginInfo> children;
+  private boolean isFromSolrConfig;
+
+  public PluginInfo(
+      String type, Map<String, String> attrs, NamedList<?> initArgs, List<PluginInfo> children) {
+    this.type = type;
+    this.name = attrs.get(NAME);
+    cName = parseClassName(attrs.get(CLASS_NAME));
+    this.className = cName.className;
+    this.pkgName = cName.pkg;
+    // Make a shallow copy for type safety
+    this.initArgs = new NamedList<>();
+    if (initArgs != null) {
+      for (Map.Entry<String, ?> entry : initArgs) {
+        this.initArgs.add(entry.getKey(), entry.getValue());
+      }
+    }
+    attributes = unmodifiableMap(attrs);
+    this.children = children == null ? List.of() : unmodifiableList(children);
+    isFromSolrConfig = false;
+  }
+
+  /**
+   * class names can be prefixed with package name e.g: my_package:my.pkg.Class This checks if it is
+   * a package name prefixed classname. the return value has first = package name and second = class
+   * name
+   */
+  public static ClassName parseClassName(String name) {
+    return new ClassName(name);
+  }
+
+  public static class ClassName {
+    public final String pkg;
+    public final String className;
+    public final String original;
+
+    public ClassName(String name) {
+      this.original = name;
+      if (name == null) {
+        pkg = null;
+        className = null;
+        return;
+      }
+      int colonIdx = name.indexOf(':');
+      if (colonIdx > -1) {
+        pkg = name.substring(0, colonIdx);
+        className = name.substring(colonIdx + 1);
+      } else {
+        pkg = null;
+        className = name;
+      }
+    }
+
+    @Override
+    public String toString() {
+      return original;
+    }
+  }
+
+  /** From XML. */
+  public PluginInfo(ConfigNode node, String err, boolean requireName, boolean requireClass) {
+    type = node.name();
+    name = requireName ? node.attrRequired(NAME, err) : node.attr(NAME);
+    cName =
+        parseClassName(requireClass ? node.attrRequired(CLASS_NAME, err) : node.attr(CLASS_NAME));
+    className = cName.className;
+    pkgName = cName.pkg;
+    initArgs = node.childNodesToNamedList();
+    attributes = node.attributes();
+    children = loadSubPlugins(node);
+    isFromSolrConfig = true;
+  }
+
+  @VisibleForTesting
+  PluginInfo(Node node, String err, boolean requireName, boolean requireClass) {
+    this(new DOMConfigNode(node), err, requireName, requireClass);
+  }
+
+  @SuppressWarnings({"unchecked", "rawtypes"})
+  public PluginInfo(String type, Map<String, Object> map) {
+    LinkedHashMap m = new LinkedHashMap<>(map);
+    initArgs = new NamedList<>();
+    for (Map.Entry<String, Object> entry : map.entrySet()) {
+      if (NAME.equals(entry.getKey()) || CLASS_NAME.equals(entry.getKey())) continue;
+      Object value = entry.getValue();
+      if (value instanceof List<?> list) {
+        if (!list.isEmpty() && list.get(0) instanceof Map) { // this is a subcomponent
+          for (Object o : list) {
+            if (o instanceof Map) o = new NamedList<>((Map) o);
+            initArgs.add(entry.getKey(), o);
+          }
+        } else {
+          initArgs.add(entry.getKey(), value);
+        }
+      } else {
+        if (value instanceof Map) value = new NamedList((Map) value);
+        initArgs.add(entry.getKey(), value);
+      }
+    }
+    this.type = type;
+    this.name = (String) m.get(NAME);
+    cName = parseClassName((String) m.get(CLASS_NAME));
+    this.className = cName.className;
+    this.pkgName = cName.pkg;
+    // TODO This is not type-safe and needs to be fixed -
+    // https://issues.apache.org/jira/browse/SOLR-14696
+    attributes = unmodifiableMap(m);
+    this.children = List.of();
+    isFromSolrConfig = true;
+  }
+
+  private List<PluginInfo> loadSubPlugins(ConfigNode node) {
+    List<PluginInfo> children = new ArrayList<>();
+    // if there is another sub tag with a non namedlist tag that has to be another plugin
+    node.forEachChild(
+        nd -> {
+          if (NL_TAGS.contains(nd.name())) return null;
+          PluginInfo pluginInfo = new PluginInfo(nd, null, false, false);
+          if (pluginInfo.isEnabled()) children.add(pluginInfo);
+          return null;
+        });
+    return children.isEmpty() ? List.of() : unmodifiableList(children);
+  }
+
+  @Override
+  public String toString() {
+    StringBuilder sb = new StringBuilder("{");
+    if (type != null) sb.append("type = ").append(type).append(',');
+    if (name != null) sb.append("name = ").append(name).append(',');
+    if (className != null) sb.append("class = ").append(className).append(',');
+    if (attributes != null && attributes.size() > 0)
+      sb.append("attributes = ").append(attributes).append(',');
+    if (initArgs != null && initArgs.size() > 0) sb.append("args = ").append(initArgs);
+    sb.append("}");
+    return sb.toString();
+  }
+
+  public boolean isEnabled() {
+    String enable = attributes.get("enable");
+    return enable == null || Boolean.parseBoolean(enable);
+  }
+
+  public boolean isDefault() {
+    return Boolean.parseBoolean(attributes.get("default"));
+  }
+
+  public PluginInfo getChild(String type) {
+    List<PluginInfo> l = getChildren(type);
+    return l.isEmpty() ? null : l.get(0);
+  }
+
+  @Override
+  @SuppressWarnings({"unchecked", "rawtypes"})
+  public void writeMap(EntryWriter ew) throws IOException {
+    // Direct forEach(ew::putNoEx) does not work: attributes is declared Map<String, String> but
+    // the PluginInfo(String, Map<String, Object>) constructor assigns it via raw types, so values
+    // may not be Strings. The bridge method generated for forEach would CCE on non-String values.
+    new NamedList<>(attributes).writeMap(ew);
+    if (initArgs != null) {
+      initArgs.asMap(3).forEach((k, v) -> ew.putNoEx((String) k, v));
+    }
+    if (children == null || children.isEmpty()) {
+      return;
+    }
+
+    Map<String, Object> childrenGrouped = new LinkedHashMap<>();
+    for (PluginInfo child : children) {
+      Object old = childrenGrouped.get(child.name);
+      if (old == null) {
+        childrenGrouped.put(child.name, child);
+      } else if (old instanceof List list) {
+        list.add(child);
+      } else {
+        List<Object> l = new ArrayList<>();
+        l.add(old);
+        l.add(child);
+        childrenGrouped.put(child.name, l);
+      }
+    }
+    for (Map.Entry<String, Object> entry : childrenGrouped.entrySet()) {
+      ew.put(entry.getKey(), entry.getValue());
+    }
+  }
+
+  /**
+   * Filter children by type
+   *
+   * @param type The type name. must not be null
+   * @return The matching children
+   */
+  public List<PluginInfo> getChildren(String type) {
+    if (children.isEmpty()) return children;
+    List<PluginInfo> result = new ArrayList<>();
+    for (PluginInfo child : children) if (type.equals(child.type)) result.add(child);
+    return result;
+  }
+
+  public static final PluginInfo EMPTY_INFO =
+      new PluginInfo("", Map.of(), new NamedList<>(), List.of());
+
+  private static final HashSet<String> NL_TAGS =
+      new HashSet<>(asList("lst", "arr", "bool", "str", "int", "long", "float", "double"));
+  public static final String DEFAULTS = "defaults";
+  public static final String APPENDS = "appends";
+  public static final String INVARIANTS = "invariants";
+
+  public boolean isFromSolrConfig() {
+    return isFromSolrConfig;
+  }
+
+  public PluginInfo copy() {
+    PluginInfo result =
+        new PluginInfo(type, attributes, initArgs != null ? initArgs.clone() : null, children);
+    result.isFromSolrConfig = isFromSolrConfig;
+    return result;
+  }
+}

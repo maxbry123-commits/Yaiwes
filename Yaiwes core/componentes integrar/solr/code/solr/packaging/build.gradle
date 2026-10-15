@@ -1,0 +1,429 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import org.apache.tools.ant.filters.ReplaceTokens
+import org.apache.tools.ant.util.TeeOutputStream
+
+// This project puts together a "distribution", assembling dependencies from
+// various other projects.
+
+plugins {
+  id 'base'
+  id 'distribution'
+}
+
+description = 'Solr distribution packaging'
+
+ext {
+  distDir = file("$buildDir/solr-${version}")
+  slimDistDir = file("$buildDir/solr-${version}-slim")
+  devDir = file("$buildDir/dev")
+  slimDevDir = file("$buildDir/dev-slim")
+  batsLibsDir = file("$buildDir/bats-libs")
+  onlineDocUnavailable = "Not available for custom/SNAPSHOT builds -- run './gradlew documentation' from the source distribution to build docs locally."
+  onlineDocUrl = (project.solrDocUrl ? "${project.solrDocUrl}/" : onlineDocUnavailable).toString()
+  onlineChangesUrl = (project.solrDocUrl ? "${project.solrDocUrl}/changes/Changes.html" : onlineDocUnavailable).toString()
+}
+
+configurations {
+  modules
+  example
+  crossDcManager
+  server
+  docker
+  solrFullTgz
+  solrSlimTgz
+  solrFullTgzSignature
+  solrSlimTgzSignature
+}
+
+dependencies {
+  rootProject.project(":solr:modules").childProjects.values().stream().map {project -> project.path}.each {
+    module -> modules project(path: module, configuration: "packaging")
+  }
+
+  crossDcManager project(path: ":solr:cross-dc-manager", configuration: "packaging")
+
+  example project(path: ":solr:example", configuration: "packaging")
+  server project(path: ":solr:server", configuration: "packaging")
+
+  docker project(path: ':solr:docker', configuration: 'packaging')
+
+  solrFullTgzSignature files("$buildDir/distributions/solr-${version}.tgz.asc") {
+    builtBy ":solr:distribution:signFullBinaryTgz"
+  }
+
+  solrSlimTgzSignature files("$buildDir/distributions/solr-${version}-slim.tgz.asc") {
+    builtBy ":solr:distribution:signSlimBinaryTgz"
+  }
+}
+
+distributions {
+  slim {
+    distributionBaseName = 'solr'
+    distributionClassifier = "slim"
+    contents {
+
+      from(rootDir, {
+        include "LICENSE.txt"
+        include "NOTICE.txt"
+        include "CHANGELOG.md"
+      })
+
+      from(project(":solr").projectDir, {
+        include "bin/**"
+        include "licenses/**"
+        exclude "licenses/README.committers.txt"
+      })
+
+      from(projectDir, {
+        include "README.txt"
+        filter(ReplaceTokens, tokens: [
+            SOLR_DOC_URL: onlineDocUrl,
+            SOLR_CHANGES_URL: onlineChangesUrl,
+        ])
+      })
+
+      from('static/lib', {
+        into 'lib'
+      })
+
+      from(configurations.example, {
+        into "example"
+      })
+
+      from(configurations.server, {
+        into "server"
+      })
+
+      from(configurations.docker, {
+        into "docker"
+        filesMatching([
+            "scripts/**",
+        ]) {copy ->
+          copy.permissions { unix("0755") }
+        }
+      })
+
+      // Manually correct posix permissions (matters when packaging on Windows).
+      filesMatching([
+          "**/*.sh",
+          "**/bin/solr",
+          "**/bin/systemd/solr.service",
+      ]) {copy ->
+        copy.permissions { unix("0755") }
+      }
+
+    }
+  }
+  full {
+    distributionBaseName = 'solr'
+    contents {
+      // Build on-top of the slim distribution
+      with(distributions.slim.getContents())
+
+      from(configurations.modules, {
+        into "modules"
+      })
+
+      from(configurations.crossDcManager, {
+        into "cross-dc-manager"
+        filesMatching([
+            "bin/*",
+        ]) {copy ->
+          copy.permissions { unix("0755") }
+        }
+      })
+    }
+  }
+}
+
+installFullDist {
+  into distDir
+}
+
+installSlimDist {
+  into slimDistDir
+}
+
+assembleDist {
+  dependsOn tasks.assembleFullDist
+  dependsOn tasks.assembleSlimDist
+}
+
+installDist {
+  dependsOn tasks.installFullDist
+  dependsOn tasks.installSlimDist
+}
+
+task devFull(type: Copy) {
+  description "Assemble Full Solr distribution into 'development' folder at ${devDir}"
+  group "build"
+
+  from installFullDist.outputs
+  into devDir
+}
+
+task devSlim(type: Copy) {
+  description "Assemble Slim Solr distribution into 'development' folder at ${slimDevDir}"
+  group "build"
+
+  from installSlimDist.outputs
+  into slimDevDir
+}
+
+task dev {
+  description "Assemble Solr distributions into 'development' folders at ${devDir} and ${slimDevDir}"
+  group "build"
+
+  dependsOn tasks.devFull
+  dependsOn tasks.devSlim
+}
+
+fullDistTar {
+  compression = Compression.GZIP
+}
+
+slimDistTar {
+  compression = Compression.GZIP
+}
+
+distTar.dependsOn tasks.fullDistTar
+distTar.dependsOn tasks.slimDistTar
+
+fullDistZip.enabled = false
+slimDistZip.enabled = false
+
+assemble.dependsOn tasks.installDist
+assemble.dependsOn tasks.installSlimDist
+
+artifacts {
+  solrFullTgz(fullDistTar)
+  solrSlimTgz(slimDistTar)
+}
+
+tasks.register('runDev', JavaExec) {
+  group = 'application'
+  description = 'Starts Solr for local experimentation.  Does NOT use the bin/solr script.'
+  dependsOn 'devSlim'
+
+  workingDir = file("$slimDevDir/server")
+
+  // Intentionally not synchronizing the logic here with bin/solr; don't want the burden
+
+  doFirst {
+    println "To attach a debugger, at the CLI pass: --debug-jvm"
+    println "To pass JVM args, at the CLI pass: -PjvmArgs='--add-modules jdk.incubator.vector'"
+    println "To pass system properties, at the CLI pass: -Dsolr.port.listen=8983"
+  }
+
+  maxHeapSize = project.findProperty('maxHeapSize') ?: '1G'
+
+  jvmArgs = [] // don't use defaults from our build that assume this is a typical build task
+  jvmArgs((project.findProperty('jvmArgs') ?: '').split())
+
+  systemProperty 'solr.host.advertise', '127.0.0.1'
+  systemProperty 'solr.port.listen', '8983'
+  systemProperty 'solr.install.dir', file("$workingDir/..")
+  systemProperty 'solr.logs.dir', file("$workingDir/logs")
+  systemProperty 'solr.zookeeper.server.enabled', 'true' // SolrCloud; embedded ZK
+
+  // Propagate CLI system properties (override defaults above)
+  systemProperties += gradle.startParameter.systemPropertiesArgs
+
+  classpath = files("$workingDir/start.jar")
+
+  args((project.findProperty('args') ?: '--module=http').split())
+}
+
+tasks.register('downloadBats') {
+  group = 'Build Dependency Download'
+  description =
+      'Downloads BATS and its helper libraries (bats-support, bats-assert, bats-file) used by integrationTests'
+
+  def batsLibs = [
+      [org: 'bats-core', repo: 'bats-core', version: libs.versions.bats.core.get()],
+      [org: 'ztombol', repo: 'bats-support', version: libs.versions.bats.support.get()],
+      [org: 'bats-core', repo: 'bats-assert', version: libs.versions.bats.assert.get()],
+      [org: 'bats-core', repo: 'bats-file', version: libs.versions.bats.file.get()],
+  ]
+  def downloadDir = file("$buildDir/bats-downloads")
+
+  inputs.property('batsLibs', batsLibs)
+  outputs.dir(batsLibsDir)
+
+  doLast {
+    delete batsLibsDir
+    mkdir downloadDir
+    batsLibs.each {lib ->
+      def archiveUrl = "https://github.com/${lib.org}/${lib.repo}/archive/refs/tags/v${lib.version}.tar.gz"
+      def archiveFile = new File(downloadDir, "${lib.repo}-${lib.version}.tar.gz")
+      ant.get(src: archiveUrl, dest: archiveFile, skipexisting: true)
+      copy {
+        from(tarTree(resources.gzip(archiveFile))) {
+          // Strip the leading "<repo>-<version>/" directory that GitHub's archive adds.
+          eachFile {details -> details.path = details.path.substring(details.path.indexOf('/') + 1)}
+          includeEmptyDirs = false
+        }
+        into "$batsLibsDir/${lib.repo}"
+      }
+    }
+  }
+}
+
+// Shared configuration for the BATS suites. outputName keeps each suite's Solr home, logs and
+// reports apart; usePicocli selects the experimental CLI implementation for the run.
+def configureBatsTask(BatsTask task, String outputName, boolean usePicocli) {
+  task.dependsOn installFullDist
+  task.dependsOn downloadBats
+
+  def integrationTestOutput = "$buildDir/$outputName"
+  def solrHome = "$integrationTestOutput/solr-home"
+  def solrTestFailuresDir = "$integrationTestOutput/failure-snapshots"
+  var solrPort = Integer
+      .parseInt((String) project.findProperty('bats.port') ?: System.getProperty("bats.port", "-1"))
+  while (solrPort > 64000 || solrPort < 0) { // We need room for +1000 for ZK
+    try (ServerSocket s = new ServerSocket(0)) {
+      solrPort = s.getLocalPort()
+    } catch (Exception e) {
+      println("WARN: Could not assign random port for Bats tests. Using default port 8983.")
+      solrPort = 8983
+    }
+  }
+
+  if (!Boolean.parseBoolean((String) project.findProperty('solr.bats.nightly'))) {
+    task.filterTags = '!nightly'
+  }
+
+  task.reportDir = integrationTestOutput
+  task.inputs.dir(distDir)
+  task.inputs.dir('test')  // Track .bats test files and helper as inputs
+  task.outputs.dir(integrationTestOutput)
+
+  task.doFirst {
+    delete integrationTestOutput
+    mkdir integrationTestOutput
+    mkdir solrHome
+    mkdir solrTestFailuresDir
+
+    // TODO - if quiet then don't tee
+    task.standardOutput = new TeeOutputStream(System.out,
+        new FileOutputStream("$integrationTestOutput/test-output.txt"))
+    println("Running BATS tests with Solr base port ${solrPort}")
+  }
+
+  task.environment SOLR_TIP: distDir.toString()
+  task.environment SOLR_HOME: solrHome
+  task.environment SOLR_PID_DIR: solrHome
+  task.environment SOLR_PORT_LISTEN: solrPort
+  task.environment SOLR_PORT: solrPort
+  task.environment SOLR2_PORT: solrPort + 1
+  task.environment SOLR3_PORT: solrPort + 2
+  task.environment ZK_PORT: solrPort + 1000
+  task.environment SOLR_LOGS_DIR: "$solrHome/logs"
+  task.environment TEST_OUTPUT_DIR: integrationTestOutput
+  task.environment TEST_FAILURE_DIR: solrTestFailuresDir
+  task.environment BATS_LIB_PREFIX: batsLibsDir
+  if (usePicocli) {
+    task.environment SOLR_PICOCLI: 'true'
+  }
+}
+
+task integrationTests(type: BatsTask) {
+  configureBatsTask(it, 'test-output', false)
+}
+
+// The same suites run against the experimental picocli CLI. Deliberately a curated list rather
+// than the whole suite, so the run stays short. A change that ports another tool to picocli
+// should add that tool's .bats file here.
+task integrationTestsPicocli(type: BatsTask) {
+  description = 'Runs the BATS suites for the migrated commands against the experimental picocli CLI.'
+  configureBatsTask(it, 'test-output-picocli', true)
+  // A suite belongs here only when every command it invokes has been migrated, not merely the
+  // command under test. test_auth.bats, for example, uses `solr assert` to wait for startup, so
+  // it cannot join until the assert command is migrated. test_help.bats asserts the exact wording
+  // of the commons-cli help output, which the picocli implementation words differently.
+  testFiles = [
+      'test/test_version.bats',
+      'test/test_status.bats',
+      'test/test_create.bats',
+      'test/test_delete_collection.bats',
+      'test/test_zk.bats',
+      'test/test_auth.bats',
+      'test/test_modules.bats',
+      'test/test_security_manager.bats',
+      'test/test_healthcheck.bats',
+      'test/test_postlogs.bats',
+      'test/test_extraction.bats',
+  ]
+}
+
+abstract class BatsTask extends Exec {
+  // Note: testDir is marked @Internal because it's a String configuration property, not a trackable input.
+  // The task using BatsTask should explicitly declare inputs.dir(testDir) in its configuration.
+  @Internal
+  String testDir = 'test'
+
+  @Input
+  var testFiles = []
+
+  @Input
+  @Optional
+  String filterTags = null
+
+  /** Where to write the junit report. Defaults to the project's test-output directory. */
+  @Internal
+  String reportDir = null
+
+  @Option(option = "tests", description = "Sets test cases to be included")
+  public void setTestNamePatterns(List<String> tests) {
+    // TODO: bats --filter <regex>
+    tests.each {testFiles << "$testDir/$it"}
+  }
+
+  @Override
+  @TaskAction
+  protected void exec() {
+    executable "$project.ext.batsLibsDir/bats-core/bin/bats"
+
+    def batsArgs = []
+    if (logger.isInfoEnabled()) {
+      batsArgs << '--verbose-run'
+    }
+    if (filterTags) {
+      batsArgs += ['--filter-tags', filterTags]
+    }
+    batsArgs += ['-T', '--print-output-on-failure', '--report-formatter', 'junit', '--output', reportDir ?: "$project.buildDir/test-output"]
+    // Note: tests to run must be listed after all other arguments
+    batsArgs += testFiles.empty ? [testDir] : testFiles
+    setArgs(batsArgs)
+    super.exec()
+  }
+}
+
+tasks.matching { it.name in ['assembleDist', 'releaseArtifacts'] }.configureEach {
+  doFirst {
+    def flagIsTrue = project.hasProperty('solr.ui.buildFromSource') &&
+        project.property('solr.ui.buildFromSource') == 'true'
+    if (!flagIsTrue) {
+      throw new GradleException(
+          "Release builds must set -Psolr.ui.buildFromSource=true so the Admin UI is " +
+              "built from the voted source tree, not pulled from nightlies.apache.org."
+      )
+    }
+  }
+}

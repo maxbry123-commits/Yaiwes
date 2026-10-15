@@ -1,0 +1,348 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.client.solrj.request;
+
+import static org.apache.solr.common.params.CommonParams.NAME;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.Properties;
+import org.apache.solr.client.solrj.SolrRequest;
+import org.apache.solr.client.solrj.response.ConfigSetAdminResponse;
+import org.apache.solr.common.params.ConfigSetParams;
+import org.apache.solr.common.params.ConfigSetParams.ConfigSetAction;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.NamedList;
+
+/**
+ * This class is experimental and subject to change.
+ *
+ * @since solr 5.4
+ */
+public abstract class ConfigSetAdminRequest<
+        Q extends ConfigSetAdminRequest<Q, R>, R extends ConfigSetAdminResponse>
+    extends SolrRequest<R> {
+
+  protected ConfigSetAction action = null;
+
+  protected ConfigSetAdminRequest<Q, R> setAction(ConfigSetAction action) {
+    this.action = action;
+    return this;
+  }
+
+  public ConfigSetAdminRequest(METHOD method) {
+    this(method, "/admin/configs");
+  }
+
+  public ConfigSetAdminRequest(METHOD method, String path) {
+    super(method, path, SolrRequestType.ADMIN);
+  }
+
+  /**
+   * @deprecated Use {@link #ConfigSetAdminRequest(METHOD)}.
+   */
+  @Deprecated(since = "10.1")
+  public ConfigSetAdminRequest() {
+    this(METHOD.POST);
+  }
+
+  /**
+   * @deprecated Use {@link #ConfigSetAdminRequest(METHOD, String)}.
+   */
+  @Deprecated(since = "10.1")
+  public ConfigSetAdminRequest(String path) {
+    this(METHOD.POST, path);
+  }
+
+  protected abstract Q getThis();
+
+  @Override
+  public SolrParams getParams() {
+    if (action == null) {
+      throw new RuntimeException("no action specified!");
+    }
+    ModifiableSolrParams params = new ModifiableSolrParams();
+    params.set(ConfigSetParams.ACTION, action.toString());
+    return params;
+  }
+
+  @Override
+  protected abstract R createResponse(NamedList<Object> namedList);
+
+  protected abstract static class ConfigSetSpecificAdminRequest<
+          T extends ConfigSetAdminRequest<T, ConfigSetAdminResponse>>
+      extends ConfigSetAdminRequest<T, ConfigSetAdminResponse> {
+    protected String configSetName = null;
+
+    protected ConfigSetSpecificAdminRequest(METHOD method) {
+      super(method);
+    }
+
+    /**
+     * @deprecated Use {@link #ConfigSetSpecificAdminRequest(METHOD)}.
+     */
+    @Deprecated(since = "10.1")
+    protected ConfigSetSpecificAdminRequest() {
+      this(METHOD.POST);
+    }
+
+    public final T setConfigSetName(String configSetName) {
+      this.configSetName = configSetName;
+      return getThis();
+    }
+
+    public final String getConfigSetName() {
+      return configSetName;
+    }
+
+    @Override
+    public SolrParams getParams() {
+      ModifiableSolrParams params = new ModifiableSolrParams(super.getParams());
+      if (configSetName == null) {
+        throw new RuntimeException("no ConfigSet specified!");
+      }
+      params.set(NAME, configSetName);
+      return params;
+    }
+
+    @Override
+    protected ConfigSetAdminResponse createResponse(NamedList<Object> namedList) {
+      return new ConfigSetAdminResponse();
+    }
+  }
+
+  /**
+   * Uploads files to create a new configset, or modify an existing config set.
+   *
+   * <p>When creating a new configset, the file to be uploaded must be a ZIP file containing the
+   * entire configset being uploaded. When modifying an existing configset, the file to be uploaded
+   * should either be a ZIP file containing the entire configset being uploaded, or an individual
+   * file to upload if {@link #setFilePath} is being used.
+   */
+  public static class Upload extends ConfigSetSpecificAdminRequest<Upload> {
+    private static final String NO_STREAM_ERROR = "There must be content or a File to Upload";
+
+    protected RequestWriter.ContentWriter contentWriter;
+    protected String filePath;
+
+    protected Boolean overwrite;
+    protected Boolean cleanup;
+
+    public Upload() {
+      super(METHOD.POST);
+      action = ConfigSetAction.UPLOAD;
+    }
+
+    @Override
+    protected Upload getThis() {
+      return this;
+    }
+
+    /**
+     * Optional {@link ConfigSetParams#FILE_PATH} to indicate a single file is being uploaded into
+     * an existing configset
+     */
+    public final Upload setFilePath(final String filePath) {
+      this.filePath = filePath;
+      return getThis();
+    }
+
+    /**
+     * @see #setFilePath
+     */
+    public final String getFilePath() {
+      return filePath;
+    }
+
+    /**
+     * A convenience method for specifying an existing File to use as the upload data.
+     *
+     * <p>This should either be a ZIP file containing the entire configset being uploaded, or an
+     * individual file to upload into an existing configset if {@link #setFilePath} is being used.
+     *
+     * @see #setUploadContent
+     */
+    public final Upload setUploadFile(final Path file, final String contentType) {
+      return setUploadContent(
+          new RequestWriter.ContentWriter() {
+            @Override
+            public void write(OutputStream os) throws IOException {
+              Files.copy(file, os);
+            }
+
+            @Override
+            public String getContentType() {
+              return contentType;
+            }
+          });
+    }
+
+    /**
+     * @see ConfigSetParams#OVERWRITE
+     */
+    public final Upload setOverwrite(final Boolean overwrite) {
+      this.overwrite = overwrite;
+      return getThis();
+    }
+
+    /**
+     * @see #setOverwrite
+     */
+    public final Boolean getOverwrite() {
+      return overwrite;
+    }
+
+    /**
+     * @see ConfigSetParams#CLEANUP
+     */
+    public final Upload setCleanup(final Boolean cleanup) {
+      this.cleanup = cleanup;
+      return getThis();
+    }
+
+    /**
+     * @see #setCleanup
+     */
+    public final Boolean getCleanup() {
+      return cleanup;
+    }
+
+    /**
+     * Specify the content to upload.
+     *
+     * <p>This should either be a ZIP file containing the entire configset being uploaded, or an
+     * individual file to upload into an existing configset if {@link #setFilePath} is being used.
+     *
+     * @see #setUploadFile
+     */
+    public final Upload setUploadContent(final RequestWriter.ContentWriter contentWriter) {
+      this.contentWriter = contentWriter;
+      return getThis();
+    }
+
+    @Override
+    public RequestWriter.ContentWriter getContentWriter(String expectedType) {
+      if (null == contentWriter) {
+        throw new NullPointerException(NO_STREAM_ERROR);
+      }
+      return contentWriter;
+    }
+
+    @Override
+    public SolrParams getParams() {
+      ModifiableSolrParams params = new ModifiableSolrParams(super.getParams());
+
+      if (null == contentWriter) {
+        throw new NullPointerException(NO_STREAM_ERROR);
+      }
+
+      params.setNonNull(ConfigSetParams.FILE_PATH, filePath);
+      params.setNonNull(ConfigSetParams.CLEANUP, cleanup);
+      params.setNonNull(ConfigSetParams.OVERWRITE, overwrite);
+
+      return params;
+    }
+  }
+
+  /**
+   * Creates a new config set by cloning an existing "base" configset. To create a new configset
+   * from scratch using a ZIP file you wish to upload, use the {@link Upload} command instead
+   */
+  public static class Create extends ConfigSetSpecificAdminRequest<Create> {
+    protected static String PROPERTY_PREFIX = "configSetProp";
+    protected String baseConfigSetName;
+    protected Properties properties;
+
+    public Create() {
+      super(METHOD.POST);
+      action = ConfigSetAction.CREATE;
+    }
+
+    @Override
+    protected Create getThis() {
+      return this;
+    }
+
+    public final Create setBaseConfigSetName(String baseConfigSetName) {
+      this.baseConfigSetName = baseConfigSetName;
+      return getThis();
+    }
+
+    public final String getBaseConfigSetName() {
+      return baseConfigSetName;
+    }
+
+    public final Create setNewConfigSetProperties(Properties properties) {
+      this.properties = properties;
+      return getThis();
+    }
+
+    public final Properties getNewConfigSetProperties() {
+      return properties;
+    }
+
+    @Override
+    public SolrParams getParams() {
+      ModifiableSolrParams params = new ModifiableSolrParams(super.getParams());
+      if (baseConfigSetName != null) {
+        params.set("baseConfigSet", baseConfigSetName);
+      }
+      if (properties != null) {
+        for (Map.Entry<?, ?> entry : properties.entrySet()) {
+          params.set(
+              PROPERTY_PREFIX + "." + entry.getKey().toString(), entry.getValue().toString());
+        }
+      }
+      return params;
+    }
+  }
+
+  // DELETE request
+  public static class Delete extends ConfigSetSpecificAdminRequest<Delete> {
+    public Delete() {
+      super(METHOD.POST);
+      action = ConfigSetAction.DELETE;
+    }
+
+    @Override
+    protected Delete getThis() {
+      return this;
+    }
+  }
+
+  // LIST request
+  public static class List extends ConfigSetAdminRequest<List, ConfigSetAdminResponse.List> {
+    public List() {
+      super(METHOD.GET);
+      action = ConfigSetAction.LIST;
+    }
+
+    @Override
+    protected List getThis() {
+      return this;
+    }
+
+    @Override
+    protected ConfigSetAdminResponse.List createResponse(NamedList<Object> namedList) {
+      return new ConfigSetAdminResponse.List();
+    }
+  }
+}

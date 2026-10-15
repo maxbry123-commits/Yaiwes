@@ -1,0 +1,344 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.servlet;
+
+import static org.apache.solr.core.NodeConfig.loadNodeConfig;
+
+import jakarta.servlet.ServletContext;
+import jakarta.servlet.ServletContextEvent;
+import jakarta.servlet.ServletContextListener;
+import jakarta.servlet.UnavailableException;
+import java.lang.invoke.MethodHandles;
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.stream.Stream;
+import javax.naming.Context;
+import javax.naming.InitialContext;
+import javax.naming.NamingException;
+import javax.naming.NoInitialContextException;
+import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.util.VectorUtil;
+import org.apache.solr.client.api.util.SolrVersion;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.util.EnvUtils;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.NodeConfig;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.core.SolrXmlConfig;
+import org.apache.solr.util.StartupLoggingUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A service that can provide access to solr cores. This allows us to have multiple filters and
+ * servlets that depend on SolrCore and CoreContainer, while still only having one CoreContainer per
+ * instance of solr.
+ */
+public class CoreContainerProvider implements ServletContextListener {
+  public static final String SOLR_PROPERTIES = "solr.properties";
+  public static final String SOLR_SOLR_HOME = "solr.solr.home";
+  public static final String SOLR_INSTALL_DIR = "solr.install.dir";
+  public static final String SOLR_LOG_MUTECONSOLE = "solr.log.muteconsole";
+  public static final String SOLR_LOG_LEVEL = "solr.log.level";
+
+  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+  private CoreContainer cores;
+
+  /**
+   * Acquires an instance from the context. Never null.
+   *
+   * @throws IllegalStateException if not present.
+   */
+  public static CoreContainerProvider serviceForContext(ServletContext ctx) {
+    var provider = (CoreContainerProvider) ctx.getAttribute(CoreContainerProvider.class.getName());
+    if (provider == null) {
+      throw new IllegalStateException("CoreContainer failed to initialize");
+    }
+    return provider;
+  }
+
+  @Override
+  public void contextInitialized(ServletContextEvent event) {
+    final var ctx = event.getServletContext();
+    init(ctx);
+    ctx.setAttribute(CoreContainerProvider.class.getName(), this);
+  }
+
+  @Override
+  public void contextDestroyed(ServletContextEvent sce) {
+    close();
+    // could remove ourselves from ctx but why bother
+  }
+
+  /** The CoreContainer. Never null. */
+  public CoreContainer getCoreContainer() throws UnavailableException {
+    checkReady();
+    return cores;
+  }
+
+  private void checkReady() throws UnavailableException {
+    // TODO throw AlreadyClosedException instead?
+    if (cores == null) {
+      // cores could be null if it didn't start properly or if it's completely shut down.
+      // It appears impossible that it'd be null if it didn't even try to start yet.
+      final String msg = "Error processing the request. CoreContainer has shut down.";
+      log.error(msg);
+      throw new UnavailableException(msg);
+    }
+    assert !cores.isShutDown(); // shutdown sequence initiates *here*, thus will be nulled first
+  }
+
+  private void close() {
+    CoreContainer cc = cores;
+
+    // Mark Miller suggested that we should be publishing that we are down before anything else
+    // which makes good sense, but the following causes test failures, so that improvement can be
+    // the subject of another PR/issue. Also, jetty might already be refusing requests by this point
+    // so that's a potential issue too. Digging slightly I see that there's a whole mess of code
+    // looking up collections and calculating state changes associated with this call, which smells
+    // a lot like we're duplicating node state in collection stuff, but it will take a lot of code
+    // reading to figure out if that's really what it is, why we did it and if there's room for
+    // improvement.
+    //    if (cc != null) {
+    //      ZkController zkController = cc.getZkController();
+    //      if (zkController != null) {
+    //        zkController.publishNodeAsDown(zkController.getNodeName());
+    //      }
+    //    }
+
+    cores = null;
+    if (cc != null) {
+      cc.shutdown();
+    }
+  }
+
+  private void init(ServletContext servletContext) {
+    if (log.isTraceEnabled()) {
+      log.trace("init(): {}", this.getClass().getClassLoader());
+    }
+    CoreContainer coresInit = null;
+    try {
+      // "extra" properties must be initialized first, so we know things like "do we have a zkHost"
+      // wrap as defaults (if set) so we can modify w/o polluting the Properties provided by our
+      // caller
+      Properties extraProperties =
+          SolrXmlConfig.wrapAndSetZkHostFromSysPropIfNeeded(
+              (Properties) servletContext.getAttribute(SOLR_PROPERTIES));
+
+      StartupLoggingUtils.checkLogDir();
+      if (log.isInfoEnabled()) {
+        log.info("Using logger factory {}", StartupLoggingUtils.getLoggerImplStr());
+      }
+
+      logWelcomeBanner(extraProperties);
+
+      String muteConsole = EnvUtils.getProperty(SOLR_LOG_MUTECONSOLE);
+      if (muteConsole != null
+          && !Arrays.asList("false", "0", "off", "no")
+              .contains(muteConsole.toLowerCase(Locale.ROOT))) {
+        StartupLoggingUtils.muteConsole();
+      }
+      String logLevel = EnvUtils.getProperty(SOLR_LOG_LEVEL);
+      if (logLevel != null) {
+        log.info("Log level override, property solr.log.level={}", logLevel);
+        StartupLoggingUtils.changeLogLevel(logLevel);
+      }
+
+      // Do initial logs for experimental Lucene classes.
+      final var lookup = MethodHandles.lookup();
+      Stream.of(MMapDirectory.class, VectorUtil.class)
+          .forEach(
+              cls -> {
+                try {
+                  lookup.ensureInitialized(cls);
+                } catch (ReflectiveOperationException re) {
+                  throw new SolrException(
+                      ErrorCode.SERVER_ERROR, "Could not load Lucene class: " + cls.getName());
+                }
+              });
+
+      coresInit = createCoreContainer(computeSolrHome(servletContext), extraProperties);
+
+      if (log.isDebugEnabled()) {
+        log.debug("user.dir={}", System.getProperty("user.dir"));
+      }
+    } catch (Throwable t) {
+      // catch this so our filter still works
+      log.error("Could not start Solr. Check solr/home property and the logs", t);
+      if (t instanceof Error) {
+        throw (Error) t;
+      }
+    } finally {
+      log.trace("init() done");
+      this.cores = coresInit; // crucially final assignment
+    }
+  }
+
+  private void logWelcomeBanner(Properties props) {
+    // _Really_ sorry about how clumsy this is as a result of the logging call checker, but this is
+    // the only one that's so ugly so far.
+    if (log.isInfoEnabled()) {
+      log.info(" ___      _       Welcome to Apache Solr™ version {}", solrVersion());
+    }
+    if (log.isInfoEnabled()) {
+      log.info(
+          "/ __| ___| |_ _   Starting in {} mode on port {}",
+          isCloudMode(props) ? "cloud" : "standalone",
+          getSolrPort());
+    }
+    if (log.isInfoEnabled()) {
+      log.info("\\__ \\/ _ \\ | '_|  Install dir: {}", EnvUtils.getProperty(SOLR_INSTALL_DIR));
+    }
+    if (log.isInfoEnabled()) {
+      log.info("|___/\\___/_|_|    Start time: {}", Instant.now());
+    }
+    try {
+      RuntimeMXBean mx = ManagementFactory.getRuntimeMXBean();
+      Optional<String> crashOnOutOfMemoryErrorArg =
+          mx.getInputArguments().stream()
+              .filter(x -> x.startsWith("-XX:+CrashOnOutOfMemoryError"))
+              .findFirst();
+      if (crashOnOutOfMemoryErrorArg.isPresent()) {
+        String errorFileArg =
+            mx.getInputArguments().stream()
+                .filter(x -> x.startsWith("-XX:ErrorFile"))
+                .findFirst()
+                .orElse("-XX:ErrorFile=hs_err_%p.log");
+        String errorFilePath =
+            errorFileArg
+                .substring(errorFileArg.indexOf('=') + 1)
+                .replace("%p", String.valueOf(mx.getPid()));
+        String logMessage =
+            "Solr started with \"-XX:+CrashOnOutOfMemoryError\" that will crash on any OutOfMemoryError exception. "
+                + "The cause of the OOME will be logged in the crash file at the following path: {}";
+        log.info(logMessage, errorFilePath);
+      }
+    } catch (Exception e) {
+      String logMessage =
+          String.format(
+              Locale.ROOT,
+              "Solr typically starts with \"-XX:+CrashOnOutOfMemoryError\" that will crash on any OutOfMemoryError exception. "
+                  + "Unable to get the specific file due to an exception."
+                  + "The cause of the OOME will be logged in a crash file in the logs directory: %s",
+              EnvUtils.getProperty("solr.logs.dir"));
+      log.info(logMessage, e);
+    }
+  }
+
+  private String solrVersion() {
+    String specVer = SolrVersion.LATEST.toString();
+    try {
+      String implVer = SolrCore.class.getPackage().getImplementationVersion();
+      return (specVer.equals(implVer.split(" ")[0])) ? specVer : implVer;
+    } catch (Exception e) {
+      return specVer;
+    }
+  }
+
+  private String getSolrPort() {
+    return EnvUtils.getProperty("solr.port.listen");
+  }
+
+  /**
+   * We are in cloud mode if Java option solr.zookeeper.server.enabled exists OR zkHost exists and
+   * is non-empty
+   *
+   * @see SolrXmlConfig#wrapAndSetZkHostFromSysPropIfNeeded
+   * @see #init
+   * @param props the "extra properties" which will indicate cloud mode before startup.
+   */
+  private boolean isCloudMode(Properties props) {
+    assert null != props; // we should never be called w/o this being initialized
+    return (null != props.getProperty(SolrXmlConfig.ZK_HOST))
+        || EnvUtils.getPropertyAsBool("solr.zookeeper.server.enabled", false);
+  }
+
+  /**
+   * Returns the effective Solr Home to use for this node, based on looking up the value in this
+   * order:
+   *
+   * <ol>
+   *   <li>attribute in the FilterConfig
+   *   <li>JNDI: via java:comp/env/solr/home
+   *   <li>The system property solr.solr.home
+   *   <li>Look in the current working directory for a solr/ directory
+   * </ol>
+   *
+   * <p>
+   *
+   * @return the Solr home, absolute and normalized.
+   */
+  @SuppressWarnings("BanJNDI")
+  private static Path computeSolrHome(ServletContext servletContext) {
+
+    // start with explicit check of servlet config...
+    String source = "servlet config: " + SOLR_SOLR_HOME;
+    String home = (String) servletContext.getAttribute(SOLR_SOLR_HOME);
+
+    if (null == home) {
+      final String lookup = "java:comp/env/solr/home";
+      // Try JNDI
+      source = "JNDI: " + lookup;
+      try {
+        Context c = new InitialContext();
+        home = (String) c.lookup(lookup);
+      } catch (NoInitialContextException e) {
+        log.debug("JNDI not configured for solr (NoInitialContextEx)");
+      } catch (NamingException e) {
+        log.debug("No /solr/home in JNDI");
+      } catch (RuntimeException ex) {
+        log.warn("Odd RuntimeException while testing for JNDI: ", ex);
+      }
+    }
+
+    if (null == home) {
+      // Now try system property
+      final String prop = "solr.solr.home";
+      source = "system property: " + prop;
+      home = EnvUtils.getProperty(prop);
+    }
+
+    if (null == home) {
+      // if all else fails, assume default dir
+      home = "solr/";
+      source = "defaulted to '" + home + "' ... could not find system property or JNDI";
+    }
+    final Path solrHome = Path.of(home).toAbsolutePath().normalize();
+    log.info("Solr Home: {} (source: {})", solrHome, source);
+
+    return solrHome;
+  }
+
+  /**
+   * CoreContainer initialization
+   *
+   * @return a CoreContainer to hold this server's cores
+   */
+  protected CoreContainer createCoreContainer(Path solrHome, Properties nodeProps) {
+    NodeConfig nodeConfig = loadNodeConfig(solrHome, nodeProps);
+    final CoreContainer coreContainer = new CoreContainer(nodeConfig, true);
+    coreContainer.load();
+    return coreContainer;
+  }
+}

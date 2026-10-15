@@ -1,0 +1,393 @@
+/*
+ Licensed to the Apache Software Foundation (ASF) under one or more
+ contributor license agreements.  See the NOTICE file distributed with
+ this work for additional information regarding copyright ownership.
+ The ASF licenses this file to You under the Apache License, Version 2.0
+ (the "License"); you may not use this file except in compliance with
+ the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+*/
+
+solrAdminApp.controller('CollectionsController',
+    function($scope, $routeParams, $location, $timeout, CollectionsV2, AliasesV2, ShardsV2, ReplicasV2, ConfigSetsV2, ClusterV2, Constants, ApiErrorHandler){
+      $scope.resetMenu("collections", Constants.IS_ROOT_PAGE);
+
+      $scope.refresh = function() {
+
+          $scope.rootUrl = Constants.ROOT_URL + "#/~collections/" + $routeParams.collection;
+
+          ClusterV2.listClusterNodes(function(error, data, response) {
+            $timeout(function() {
+              if (error) { ApiErrorHandler.handle(response); return; }
+              $scope.availableNodeSet = data.nodes;
+            });
+          });
+
+          // Just names for the sidebar/alias-picker - the detailed per-collection data
+          // (shards, replicas, health) for whichever one is selected is fetched separately
+          // below, narrowed to that one collection, instead of fetching detail for all of them.
+          CollectionsV2.listCollections({}, function (error, data, response) {
+            $timeout(function() {
+              if (error) { ApiErrorHandler.handle(response); return; }
+              $scope.collections = [];
+              for (var i in data.collections) {
+                  var name = data.collections[i];
+                  if (name.startsWith("._designer_")) {
+                      continue;
+                  }
+                  $scope.collections.push({name: name});
+              }
+            });
+          });
+
+          $scope.refreshSelectedCollection();
+
+          // Fetch aliases using getAliases to get properties
+          AliasesV2.getAliases(function (error, adata, response) {
+              $timeout(function() {
+                  if (error) { ApiErrorHandler.handle(response); return; }
+                  // TODO: Population of aliases array duplicated in app.js
+                  $scope.aliases = [];
+                  for (var key in adata.aliases) {
+                      var props = {};
+                      if (key in adata.properties) {
+                          props = adata.properties[key];
+                      }
+                      var alias = {name: key, collections: adata.aliases[key], type: 'alias', properties: props};
+                      $scope.aliases.push(alias);
+                      if ($routeParams.collection == 'alias_' + key) {
+                          $scope.collection = alias;
+                      }
+                  }
+                  if ($routeParams.collection && $routeParams.collection.indexOf('alias_') === 0 && !$scope.collection) {
+                      alert("No collection or alias called " + $routeParams.collection);
+                      $location.path("/~collections");
+                  }
+              });
+          });
+
+          ConfigSetsV2.listConfigSet(function(error, data, response) {
+              $timeout(function() {
+                  if (error) { ApiErrorHandler.handle(response); return; }
+                  $scope.configs = [];
+                  var items = data.configSets;
+                  for (var i in items) {
+                      $scope.configs.push({name: items[i]});
+                  }
+              });
+          });
+
+          $timeout.cancel($scope.timeout);
+          $scope.timeout = $timeout($scope.refreshHealth, 10000);
+      };
+
+      // Fetches shard/replica detail for the single collection named by the route,
+      // narrowed server-side via the "collection" param instead of fetching every collection.
+      $scope.refreshSelectedCollection = function() {
+          var name = $routeParams.collection;
+          if (!name || name.indexOf('alias_') === 0) {
+              return;
+          }
+          CollectionsV2.listCollections({detailed: true, collection: name}, function(error, data, response) {
+              $timeout(function() {
+                  if (error) { ApiErrorHandler.handle(response); return; }
+                  var collection = data.collectionsDetail && data.collectionsDetail[name];
+                  if (!collection) {
+                      alert("No collection or alias called " + name);
+                      $location.path("/~collections");
+                      return;
+                  }
+                  collection.name = name;
+                  collection.type = 'collection';
+                  var shards = collection.shards;
+                  collection.shards = [];
+                  for (var shardName in shards) {
+                      var shard = shards[shardName];
+                      shard.name = shardName;
+                      shard.collection = collection.name;
+                      var replicas = shard.replicas;
+                      shard.replicas = [];
+                      for (var replicaName in replicas) {
+                          var replica = replicas[replicaName];
+                          replica.name = replicaName;
+                          replica.collection = collection.name;
+                          replica.shard = shard.name;
+                          shard.replicas.push(replica);
+                      }
+                      collection.shards.push(shard);
+                  }
+                  $scope.collection = collection;
+              });
+          });
+      };
+
+      // Patches health onto the selected collection in place, so it never disturbs expanded/open UI state.
+      $scope.refreshHealth = function() {
+          var name = $scope.collection && $scope.collection.type === 'collection' && $scope.collection.name;
+          if (!name) {
+              $scope.timeout = $timeout($scope.refreshHealth, 10000);
+              return;
+          }
+          CollectionsV2.listCollections({detailed: true, collection: name}, function(error, data, response) {
+              $timeout(function() {
+                  if (error) {
+                      ApiErrorHandler.handle(response);
+                  } else if ($scope.collection && $scope.collection.name === name) {
+                      var freshCollection = data.collectionsDetail && data.collectionsDetail[name];
+                      if (freshCollection) {
+                          $scope.collection.health = freshCollection.health;
+                          for (var shardName in freshCollection.shards) {
+                              var existingShard = $scope.collection.shards.find(function(s) { return s.name === shardName; });
+                              if (existingShard) {
+                                  existingShard.health = freshCollection.shards[shardName].health;
+                              }
+                          }
+                      }
+                  }
+                  $scope.timeout = $timeout($scope.refreshHealth, 10000);
+              });
+          });
+      };
+
+      var onRouteChangeOff = $scope.$on('$routeChangeStart', function() {
+          $timeout.cancel($scope.timeout);
+          onRouteChangeOff();
+      });
+
+      $scope.hideAll = function() {
+          $scope.showRename = false;
+          $scope.showAdd = false;
+          $scope.showDelete = false;
+          $scope.showSwap = false;
+          $scope.showCreateAlias = false;
+          $scope.showDeleteAlias = false;
+      };
+
+      $scope.showAddCollection = function() {
+        $scope.hideAll();
+        $scope.showAdd = true;
+        $scope.newCollection = {
+          name: "",
+          routerName: "compositeId",
+          numShards: 1,
+          configName: "",
+          nrtReplicas: 0,
+          tlogReplicas: 0,
+          pullReplicas: 0,
+          replicationFactor: 1
+        };
+      };
+
+      $scope.toggleCreateAlias = function() {
+        $scope.hideAll();
+        $scope.showCreateAlias = true;
+      }
+
+      $scope.toggleDeleteAlias = function() {
+        $scope.hideAll();
+        $scope.showDeleteAlias = true;
+      }
+
+      $scope.cancelCreateAlias = $scope.cancelDeleteAlias = function() {
+        $scope.hideAll();
+      }
+
+      $scope.createAlias = function() {
+        var collections = [];
+        for (var i in $scope.aliasCollections) {
+          collections.push($scope.aliasCollections[i].name);
+        }
+        AliasesV2.createAlias({createAliasRequestBody: {name: $scope.aliasToCreate, collections: collections}}, function(error, data, response) {
+          $timeout(function() {
+            if (error) { ApiErrorHandler.handle(response); return; }
+            $scope.cancelCreateAlias();
+            $scope.resetMenu("collections", Constants.IS_ROOT_PAGE);
+            $location.path("/~collections/alias_" + $scope.aliasToCreate);
+          });
+        });
+      }
+      $scope.deleteAlias = function() {
+        AliasesV2.deleteAlias($scope.collection.name, {}, function(error, data, response) {
+          $timeout(function() {
+            if (error) { ApiErrorHandler.handle(response); return; }
+            $scope.hideAll();
+            $scope.resetMenu("collections", Constants.IS_ROOT_PAGE);
+            $location.path("/~collections/");
+          });
+        });
+
+      };
+      $scope.addCollection = function() {
+        if (!$scope.newCollection.name) {
+          $scope.addMessage = "Please provide a core name";
+        } else if (false) { //@todo detect whether core exists
+          $scope.AddMessage = "A core with that name already exists";
+        } else if ( $scope.newCollection.pullReplicas > 0 && ($scope.newCollection.nrtReplicas + $scope.newCollection.tlogReplicas == 0))
+        {
+          $scope.addMessage = "A collection can't be made up of just PULL replicas";
+        } else {
+            var coll = $scope.newCollection;
+            var createCollectionParams = {
+              name: coll.name,
+              router: {name: coll.routerName},
+              numShards: coll.numShards,
+              config: coll.configName
+            };
+            if (coll.shards) createCollectionParams.shardNames = coll.shards.split(",").map(function(s) { return s.trim(); });
+            if (coll.routerField) createCollectionParams.router.field = coll.routerField;
+            if (coll.createNodeSet) createCollectionParams.nodeSet = coll.createNodeSet;
+            if ($scope.replicaTypesChosen()) {
+              createCollectionParams.nrtReplicas = coll.nrtReplicas;
+              createCollectionParams.tlogReplicas = coll.tlogReplicas;
+              createCollectionParams.pullReplicas = coll.pullReplicas;
+            } else {
+              createCollectionParams.replicationFactor = coll.replicationFactor;
+            }
+            CollectionsV2.createCollection({createCollectionRequestBody: createCollectionParams}, function(error, data, response) {
+              $timeout(function() {
+                if (error) { ApiErrorHandler.handle(response); return; }
+                $scope.cancelAddCollection();
+                $scope.resetMenu("collections", Constants.IS_ROOT_PAGE);
+                $location.path("/~collections/" + $scope.newCollection.name);
+              });
+            });
+        }
+      };
+
+      $scope.cancelAddCollection = function() {
+        delete $scope.addMessage;
+        $scope.showAdd = false;
+      };
+
+      $scope.showDeleteCollection = function() {
+          $scope.hideAll();
+          if ($scope.collection) {
+              $scope.showDelete = true;
+          } else {
+              alert("No collection selected.");
+          }
+      };
+
+      $scope.deleteCollection = function() {
+        if ($scope.collection.name == $scope.collectionDeleteConfirm) {
+            CollectionsV2.deleteCollection($scope.collection.name, {}, function (error, data, response) {
+                $timeout(function() {
+                    if (error) { ApiErrorHandler.handle(response); return; }
+                    $location.path("/~collections");
+                });
+            });
+        } else {
+            $scope.deleteMessage = "Collection names do not match.";
+        }
+      };
+
+      $scope.reloadCollection = function() {
+        if (!$scope.collection) {
+            alert("No collection selected.");
+            return;
+        }
+        $scope.reloadSuccess = false;
+        $scope.reloadFailure = false;
+        CollectionsV2.reloadCollection($scope.collection.name, {}, function(error, data,response) {
+           $timeout(function() {
+             if (error) {
+                 $scope.reloadFailure = true;
+                 ApiErrorHandler.handle(response);
+             } else {
+                 $scope.reloadSuccess = true;
+                 $scope.refreshHealth();
+             }
+           });
+        });
+      };
+
+      $scope.toggleAddReplica = function(shard) {
+          $scope.hideAll();
+          shard.showAdd = !shard.showAdd;
+          delete $scope.addReplicaMessage;
+
+          ClusterV2.listClusterNodes(function(error, data, response) {
+            $timeout(function() {
+              if (error) { ApiErrorHandler.handle(response); return; }
+              $scope.nodes = data.nodes;
+            });
+          });
+      };
+
+      $scope.toggleRemoveReplica = function(replica) {
+          $scope.hideAll();
+          replica.showRemove = !replica.showRemove;
+      };
+
+      $scope.toggleRemoveShard = function(shard) {
+          $scope.hideAll();
+          shard.showRemove = !shard.showRemove;
+      };
+
+      $scope.deleteShard = function(shard) {
+          ShardsV2.deleteShard(shard.collection, shard.name, {}, function(error, data, response) {
+            $timeout(function() {
+              if (error) { ApiErrorHandler.handle(response); return; }
+              shard.deleted = true;
+              $timeout(function() {
+                $scope.refresh();
+              }, 2000);
+            });
+          });
+        }
+
+      $scope.deleteReplica = function(replica) {
+        ReplicasV2.deleteReplicaByName(replica.collection, replica.shard, replica.name, {}, function(error, data, response) {
+          $timeout(function() {
+            if (error) { ApiErrorHandler.handle(response); return; }
+            replica.deleted = true;
+            $timeout(function() {
+              $scope.refresh();
+            }, 2000);
+          });
+        });
+      }
+      $scope.addReplica = function(shard) {
+        var createReplicaParams = {
+          type: shard.replicaType
+        }
+        if (shard.replicaNodeName && shard.replicaNodeName != "") {
+          createReplicaParams.node = shard.replicaNodeName;
+        }
+        ReplicasV2.createReplica(shard.collection, shard.name, {createReplicaRequestBody: createReplicaParams}, function(error, data, response) {
+          $timeout(function() {
+            if (error) { ApiErrorHandler.handle(response); return; }
+            shard.replicaAdded = true;
+            $timeout(function () {
+              shard.replicaAdded = false;
+              shard.showAdd = false;
+              $scope.refresh();
+            }, 2000);
+          });
+        });
+      };
+
+      $scope.toggleShard = function(shard) {
+          shard.show = !shard.show;
+      }
+
+      $scope.toggleReplica = function(replica) {
+          replica.show = !replica.show;
+      }
+
+      $scope.replicaTypesChosen = function () {
+          if ($scope.newCollection) {
+            return ( $scope.newCollection.nrtReplicas + $scope.newCollection.tlogReplicas + $scope.newCollection.pullReplicas > 0 );
+          }
+      }
+
+      $scope.refresh();
+    }
+);

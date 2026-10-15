@@ -1,0 +1,74 @@
+# Lucene upgrade steps
+
+## Read
+
+https://lucene.apache.org/core/9_4_0/MIGRATE.html
+
+## Start
+
+Create a new branch locally e.g. `git checkout -b lucene1051 -t origin/main` for upgrading to Lucene 10.5.1 version.
+
+## Build
+
+### `gradle/libs.versions.toml` update
+
+```
+-apache-lucene = "10.4.0"
++apache-lucene = "10.5.1"
+```
+
+### lockfiles update
+
+```
+./gradlew resolveAndLockAll --write-locks
+```
+
+### `solr/licenses` update
+
+```
+./gradlew updateLicenses
+
+git add solr/licenses
+```
+
+Note that `updateLicenses` compiles Solr, because it enumerates the JARs on the
+compile and runtime classpaths. If Lucene made signature changes, fix the code
+first (see below) and then come back to this step.
+
+## Code
+
+```
+./gradlew compileJava
+```
+
+* adjust for signature changes e.g.
+  * `int` to `long` type change
+  * additional or removed constructor arguments
+  * additional abstract base class or interface methods
+  * inner classes becoming outer classes
+* codec changes (if any)
+  * conceptually `s/org.apache.lucene.codecs.lucene10x.Lucene10x/org.apache.lucene.codecs.lucene104.Lucene104`
+  * if the Lucene codec version changed, add an entry in `solr/solr-ref-guide/modules/upgrade-notes/pages/major-changes-in-solr-10.adoc` noting the codec change and warning users that downgrading to a prior Solr version after this upgrade may require a full reindex
+
+## Test
+
+```
+./gradlew compileTestJava
+```
+
+```
+./gradlew precommit
+```
+
+```
+./gradlew test
+```
+
+## Finish
+
+Push the local branch to github (fork) and open a pull request.
+
+## Looking for something else?
+
+Thanks for reading these upgrade steps! But perhaps you were looking for information on trying out prerelease Lucene changes or joint local Solr and Lucene development? If so then please see the 'Update Lucene prerelease' and 'Lucene local dependency substitution' sections in the [dev-docs/gradle-help/dependencies.txt](gradle-help/dependencies.txt) documentation.
+

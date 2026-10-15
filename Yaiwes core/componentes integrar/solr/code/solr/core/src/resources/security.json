@@ -1,0 +1,72 @@
+{
+  "authentication": {
+    "blockUnknown": false,
+    "class": "solr.BasicAuthPlugin",
+    "credentials": {
+      "search": "",
+      "index": "",
+      "admin": ""
+    }
+  },
+  "authorization": {
+    "class": "solr.RuleBasedAuthorizationPlugin",
+    "permissions": [{
+        "name": "security-edit",
+        "role": "superadmin"
+      },
+      {
+        "name": "security-read",
+        "role": "admin"
+      },
+      {
+        "name": "config-edit",
+        "role": "admin"
+      },
+      {
+        "name": "config-read",
+        "role": "admin"
+      },
+      {
+        "name": "collection-admin-edit",
+        "role": "admin"
+      },
+      {
+        "name": "core-admin-edit",
+        "role": "admin"
+      },
+      {
+        "name": "core-admin-read",
+        "role": "admin"
+      },
+      {
+        "name": "read",
+        "role": "search"
+      },
+      {
+        "name": "collection-admin-read",
+        "role": "search"
+      },
+      {
+        "name": "update",
+        "role": "index"
+      },
+      {
+        "name": "health",
+        "role": null
+      },
+      {
+        "name": "metrics-read",
+        "role": null
+      },
+      {
+        "name": "all",
+        "role": "admin"
+      }
+    ],
+    "user-role": {
+      "search": ["search"],
+      "index": ["index", "search"],
+      "admin": ["admin", "index", "search"]
+    }
+  }
+}

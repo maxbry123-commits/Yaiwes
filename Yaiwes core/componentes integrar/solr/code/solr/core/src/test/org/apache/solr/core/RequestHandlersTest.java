@@ -1,0 +1,147 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.core;
+
+import org.apache.solr.SolrTestCaseJ4;
+import org.apache.solr.request.SolrRequestHandler;
+import org.apache.solr.util.SolrMetricTestUtils;
+import org.junit.BeforeClass;
+import org.junit.Test;
+
+public class RequestHandlersTest extends SolrTestCaseJ4 {
+  @BeforeClass
+  public static void beforeClass() throws Exception {
+    initCore("solrconfig.xml", "schema.xml");
+  }
+
+  @Test
+  public void testInitCount() {
+    var datapoint =
+        SolrMetricTestUtils.getGaugeDatapoint(
+            h.getCore(),
+            "mock_request",
+            SolrMetricTestUtils.newStandaloneLabelsBuilder(h.getCore())
+                .label("handler", "/mock")
+                .build());
+    assertEquals(1.0, datapoint.getValue(), 0.0);
+  }
+
+  @Test
+  public void testImplicitRequestHandlers() {
+    SolrCore core = h.getCore();
+    assertNotNull(core.getRequestHandler("/update/json"));
+    assertNotNull(core.getRequestHandler("/update/json/docs"));
+    assertNotNull(core.getRequestHandler("/update/csv"));
+  }
+
+  @Test
+  public void testLazyLoading() {
+    SolrCore core = h.getCore();
+    PluginBag.PluginHolder<SolrRequestHandler> handler =
+        core.getRequestHandlers().getRegistry().get("/lazy");
+    assertFalse(handler.isLoaded());
+
+    assertU(
+        adoc(
+            "id", "42",
+            "name", "Zapp Brannigan"));
+    assertU(
+        adoc(
+            "id", "43",
+            "title", "Democratic Order of Planets"));
+    assertU(
+        adoc(
+            "id", "44",
+            "name", "The Zapper"));
+    assertU(
+        adoc(
+            "id", "45",
+            "title", "25 star General"));
+    assertU(
+        adoc(
+            "id", "46",
+            "subject", "Defeated the pacifists of the Gandhi nebula"));
+    assertU(
+        adoc(
+            "id", "47",
+            "text",
+                "line up and fly directly at the enemy death cannons, clogging them with wreckage!"));
+    assertU(commit());
+
+    assertQ(
+        "lazy request handler returns all matches", req("q", "id:[42 TO 47]"), "*[count(//doc)=6]");
+
+    // But it should behave just like the 'defaults' request handler above
+    assertQ(
+        "lazy handler returns fewer matches",
+        reqWithPath("/lazy", "q", "id:[42 TO 47]"),
+        "*[count(//doc)=4]");
+
+    assertQ(
+        "lazy handler includes highlighting",
+        reqWithPath("/lazy", "q", "name:Zapp OR title:General"),
+        "//lst[@name='highlighting']");
+  }
+
+  @Test
+  public void testPathNormalization() {
+    SolrCore core = h.getCore();
+    SolrRequestHandler h1 = core.getRequestHandler("/update");
+    assertNotNull(h1);
+
+    SolrRequestHandler h2 = core.getRequestHandler("/update/");
+    assertNotNull(h2);
+
+    assertEquals(h1, h2); // the same object
+
+    assertNull(core.getRequestHandler("/update/asdgadsgas")); // prefix
+  }
+
+  @Test
+  public void testStatistics() {
+    SolrCore core = h.getCore();
+
+    assertU(
+        adoc(
+            "id",
+            "47",
+            "text",
+            "line up and fly directly at the enemy death cannons, clogging them with wreckage!"));
+    assertU(commit());
+
+    var updateDp =
+        SolrMetricTestUtils.getHistogramDatapoint(
+            core,
+            "solr_core_requests_times_milliseconds",
+            SolrMetricTestUtils.newStandaloneLabelsBuilder(core)
+                .label("category", "UPDATE")
+                .label("handler", "/update")
+                .build());
+    var termDp =
+        SolrMetricTestUtils.getHistogramDatapoint(
+            core,
+            "solr_core_requests_times_milliseconds",
+            SolrMetricTestUtils.newStandaloneLabelsBuilder(core)
+                .label("category", "QUERY")
+                .label("handler", "/terms")
+                .build());
+
+    // RequestHandlers should not share statistics
+    assertTrue(updateDp.getSum() > 0);
+    assertNull("/terms should not have any time value", termDp);
+  }
+}

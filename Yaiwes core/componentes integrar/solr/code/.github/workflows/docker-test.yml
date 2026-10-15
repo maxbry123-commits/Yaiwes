@@ -1,0 +1,38 @@
+name: Docker Build & Test
+
+on:
+  pull_request:
+    branches:
+      - '*'
+    paths:
+      - '.github/workflows/docker-test.yml'
+      - 'solr/bin/**'
+      - 'solr/docker/**'
+      - 'solr/packaging/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test Docker image
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      SOLR_DOCKER_IMAGE_REPO: github-pr/solr
+      SOLR_DOCKER_IMAGE_TAG: ${{github.event.number}}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: ./.github/actions/prepare-for-build
+
+    - name: Build Docker image with Gradle
+      run: ./gradlew solr:docker:docker
+
+    - name: Run tests on Docker image
+      run: ./gradlew solr:docker:testDocker

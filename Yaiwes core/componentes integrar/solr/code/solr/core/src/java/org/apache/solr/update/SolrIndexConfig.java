@@ -1,0 +1,386 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.update;
+
+import static org.apache.solr.core.XmlConfigFile.assertWarnOrFail;
+
+import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.util.Map;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.DelegatingAnalyzerWrapper;
+import org.apache.lucene.index.ConcurrentMergeScheduler;
+import org.apache.lucene.index.IndexWriter.IndexReaderWarmer;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.MergeScheduler;
+import org.apache.lucene.search.Sort;
+import org.apache.lucene.util.InfoStream;
+import org.apache.lucene.util.Version;
+import org.apache.solr.common.ConfigNode;
+import org.apache.solr.common.MapWriter;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SuppressForbidden;
+import org.apache.solr.core.DirectoryFactory;
+import org.apache.solr.core.PluginInfo;
+import org.apache.solr.core.SolrConfig;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.core.SolrResourceLoader;
+import org.apache.solr.index.DefaultMergePolicyFactory;
+import org.apache.solr.index.MergePolicyFactory;
+import org.apache.solr.index.MergePolicyFactoryArgs;
+import org.apache.solr.index.SortingMergePolicy;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.solr.util.SolrPluginUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * This config object encapsulates IndexWriter config params, defined in the &lt;indexConfig&gt;
+ * section of solrconfig.xml
+ */
+public class SolrIndexConfig implements MapWriter {
+  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+
+  private static final String NO_SUB_PACKAGES[] = new String[0];
+
+  private static final String DEFAULT_MERGE_POLICY_FACTORY_CLASSNAME =
+      DefaultMergePolicyFactory.class.getName();
+  public static final String DEFAULT_MERGE_SCHEDULER_CLASSNAME =
+      ConcurrentMergeScheduler.class.getName();
+
+  public final boolean useCompoundFile;
+
+  public final int maxBufferedDocs;
+
+  public final double ramBufferSizeMB;
+  public final int ramPerThreadHardLimitMB;
+
+  /**
+   * When using a custom merge policy that allows triggering synchronous merges on commit (see
+   * {@link MergePolicy#findFullFlushMerges(org.apache.lucene.index.MergeTrigger,
+   * org.apache.lucene.index.SegmentInfos, org.apache.lucene.index.MergePolicy.MergeContext)}), a
+   * timeout (in milliseconds) can be set for those merges to finish. Use {@code
+   * <maxCommitMergeWaitTime>1000</maxCommitMergeWaitTime>} in the {@code <indexConfig>} section.
+   * See {@link IndexWriterConfig#setMaxFullFlushMergeWaitMillis(long)}.
+   *
+   * <p>Note that as of Solr 8.6, no {@code MergePolicy} shipped with Lucene/Solr make use of {@code
+   * MergePolicy.findFullFlushMerges}, which means this setting has no effect unless a custom {@code
+   * MergePolicy} is used.
+   */
+  public final int maxCommitMergeWaitMillis;
+
+  public final int writeLockTimeout;
+  public final String lockType;
+  public final PluginInfo mergePolicyFactoryInfo;
+  public final PluginInfo mergeSchedulerInfo;
+  public final PluginInfo metricsInfo;
+
+  public final PluginInfo mergedSegmentWarmerInfo;
+
+  public InfoStream infoStream = InfoStream.NO_OUTPUT;
+  private ConfigNode node;
+
+  /** Internal constructor for setting defaults based on Lucene Version */
+  private SolrIndexConfig() {
+    useCompoundFile = false;
+    maxBufferedDocs = -1;
+    ramBufferSizeMB = 100;
+    ramPerThreadHardLimitMB = -1;
+    maxCommitMergeWaitMillis = -1;
+    writeLockTimeout = -1;
+    lockType = DirectoryFactory.LOCK_TYPE_NATIVE;
+    mergePolicyFactoryInfo = null;
+    mergeSchedulerInfo = null;
+    mergedSegmentWarmerInfo = null;
+    // enable coarse-grained metrics by default
+    metricsInfo = new PluginInfo("metrics", Map.of(), null, null);
+  }
+
+  private ConfigNode get(String s) {
+    return node.get(s);
+  }
+
+  public SolrIndexConfig(SolrConfig cfg, SolrIndexConfig def) {
+    this(cfg.get("indexConfig"), def);
+  }
+
+  /**
+   * Constructs a SolrIndexConfig which parses the Lucene related config params in solrconfig.xml
+   *
+   * @param def a SolrIndexConfig instance to pick default values from (optional)
+   */
+  public SolrIndexConfig(ConfigNode cfg, SolrIndexConfig def) {
+    this.node = cfg;
+    if (def == null) {
+      def = new SolrIndexConfig();
+    }
+
+    // sanity check: this will throw an error for us if there is more then one
+    // config section
+    //    Object unused =  solrConfig.getNode(prefix, false);
+
+    // Assert that end-of-life parameters or syntax is not in our config.
+    // Warn for luceneMatchVersion's before LUCENE_3_6, fail fast above
+    assertWarnOrFail(
+        "The <mergeScheduler>myclass</mergeScheduler> syntax is no longer supported in solrconfig.xml. Please use syntax <mergeScheduler class=\"myclass\"/> instead.",
+        get("mergeScheduler").isNull() || get("mergeScheduler").attr("class") != null,
+        true);
+    assertWarnOrFail(
+        "Beginning with Solr 7.0, <mergePolicy>myclass</mergePolicy> is no longer supported, use <mergePolicyFactory> instead.",
+        get("mergePolicy").isNull() || get("mergePolicy").attr("class") != null,
+        true);
+    assertWarnOrFail(
+        "The <luceneAutoCommit>true|false</luceneAutoCommit> parameter is no longer valid in solrconfig.xml.",
+        get("luceneAutoCommit").isNull(),
+        true);
+
+    useCompoundFile = get("useCompoundFile").boolVal(def.useCompoundFile);
+    maxBufferedDocs = get("maxBufferedDocs").intVal(def.maxBufferedDocs);
+    ramBufferSizeMB = get("ramBufferSizeMB").doubleVal(def.ramBufferSizeMB);
+    maxCommitMergeWaitMillis = get("maxCommitMergeWaitTime").intVal(def.maxCommitMergeWaitMillis);
+
+    // how do we validate the value??
+    ramPerThreadHardLimitMB = get("ramPerThreadHardLimitMB").intVal(def.ramPerThreadHardLimitMB);
+
+    writeLockTimeout = get("writeLockTimeout").intVal(def.writeLockTimeout);
+    lockType = get("lockType").txt(def.lockType);
+
+    metricsInfo = getPluginInfo(get("metrics"), def.metricsInfo);
+    mergeSchedulerInfo = getPluginInfo(get("mergeScheduler"), def.mergeSchedulerInfo);
+    mergePolicyFactoryInfo = getPluginInfo(get("mergePolicyFactory"), def.mergePolicyFactoryInfo);
+
+    assertWarnOrFail(
+        "Beginning with Solr 7.0, <mergePolicy> is no longer supported, use <mergePolicyFactory> instead.",
+        get("mergePolicy").isNull(),
+        true);
+    assertWarnOrFail(
+        "Beginning with Solr 7.0, <maxMergeDocs> is no longer supported, configure it on the relevant <mergePolicyFactory> instead.",
+        get("maxMergeDocs").isNull(),
+        true);
+    assertWarnOrFail(
+        "Beginning with Solr 7.0, <mergeFactor> is no longer supported, configure it on the relevant <mergePolicyFactory> instead.",
+        get("mergeFactor").isNull(),
+        true);
+
+    if (get("termIndexInterval").exists()) {
+      throw new IllegalArgumentException("Illegal parameter 'termIndexInterval'");
+    }
+
+    if (get("infoStream").boolVal(false)) {
+      log.info("IndexWriter infoStream solr logging is enabled");
+      infoStream = new LoggingInfoStream();
+    }
+    mergedSegmentWarmerInfo =
+        getPluginInfo(get("mergedSegmentWarmer"), def.mergedSegmentWarmerInfo);
+
+    assertWarnOrFail(
+        "Beginning with Solr 5.0, <checkIntegrityAtMerge> option is no longer supported and should be removed from solrconfig.xml (these integrity checks are now automatic)",
+        get("checkIntegrityAtMerge").isNull(),
+        true);
+  }
+
+  @Override
+  @SuppressWarnings(
+      "ReferenceEquality") // InfoStream.NO_OUTPUT is a Lucene sentinel; identity check is
+  // intentional
+  public void writeMap(EntryWriter ew) throws IOException {
+    ew.put("useCompoundFile", useCompoundFile)
+        .put("maxBufferedDocs", maxBufferedDocs)
+        .put("ramBufferSizeMB", ramBufferSizeMB)
+        .put("ramPerThreadHardLimitMB", ramPerThreadHardLimitMB)
+        .put("maxCommitMergeWaitTime", maxCommitMergeWaitMillis)
+        .put("writeLockTimeout", writeLockTimeout)
+        .put("lockType", lockType)
+        .put("infoStreamEnabled", infoStream != InfoStream.NO_OUTPUT)
+        .putIfNotNull("mergeScheduler", mergeSchedulerInfo)
+        .putIfNotNull("metrics", metricsInfo)
+        .putIfNotNull("mergePolicyFactory", mergePolicyFactoryInfo)
+        .putIfNotNull("mergedSegmentWarmer", mergedSegmentWarmerInfo);
+  }
+
+  private PluginInfo getPluginInfo(ConfigNode node, PluginInfo def) {
+    return node != null && node.exists()
+        ? new PluginInfo(node, "[solrconfig.xml] " + node.name(), false, false)
+        : def;
+  }
+
+  private static class DelayedSchemaAnalyzer extends DelegatingAnalyzerWrapper {
+    private final SolrCore core;
+
+    public DelayedSchemaAnalyzer(SolrCore core) {
+      super(PER_FIELD_REUSE_STRATEGY);
+      this.core = core;
+    }
+
+    @Override
+    protected Analyzer getWrappedAnalyzer(String fieldName) {
+      return core.getLatestSchema().getIndexAnalyzer();
+    }
+  }
+
+  public IndexWriterConfig toIndexWriterConfig(SolrCore core) throws IOException {
+    IndexSchema schema = core.getLatestSchema();
+    IndexWriterConfig iwc = new IndexWriterConfig(new DelayedSchemaAnalyzer(core));
+    if (maxBufferedDocs != -1) iwc.setMaxBufferedDocs(maxBufferedDocs);
+
+    if (ramBufferSizeMB != -1) iwc.setRAMBufferSizeMB(ramBufferSizeMB);
+
+    if (ramPerThreadHardLimitMB != -1) {
+      if (ramPerThreadHardLimitMB > 2048) {
+        setPerThreadRAMLimitViaVarHandle(iwc, ramPerThreadHardLimitMB);
+      } else {
+        iwc.setRAMPerThreadHardLimitMB(ramPerThreadHardLimitMB);
+      }
+    }
+
+    if (maxCommitMergeWaitMillis > 0) {
+      iwc.setMaxFullFlushMergeWaitMillis(maxCommitMergeWaitMillis);
+    }
+
+    iwc.setSimilarity(schema.getSimilarity());
+    MergePolicy mergePolicy = buildMergePolicy(core.getResourceLoader(), schema);
+    iwc.setMergePolicy(mergePolicy);
+    MergeScheduler mergeScheduler = buildMergeScheduler(core.getResourceLoader());
+    iwc.setMergeScheduler(mergeScheduler);
+    iwc.setInfoStream(infoStream);
+
+    if (mergePolicy instanceof SortingMergePolicy) {
+      Sort indexSort = ((SortingMergePolicy) mergePolicy).getSort();
+      iwc.setIndexSort(indexSort);
+    }
+
+    if (iwc.getIndexSort() != null
+        && schema.isUsableForChildDocs()
+        && core.getSolrConfig().luceneMatchVersion.onOrAfter(Version.LUCENE_10_4_0)) {
+      // Solr 10 shipped with Lucene 10.3.x, and Solr <=10 didn't set the parent field.
+      // This version check allows an upgrading user to continue to do index sorting.
+      iwc.setParentField(IndexSchema.IS_ROOT_FIELD_NAME);
+    }
+
+    iwc.setUseCompoundFile(useCompoundFile);
+
+    if (mergedSegmentWarmerInfo != null) {
+      // TODO: add infostream -> normal logging system (there is an issue somewhere)
+      IndexReaderWarmer warmer =
+          core.getResourceLoader()
+              .newInstance(
+                  mergedSegmentWarmerInfo.className,
+                  IndexReaderWarmer.class,
+                  null,
+                  new Class<?>[] {InfoStream.class},
+                  new Object[] {iwc.getInfoStream()});
+      iwc.setMergedSegmentWarmer(warmer);
+    }
+
+    return iwc;
+  }
+
+  /**
+   * Builds a MergePolicy using the configured MergePolicyFactory or if no factory is configured
+   * uses the configured mergePolicy PluginInfo.
+   */
+  private MergePolicy buildMergePolicy(SolrResourceLoader resourceLoader, IndexSchema schema) {
+
+    final String mpfClassName;
+    final MergePolicyFactoryArgs mpfArgs;
+    if (mergePolicyFactoryInfo == null) {
+      mpfClassName = DEFAULT_MERGE_POLICY_FACTORY_CLASSNAME;
+      mpfArgs = new MergePolicyFactoryArgs();
+    } else {
+      mpfClassName = mergePolicyFactoryInfo.className;
+      mpfArgs = new MergePolicyFactoryArgs(mergePolicyFactoryInfo.initArgs);
+    }
+
+    final MergePolicyFactory mpf =
+        resourceLoader.newInstance(
+            mpfClassName,
+            MergePolicyFactory.class,
+            NO_SUB_PACKAGES,
+            new Class<?>[] {
+              SolrResourceLoader.class, MergePolicyFactoryArgs.class, IndexSchema.class
+            },
+            new Object[] {resourceLoader, mpfArgs, schema});
+
+    return mpf.getMergePolicy();
+  }
+
+  private MergeScheduler buildMergeScheduler(SolrResourceLoader resourceLoader) {
+    String msClassName =
+        mergeSchedulerInfo == null
+            ? SolrIndexConfig.DEFAULT_MERGE_SCHEDULER_CLASSNAME
+            : mergeSchedulerInfo.className;
+    MergeScheduler scheduler = resourceLoader.newInstance(msClassName, MergeScheduler.class);
+
+    if (mergeSchedulerInfo != null) {
+      // LUCENE-5080: these two setters are removed, so we have to invoke setMaxMergesAndThreads
+      // if someone has them configured.
+      if (scheduler instanceof ConcurrentMergeScheduler) {
+        NamedList<?> args = mergeSchedulerInfo.initArgs.clone();
+        Integer maxMergeCount = (Integer) args.remove("maxMergeCount");
+        if (maxMergeCount == null) {
+          maxMergeCount = ((ConcurrentMergeScheduler) scheduler).getMaxMergeCount();
+        }
+        Integer maxThreadCount = (Integer) args.remove("maxThreadCount");
+        if (maxThreadCount == null) {
+          maxThreadCount = ((ConcurrentMergeScheduler) scheduler).getMaxThreadCount();
+        }
+        ((ConcurrentMergeScheduler) scheduler)
+            .setMaxMergesAndThreads(maxMergeCount, maxThreadCount);
+        Boolean ioThrottle = (Boolean) args.remove("ioThrottle");
+        if (ioThrottle != null && ioThrottle) { // by-default 'disabled'
+          ((ConcurrentMergeScheduler) scheduler).enableAutoIOThrottle();
+        }
+        SolrPluginUtils.invokeSetters(scheduler, args);
+      } else {
+        SolrPluginUtils.invokeSetters(scheduler, mergeSchedulerInfo.initArgs);
+      }
+    }
+
+    return scheduler;
+  }
+
+  @SuppressForbidden(reason = "Need to override Lucene's 2GB per-thread limit for large datasets")
+  private static void setPerThreadRAMLimitViaVarHandle(IndexWriterConfig config, int limitMB) {
+    MethodHandles.Lookup lookup = MethodHandles.lookup();
+    VarHandle fieldHandle = null;
+    Class<?> currentClass = config.getClass();
+
+    // Traverse the hierarchy to find the field
+    while (currentClass != null && fieldHandle == null) {
+      try {
+        MethodHandles.Lookup privateLookup = MethodHandles.privateLookupIn(currentClass, lookup);
+        fieldHandle = privateLookup.findVarHandle(currentClass, "perThreadHardLimitMB", int.class);
+      } catch (IllegalAccessException | NoSuchFieldException e) {
+        currentClass = currentClass.getSuperclass();
+      }
+    }
+
+    if (fieldHandle == null) {
+      log.error("Could not find VarHandle for perThreadHardLimitMB field");
+      return;
+    }
+
+    try {
+      fieldHandle.set(config, limitMB);
+      log.info("Set perThreadHardLimitMB to {} MB via VarHandle", limitMB);
+    } catch (RuntimeException | Error e) {
+      log.error("Failed to set per-thread RAM limit via VarHandle", e);
+    }
+  }
+}

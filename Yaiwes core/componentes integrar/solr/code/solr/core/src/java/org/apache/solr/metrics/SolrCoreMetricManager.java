@@ -1,0 +1,187 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.metrics;
+
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.solr.cloud.CloudDescriptor;
+import org.apache.solr.common.util.IOUtils;
+import org.apache.solr.common.util.Utils;
+import org.apache.solr.core.SolrCore;
+
+/**
+ * Helper class for managing registration of {@link SolrMetricProducer}'s specific to a {@link
+ * SolrCore} instance.
+ */
+public class SolrCoreMetricManager implements Closeable {
+
+  public static final AttributeKey<String> COLLECTION_ATTR = AttributeKey.stringKey("collection");
+  public static final AttributeKey<String> CORE_ATTR = AttributeKey.stringKey("core");
+  public static final AttributeKey<String> SHARD_ATTR = AttributeKey.stringKey("shard");
+  public static final AttributeKey<String> REPLICA_TYPE_ATTR =
+      AttributeKey.stringKey("replica_type");
+
+  private final SolrCore core;
+  private SolrMetricsContext solrMetricsContext;
+  private SolrMetricManager metricManager;
+  private String collectionName;
+  private String shardName;
+  private String replicaName;
+  private boolean cloudMode;
+
+  // Track all metric producers registered for this core so we can re-initialize them during core
+  // rename
+  private final List<MetricProducerInfo> registeredProducers = new ArrayList<>();
+
+  private record MetricProducerInfo(SolrMetricProducer producer, Attributes attributes) {}
+
+  /**
+   * Constructs a metric manager.
+   *
+   * @param core the metric manager's core
+   */
+  public SolrCoreMetricManager(SolrCore core) {
+    this.core = core;
+    initCloudMode();
+    metricManager = core.getCoreContainer().getMetricManager();
+    String registryName =
+        createRegistryName(cloudMode, collectionName, shardName, replicaName, core.getName());
+    solrMetricsContext = new SolrMetricsContext(metricManager, registryName);
+  }
+
+  private void initCloudMode() {
+    CloudDescriptor cd = core.getCoreDescriptor().getCloudDescriptor();
+    if (cd != null) {
+      cloudMode = true;
+      collectionName = core.getCoreDescriptor().getCollectionName();
+      shardName = cd.getShardId();
+      // replicaName = cd.getCoreNodeName();
+      String coreName = core.getName();
+      replicaName = Utils.parseMetricsReplicaName(collectionName, coreName);
+      if (replicaName == null) {
+        replicaName = cd.getCoreNodeName();
+      }
+    }
+  }
+
+  /**
+   * Re-register all metric producers associated with this core. This recreates the metric registry
+   * resetting its state and recreating its attributes for all tracked registered producers.
+   */
+  public void reregisterCoreMetrics() {
+    // Close old contexts before re-creating
+    IOUtils.closeQuietly(solrMetricsContext);
+    registeredProducers.forEach(
+        metricProducer -> IOUtils.closeQuietly(metricProducer.producer.getSolrMetricsContext()));
+
+    this.solrMetricsContext =
+        new SolrMetricsContext(
+            metricManager,
+            createRegistryName(cloudMode, collectionName, shardName, replicaName, core.getName()));
+    metricManager.removeRegistry(solrMetricsContext.getRegistryName());
+
+    // TODO: We are going to recreate the attributes and re-initialize/reregister metrics from
+    // tracked producers.
+    // There is some possible improvement that can be done here to not have to duplicate code in
+    // registerMetricProducer
+    core.initializeMetrics(solrMetricsContext, core.getCoreAttributes());
+
+    registeredProducers.forEach(
+        metricProducer -> {
+          metricProducer.producer.initializeMetrics(
+              solrMetricsContext,
+              metricProducer.attributes.toBuilder().putAll(core.getCoreAttributes()).build());
+        });
+  }
+
+  /**
+   * Registers a mapping of name/metric's with the manager's metric registry and creates the base
+   * set of attributes for core level metrics. All metric producers are tracked for re-registering
+   * in the case of core swapping/renaming
+   *
+   * @param producer producer of metrics to be registered
+   */
+  public void registerMetricProducer(SolrMetricProducer producer, Attributes attributes) {
+    if (attributes == null || producer == null) {
+      throw new IllegalArgumentException(
+          "registerMetricProducer() called with illegal arguments: "
+              + "attributes = "
+              + attributes
+              + ", producer = "
+              + producer);
+    }
+
+    // Track this producer for potential re-initialization during core rename
+    registeredProducers.add(new MetricProducerInfo(producer, attributes));
+
+    // TODO: We initialize metrics with attributes of the core. This happens again in
+    // reregisterCoreMetrics
+    // There is some possible improvement that can be done here to not have to duplicate code in
+    // reregisterCoreMetrics
+    producer.initializeMetrics(
+        solrMetricsContext, attributes.toBuilder().putAll(core.getCoreAttributes()).build());
+  }
+
+  /**
+   * Closes reporters specific to this core and unregisters gauges with this core's instance tag.
+   */
+  @Override
+  public void close() throws IOException {
+    solrMetricsContext.close();
+  }
+
+  public SolrMetricsContext getSolrMetricsContext() {
+    return solrMetricsContext;
+  }
+
+  public SolrCore getCore() {
+    return core;
+  }
+
+  /**
+   * Metric registry name of the manager.
+   *
+   * <p>In order to make it easier for reporting tools to aggregate metrics from different cores
+   * that logically belong to a single collection we convert the core name into a dot-separated
+   * hierarchy of: collection name, shard name (with optional split) and replica name.
+   *
+   * <p>For example, when the core name looks like this, but it's NOT a SolrCloud collection: <code>
+   * my_collection_shard1_1_replica1</code> then this will be used as the registry name (plus the
+   * required <code>solr.core</code> prefix). However, if this is a SolrCloud collection <code>
+   * my_collection</code> then the registry name will become <code>
+   * solr.core.my_collection.shard1_1.replica1</code>.
+   *
+   * @return the metric registry name of the manager.
+   */
+  public String getRegistryName() {
+    return solrMetricsContext != null ? solrMetricsContext.getRegistryName() : null;
+  }
+
+  public static String createRegistryName(
+      boolean cloud, String collectionName, String shardName, String replicaName, String coreName) {
+    if (cloud) { // build registry name from logical names
+      return SolrMetricManager.enforcePrefix(
+          "core." + collectionName + "." + shardName + "." + replicaName);
+    } else {
+      return SolrMetricManager.enforcePrefix("core." + coreName);
+    }
+  }
+}

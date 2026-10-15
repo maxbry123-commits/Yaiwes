@@ -1,0 +1,187 @@
+= Performance Statistics Reference
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+This page explains some of the statistics that Solr exposes.
+
+There are two approaches to retrieving metrics.
+First, you can use the xref:metrics-reporting.adoc#metrics-api[Metrics API] or push metrics with OTLP to your monitoring backend.
+The descriptions below focus on retrieving metrics using the Metrics API and Prometheus, but the metric names are the same with OTLP.
+
+These statistics are per core. When you are running in SolrCloud mode these statistics would co-relate to the performance of an individual replica.
+
+[NOTE]
+====
+*What about rates and percentiles e.g. QPS, p95 latency?*
+
+Solr exposes raw counters and histograms. You need to use PromQL (or similar query language) to transform these raw metrics into useful statistics. Below are examples using PromQL. See https://prometheus.io/docs/prometheus/latest/querying/functions/[PromQL Query Functions documentation] for more information.
+
+[cols="1,1,2",options="header"]
+|===
+|What you want |Raw metric type |PromQL
+
+|Queries per second (QPS)
+|Counter: `solr_core_requests_total`
+|`rate(solr_core_requests_total[5m])`
+
+|Total number of errors over 5 minutes
+|Counter: `solr_core_requests_total`
+|`increase(solr_core_requests_errors_total[5m])`
+
+|95th percentile latency
+|Histogram: `_bucket` metrics
+|`histogram_quantile(0.95, rate(solr_core_requests_times_milliseconds_bucket[5m]))`
+
+|===
+
+*Filtering by handler and excluding internal requests:*
+You can apply the same functions to aggregate on specific handlers and exclude internal SolrCloud requests:
+
+[source,promql]
+----
+rate(solr_core_requests_total{handler="/select", internal="false"}[5m])
+----
+
+====
+
+== Request Handler Statistics
+
+All handler metrics include a `handler` label that identifies the specific handler the metric corresponds to (e.g., `/select`, `/sql`, `/export`, `/get`, `/update`, etc.).
+This allows you to analyze statistics for individual handlers based on your needs.
+
+=== Update Request Handler
+
+The update request handler is an endpoint to send data to Solr.
+We can see how many update requests are being fired, how fast is it performing, and other valuable information regarding requests.
+
+You can request update request handler statistics with an API request such as `\http://localhost:8983/solr/admin/metrics?category=UPDATE`.
+
+=== Search Request Handler
+
+Can be useful to measure and track number of search queries, response times, etc.
+
+You can request statistics for the `/select` request handler with an API request by filtering with category name with `\http://localhost:8983/solr/admin/metrics?category=QUERY`.
+
+=== Commonly Used Stats for Request Handlers
+All of the update and search request handlers will provide the following statistics.
+
+*Request counts*
+
+[%autowidth.stretch,options="header"]
+|===
+|Metric |Description
+|`solr_core_requests_total` |Total number of HTTP requests to a core.
+|===
+
+*Request Times*
+
+To get request times, specifically, you can send an API request such as:
+
+* `\http://localhost:8983/solr/admin/metrics?name=solr_core_requests_times_milliseconds_bucket&category=UPDATE`
+*  `\http://localhost:8983/solr/admin/metrics?name=solr_core_requests_times_milliseconds_bucket&category=QUERY`
+
+[%autowidth.stretch,options="header"]
+|===
+|Metric |Description
+|`solr_core_requests_times_milliseconds_bucket` |Individual histogram buckets containing cumulative counts of requests that completed within specific time thresholds. Each bucket has an `le` (less than or equal) label indicating the upper bound in milliseconds (e.g., `le="50.0"` counts all requests that took ≤50ms). The buckets are cumulative, so higher thresholds include counts from all lower buckets. The final bucket with `le="+Inf"` contains the total count of all requests regardless of duration.
+|`solr_core_requests_times_milliseconds_count` |Total count of duration requests times processed by the handler since the Solr core was created.
+|`solr_core_requests_times_milliseconds_sum` |Total sum of all request processing times in milliseconds since the Solr core was created.
+|===
+
+*Errors and Other Times*
+
+Other types of data such as errors and timeouts are also provided.
+These are available under different metric names.
+For example:
+
+* `\http://localhost:8983/solr/admin/metrics?name=solr_core_requests_errors_total`
+*  `\http://localhost:8983/solr/admin/metrics?name=solr_core_requests_timeout_total`
+
+The table below shows the metric names and attributes to request:
+
+[cols="30,70",options="header"]
+|===
+|Metric name | Description
+|`solr_core_requests_errors_total` |Number of errors encountered by handler. Uses `source` attribute to differentiate between client errors (bad requests, malformed queries) and server errors (internal failures). Client errors have `source="client"` while server errors have `source="server"`.
+|`solr_core_requests_timeout_total` |Counter for requests that were cancelled due to timeouts.
+|===
+
+*Differentiating Internal Requests*
+
+Processing of a single request in SolrCloud for a large collection requires making additional requests to other replicas, often on other nodes.
+The internal requests look much the same on the surface (same handler), but they are performing a portion of the over-arching task.
+Differentiating these requests is really important!
+Solr tracks its metrics on these handlers with an `internal` attribute when the request is contributing to some other request:
+
+* Queries: `/select` query's internal requests will have `internal=true` in their metric attributes.  This occurs on `SearchHandler` and its subclasses.
+* _(More can be instrumented some day)_
+
+When using external monitoring tools like Prometheus or Grafana, be sure to filter metrics based on the `internal` attribute depending on what is being analyzed.
+
+== Update Handler
+
+This section has information on the total number of adds and how many commits have been fired against a Solr core.
+
+You can get all update handler statistics shown in the table below with an API request such as `\http://localhost:8983/solr/admin/metrics?category=UPDATE,TLOG`.
+
+The following describes the specific statistics you can get:
+
+[%autowidth.stretch,options="header"]
+|===
+|Metric |Description
+|`solr_core_update_submitted_ops` |Counter for operations submitted to the update handler.
+|`solr_core_update_committed_ops` |Counter for operations that have been committed.
+|`solr_core_update_cumulative_ops` |Gauge showing cumulative count of operations over the lifetime. Cumulative can decrease from rollback command.
+|`solr_core_update_commit_ops` |Counter for commit operations.
+|`solr_core_update_maintenance_ops` |Counter for total number of maintenance operations such as rollback
+|`solr_core_update_docs_pending_commit` |Gauge showing number of documents pending commit.
+|`solr_core_update_log_buffered_ops` |Gauge for current number of buffered operations.
+|`solr_core_update_log_replay_logs_remaining` |Gauge current number of tlogs remaining to be replayed.
+|`solr_core_update_log_size_remaining` |Gauge total size in bytes of all tlogs remaining to be replayed.
+|`solr_core_update_log_state` |Gauge The current state of the update log. Replaying (0), buffering (1), applying buffered (2), active (3).
+|`solr_core_update_log_applied_buffered_ops` |Counter number of buffered operations applied.
+|===
+
+== Cache Statistics
+
+You can get the statistics shown in the table below with an API request such as `\http://localhost:8983/solr/admin/metrics?category=CACHE`. Each cache metric has a `name` attribute attached that correspond to the cache the metric was recorded from.
+
+The following statistics are available for each of the caches mentioned below:
+
+[%autowidth.stretch,options="header"]
+|===
+|Metric Name |Description
+|`solr_caffeine_cache_ops` |Number of cumulative cache operations (inserts and evictions).
+|`solr_caffeine_cache_lookups` |Number of cumulative cache lookup results (hits and misses).
+|`solr_caffeine_cache_size` |Current number of cache entries.
+|`solr_caffeine_cache_ram_used` |RAM bytes used by cache.
+|===
+
+=== Document Cache
+
+This cache holds Lucene Document objects (the stored fields for each document).
+Since Lucene internal document IDs are transient, this cache cannot be auto-warmed.
+
+=== Query Result Cache
+
+This cache holds the results of previous searches: ordered lists of document IDs based on a query, a sort, and the range of documents requested
+
+=== Filter Cache
+
+This cache is used for filters for unordered sets of all documents that match a query.
+
+More information on Solr caches is available in the section xref:configuration-guide:caches-warming.adoc[].

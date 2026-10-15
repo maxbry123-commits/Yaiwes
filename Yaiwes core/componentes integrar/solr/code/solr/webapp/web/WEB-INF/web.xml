@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+ Licensed to the Apache Software Foundation (ASF) under one or more
+ contributor license agreements.  See the NOTICE file distributed with
+ this work for additional information regarding copyright ownership.
+ The ASF licenses this file to You under the Apache License, Version 2.0
+ (the "License"); you may not use this file except in compliance with
+ the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_0.xsd"
+  version="6.0"
+  metadata-complete="true">
+
+  <listener>
+    <listener-class>org.apache.solr.servlet.CoreContainerProvider</listener-class>
+  </listener>
+
+  <filter>
+    <filter-name>SolrFilter</filter-name>
+    <filter-class>org.apache.solr.servlet.RequiredSolrRequestFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>SolrFilter</filter-name>
+    <servlet-name>SolrServlet</servlet-name>
+  </filter-mapping>
+
+  <filter>
+    <filter-name>RateLimitFilter</filter-name>
+    <filter-class>org.apache.solr.servlet.RateLimitFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>RateLimitFilter</filter-name>
+    <servlet-name>SolrServlet</servlet-name>
+  </filter-mapping>
+
+  <filter>
+    <filter-name>TracingFilter</filter-name>
+    <filter-class>org.apache.solr.servlet.TracingFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>TracingFilter</filter-name>
+    <servlet-name>SolrServlet</servlet-name>
+  </filter-mapping>
+
+  <filter>
+    <filter-name>AuthenticationFilter</filter-name>
+    <filter-class>org.apache.solr.servlet.AuthenticationFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>AuthenticationFilter</filter-name>
+    <servlet-name>SolrServlet</servlet-name>
+  </filter-mapping>
+
+  <servlet>
+    <servlet-name>SolrServlet</servlet-name>
+    <servlet-class>org.apache.solr.servlet.SolrServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>SolrServlet</servlet-name>
+    <url-pattern>/*</url-pattern>
+  </servlet-mapping>
+
+  <!-- Define servlet for static Admin UI resources -->
+  <servlet>
+    <servlet-name>static</servlet-name>
+    <servlet-class>org.eclipse.jetty.ee10.servlet.ResourceServlet</servlet-class>
+    <init-param>
+      <param-name>pathInfoOnly</param-name>
+      <param-value>false</param-value>
+    </init-param>
+    <init-param>
+      <param-name>dirAllowed</param-name>
+      <param-value>false</param-value>
+    </init-param>
+  </servlet>
+  <!-- Map static Admin UI resources to the static servlet -->
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/partials/*</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/libs/*</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/css/*</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/js/*</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/img/*</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/templates/*</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>static</servlet-name>
+    <url-pattern>/ui/*</url-pattern>
+  </servlet-mapping>
+
+  <servlet>
+    <servlet-name>LoadAdminUI</servlet-name>
+    <servlet-class>org.apache.solr.servlet.LoadAdminUiServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>LoadAdminUI</servlet-name>
+    <url-pattern>/index.html</url-pattern>
+  </servlet-mapping>
+
+  <mime-mapping>
+    <extension>.xsl</extension>
+    <!-- per http://www.w3.org/TR/2006/PR-xslt20-20061121/ -->
+    <mime-type>application/xslt+xml</mime-type>
+  </mime-mapping>
+
+  <welcome-file-list>
+    <welcome-file>index.html</welcome-file>
+  </welcome-file-list>
+
+  <!-- Get rid of error message -->
+  <security-constraint>
+    <web-resource-collection>
+      <web-resource-name>Disable TRACE</web-resource-name>
+      <url-pattern>/</url-pattern>
+      <http-method>TRACE</http-method>
+    </web-resource-collection>
+    <auth-constraint/>
+  </security-constraint>
+  <security-constraint>
+    <web-resource-collection>
+      <web-resource-name>Enable everything but TRACE</web-resource-name>
+      <url-pattern>/</url-pattern>
+      <http-method-omission>TRACE</http-method-omission>
+    </web-resource-collection>
+  </security-constraint>
+
+  <!--
+    RedirectServlet can be used to redirect old endpoints to a new location to support back compatibility.
+    Example below
+  -->
+<!--
+  <servlet>
+    <servlet-name>RedirectOldZookeeper</servlet-name>
+    <servlet-class>org.apache.solr.servlet.RedirectServlet</servlet-class>
+    <init-param>
+      <param-name>destination</param-name>
+      <param-value>${context}/admin/zookeeper</param-value>
+    </init-param>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>RedirectOldZookeeper</servlet-name>
+    <url-pattern>/zookeeper</url-pattern>
+  </servlet-mapping>
+-->
+</web-app>

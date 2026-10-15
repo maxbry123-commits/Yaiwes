@@ -1,0 +1,42 @@
+= Lib Directories
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+Here we describe two simple and effective methods to make the `.jar` files for Solr plugins visible to Solr.
+
+Such files are sometimes called "libraries" or "libs" for short.
+Essentially you can put them in some special places or explicitly tell Solr about them from your config.
+
+If there is overlap or inter-dependencies between libraries, then pay attention to the order.  You can think of it like a stack that is searched top-down.  At the top are the lib directives in reverse order, then Solr core's lib, then Solr home's lib, then Solr itself.
+
+== Lib Directories
+
+There are several special places you can place Solr plugin `.jar` files, described in the table below:
+
+
+[width="100%",options="header",]
+|===
+|Location |Visible To |Purpose |Additional Notes
+|`<solr_install>/lib/` | Everything (Node-level plugins, Core-level plugins, `bin/solr` tools) |Any plugins that administrators want to make available to all of Solrand its tooling, esp. when building a custom Solr package or Dockerfile. |N/A
+|`<solr_home/lib/` | Node-level plugins, Core-level plugins |Useful when plugins should be made available to all of Solr, but cannot be put in `<solr_install>/lib/` for whatever reason (e.g. Solr installed on read-only file system) | Directory not present by default and must be created by administrators. See xref:deployment-guide:taking-solr-to-production.adoc[].
+|`<core_instance>/lib/` |Core-level plugins (for a specific core) |User-managed clusters or standalone installations that want to make a plugin visible to a specific Solr core, but not others. |Directory is not created by default, and must be created by administrators adjacent to `<core_instance>/conf/`
+|`<solr_install>/server/solr-webapp/webapp/WEB-INF/lib/` |Everything (Node-level plugins, Core-level plugins, `bin/solr` tools) |Intended for Solr's own jars and dependencies |Should not be used for plugins, except in the case of a few rare plugin typs whose documentation explicitly calls out the need for placement here.
+|`<solr_install>/server/lib/ext` |Everything (Node-level plugins, Core-level plugins, `bin/solr` tools) |Intended to contain Jetty jars and other things needed by the Jetty servlet classpath. Not typically used for plugins |N/A
+|===
+
+Note that while it's possible to place custom code in `<solr_install>/server/solr-webapp/webapp/WEB-INF/lib/` and `<solr_install>/server/lib/ext/`, doing so is discouraged as these directories are intended for holding Solr and Jetty code, respectively.

@@ -1,0 +1,300 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.solr.handler;
+
+import static org.hamcrest.Matchers.containsString;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import org.apache.solr.client.solrj.RemoteSolrException;
+import org.apache.solr.client.solrj.SolrRequest;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.client.solrj.jetty.HttpJettySolrClient;
+import org.apache.solr.client.solrj.request.CollectionAdminRequest;
+import org.apache.solr.client.solrj.request.CollectionsApi;
+import org.apache.solr.client.solrj.request.GenericV2SolrRequest;
+import org.apache.solr.client.solrj.request.V2Request;
+import org.apache.solr.client.solrj.response.InputStreamResponseParser;
+import org.apache.solr.client.solrj.response.JavaBinResponseParser;
+import org.apache.solr.client.solrj.response.ResponseParser;
+import org.apache.solr.client.solrj.response.V2Response;
+import org.apache.solr.client.solrj.response.XMLResponseParser;
+import org.apache.solr.client.solrj.response.json.JsonMapResponseParser;
+import org.apache.solr.cloud.SolrCloudTestCase;
+import org.apache.solr.common.SolrDocumentList;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.Utils;
+import org.eclipse.jetty.client.HttpClient;
+import org.junit.BeforeClass;
+import org.junit.Test;
+
+public class V2ApiIntegrationTest extends SolrCloudTestCase {
+  private static final String COLL_NAME = "collection1";
+
+  @BeforeClass
+  public static void createCluster() throws Exception {
+    System.setProperty("managed.schema.mutable", "true");
+    configureCluster(2)
+        .addConfig(
+            "conf1", TEST_PATH().resolve("configsets").resolve("cloud-managed").resolve("conf"))
+        .configure();
+    CollectionAdminRequest.createCollection(COLL_NAME, "conf1", 1, 2)
+        .process(cluster.getSolrClient());
+    cluster.waitForActiveCollection(COLL_NAME, 1, 2);
+  }
+
+  @Test
+  public void testWelcomeMessage() throws Exception {
+    V2Response res = new V2Request.Builder("").build().process(cluster.getSolrClient());
+    assertEquals(0, res.getStatus());
+
+    res = new V2Request.Builder("/_introspect").build().process(cluster.getSolrClient());
+    assertEquals(0, res.getStatus());
+  }
+
+  private void testException(
+      ResponseParser responseParser, int expectedCode, String path, String payload) {
+    V2Request v2Request =
+        new V2Request.Builder(path)
+            .withMethod(SolrRequest.METHOD.POST)
+            .withPayload(payload)
+            .build();
+    v2Request.setResponseParser(responseParser);
+    RemoteSolrException ex =
+        expectThrows(RemoteSolrException.class, () -> v2Request.process(cluster.getSolrClient()));
+    assertEquals(expectedCode, ex.code());
+  }
+
+  @Test
+  public void testException() {
+    String notFoundPath = "/c/" + COLL_NAME + "/abccdef";
+    String incorrectPayload = "{rebalance-leaders: {maxAtOnce: abc, maxWaitSeconds: xyz}}";
+    testException(new XMLResponseParser(), 404, notFoundPath, incorrectPayload);
+    testException(new JsonMapResponseParser(), 404, notFoundPath, incorrectPayload);
+    testException(new JavaBinResponseParser(), 404, notFoundPath, incorrectPayload);
+    testException(new XMLResponseParser(), 400, "/c/" + COLL_NAME, incorrectPayload);
+    testException(new JavaBinResponseParser(), 400, "/c/" + COLL_NAME, incorrectPayload);
+    testException(new JsonMapResponseParser(), 400, "/c/" + COLL_NAME, incorrectPayload);
+  }
+
+  @Test
+  public void testIntrospect() throws Exception {
+    ModifiableSolrParams params = new ModifiableSolrParams();
+    params.set("command", "XXXX");
+    params.set("method", "POST");
+    Map<?, ?> result =
+        resAsMap(
+            cluster.getSolrClient(),
+            new V2Request.Builder("/c/" + COLL_NAME + "/_introspect").withParams(params).build());
+    assertEquals(
+        "Command not found!", Utils.getObjectByPath(result, false, "/spec[0]/commands/XXXX"));
+  }
+
+  @Test
+  public void testInvalidWTParamReturnsError() throws Exception {
+    V2Request request = new V2Request.Builder("/c/" + COLL_NAME + "/get/_introspect").build();
+    // Using an invalid wt parameter should return a 400 error
+    request.setResponseParser(new InputStreamResponseParser("bleh"));
+    NamedList<Object> res = cluster.getSolrClient().request(request);
+    String respString = InputStreamResponseParser.consumeResponseToString(res);
+
+    // Should get a 400 Bad Request error for unknown writer type
+    assertTrue(
+        "Expected error message about unknown writer type",
+        respString.contains("Unknown response writer type"));
+    assertTrue("Expected 400 error code", respString.contains("400"));
+  }
+
+  @Test
+  public void testWTParam() throws Exception {
+    // When no response parser is set, the default JSON writer should be used
+    V2Request request = new V2Request.Builder("/c/" + COLL_NAME + "/get/_introspect").build();
+    request.setResponseParser(null);
+    Map<?, ?> resp = resAsMap(cluster.getSolrClient(), request);
+    String respString = resp.toString();
+
+    assertFalse(respString.contains("400"));
+    assertFalse(
+        respString.contains(
+            "<p>Problem accessing /solr/____v2/c/collection1/get/_introspect. Reason:"));
+    assertEquals("/c/collection1/get", Utils.getObjectByPath(resp, true, "/spec[0]/url/paths[0]"));
+    assertEquals(respString, 0, Utils.getObjectByPath(resp, true, "/responseHeader/status"));
+  }
+
+  @Test
+  public void testObeysWtParameterWhenProvided() throws Exception {
+    final HttpClient httpClient = getRawClient();
+    final String url = getListCollectionsUrl();
+
+    final var response = httpClient.GET(url + "?wt=xml");
+
+    assertEquals(200, response.getStatus());
+    assertEquals("application/xml", response.getHeaders().get("Content-type"));
+  }
+
+  @Test
+  public void testObeysAcceptHeaderWhenWtParamNotProvided() throws Exception {
+    final HttpClient httpClient = getRawClient();
+    final String url = getListCollectionsUrl();
+
+    final var response =
+        httpClient.newRequest(url).headers(h -> h.add("Accept", "application/xml")).send();
+
+    assertEquals(200, response.getStatus());
+    assertEquals("application/xml", response.getHeaders().get("Content-type"));
+  }
+
+  @Test
+  public void testRespondsWithJsonWhenWtAndAcceptAreMissing() throws Exception {
+    final HttpClient httpClient = getRawClient();
+    final String url = getListCollectionsUrl();
+
+    final var response = httpClient.GET(url);
+
+    assertEquals(200, response.getStatus());
+    assertEquals("application/json", response.getHeaders().get("Content-type"));
+  }
+
+  private HttpClient getRawClient() {
+    return cluster.getRandomJetty(random()).getSolrClient().getHttpClient();
+  }
+
+  private String getListCollectionsUrl() {
+    final var v2BaseUrl = cluster.getJettySolrRunner(0).getBaseURLV2().toString();
+    return v2BaseUrl + "/collections";
+  }
+
+  @Test
+  public void testSingleWarning() throws Exception {
+    NamedList<?> resp =
+        cluster
+            .getSolrClient()
+            .request(new V2Request.Builder("/c/" + COLL_NAME + "/_introspect").build());
+    List<?> warnings = resp.getAll("WARNING");
+    assertEquals(1, warnings.size());
+  }
+
+  @Test
+  public void testSetPropertyValidationOfCluster() throws IOException, SolrServerException {
+    NamedList<?> resp =
+        cluster
+            .getSolrClient()
+            .request(
+                new V2Request.Builder("/cluster/properties/maxCoresPerNode")
+                    .withMethod(SolrRequest.METHOD.PUT)
+                    .withPayload("{\"value\": \"42\"}")
+                    .build());
+    assertTrue(resp.toString().contains("status=0"));
+    resp =
+        cluster
+            .getSolrClient()
+            .request(
+                new V2Request.Builder("/cluster/properties/maxCoresPerNode")
+                    .withMethod(SolrRequest.METHOD.DELETE)
+                    .build());
+    assertTrue(resp.toString().contains("status=0"));
+  }
+
+  @Test
+  public void testCollectionsApi() throws Exception {
+    CloudSolrClient client = cluster.getSolrClient();
+    V2Request req1 = new V2Request.Builder("/c/" + COLL_NAME + "/get/_introspect").build();
+    assertEquals(COLL_NAME, req1.getCollection());
+    Map<?, ?> result = resAsMap(client, req1);
+    assertEquals(
+        "/c/collection1/get", Utils.getObjectByPath(result, true, "/spec[0]/url/paths[0]"));
+    result =
+        resAsMap(
+            client,
+            new V2Request.Builder("/collections/" + COLL_NAME + "/get/_introspect").build());
+    assertEquals(
+        "/collections/collection1/get",
+        Utils.getObjectByPath(result, true, "/spec[0]/url/paths[0]"));
+    String tempDir = createTempDir().toString();
+    Map<String, Object> backupParams = new HashMap<>();
+    backupParams.put("location", tempDir);
+    cluster
+        .getJettySolrRunners()
+        .forEach(j -> j.getCoreContainer().getAllowPaths().add(Path.of(tempDir)));
+    client.request(
+        new V2Request.Builder("/collections/" + COLL_NAME + "/backups/backup_test/versions")
+            .withMethod(SolrRequest.METHOD.POST)
+            .withPayload(Utils.toJSONString(backupParams))
+            .build());
+  }
+
+  @Test
+  public void testSelect() throws Exception {
+    CloudSolrClient cloudClient = cluster.getSolrClient();
+    final V2Response v2Response =
+        new V2Request.Builder("/c/" + COLL_NAME + "/select")
+            .withMethod(SolrRequest.METHOD.GET)
+            .withParams(params("q", "-*:*"))
+            .build()
+            .process(cloudClient);
+    assertEquals(0, ((SolrDocumentList) v2Response.getResponse().get("response")).getNumFound());
+  }
+
+  @Test
+  public void testV2ApiErrorHandling() throws Exception {
+    final var deleteRequest = new CollectionsApi.DeleteCollection("collection-does-not-exist");
+
+    // Test with "Http" client
+    final String baseUrl = cluster.getJettySolrRunner(0).getBaseUrl().toString();
+    try (var httpClient = new HttpJettySolrClient.Builder(baseUrl).build()) {
+      final var ex =
+          expectThrows(RemoteSolrException.class, () -> deleteRequest.process(httpClient));
+      assertRSECodeAndMessage(ex, 400, "Could not find collection", "collection-does-not-exist");
+    }
+
+    // Test with "Cloud" client
+    final var ex =
+        expectThrows(
+            RemoteSolrException.class, () -> deleteRequest.process(cluster.getSolrClient()));
+    assertRSECodeAndMessage(ex, 400, "Could not find collection", "collection-does-not-exist");
+
+    // Test with the less desirable Generic option to make sure exception is equivalent.
+    final var genericDeleteRequest =
+        new GenericV2SolrRequest(SolrRequest.METHOD.DELETE, "/collections/coll-does-not-exist");
+    final var ex2 =
+        expectThrows(
+            RemoteSolrException.class, () -> genericDeleteRequest.process(cluster.getSolrClient()));
+    assertRSECodeAndMessage(ex2, 400, "Could not find collection", "coll-does-not-exist");
+  }
+
+  private void assertRSECodeAndMessage(
+      RemoteSolrException rse, int expectedCode, String... expectedMessagePieces) {
+    assertEquals(expectedCode, rse.code());
+    if (expectedMessagePieces != null) {
+      for (String expectedMessageSubStr : expectedMessagePieces) {
+        assertThat(rse.getMessage(), containsString(expectedMessageSubStr));
+      }
+    }
+  }
+
+  private Map<?, ?> resAsMap(CloudSolrClient client, V2Request request)
+      throws SolrServerException, IOException {
+    NamedList<Object> rsp = client.request(request);
+    return rsp.asMap(100);
+  }
+}

@@ -1,0 +1,85 @@
+= v2 API
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+[[top-v2-api]]
+The v2 API is a modernized API interface covering most current Solr APIs.
+It is anticipated that once the v2 API reaches full coverage, and Solr-internal API usages like SolrJ and the Admin UI have been converted from the old API to the v2 API, the old API will eventually be retired.
+Today, the two API styles coexist, and all the old APIs will continue to work without any change.
+
+NOTE: The v2 API is classified as "experimental".
+It may change in backwards-incompatible ways as it evolves to cover additional functionality.
+
+The old API and the v2 API differ in two principle ways:
+
+.  Command format: The old API commands and associated parameters are provided through URL request parameters on HTTP GET requests, while in the v2 API most API commands are provided via a JSON body POST'ed to v2 API endpoints.
+The v2 API also supports HTTP methods GET and DELETE where appropriate.
+.  Endpoint structure: The v2 API endpoint structure has been rationalized and regularized.
+
+== v2 API Path Prefixes
+
+Following are some v2 API URL paths and path prefixes, along with some of the operations that are supported at these paths and their sub-paths.
+
+[width="100%",options="header",]
+|===
+|Path prefix |Some Supported Operations
+|`/api/collections` |Create, alias, backup, and restore a collection. Fetch the collections, shards, and replicas tree (`?detailed=true`).
+|`/api/c/\{collectionName}/update` |Update requests.
+|`/api/c/\{collectionName}/config` |Configuration requests.
+|`/api/c/\{collectionName}/schema` |Schema requests.
+|`/api/c/\{collectionName}/\{handlerName}` |Handler-specific requests.
+|`/api/c/\{collectionName}/shards` |Split a shard, create a shard, add a replica.
+|`/api/c/\{collectionName}/shards/\{shardName}` |Delete a shard, force leader election
+|`/api/c/\{collectionName}/shards/\{shardName}/\{replicaName}` |Delete a replica.
+|`/api/cores` |Create a core.
+|`/api/cores/\{coreName}` |Reload, rename, delete, and unload a core.
+|`/api/node` |Perform overseer operation, rejoin leader election.
+|`/api/cluster/nodes` |List live nodes.
+|`/api/cluster/properties` |List, get, set, and delete cluster properties.
+|`/api/cluster` |`POST` sets the cluster rate limiter.
+|===
+
+== Invocation Examples
+
+For the "gettingstarted" collection, set the replication factor and whether to automatically add replicas:
+
+[source,bash]
+----
+curl 'http://localhost:8983/api/c/gettingstarted' -H 'Content-type:application/json' -d '
+{ modify: { replicationFactor: "3" } }'
+
+{"responseHeader":{"status":0,"QTime":842}}
+----
+
+See the collections, shards, and replicas in the cluster:
+
+[source,bash]
+----
+curl 'http://localhost:8983/api/collections?detailed=true'
+
+{"responseHeader":{"status":0,"QTime":1},"collectionsDetail":{"gettingstarted":{"health":"GREEN","shards":{"shard1":{"state":"active"}}}}}
+----
+
+Set a cluster property:
+
+[source,bash]
+----
+curl -X PUT 'http://localhost:8983/api/cluster/properties/urlScheme' -H 'Content-type: application/json' -d '
+{ "value": "http" }'
+
+{"responseHeader":{"status":0,"QTime":4}}
+----

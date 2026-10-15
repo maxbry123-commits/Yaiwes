@@ -1,0 +1,151 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.solr.search.join;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
+import org.apache.lucene.search.Query;
+import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.params.ShardParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.search.QParser;
+import org.apache.solr.search.QueryParsing;
+import org.apache.solr.search.SyntaxError;
+
+@SuppressWarnings("WeakerAccess")
+public class CrossCollectionJoinQParser extends QParser {
+
+  public static final String ZK_HOST = "zkHost";
+  public static final String SOLR_CONNECTION = "solrConnection";
+  public static final String SOLR_URL = "solrUrl";
+  public static final String FROM_INDEX = "fromIndex";
+  public static final String FROM = "from";
+  public static final String TO = "to";
+  public static final String ROUTED_BY_JOIN_KEY = "routed";
+  public static final String TTL = "ttl";
+
+  public static final int TTL_DEFAULT = 60 * 60; // in seconds
+
+  private static final Set<String> OWN_PARAMS =
+      new HashSet<>(
+          Arrays.asList(
+              QueryParsing.TYPE,
+              QueryParsing.V,
+              ZK_HOST,
+              SOLR_CONNECTION,
+              SOLR_URL,
+              FROM_INDEX,
+              FROM,
+              TO,
+              ROUTED_BY_JOIN_KEY,
+              TTL));
+
+  private final String routerField;
+  private final Set<String> allowSolrUrls;
+
+  public CrossCollectionJoinQParser(
+      String qstr,
+      SolrParams localParams,
+      SolrParams params,
+      SolrQueryRequest req,
+      String routerField,
+      Set<String> allowSolrUrls) {
+    super(qstr, localParams, params, req);
+    this.routerField = routerField;
+    // If specified in the config, this will limit which solr url's the parser can connect to.
+    this.allowSolrUrls = allowSolrUrls;
+  }
+
+  @Override
+  public Query parse() throws SyntaxError {
+    String query = localParams.get(QueryParsing.V);
+    String zkHost = localParams.get(ZK_HOST);
+    String solrConnectionString = localParams.get(SOLR_CONNECTION);
+    String solrUrl = localParams.get(SOLR_URL);
+    // CrossCollectionJoinQuery.getDocSet() silently prefers zkHost when both are set.
+    if (zkHost != null && solrUrl != null) {
+      throw new SyntaxError(
+          "zkHost and solrUrl are mutually exclusive; specify at most one of them.");
+    }
+    CoreContainer cc = req.getCoreContainer(); // null in some unit tests
+    if (cc != null && cc.getZkController() == null) {
+      throw new SyntaxError("Cross-collection join requires SolrCloud.");
+    }
+    // Test if this is a valid solr url.
+    if (solrUrl != null) {
+      if (allowSolrUrls == null) {
+        throw new SyntaxError("allowSolrUrls list must be configured to use solrUrl parameter.");
+      }
+      if (!allowSolrUrls.contains(solrUrl)) {
+        throw new SyntaxError(
+            "Solr URL was not in allowSolrUrls list.  Please check your configuration.");
+      }
+    }
+
+    String collection = localParams.get(FROM_INDEX);
+    String fromField = localParams.get(FROM);
+    String toField = localParams.get(TO);
+    ScoreJoinQParserPlugin.requireFromAndTo(fromField, toField);
+
+    boolean routedByJoinKey = localParams.getBool(ROUTED_BY_JOIN_KEY, toField.equals(routerField));
+    int ttl = localParams.getInt(TTL, TTL_DEFAULT);
+
+    ModifiableSolrParams otherParams = new ModifiableSolrParams();
+    for (Iterator<String> it = localParams.getParameterNamesIterator(); it.hasNext(); ) {
+      String paramName = it.next();
+      if (!OWN_PARAMS.contains(paramName)) {
+        otherParams.set(paramName, localParams.getParams(paramName));
+      }
+    }
+
+    // Propagate shards.preference from request-level params if not already set in localParams
+    String shardsPreference = req.getParams().get(ShardParams.SHARDS_PREFERENCE);
+    if (shardsPreference != null && otherParams.get(ShardParams.SHARDS_PREFERENCE) == null) {
+      otherParams.set(ShardParams.SHARDS_PREFERENCE, shardsPreference);
+    }
+    CloudSolrClient.CloudSolrClientConnection solrConnection = null;
+    if (solrConnectionString != null && !solrConnectionString.isBlank()) {
+      solrConnection = CloudSolrClient.CloudSolrClientConnection.parse(solrConnectionString);
+    } else if (zkHost != null && !zkHost.isBlank()) {
+      solrConnection = CloudSolrClient.CloudSolrClientConnection.parse(zkHost);
+    }
+    if (solrConnection != null && cc != null) { // no CoreContainer -- unit test
+      try {
+        cc.getZkController().validateSolrConnection(solrConnection);
+      } catch (SolrException e) {
+        throw new SyntaxError(e.getMessage(), e);
+      }
+    }
+    return new CrossCollectionJoinQuery(
+        query,
+        solrConnection,
+        solrUrl,
+        collection,
+        fromField,
+        toField,
+        routedByJoinKey,
+        ttl,
+        otherParams);
+  }
+}
