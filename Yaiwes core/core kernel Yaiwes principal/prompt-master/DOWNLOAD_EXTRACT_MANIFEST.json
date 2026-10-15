@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 33127,
+  "bundle_sha256": "68241a09f4f54775b36b9cd59aa00e5923bb38b247698393423f2b8896ceb4e2",
+  "extracted_tree": {
+    "bytes": 78267,
+    "files": 5,
+    "sha256": "a1b59f7641237b1a8323e1988629c259fbd8319176139cbffbfaf6fdcdb7520d"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 33127,
+      "name": "prompt-master.bundle.zip.part-0001",
+      "sha256": "68241a09f4f54775b36b9cd59aa00e5923bb38b247698393423f2b8896ceb4e2"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "prompt-master",
+  "source_bytes": 78267,
+  "source_commit": "769bf64d8e11f78fee2d183ad8891f9403f365e6",
+  "source_files": 5,
+  "source_ref": "main",
+  "source_repo": "nidhinjs/prompt-master",
+  "source_tree": {
+    "bytes": 78267,
+    "files": 5,
+    "sha256": "a1b59f7641237b1a8323e1988629c259fbd8319176139cbffbfaf6fdcdb7520d"
+  }
+}
