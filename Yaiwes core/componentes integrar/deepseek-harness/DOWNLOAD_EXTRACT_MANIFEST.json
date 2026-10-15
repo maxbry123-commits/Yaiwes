@@ -1,0 +1,65 @@
+{
+  "bundle_bytes": 43161176,
+  "bundle_sha256": "83895bf9eb5ea4971168997e89dc120af9b6be1784305d4c2560cc0c267f6ad8",
+  "extracted_tree": {
+    "bytes": 131770396,
+    "files": 16069,
+    "sha256": "9acd9c2692c23bcb5d5e1be357b4f97ebc3aee630c636d969a415ec2513a3d07"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "deepseek-harness.bundle.zip.part-0001",
+      "sha256": "1206f2c80acac3cfb385986636ab7c2dcb9eb73ae73d68884259d3207d975122"
+    },
+    {
+      "bytes": 12582912,
+      "name": "deepseek-harness.bundle.zip.part-0002",
+      "sha256": "f23c62efbd08708369f9045d6e6f0882b3dc94725e3f89f78d084012e1c7ac9a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "deepseek-harness.bundle.zip.part-0003",
+      "sha256": "472e22a624c6c17fdb6d329bd07153e435bc0b42a201bb420fdab78632c11017"
+    },
+    {
+      "bytes": 5412440,
+      "name": "deepseek-harness.bundle.zip.part-0004",
+      "sha256": "a3180889cbe5123e94dfad7d7b30181ee7cb87cad70ba1be6f538ea9b6ed0ac9"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".agents/notes/implemented/CLAUDE.md",
+    ".agents/skills/agent-experience/SKILL.md",
+    ".claude/skills",
+    "CLAUDE.md",
+    "apps/cli/tests/profiles/acp/cordis.yml",
+    "packages/CLAUDE.md",
+    "snapshots/acp/escalation-approved/system-prompt.expected.md",
+    "snapshots/acp/escalation-approved/tool-schemas.expected.json",
+    "snapshots/acp/image-compaction/system-prompt.expected.md",
+    "snapshots/sdk/account-provider-signout/system-prompt.expected.md",
+    "snapshots/sdk/account-provider-signout/tool-schemas.expected.json",
+    "snapshots/session/agent-instructions/workspace/AGENTS.md",
+    "snapshots/session/agent-instructions/workspace/nested/AGENTS.md",
+    "vendor/CLAUDE.md"
+  ],
+  "skipped_special_count": 14,
+  "slug": "deepseek-harness",
+  "source_bytes": 131770396,
+  "source_commit": "571902028a75c64c1d767f4ae5fd099485f0ddf0",
+  "source_files": 16069,
+  "source_ref": "master",
+  "source_repo": "deepseek-ai/deepseek-harness",
+  "source_tree": {
+    "bytes": 131770396,
+    "files": 16069,
+    "sha256": "9acd9c2692c23bcb5d5e1be357b4f97ebc3aee630c636d969a415ec2513a3d07"
+  }
+}
