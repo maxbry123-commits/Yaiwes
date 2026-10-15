@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 136002,
+  "bundle_sha256": "8447ee8d6ea76e75b19f1baa27ef1f02574c77db7896d53be963fa4df414e775",
+  "extracted_tree": {
+    "bytes": 416441,
+    "files": 124,
+    "sha256": "b00fccfbc68e8c2a03b66f28acd12bac04aa9be431581817452c8fc892f00a1b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 136002,
+      "name": "pyahocorasick.bundle.zip.part-0001",
+      "sha256": "8447ee8d6ea76e75b19f1baa27ef1f02574c77db7896d53be963fa4df414e775"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "pyahocorasick",
+  "source_bytes": 416441,
+  "source_commit": "4e28d29898f1019d9706485b2a06026466814d9d",
+  "source_files": 124,
+  "source_ref": "master",
+  "source_repo": "WojciechMula/pyahocorasick",
+  "source_tree": {
+    "bytes": 416441,
+    "files": 124,
+    "sha256": "b00fccfbc68e8c2a03b66f28acd12bac04aa9be431581817452c8fc892f00a1b"
+  }
+}
