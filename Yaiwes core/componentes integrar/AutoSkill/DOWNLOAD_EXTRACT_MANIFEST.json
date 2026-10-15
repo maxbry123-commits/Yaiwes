@@ -1,0 +1,55 @@
+{
+  "bundle_bytes": 55043021,
+  "bundle_sha256": "bc7ba80393f9000c9a2db9c47d96b522c4c936aaedee7709494a4eb6b1498248",
+  "extracted_tree": {
+    "bytes": 119979897,
+    "files": 10048,
+    "sha256": "2be16e023ca49c24eec2bca8b0f161bea58b040929049bfb17ddad3df08cdafd"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "AutoSkill.bundle.zip.part-0001",
+      "sha256": "fbeb337b202719f29b91eb2ab60d35b4c0fedb5e3a929143488785169e05ae36"
+    },
+    {
+      "bytes": 12582912,
+      "name": "AutoSkill.bundle.zip.part-0002",
+      "sha256": "3ec749416089fbe2ebf73b517d3ac2aac87fcec5bf33983bfd66a9e38fe0b1bd"
+    },
+    {
+      "bytes": 12582912,
+      "name": "AutoSkill.bundle.zip.part-0003",
+      "sha256": "40a7a98f82b04f8d5bf8d70d77bc68ad1593bc44225341de6bb89216f5eb1da9"
+    },
+    {
+      "bytes": 12582912,
+      "name": "AutoSkill.bundle.zip.part-0004",
+      "sha256": "bb4a86db418af19e2ceb3cba9b7b614de000bd811e68e5e7b669221b1ebf826c"
+    },
+    {
+      "bytes": 4711373,
+      "name": "AutoSkill.bundle.zip.part-0005",
+      "sha256": "9012b707bcb600b8a709db007bd2644050af10ade594799717ab04433def51ba"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "AutoSkill",
+  "source_bytes": 119979897,
+  "source_commit": "94c47ca488d4ba4117d20272e66d49b9877e68cf",
+  "source_files": 10048,
+  "source_ref": "main",
+  "source_repo": "ECNU-ICALK/AutoSkill",
+  "source_tree": {
+    "bytes": 119979897,
+    "files": 10048,
+    "sha256": "2be16e023ca49c24eec2bca8b0f161bea58b040929049bfb17ddad3df08cdafd"
+  }
+}
