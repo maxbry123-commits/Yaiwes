@@ -1,0 +1,236 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - errcheck
+    - forbidigo
+    - gocritic
+    - govet
+    - ineffassign
+    - mirror
+    - misspell
+    - modernize
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - revive # replacement for golint
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - usetesting
+    # - gosec # too many false positives
+  settings:
+    errcheck:
+      exclude-functions:
+        - github.com/open-policy-agent/opa/v1/util.WriteAppender
+        - github.com/open-policy-agent/opa/v1/util.WriteInt
+        - (io.Writer).Write
+        # Intermediate token writes are safe to ignore: a jsontext.Encoder
+        # sticks to its first error, so checking the last call in a sequence
+        # (as these files already do) is sufficient. See the "ignoring errors
+        # for brevity" example in the encoding/json/jsontext.Encoder docs.
+        - (*encoding/json/jsontext.Encoder).WriteToken
+        - (*encoding/json/jsontext.Encoder).WriteValue
+    forbidigo:
+      forbid:
+        - pattern: '^errors\.As$'
+          message: "Prefer to use errors.AsType instead"
+        - pattern: '^sort\.[A-Z][a-zA-Z]+$'
+          message: "Prefer the more performant sort/search functions in the slices package"
+    gocritic:
+      enabled-checks:
+        # NOTE that these are rules enabled in addition to the default set
+        - filepathJoin
+        - dupImport
+        - redundantSprint
+        - stringConcatSimplify
+      disabled-checks:
+        - appendAssign
+        # Reasonable rule, but not sure what to replace with in
+        # many locations, so disabling for now
+        - exitAfterDefer
+      enabled-tags:
+        - performance
+      settings:
+        ifElseChain:
+          # ridiculous value set for now, but this should be
+          # lowered to something more reasonable, as the rule
+          # is reasonable (replace long if-else chains with
+          # switch)... just too many violations right now
+          minThreshold: 5
+        hugeParam:
+          sizeThreshold: 400
+    govet:
+      disable:
+        - fieldalignment
+        - shadow
+        # definitely look into these isses when given time
+        - unusedwrite
+      enable-all: true
+    lll:
+      line-length: 200
+    modernize:
+      disable:
+        # this should be enabled only outside of hot paths, as it's likely
+        # less performant (and there have been reports of that)
+        - slicesbackward
+    perfsprint:
+      # only rule disabled by default, but it's a good one
+      err-error: true
+    revive:
+      enable-all-rules: true
+      rules:
+        # https://github.com/mgechev/revive/blob/master/RULES_DESCRIPTIONS.md#unused-parameter
+        - name: unused-parameter
+          arguments:
+            - allowRegex: ^_
+          severity: warning
+        # https://github.com/mgechev/revive/blob/master/RULES_DESCRIPTIONS.md#unused-receiver
+        - name: unused-receiver
+          arguments:
+            - allowRegex: ^_
+          severity: warning
+        # covered by lll linter
+        - name: line-length-limit
+          disabled: true
+        # covered by errcheck linter
+        - name: unhandled-error
+          disabled: true
+        # covered by forcetypeassert linter
+        - name: unchecked-type-assertion
+          disabled: true
+        - name: cyclomatic
+          disabled: true
+        - name: cognitive-complexity
+          disabled: true
+        - name: add-constant
+          disabled: true
+        - name: max-public-structs
+          disabled: true
+        - name: flag-parameter
+          disabled: true
+        - name: blank-imports
+          disabled: true
+        - name: deep-exit
+          disabled: true
+        - name: function-length
+          disabled: true
+        - name: nested-structs
+          disabled: true
+        - name: import-shadowing
+          disabled: true
+        - name: package-naming
+          disabled: true
+        - name: var-naming
+          disabled: true
+        - name: unexported-return
+          disabled: true
+        - name: comment-spacings
+          arguments:
+            - "nolint"
+        - name: import-alias-naming
+          disabled: true
+        - name: function-result-limit
+          disabled: true
+        - name: confusing-naming
+          disabled: true
+        - name: modifies-value-receiver
+          disabled: true
+        - name: enforce-switch-style
+          disabled: true
+        - name: unexported-naming
+          disabled: true
+        - name: max-control-nesting
+          disabled: true
+        - name: exported
+          disabled: true
+        - name: indent-error-flow
+          disabled: true
+        # for now — enbable 'whitespace' linter later
+        - name: empty-lines
+          disabled: true
+        - name: redefines-builtin-id
+          disabled: true
+        - name: bare-return
+          disabled: true
+        - name: confusing-results
+          disabled: true
+        - name: argument-limit
+          disabled: true
+        - name: package-directory-mismatch
+          disabled: true
+        - name: redundant-test-main-exit
+          disabled: true
+        - name: context-as-argument
+          disabled: true
+        - name: early-return
+          disabled: true # sometimes valid, but too noisy
+        - name: multiline-if-init
+          disabled: true
+        - name: marshal-receiver
+          disabled: true
+    staticcheck:
+      checks:
+        # https://staticcheck.dev/docs/checks/#<check-id> for more details on these rules
+        [
+          "all",
+          "-ST1000",
+          "-ST1003",
+          "-ST1020",
+          "-ST1021",
+          "-ST1022",
+          "-QF1001",
+          "-QF1002",
+          "-QF1003",
+          "-QF1008",
+        ]
+    usetesting:
+      os-temp-dir: true
+      context-background: true
+      context-todo: true
+  exclusions:
+    warn-unused: true
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters: revive
+        path: internal/lcss
+      - linters:
+          - gocritic
+        text: hugeParam
+        path: v1/test/|cmd/|v1/runtime/runtime.go|_test\.go
+      - linters:
+          - staticcheck
+        text: SA1019 # Using a deprecated function, variable, constant or field
+        path: _test\.go
+      - linters:
+          - prealloc
+          - errcheck
+          - revive
+        path: _test\.go
+      - linters: revive
+        path: v1/plugins/rest
+        text: unsecure-url-scheme
+    paths:
+      # v0 - ^ needed to avoid matching name in any path
+      - ^ast|^bundle|^cover|^compile|^debug|^dependencies|^download|^format|^loader|^server
+      - ^topdown|^plugins|^rego|^repl|^resolver|^runtime|^sdk|^storage|^test|^util
+      # various exclusions
+      - ^internal/gojsonschema|^internal/methodlesstemplate|node_modules|example_test
+issues:
+  # don't hide issues in CI runs because they are the same type
+  max-same-issues: 0
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
