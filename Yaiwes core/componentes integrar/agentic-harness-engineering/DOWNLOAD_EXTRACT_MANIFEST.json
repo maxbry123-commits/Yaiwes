@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 3053007,
+  "bundle_sha256": "5efac8812fae5d3dd187571374148e8303667744840035726f9cf0022a89b36d",
+  "extracted_tree": {
+    "bytes": 4002008,
+    "files": 224,
+    "sha256": "11dab4413e277069bafb72ccfb41f3d7545719130cfa6be05b2693c91bbdfd31"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 3053007,
+      "name": "agentic-harness-engineering.bundle.zip.part-0001",
+      "sha256": "5efac8812fae5d3dd187571374148e8303667744840035726f9cf0022a89b36d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "agentic-harness-engineering",
+  "source_bytes": 4002008,
+  "source_commit": "8b2a55d97590363fe50c3cc6b5e833b020a4bb4c",
+  "source_files": 224,
+  "source_ref": "main",
+  "source_repo": "china-qijizhifeng/agentic-harness-engineering",
+  "source_tree": {
+    "bytes": 4002008,
+    "files": 224,
+    "sha256": "11dab4413e277069bafb72ccfb41f3d7545719130cfa6be05b2693c91bbdfd31"
+  }
+}
