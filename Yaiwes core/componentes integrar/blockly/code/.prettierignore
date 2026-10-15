@@ -1,0 +1,55 @@
+# Root-level
+.github
+.prettierrc.js
+eslint.config.mjs
+package.json
+.claude/
+
+# Symlinks to AGENTS.md. Formatting these in place would replace the symlink
+# with a regular file.
+**/CLAUDE.md
+
+# Package build aritifacts, etc.
+**/dist/*
+**/build/*
+**/node_modules/*
+**/package-lock.json
+**/CHANGELOG.md
+
+# Core: Build Artifacts
+packages/blockly/msg/*
+packages/blockly/build/*
+packages/blockly/dist/*
+packages/blockly/typings/*
+
+# Core: Tests other than mocha unit tests
+packages/blockly/tests/themes/*
+packages/blockly/tests/compile/*
+packages/blockly/tests/generators/*
+packages/blockly/tests/mocha/webdriver.js
+
+# Core: Demos, scripts, misc
+packages/blockly/node_modules/*
+packages/blockly/demos/*
+packages/blockly/appengine/*
+packages/blockly/scripts/gulpfiles/*
+
+# Docs: Markdown/MDX (linted by ESLint + eslint-plugin-mdx instead)
+packages/docs/**/*.md
+packages/docs/**/*.mdx
+
+# Docs: Build artifacts
+packages/docs/build/
+packages/docs/.docusaurus/
+packages/docs/node_modules/
+
+# Docs: Auto-generated
+packages/docs/CHANGELOG.md
+packages/docs/blockly_api.json
+
+# Plugins: Specific examples that are sometimes copied into plugins
+packages/plugins/dev-create/templates/sample-app/*
+packages/plugins/dev-create/templates/sample-app-ts/*
+
+# Plugins: Golden test files
+packages/plugins/**/golden/*

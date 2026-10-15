@@ -1,0 +1,694 @@
+/**
+ * @license
+ * Copyright 2019 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import * as Blockly from '#core/blockly.js';
+import {assert} from 'chai';
+import {defineRowBlock} from './test_helpers/block_definitions.js';
+import {runTestCases} from './test_helpers/common.js';
+import {
+  assertFieldValue,
+  runConstructorSuiteTests,
+  runFromJsonSuiteTests,
+  runSetValueTests,
+} from './test_helpers/fields.js';
+import {
+  DEFAULT_INJECT_OPTIONS,
+  sharedTestSetup,
+  sharedTestTeardown,
+  workspaceTeardown,
+} from './test_helpers/setup_teardown.js';
+
+suite('Number Fields', function () {
+  setup(function () {
+    sharedTestSetup.call(this);
+  });
+  teardown(function () {
+    sharedTestTeardown.call(this);
+  });
+  /**
+   * Configuration for field tests with invalid values.
+   * @type {!Array<!FieldCreationTestCase>}
+   */
+  const invalidValueTestCases = [
+    {title: 'Undefined', value: undefined},
+    {title: 'Null', value: null},
+    {title: 'NaN', value: NaN},
+    {title: 'Non-Parsable String', value: 'bad'},
+  ];
+  /**
+   * Configuration for field tests with valid values.
+   * @type {!Array<!FieldCreationTestCase>}
+   */
+  const validValueTestCases = [
+    {title: 'Integer', value: 1, expectedValue: 1},
+    {title: 'Float', value: 1.5, expectedValue: 1.5},
+    {title: 'Integer String', value: '1', expectedValue: 1},
+    {title: 'Float String', value: '1.5', expectedValue: 1.5},
+    {title: 'Infinity', value: Infinity, expectedValue: Infinity},
+    {title: 'Negative Infinity', value: -Infinity, expectedValue: -Infinity},
+    {title: 'Infinity String', value: 'Infinity', expectedValue: Infinity},
+    {
+      title: 'Negative Infinity String',
+      value: '-Infinity',
+      expectedValue: -Infinity,
+    },
+  ];
+  const addArgsAndJson = function (testCase) {
+    testCase.args = Array(4).fill(testCase.value);
+    testCase.json = {
+      'value': testCase.value,
+      'min': testCase.value,
+      'max': testCase.value,
+      'precision': testCase.value,
+    };
+  };
+  invalidValueTestCases.forEach(addArgsAndJson);
+  validValueTestCases.forEach(addArgsAndJson);
+
+  /**
+   * The expected default value for the field being tested.
+   * @type {*}
+   */
+  const defaultFieldValue = 0;
+  /**
+   * Asserts that the field property values are as expected.
+   * @param {!Blockly.FieldNumber} field The field to check.
+   * @param {!number} expectedMin The expected min.
+   * @param {!number} expectedMax The expected max.
+   * @param {!number} expectedPrecision The expected precision.
+   * @param {!number} expectedValue The expected value.
+   */
+  function assertNumberField(
+    field,
+    expectedMin,
+    expectedMax,
+    expectedPrecision,
+    expectedValue,
+  ) {
+    assertFieldValue(field, expectedValue);
+    assert.equal(field.getMin(), expectedMin, 'Min');
+    assert.equal(field.getMax(), expectedMax, 'Max');
+    assert.equal(field.getPrecision(), expectedPrecision, 'Precision');
+  }
+  /**
+   * Asserts that the field property values are set to default.
+   * @param {!Blockly.FieldNumber} field The field to check.
+   */
+  const assertFieldDefault = function (field) {
+    assertNumberField(field, -Infinity, Infinity, 0, defaultFieldValue);
+  };
+  /**
+   * Asserts that the field properties are correct based on the test case.
+   * @param {!Blockly.FieldNumber} field The field to check.
+   * @param {!FieldValueTestCase} testCase The test case.
+   */
+  const validTestCaseAssertField = function (field, testCase) {
+    assertNumberField(
+      field,
+      testCase.expectedValue,
+      testCase.expectedValue,
+      testCase.expectedValue,
+      testCase.expectedValue,
+    );
+  };
+
+  runConstructorSuiteTests(
+    Blockly.FieldNumber,
+    validValueTestCases,
+    invalidValueTestCases,
+    validTestCaseAssertField,
+    assertFieldDefault,
+  );
+
+  runFromJsonSuiteTests(
+    Blockly.FieldNumber,
+    validValueTestCases,
+    invalidValueTestCases,
+    validTestCaseAssertField,
+    assertFieldDefault,
+  );
+
+  suite('setValue', function () {
+    suite('Empty -> New Value', function () {
+      setup(function () {
+        this.field = new Blockly.FieldNumber();
+      });
+      runSetValueTests(
+        validValueTestCases,
+        invalidValueTestCases,
+        defaultFieldValue,
+      );
+    });
+    suite('Value -> New Value', function () {
+      const initialValue = 1;
+      setup(function () {
+        this.field = new Blockly.FieldNumber(initialValue);
+      });
+      runSetValueTests(
+        validValueTestCases,
+        invalidValueTestCases,
+        initialValue,
+      );
+    });
+    suite('Constraints', function () {
+      const testCases = [
+        {title: 'Float', json: {}, value: 123.456, expectedValue: 123.456},
+        {
+          title: '0.01',
+          json: {precision: 0.01},
+          value: 123.456,
+          expectedValue: 123.46,
+        },
+        {
+          title: '1e-7',
+          json: {precision: 0.0000001},
+          value: 123.00000456,
+          expectedValue: 123.0000046,
+        },
+        {
+          title: '0.5',
+          json: {precision: 0.5},
+          value: 123.456,
+          expectedValue: 123.5,
+        },
+        {title: '1', json: {precision: 1}, value: 123.456, expectedValue: 123},
+        {
+          title: '1.5',
+          json: {precision: 1.5},
+          value: 123.456,
+          expectedValue: 123,
+        },
+      ];
+      suite('Precision', function () {
+        runTestCases(testCases, function (testCase) {
+          return function () {
+            const field = Blockly.FieldNumber.fromJson(testCase.json);
+            field.setValue(testCase.value);
+            assertFieldValue(field, testCase.expectedValue);
+          };
+        });
+        test('Null', function () {
+          const field = Blockly.FieldNumber.fromJson({precision: null});
+          assert.equal(field.getPrecision(), 0);
+        });
+      });
+      const setValueBoundsTestFn = function (testCase) {
+        return function () {
+          const field = Blockly.FieldNumber.fromJson(testCase.json);
+          testCase.values.forEach(function (value, i) {
+            field.setValue(value);
+            assertFieldValue(field, testCase.expectedValues[i]);
+          });
+        };
+      };
+      suite('Min', function () {
+        const testCases = [
+          {
+            title: '-10',
+            json: {min: -10},
+            values: [-20, 0, 20],
+            expectedValues: [-10, 0, 20],
+          },
+          {
+            title: '0',
+            json: {min: 0},
+            values: [-20, 0, 20],
+            expectedValues: [0, 0, 20],
+          },
+          {
+            title: '+10',
+            json: {min: 10},
+            values: [-20, 0, 20],
+            expectedValues: [10, 10, 20],
+          },
+        ];
+        runTestCases(testCases, setValueBoundsTestFn);
+        test('Null', function () {
+          const field = Blockly.FieldNumber.fromJson({min: null});
+          assert.equal(field.getMin(), -Infinity);
+        });
+      });
+      suite('Max', function () {
+        const testCases = [
+          {
+            title: '-10',
+            json: {max: -10},
+            values: [-20, 0, 20],
+            expectedValues: [-20, -10, -10],
+          },
+          {
+            title: '0',
+            json: {max: 0},
+            values: [-20, 0, 20],
+            expectedValues: [-20, 0, 0],
+          },
+          {
+            title: '+10',
+            json: {max: 10},
+            values: [-20, 0, 20],
+            expectedValues: [-20, 0, 10],
+          },
+        ];
+        runTestCases(testCases, setValueBoundsTestFn);
+        test('Null', function () {
+          const field = Blockly.FieldNumber.fromJson({max: null});
+          assert.equal(field.getMax(), Infinity);
+        });
+      });
+    });
+  });
+  suite('Validators', function () {
+    setup(function () {
+      this.field = new Blockly.FieldNumber(1);
+      this.field.valueWhenEditorWasOpened_ = this.field.getValue();
+      this.field.htmlInput_ = document.createElement('input');
+      this.field.htmlInput_.setAttribute('data-old-value', '1');
+      this.field.htmlInput_.setAttribute('data-untyped-default-value', '1');
+      this.stub = sinon.stub(this.field, 'resizeEditor_');
+    });
+    teardown(function () {
+      sinon.restore();
+    });
+    const testSuites = [
+      {
+        title: 'Null Validator',
+        validator: function () {
+          return null;
+        },
+        value: 2,
+        expectedValue: 1,
+      },
+      {
+        title: 'Force End with 6 Validator',
+        validator: function (newValue) {
+          return +String(newValue).replace(/.$/, '6');
+        },
+        value: 25,
+        expectedValue: 26,
+      },
+      {
+        title: 'Returns Undefined Validator',
+        validator: function () {},
+        value: 2,
+        expectedValue: 2,
+      },
+    ];
+    testSuites.forEach(function (suiteInfo) {
+      suite(suiteInfo.title, function () {
+        setup(function () {
+          this.field.setValidator(suiteInfo.validator);
+        });
+        test('When Editing', function () {
+          this.field.isBeingEdited_ = true;
+          this.field.htmlInput_.value = String(suiteInfo.value);
+          this.field.onHtmlInputChange(null);
+          assertFieldValue(
+            this.field,
+            suiteInfo.expectedValue,
+            String(suiteInfo.value),
+          );
+        });
+        test('When Not Editing', function () {
+          this.field.setValue(suiteInfo.value);
+          assertFieldValue(this.field, +suiteInfo.expectedValue);
+        });
+      });
+    });
+  });
+  suite('Customizations', function () {
+    suite('Min', function () {
+      test('JS Constructor', function () {
+        const field = new Blockly.FieldNumber(0, -10);
+        assertNumberField(field, -10, Infinity, 0, 0);
+      });
+      test('JSON Definition', function () {
+        const field = Blockly.FieldNumber.fromJson({
+          min: -10,
+        });
+        assertNumberField(field, -10, Infinity, 0, 0);
+      });
+      test('Set Constraints', function () {
+        const field = new Blockly.FieldNumber();
+        field.setConstraints(-10);
+        assertNumberField(field, -10, Infinity, 0, 0);
+      });
+      test('Set Min', function () {
+        const field = new Blockly.FieldNumber();
+        field.setMin(-10);
+        assertNumberField(field, -10, Infinity, 0, 0);
+      });
+      test('JS Configuration - Simple', function () {
+        const field = new Blockly.FieldNumber(
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {
+            min: -10,
+          },
+        );
+        assertNumberField(field, -10, Infinity, 0, 0);
+      });
+      test('JS Configuration - Ignore', function () {
+        const field = new Blockly.FieldNumber(
+          undefined,
+          -1,
+          undefined,
+          undefined,
+          undefined,
+          {
+            min: -10,
+          },
+        );
+        assertNumberField(field, -10, Infinity, 0, 0);
+      });
+    });
+    suite('Max', function () {
+      test('JS Constructor', function () {
+        const field = new Blockly.FieldNumber(0, undefined, 10);
+        assertNumberField(field, -Infinity, 10, 0, 0);
+      });
+      test('JSON Definition', function () {
+        const field = Blockly.FieldNumber.fromJson({
+          max: 10,
+        });
+        assertNumberField(field, -Infinity, 10, 0, 0);
+      });
+      test('Set Constraints', function () {
+        const field = new Blockly.FieldNumber();
+        field.setConstraints(undefined, 10);
+        assertNumberField(field, -Infinity, 10, 0, 0);
+      });
+      test('Set Max', function () {
+        const field = new Blockly.FieldNumber();
+        field.setMax(10);
+        assertNumberField(field, -Infinity, 10, 0, 0);
+      });
+      test('JS Configuration - Simple', function () {
+        const field = new Blockly.FieldNumber(
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {
+            max: 10,
+          },
+        );
+        assertNumberField(field, -Infinity, 10, 0, 0);
+      });
+      test('JS Configuration - Ignore', function () {
+        const field = new Blockly.FieldNumber(
+          undefined,
+          undefined,
+          1,
+          undefined,
+          undefined,
+          {
+            max: 10,
+          },
+        );
+        assertNumberField(field, -Infinity, 10, 0, 0);
+      });
+    });
+    suite('Precision', function () {
+      test('JS Constructor', function () {
+        const field = new Blockly.FieldNumber(0, undefined, undefined, 1);
+        assertNumberField(field, -Infinity, Infinity, 1, 0);
+      });
+      test('JSON Definition', function () {
+        const field = Blockly.FieldNumber.fromJson({
+          precision: 1,
+        });
+        assertNumberField(field, -Infinity, Infinity, 1, 0);
+      });
+      test('Set Constraints', function () {
+        const field = new Blockly.FieldNumber();
+        field.setConstraints(undefined, undefined, 1);
+        assertNumberField(field, -Infinity, Infinity, 1, 0);
+      });
+      test('Set Precision', function () {
+        const field = new Blockly.FieldNumber();
+        field.setPrecision(1);
+        assertNumberField(field, -Infinity, Infinity, 1, 0);
+      });
+      test('JS Configuration - Simple', function () {
+        const field = new Blockly.FieldNumber(
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {
+            precision: 1,
+          },
+        );
+        assertNumberField(field, -Infinity, Infinity, 1, 0);
+      });
+      test('JS Configuration - Ignore', function () {
+        const field = new Blockly.FieldNumber(
+          undefined,
+          undefined,
+          undefined,
+          0.5,
+          undefined,
+          {
+            precision: 1,
+          },
+        );
+        assertNumberField(field, -Infinity, Infinity, 1, 0);
+      });
+    });
+  });
+
+  suite('Serialization', function () {
+    setup(function () {
+      this.workspace = new Blockly.Workspace();
+      defineRowBlock();
+
+      this.assertValue = (value) => {
+        const block = this.workspace.newBlock('row_block');
+        const field = new Blockly.FieldNumber(value);
+        block.getInput('INPUT').appendField(field, 'NUMBER');
+        const jso = Blockly.serialization.blocks.save(block);
+        assert.deepEqual(jso['fields'], {'NUMBER': value});
+      };
+    });
+
+    teardown(function () {
+      workspaceTeardown.call(this, this.workspace);
+    });
+
+    test('Simple', function () {
+      this.assertValue(10);
+    });
+
+    test('Max precision small', function () {
+      this.assertValue(1.000000000000001);
+    });
+
+    test('Max precision large', function () {
+      this.assertValue(1000000000000001);
+    });
+
+    test('Smallest', function () {
+      this.assertValue(5e-324);
+    });
+
+    test('Largest', function () {
+      this.assertValue(1.7976931348623157e308);
+    });
+  });
+  suite('ARIA', function () {
+    setup(function () {
+      this.workspace = Blockly.inject('blocklyDiv', {
+        ...DEFAULT_INJECT_OPTIONS,
+        renderer: 'geras',
+      });
+      this.block = this.workspace.newBlock('math_number');
+      this.field = this.block.getField('NUM');
+      this.block.initSvg();
+      this.block.render();
+
+      this.focusableElement = this.field.getClickTarget_();
+    });
+
+    teardown(function () {
+      workspaceTeardown.call(this, this.workspace);
+    });
+
+    test('Field has field type name in ARIA label', function () {
+      const fieldLabel = this.focusableElement.getAttribute('aria-label');
+      assert.include(fieldLabel, 'number:');
+    });
+    test('Focusable element has role of button', function () {
+      const role = this.focusableElement.getAttribute('role');
+      assert.equal(role, 'button');
+    });
+    test('Hidden when in a flyout', function () {
+      this.block.isInFlyout = true;
+      // Force recompute of ARIA label.
+      this.field.setValue(this.field.getValue());
+      const ariaHidden = this.focusableElement.getAttribute('aria-hidden');
+      assert.equal(ariaHidden, 'true');
+    });
+    test('Has an ARIA label by default', function () {
+      const label = this.focusableElement.getAttribute('aria-label');
+      assert.isTrue(label.includes('0'));
+    });
+    test('Has Edit prefix if editable', function () {
+      const label = this.focusableElement.getAttribute('aria-label');
+      assert.isTrue(label.includes('Edit'));
+    });
+    test('Does not have Edit prefix if not editable', function () {
+      this.field.EDITABLE = false;
+      // Force recompute of ARIA label.
+      this.field.setValue(this.field.getValue());
+      const label = this.focusableElement.getAttribute('aria-label');
+      assert.isFalse(label.includes('Edit'));
+    });
+    test('setValue updates ARIA label', function () {
+      const initialLabel = this.focusableElement.getAttribute('aria-label');
+      assert.isTrue(initialLabel.includes('0'));
+      this.field.setValue(1);
+      const updatedLabel = this.focusableElement.getAttribute('aria-label');
+      assert.isTrue(updatedLabel.includes('1'));
+    });
+    test('ARIA label resets after closing editor with invalid input', function () {
+      this.field.setValue(5);
+      this.field.showEditor();
+
+      this.field.htmlInput_.value = 'dog';
+      this.field.onHtmlInputChange(null);
+      assert.equal(this.field.getValue(), 5);
+
+      const labelWhileInvalid =
+        this.focusableElement.getAttribute('aria-label');
+      assert.include(labelWhileInvalid, 'dog');
+
+      Blockly.WidgetDiv.hideIfOwner(this.field);
+
+      const label = this.focusableElement.getAttribute('aria-label');
+      assert.notInclude(label, 'dog');
+      assert.include(label, '5');
+    });
+    test('Invalid input has ARIA invalid state', function () {
+      this.field.setValue(5);
+      this.field.showEditor();
+
+      this.field.htmlInput_.value = 'a';
+      this.field.onHtmlInputChange(null);
+
+      // Move forward a few ticks to give the render_() a chance to run
+      this.clock.tick(16);
+      const ariaInvalid = this.field.htmlInput_.getAttribute('aria-invalid');
+      assert.equal(ariaInvalid, 'true');
+    });
+    test('Invalid input displays warning icon', function () {
+      this.field.setValue(5);
+      this.field.showEditor();
+
+      this.field.htmlInput_.value = 'a';
+      this.field.onHtmlInputChange(null);
+
+      // Move forward a few ticks to give the render_() a chance to run
+      this.clock.tick(16);
+      const warningIconDisplay = this.field.warningIcon.checkVisibility();
+      assert.isTrue(warningIconDisplay);
+    });
+    suite('Full block fields', function () {
+      setup(function () {
+        this.workspace = Blockly.inject('blocklyDiv', {
+          ...DEFAULT_INJECT_OPTIONS,
+          renderer: 'zelos',
+        });
+        this.block = this.workspace.newBlock('math_number');
+        this.field = this.block.getField('NUM');
+        this.block.initSvg();
+        this.block.render();
+      });
+      teardown(function () {
+        workspaceTeardown.call(this, this.workspace);
+      });
+      test('Top block ARIA label includes "Begin stack" label before expected field label', function () {
+        const labels = this.block
+          .getFocusableElement()
+          .getAttribute('aria-label')
+          .split(', ');
+
+        const expectedBeginStackLabel = 'Begin stack';
+        const expectedFieldLabel = 'Edit number: 0';
+        assert.include(labels, expectedBeginStackLabel);
+        assert.include(labels, expectedFieldLabel);
+        assert.isTrue(
+          labels.indexOf(expectedBeginStackLabel) <
+            labels.indexOf(expectedFieldLabel),
+        );
+      });
+      test('Connect to parent updates ARIA label with parent input label', function () {
+        const parentBlock = this.workspace.newBlock('controls_repeat_ext');
+        parentBlock.initSvg();
+        parentBlock.render();
+        this.block.outputConnection.connect(
+          parentBlock.getInput('TIMES').connection,
+        );
+        const labels = this.block
+          .getFocusableElement()
+          .getAttribute('aria-label')
+          .split(', ');
+
+        const expectedInputLabel = 'Edit number of times to repeat';
+        const expectedFieldLabel = 'number: 0';
+        assert.include(labels, expectedInputLabel);
+        assert.include(labels, expectedFieldLabel);
+        assert.isTrue(
+          labels.indexOf(expectedInputLabel) <
+            labels.indexOf(expectedFieldLabel),
+        );
+        assert.notInclude(labels, 'Begin stack');
+      });
+      test('Disconnect from parent updates ARIA label with Begin stack', function () {
+        const parentBlock = this.workspace.newBlock('controls_repeat_ext');
+        parentBlock.initSvg();
+        parentBlock.render();
+        this.block.outputConnection.connect(
+          parentBlock.getInput('TIMES').connection,
+        );
+        this.block.outputConnection.disconnect();
+
+        const label = this.block
+          .getFocusableElement()
+          .getAttribute('aria-label');
+        assert.include(label, 'Begin stack');
+        assert.notInclude(label, 'number of times to repeat');
+      });
+      test('Disconnect during drag updates ARIA label after drag ends', function () {
+        const parentBlock = this.workspace.newBlock('controls_repeat_ext');
+        parentBlock.initSvg();
+        parentBlock.render();
+        this.block.outputConnection.connect(
+          parentBlock.getInput('TIMES').connection,
+        );
+
+        this.block.setDragging(true);
+        this.block.outputConnection.disconnect();
+
+        const labelWhileDragging = this.block
+          .getFocusableElement()
+          .getAttribute('aria-label');
+        assert.notInclude(labelWhileDragging, 'Begin stack');
+
+        this.block.setDragging(false);
+
+        const labelAfterDrag = this.block
+          .getFocusableElement()
+          .getAttribute('aria-label');
+        assert.include(labelAfterDrag, 'Begin stack');
+      });
+    });
+  });
+});

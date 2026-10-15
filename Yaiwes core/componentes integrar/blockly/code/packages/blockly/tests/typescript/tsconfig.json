@@ -1,0 +1,21 @@
+{
+  "include": ["src/**/*"],
+  "compilerOptions": {
+    "allowJs": false,
+    "outDir": "dist",
+    "rootDir": "./src",
+    "types": [],
+    "paths": {
+      "blockly-test/*": ["../../dist/*"]
+    },
+
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+
+    "module": "ES2015",
+    "moduleResolution": "bundler",
+    "target": "ES2020",
+    "strict": true
+  }
+}

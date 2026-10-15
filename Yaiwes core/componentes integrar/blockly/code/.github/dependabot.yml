@@ -1,0 +1,44 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://help.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: 'npm' # See documentation for possible values
+    directory: '/' # Location of package manifests
+    target-branch: 'main'
+    schedule:
+      interval: 'weekly'
+    commit-message:
+      prefix: 'chore(deps)'
+    labels:
+      - 'PR: chore'
+      - 'PR: dependencies'
+    groups:
+      docusaurus:
+        patterns:
+          - '@docusaurus/*'
+      # nx requires every @nx/* package to be on exactly the same version as
+      # nx itself, so they are pinned exactly and must be updated together.
+      nx:
+        patterns:
+          - 'nx'
+          - '@nx/*'
+      react:
+        patterns:
+          - 'react*'
+  - package-ecosystem: 'github-actions' # See documentation for possible values
+    directory: '/'
+    target-branch: 'main'
+    schedule:
+      interval: 'weekly'
+    ignore:
+      # See notes in welcome_new_contributors.yml for details on this.
+      - dependency-name: 'actions/first-interaction'
+        versions: ['> 1.3.0']
+    commit-message:
+      prefix: 'chore(deps)'
+    labels:
+      - 'PR: chore'
+      - 'PR: dependencies'

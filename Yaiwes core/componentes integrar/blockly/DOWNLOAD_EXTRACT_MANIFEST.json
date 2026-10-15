@@ -1,0 +1,55 @@
+{
+  "bundle_bytes": 38278835,
+  "bundle_sha256": "1ca2b3fb2e64cd8ecf939acb8a47aa07a24c0015df4bfbd777ab7327aadff132",
+  "extracted_tree": {
+    "bytes": 67275608,
+    "files": 2561,
+    "sha256": "c0ab69e0563182aea1b82746e3a3289057049ba89d2742b0b0746d8ac4d84a75"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "blockly.bundle.zip.part-0001",
+      "sha256": "6cab90d12d73450ca3d74fa6955addfc71ae567e4a2ddd28bdf059984a5b4dc7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "blockly.bundle.zip.part-0002",
+      "sha256": "f2b1b8dbc705d96f165321fd39b3f44032bade1692585538ce5723e287ed6c09"
+    },
+    {
+      "bytes": 12582912,
+      "name": "blockly.bundle.zip.part-0003",
+      "sha256": "65f5feacbf445ce8e80a41503a144e748105524ba98e82cd6a3e18521757efc8"
+    },
+    {
+      "bytes": 530099,
+      "name": "blockly.bundle.zip.part-0004",
+      "sha256": "729206f1dfbf25327a971a29bd9d979f704353e1d5ddd686ccd94f84a4dad4ad"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "CLAUDE.md",
+    "packages/blockly/CLAUDE.md",
+    "packages/docs/CLAUDE.md",
+    "packages/plugins/CLAUDE.md"
+  ],
+  "skipped_special_count": 4,
+  "slug": "blockly",
+  "source_bytes": 67275608,
+  "source_commit": "864f132d25bcfff27219a83b79554a22e217b94d",
+  "source_files": 2561,
+  "source_ref": "main",
+  "source_repo": "RaspberryPiFoundation/blockly",
+  "source_tree": {
+    "bytes": 67275608,
+    "files": 2561,
+    "sha256": "c0ab69e0563182aea1b82746e3a3289057049ba89d2742b0b0746d8ac4d84a75"
+  }
+}

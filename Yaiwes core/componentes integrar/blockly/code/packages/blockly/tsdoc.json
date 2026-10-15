@@ -1,0 +1,25 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/tsdoc/v0/tsdoc.schema.json",
+  // Include the non-standard tags
+  "extends": ["typedoc/tsdoc.json"],
+  "tagDefinitions": [
+    {
+      "tagName": "@define",
+      "syntaxKind": "block"
+    },
+    {
+      "tagName": "@license",
+      "syntaxKind": "block"
+    },
+    {
+      "tagName": "@nocollapse",
+      "syntaxKind": "modifier"
+    }
+  ],
+
+  "supportForTags": {
+    "@define": true,
+    "@license": true,
+    "@nocollapse": true
+  }
+}

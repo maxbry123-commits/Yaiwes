@@ -1,0 +1,475 @@
+/**
+ * @license
+ * Copyright 2019 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import * as Blockly from '#core/blockly.js';
+import {assert} from 'chai';
+import {
+  assertFieldValue,
+  runConstructorSuiteTests,
+  runFromJsonSuiteTests,
+  runSetValueTests,
+} from './test_helpers/fields.js';
+import {
+  DEFAULT_INJECT_OPTIONS,
+  sharedTestSetup,
+  sharedTestTeardown,
+  workspaceTeardown,
+} from './test_helpers/setup_teardown.js';
+
+suite('Image Fields', function () {
+  setup(function () {
+    sharedTestSetup.call(this);
+    this.workspace = Blockly.inject('blocklyDiv', DEFAULT_INJECT_OPTIONS);
+  });
+  teardown(function () {
+    sharedTestTeardown.call(this);
+  });
+  /**
+   * Configuration for field tests with invalid values.
+   * @type {!Array<!FieldCreationTestCase>}
+   */
+  const invalidValueTestCases = [
+    {
+      title: 'Undefined Size',
+      value: 'src',
+      args: ['src', undefined, undefined],
+    },
+    {title: 'Zero Size', value: 'src', args: ['src', 0, 0]},
+    {
+      title: 'Non-Parsable String for Size',
+      value: 'src',
+      args: ['src', 'bad', 'bad'],
+    },
+  ];
+  /**
+   * Configuration for field tests with valid values.
+   * @type {!Array<!FieldCreationTestCase>}
+   */
+  const validValueCreationTestCases = [
+    {
+      title: 'With Alt',
+      value: 'src',
+      expectedValue: 'src',
+      args: ['src', 1, 1, 'alt'],
+      expectedText: 'alt',
+    },
+    {
+      title: 'Without Alt',
+      value: 'src',
+      expectedValue: 'src',
+      args: ['src', 1, 1],
+      expectedText: '',
+    },
+  ];
+  /**
+   * Adds json property to test cases based on args property.
+   * @param {!Array<!FieldCreationTestCase>} testCase The test case to modify.
+   */
+  const addJson = function (testCase) {
+    testCase.json = {
+      'src': testCase.args[0],
+      'width': testCase.args[1],
+      'height': testCase.args[2],
+    };
+    if (testCase.args[3]) {
+      testCase.json['alt'] = testCase.args[3];
+    }
+  };
+  invalidValueTestCases.forEach(addJson);
+  validValueCreationTestCases.forEach(addJson);
+
+  /**
+   * Asserts that the field properties are correct based on the test case.
+   * @param {!Blockly.FieldImage} field The field to check.
+   * @param {!FieldValueTestCase} testCase The test case.
+   */
+  const validTestCaseAssertField = function (field, testCase) {
+    assertFieldValue(field, testCase.expectedValue, testCase.expectedText);
+  };
+
+  runConstructorSuiteTests(
+    Blockly.FieldImage,
+    validValueCreationTestCases,
+    invalidValueTestCases,
+    validTestCaseAssertField,
+  );
+
+  runFromJsonSuiteTests(
+    Blockly.FieldImage,
+    validValueCreationTestCases,
+    invalidValueTestCases,
+    validTestCaseAssertField,
+  );
+
+  /**
+   * Configuration for field tests with valid values.
+   * @type {!Array<!FieldValueTestCase>}
+   */
+  const validValueSetValueTestCases = [
+    {
+      title: 'Good src',
+      value: 'newSrc',
+      expectedValue: 'newSrc',
+      expectedText: 'alt',
+    },
+  ];
+
+  suite('setValue', function () {
+    setup(function () {
+      this.field = new Blockly.FieldImage('src', 1, 1, 'alt');
+    });
+    runSetValueTests(
+      validValueSetValueTestCases,
+      invalidValueTestCases,
+      'src',
+      'alt',
+    );
+  });
+
+  suite('Customizations', function () {
+    suite('On Click Handler', function () {
+      setup(function () {
+        this.onClick = function () {
+          console.log('on click');
+        };
+      });
+      test('JS Constructor', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, this.onClick);
+        assert.equal(field.clickHandler, this.onClick);
+      });
+      test('setOnClickHandler', function () {
+        const field = new Blockly.FieldImage('src', 10, 10);
+        field.setOnClickHandler(this.onClick);
+        assert.equal(field.clickHandler, this.onClick);
+      });
+      test('Remove Click Handler', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, this.onClick);
+        field.setOnClickHandler(null);
+        assert.isNull(field.clickHandler);
+      });
+    });
+    suite('Alt', function () {
+      test('JS Constructor', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, 'alt');
+        assert.equal(field.getText(), 'alt');
+      });
+      test('JSON Definition', function () {
+        const field = Blockly.FieldImage.fromJson({
+          src: 'src',
+          width: 10,
+          height: 10,
+          alt: 'alt',
+        });
+        assert.equal(field.getText(), 'alt');
+      });
+      suite('SetAlt', function () {
+        setup(function () {
+          this.imageField = new Blockly.FieldImage('src', 10, 10, 'alt');
+        });
+        test('Null', function () {
+          this.imageField.setAlt(null);
+          assertFieldValue(this.imageField, 'src', '');
+        });
+        test('Empty String', function () {
+          this.imageField.setAlt('');
+          assertFieldValue(this.imageField, 'src', '');
+        });
+        test('Good Alt', function () {
+          this.imageField.setAlt('newAlt');
+          assertFieldValue(this.imageField, 'src', 'newAlt');
+        });
+      });
+      test('JS Configuration - Simple', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, null, null, {
+          alt: 'alt',
+        });
+        assert.equal(field.getText(), 'alt');
+      });
+      test('JS Configuration - Block Factory style (config as 4th arg)', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, {
+          alt: 'alt',
+          flipRtl: false,
+        });
+        assert.equal(field.getText(), 'alt');
+        assert.isFalse(field.getFlipRtl());
+      });
+      test('JS Configuration - Ignore', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, 'alt', null, null, {
+          alt: 'configAlt',
+        });
+        assert.equal(field.getText(), 'configAlt');
+      });
+      test("JS Configuration - Ignore - ''", function () {
+        const field = new Blockly.FieldImage('src', 10, 10, '', null, null, {
+          alt: 'configAlt',
+        });
+        assert.equal(field.getText(), 'configAlt');
+      });
+      test("JS Configuration - Ignore - Config ''", function () {
+        const field = new Blockly.FieldImage('src', 10, 10, 'alt', null, null, {
+          alt: '',
+        });
+        assert.equal(field.getText(), '');
+      });
+    });
+    suite('Flip RTL', function () {
+      test('JS Constructor', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, null, true);
+        assert.isTrue(field.getFlipRtl());
+      });
+      test('JSON Definition', function () {
+        const field = Blockly.FieldImage.fromJson({
+          src: 'src',
+          width: 10,
+          height: 10,
+          flipRtl: true,
+        });
+        assert.isTrue(field.getFlipRtl());
+      });
+      test('JS Configuration - Simple', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, null, null, {
+          flipRtl: true,
+        });
+        assert.isTrue(field.getFlipRtl());
+      });
+      test('JS Configuration - Ignore - True', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, null, true, {
+          flipRtl: false,
+        });
+        assert.isFalse(field.getFlipRtl());
+      });
+      test('JS Configuration - Ignore - False', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null, null, false, {
+          flipRtl: true,
+        });
+        assert.isTrue(field.getFlipRtl());
+      });
+    });
+    suite('isClickable', function () {
+      setup(function () {
+        this.onClick = function () {
+          console.log('on click');
+        };
+        this.setUpBlockWithFieldImages = function () {
+          const blockJson = {
+            'type': 'text',
+            'id': 'block_id',
+            'x': 0,
+            'y': 0,
+            'fields': {
+              'TEXT': '',
+            },
+          };
+          Blockly.serialization.blocks.append(blockJson, this.workspace);
+          return this.workspace.getBlockById('block_id');
+        };
+        this.extractFieldImage = function (block) {
+          const fields = Array.from(block.getFields());
+          // Sanity check (as a precondition).
+          assert.strictEqual(fields.length, 3);
+          const imageField = fields[0];
+          // Sanity check (as a precondition).
+          assert.isTrue(imageField instanceof Blockly.FieldImage);
+          return imageField;
+        };
+      });
+
+      test('Unattached field without click handler returns false', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, null);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('Unattached field with click handler returns false', function () {
+        const field = new Blockly.FieldImage('src', 10, 10, this.onClick);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('For attached but disabled field without click handler returns false', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+        field.setEnabled(false);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('For attached but disabled field with click handler returns false', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+        field.setEnabled(false);
+        field.setOnClickHandler(this.onClick);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('For attached, enabled, but not editable field without click handler returns false', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+        block.setEditable(false);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('For attached, enabled, but not editable field with click handler returns false', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+        block.setEditable(false);
+        field.setOnClickHandler(this.onClick);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('For attached, enabled, editable field without click handler returns false', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+      test('For attached, enabled, editable field with click handler returns true', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+        field.setOnClickHandler(this.onClick);
+
+        const isClickable = field.isClickable();
+
+        assert.isTrue(isClickable);
+      });
+      test('For attached, enabled, editable field with removed click handler returns false', function () {
+        const block = this.setUpBlockWithFieldImages();
+        const field = this.extractFieldImage(block);
+        field.setOnClickHandler(this.onClick);
+        field.setOnClickHandler(null);
+
+        const isClickable = field.isClickable();
+
+        assert.isFalse(isClickable);
+      });
+    });
+  });
+  suite('ARIA', function () {
+    setup(function () {
+      this.workspace = Blockly.inject('blocklyDiv', {
+        ...DEFAULT_INJECT_OPTIONS,
+        renderer: 'geras',
+      });
+    });
+
+    teardown(function () {
+      workspaceTeardown.call(this, this.workspace);
+    });
+
+    suite('Image without click handler', function () {
+      setup(function () {
+        this.block = this.workspace.newBlock('text');
+        this.field = this.block.inputList[0].fieldRow[0];
+        this.block.initSvg();
+        this.block.render();
+        this.focusableElement = this.field.getFocusableElement();
+      });
+      test('Block has image alt text in ARIA label', function () {
+        const blockLabel = this.block.getAriaLabel();
+        assert.include(blockLabel, this.field.altText);
+      });
+      test('Focusable element has role of none', function () {
+        const role = this.focusableElement.getAttribute('role');
+        assert.equal(role, 'none');
+      });
+      test('Hidden when in a flyout', function () {
+        this.block.isInFlyout = true;
+        // Force recompute of ARIA label.
+        this.field.setValue(this.field.getValue());
+        const ariaHidden = this.focusableElement.getAttribute('aria-hidden');
+        assert.equal(ariaHidden, 'true');
+      });
+      test('Empty label when no alt text provided', function () {
+        this.field.setAlt(null);
+        assert.equal(this.field.computeAriaLabel(false), '');
+      });
+      test('Empty label when no alt text provided and type requested', function () {
+        this.field.setAlt(null);
+        assert.equal(this.field.computeAriaLabel(true), '');
+      });
+      test('Label includes type when set, requested, and alt text present', function () {
+        this.field.setAlt('altered');
+        this.field.setAriaTypeName('demo');
+        assert.equal(this.field.computeAriaLabel(true), 'demo: altered');
+      });
+      test('Label does not include type when set, not requested, and alt text present', function () {
+        this.field.setAlt('altered');
+        this.field.setAriaTypeName('demo');
+        assert.equal(this.field.computeAriaLabel(false), 'altered');
+      });
+    });
+    suite('Image with click handler', function () {
+      test('Field has alt text ARIA label', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        block.initSvg();
+        block.render();
+
+        const focusableElement = field.getFocusableElement();
+        const fieldLabel = focusableElement.getAttribute('aria-label');
+        assert.include(fieldLabel, 'image with click handler');
+      });
+      test('Focusable element has role of button', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        block.initSvg();
+        block.render();
+
+        const focusableElement = field.getFocusableElement();
+        const role = focusableElement.getAttribute('role');
+        assert.equal(role, 'button');
+      });
+      test('Block omits image button from ARIA label', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        block.initSvg();
+        block.render();
+
+        const blockFocusableElement = block.getFocusableElement();
+        const blockLabel = blockFocusableElement.getAttribute('aria-label');
+        assert.notInclude(blockLabel, 'Image:');
+        assert.notInclude(blockLabel, 'image with click handler');
+      });
+      test('Empty label when no alt text provided', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        field.setAlt(null);
+        assert.equal(field.computeAriaLabel(false), '');
+      });
+      test('Empty label when no alt text provided and type requested', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        field.setAlt(null);
+        assert.equal(field.computeAriaLabel(true), '');
+      });
+      test('Empty label when type set, requested, and alt text present', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        field.setAlt('altered');
+        field.setAriaTypeName('demo');
+        assert.equal(field.computeAriaLabel(true), '');
+      });
+      test('Empty label when type set, not requested, and alt text present', function () {
+        const block = this.workspace.newBlock('test_images_clickhandler');
+        const field = block.getField('IMAGE');
+        field.setAlt('altered');
+        field.setAriaTypeName('demo');
+        assert.equal(field.computeAriaLabel(false), '');
+      });
+    });
+  });
+});

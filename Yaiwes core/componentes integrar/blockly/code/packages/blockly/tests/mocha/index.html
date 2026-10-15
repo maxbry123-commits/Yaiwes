@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Mocha Tests for Blockly</title>
+    <link rel="stylesheet" href="../../build/tests/mocha-bundle.css" />
+  </head>
+  <style>
+    #blocklyDiv {
+      height: 1000px;
+      position: fixed;
+      visibility: hidden;
+      width: 1000px;
+    }
+  </style>
+  <body tabindex="-1">
+    <div id="mocha"></div>
+    <script src="../../build/tests/mocha.js"></script>
+    <script src="../../build/tests/mocha-bundle.js"></script>
+    <script src="../../build/msg/en.js"></script>
+    <script>
+      // Mocha displays a stacktrace, but it points to the bundle. Log errors
+      // to the console since devtools automatically applies sourcemaps to the
+      // logged error, pointing to the problematic line in the actual test file.
+      mocha.run().on('fail', (test, err) => {
+        console.error(`FAIL: ${test.fullTitle()}`, err);
+      });
+    </script>
+    <script>
+      // Hot reload with a 1 second debounce.
+      let pending;
+      new EventSource('/esbuild').addEventListener('change', (event) => {
+        const {updated} = JSON.parse(event.data);
+        // Ignore sourcemap changes.
+        if (!updated.some((path) => path.endsWith('.js'))) return;
+        clearTimeout(pending);
+        pending = setTimeout(() => location.reload(), 1000);
+      });
+    </script>
+  </body>
+</html>
