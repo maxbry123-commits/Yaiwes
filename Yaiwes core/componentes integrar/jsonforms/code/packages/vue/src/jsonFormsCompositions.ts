@@ -1,0 +1,703 @@
+import {
+  ControlElement,
+  Dispatch,
+  Layout,
+  mapDispatchToControlProps,
+  mapStateToControlProps,
+  mapStateToLayoutProps,
+  JsonFormsSubStates,
+  JsonSchema,
+  UISchemaElement,
+  CoreActions,
+  mapStateToEnumControlProps,
+  JsonFormsState,
+  mapStateToOneOfEnumControlProps,
+  OwnPropsOfMasterListItem,
+  mapStateToMasterListItemProps,
+  mapStateToControlWithDetailProps,
+  mapStateToArrayControlProps,
+  mapDispatchToArrayControlProps,
+  mapStateToAllOfProps,
+  mapStateToAnyOfProps,
+  mapStateToOneOfProps,
+  mapStateToJsonFormsRendererProps,
+  mapStateToArrayLayoutProps,
+  mapStateToCellProps,
+  JsonFormsRendererRegistryEntry,
+  JsonFormsCellRendererRegistryEntry,
+  defaultMapStateToEnumCellProps,
+  mapStateToDispatchCellProps,
+  mapStateToOneOfEnumCellProps,
+  StatePropsOfJsonFormsRenderer,
+  Id,
+  mapStateToMultiEnumControlProps,
+  mapDispatchToMultiEnumProps,
+  mapStateToLabelProps,
+  LabelElement,
+  Categorization,
+  isControl,
+  Scopable,
+  Translator,
+} from '@jsonforms/core';
+import type Ajv from 'ajv';
+import isEqualWith from 'lodash/isEqualWith';
+import {
+  PropType,
+  computed,
+  ComputedRef,
+  inject,
+  onBeforeMount,
+  onUnmounted,
+  ref,
+  watch,
+} from 'vue';
+
+/**
+ * Constructs a props declaration for Vue components which can be used
+ * for registered renderers and cells. These are typically used in combination
+ * with one of the provided bindings, e.g. 'useJsonFormsControl'.
+ *
+ * Use the generic type parameter when using a specialized binding, e.g.
+ * `rendererProps<Layout>()` in combination with `useJsonFormsLayout` or
+ * `rendererProps<ControlElement>()` in combination with `useJsonFormsControl`.
+ */
+export const rendererProps = <U = UISchemaElement>() => ({
+  schema: {
+    required: true as const,
+    type: [Object, Boolean] as PropType<JsonSchema>,
+  },
+  uischema: {
+    required: true as const,
+    type: Object as PropType<U>,
+  },
+  path: {
+    required: true as const,
+    type: String,
+  },
+  enabled: {
+    required: false as const,
+    type: Boolean,
+    default: undefined,
+  },
+  readonly: {
+    required: false as const,
+    type: Boolean,
+    default: undefined,
+  },
+  renderers: {
+    required: false,
+    type: Array as PropType<JsonFormsRendererRegistryEntry[]>,
+    default: undefined,
+  },
+  cells: {
+    required: false,
+    type: Array as PropType<JsonFormsCellRendererRegistryEntry[]>,
+    default: undefined,
+  },
+  config: {
+    required: false,
+    type: Object,
+    default: undefined,
+  },
+});
+
+/**
+ * Constructs a props declaration for Vue components which shall be used as
+ * master list items.
+ */
+export const masterListItemProps = () => ({
+  index: {
+    required: true as const,
+    type: Number,
+  },
+  selected: {
+    required: true as const,
+    type: Boolean,
+  },
+  path: {
+    required: true as const,
+    type: String,
+  },
+  schema: {
+    required: true as const,
+    type: [Object, Boolean] as PropType<JsonSchema>,
+  },
+  handleSelect: {
+    required: false as const,
+    type: Function as PropType<(index: number) => void>,
+    default: undefined,
+  },
+  removeItem: {
+    required: false as const,
+    type: Function as PropType<(path: string, value: number) => void>,
+    default: undefined,
+  },
+});
+
+export interface RendererProps<U = UISchemaElement> {
+  schema: JsonSchema;
+  uischema: U;
+  path: string;
+  enabled?: boolean;
+  readonly?: boolean;
+  renderers?: JsonFormsRendererRegistryEntry[];
+  cells?: JsonFormsCellRendererRegistryEntry[];
+  config?: any;
+}
+
+export interface ControlProps extends RendererProps {
+  uischema: ControlElement;
+}
+
+/**
+ * Returns `true` for an instance of a class that has no `Symbol.toStringTag`.
+ * `isEqual` compares such an instance by its own keys. Thus it finds two
+ * instances equal when their contents are in private fields. `isEqual` compares
+ * `Date`, `Map`, `Set` and other values with a known tag by their contents, and
+ * it finds values with an unknown tag (for example `Temporal`) equal only when
+ * they are identical.
+ */
+const isClassInstance = (value: unknown): boolean => {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Object.prototype.toString.call(value) !== '[object Object]'
+  ) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype !== Object.prototype && prototype !== null;
+};
+
+/**
+ * Compares two values structurally with `isEqual`, but compares class
+ * instances by identity. Thus the result is `true` only when the values are
+ * deep-equal.
+ */
+const isDeepEqual = (a: unknown, b: unknown): boolean =>
+  isEqualWith(a, b, (x: unknown, y: unknown) =>
+    isClassInstance(x) || isClassInstance(y) ? x === y : undefined
+  );
+
+/**
+ * The keys of a bindings object that are compared by identity. For these keys
+ * the core gives the same object when the value does not change: it replaces
+ * the data immutably, and it resolves a schema to a part of the root schema.
+ * Thus a structural compare can find an equal value only when the application
+ * gives a copy, and the values can be large. All other keys are compared with
+ * `isDeepEqual`, because the core or a renderer makes a new but equal value on
+ * each change, for example a filtered `childErrors` array or a clone of a UI
+ * schema element.
+ */
+const identityKeys = new Set(['data', 'schema', 'rootSchema']);
+
+/**
+ * Returns `previous` when `next` has the same keys, and each value is equal to
+ * the value in `previous`. Otherwise returns `next`.
+ */
+const reuseIfEqual = <T extends object>(
+  previous: T | undefined,
+  next: T
+): T => {
+  if (previous === undefined) {
+    return next;
+  }
+  const previousKeys = Object.keys(previous);
+  const nextKeys = Object.keys(next);
+  const equal =
+    previousKeys.length === nextKeys.length &&
+    nextKeys.every(
+      (key) =>
+        Object.prototype.hasOwnProperty.call(previous, key) &&
+        (identityKeys.has(key)
+          ? (previous as Record<string, unknown>)[key] ===
+            (next as Record<string, unknown>)[key]
+          : isDeepEqual(
+              (previous as Record<string, unknown>)[key],
+              (next as Record<string, unknown>)[key]
+            ))
+    );
+  return equal ? previous : next;
+};
+
+/**
+ * A `computed` for a bindings object. Each change of the JSON Forms state
+ * recomputes the bindings of all renderers, and the getter returns a new
+ * object each time. Vue compares a computed value by identity, thus without
+ * this wrapper each change re-renders all renderers in the form. When the new
+ * bindings are equal to the previous bindings, this computed keeps the
+ * previous object, and Vue does not trigger the dependents.
+ */
+const stableComputed = <T extends object>(getter: () => T): ComputedRef<T> =>
+  computed((previous?: T) => reuseIfEqual(previous, getter()));
+
+export type Required<T> = T extends object
+  ? { [P in keyof T]-?: NonNullable<T[P]> }
+  : T;
+
+// TODO fix @typescript-eslint/ban-types
+// eslint-disable-next-line @typescript-eslint/ban-types, @typescript-eslint/no-unused-vars
+export function useControl<
+  R,
+  D,
+  P extends { schema: JsonSchema; uischema: UISchemaElement & Scopable }
+>(
+  props: P,
+  stateMap: (state: JsonFormsState, props: P) => R
+): { control: ComputedRef<Required<P & R>> };
+// TODO fix @typescript-eslint/ban-types
+// eslint-disable-next-line @typescript-eslint/ban-types
+export function useControl<
+  R,
+  D,
+  P extends { schema: JsonSchema; uischema: UISchemaElement & Scopable }
+>(
+  props: P,
+  stateMap: (state: JsonFormsState, props: P) => R,
+  dispatchMap: (dispatch: Dispatch<CoreActions>) => D
+): { control: ComputedRef<Required<P & R>> } & D;
+// TODO fix @typescript-eslint/ban-types
+// eslint-disable-next-line @typescript-eslint/ban-types
+export function useControl<
+  R,
+  D,
+  P extends { schema: JsonSchema; uischema: UISchemaElement & Scopable }
+>(
+  props: P,
+  stateMap: (state: JsonFormsState, props: P) => R,
+  dispatchMap?: (dispatch: Dispatch<CoreActions>) => D
+) {
+  const jsonforms = useJsonForms();
+  const dispatch = useDispatch();
+
+  const id = ref<string | undefined>(undefined);
+  const control = stableComputed(() => ({
+    ...props,
+    ...stateMap({ jsonforms }, props),
+    id: id.value,
+  }));
+
+  const dispatchMethods = dispatchMap?.(dispatch);
+
+  onBeforeMount(() => {
+    if (control.value.uischema.scope) {
+      id.value = Id.createId(control.value.uischema.scope);
+    }
+  });
+
+  watch(
+    () => props.schema,
+    (newSchema, prevSchem) => {
+      if (newSchema !== prevSchem && isControl(control.value.uischema)) {
+        if (id.value) {
+          Id.removeId(id.value);
+        }
+        id.value = Id.createId(control.value.uischema.scope);
+      }
+    }
+  );
+
+  onUnmounted(() => {
+    if (id.value) {
+      Id.removeId(id.value);
+      id.value = undefined;
+    }
+  });
+
+  return {
+    control: control,
+    ...dispatchMethods,
+  };
+}
+
+/**
+ * Provides generic bindings for 'Control' elements.
+ * Should be used when no specialized bindings are appropriate.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsControl = (props: ControlProps) => {
+  return useControl(props, mapStateToControlProps, mapDispatchToControlProps);
+};
+
+/**
+ * Provides bindings for 'Control' elements which can provide a 'detail',
+ * for example array and object renderers.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsControlWithDetail = (props: ControlProps) => {
+  return useControl(
+    props,
+    mapStateToControlWithDetailProps,
+    mapDispatchToControlProps
+  );
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to 'enum' schema elements.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsEnumControl = (props: ControlProps) => {
+  return useControl(
+    props,
+    mapStateToEnumControlProps,
+    mapDispatchToControlProps
+  );
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to manually constructed
+ * 'oneOf' enums. These are used to enhance enums with label support.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsOneOfEnumControl = (props: ControlProps) => {
+  return useControl(
+    props,
+    mapStateToOneOfEnumControlProps,
+    mapDispatchToControlProps
+  );
+};
+
+// Explicitly create type to avoid TS2732.
+// This is due to core's StatePropsOfArrayControl exposing AJV's ErrorObject type.
+// The same as the parameterized return type of useControl
+// Could alternatively be created like the following with Typescript 4.7+
+// but this does not work with the ESLint typescript parser, yet:
+// type UseJsonFormsArrayControlReturnType = typeof useControl<
+//   ReturnType<typeof mapStateToArrayControlProps>,
+//   ReturnType<typeof mapDispatchToArrayControlProps>,
+//   ControlProps
+// >;
+type UseJsonFormsArrayControlReturnType = {
+  control: ComputedRef<
+    Required<ReturnType<typeof mapStateToArrayControlProps>>
+  >;
+} & ReturnType<typeof mapDispatchToArrayControlProps>;
+/**
+ * Provides bindings for 'Control' elements which resolve to 'array' schema elements.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsArrayControl: (
+  props: ControlProps
+) => UseJsonFormsArrayControlReturnType = (props: ControlProps) => {
+  return useControl(
+    props,
+    mapStateToArrayControlProps,
+    mapDispatchToArrayControlProps
+  );
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to 'allOf' schema elements.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsAllOfControl = (props: ControlProps) => {
+  return useControl(props, mapStateToAllOfProps, mapDispatchToControlProps);
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to 'anyOf' schema elements.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsAnyOfControl = (props: ControlProps) => {
+  return useControl(props, mapStateToAnyOfProps, mapDispatchToControlProps);
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to 'oneOf' schema elements.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsOneOfControl = (props: ControlProps) => {
+  return useControl(props, mapStateToOneOfProps, mapDispatchToControlProps);
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to multiple choice enums.
+ *
+ * Access bindings via the provided reactive `control` object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsMultiEnumControl = (props: ControlProps) => {
+  return useControl(
+    props,
+    mapStateToMultiEnumControlProps,
+    mapDispatchToMultiEnumProps
+  );
+};
+
+export interface LayoutProps extends RendererProps {
+  uischema: Layout;
+}
+
+/**
+ * Provides bindings for 'Layout' elements, e.g. VerticalLayout, HorizontalLayout, Group.
+ *
+ * Access bindings via the provided reactive 'layout' object.
+ */
+export const useJsonFormsLayout = (props: LayoutProps) => {
+  const { control, ...other } = useControl(props, mapStateToLayoutProps);
+  return { layout: control, ...other };
+};
+
+/**
+ * Provides bindings for 'Control' elements which resolve to 'array' elements which
+ * shall be rendered as a layout instead of a control.
+ *
+ * Access bindings via the provided reactive 'layout' object.
+ */
+export const useJsonFormsArrayLayout = (props: ControlProps) => {
+  const { control, ...other } = useControl(props, mapStateToArrayLayoutProps);
+  return { layout: control, ...other };
+};
+
+/**
+ * Provides bindings for list elements of a master-list-detail control setup.
+ * The element using this binding is not supposed to be registered as an own renderer
+ * but used in a more specialized control.
+ *
+ * Access bindings via the provided reactive 'item' object.
+ */
+export const useJsonFormsMasterListItem = (props: OwnPropsOfMasterListItem) => {
+  const { control, ...other } = useControl<
+    Omit<OwnPropsOfMasterListItem, 'handleSelect' | 'removeItem'>,
+    unknown,
+    OwnPropsOfMasterListItem
+  >(props, mapStateToMasterListItemProps);
+  return { item: control, ...other };
+};
+
+/**
+ * Provides specialized bindings which can be used for any renderer.
+ * Useful for meta elements like dispatchers.
+ *
+ * Access bindings via the provided reactive 'renderer' object.
+ */
+export const useJsonFormsRenderer = (props: RendererProps) => {
+  const jsonforms = useJsonForms();
+
+  const rawProps = computed(
+    () =>
+      mapStateToJsonFormsRendererProps(
+        { jsonforms },
+        props
+      ) as Required<StatePropsOfJsonFormsRenderer>
+  );
+
+  const rootSchema = computed(() => rawProps.value.rootSchema);
+  const renderer = stableComputed(() => {
+    const { rootSchema: _rootSchema, ...rest } = rawProps.value;
+    return rest;
+  });
+
+  return {
+    renderer,
+    rootSchema,
+  };
+};
+
+/**
+ * Provides bindings for 'Label' elements.
+ *
+ * Access bindings via the provided reactive `label` object.
+ */
+export const useJsonFormsLabel = (props: RendererProps<LabelElement>) => {
+  const { control, ...other } = useControl(props, mapStateToLabelProps);
+  return { label: control, ...other };
+};
+
+/**
+ * Provides bindings for cell elements. Cells are meant to show simple inputs,
+ * for example without error validation, within a larger structure like tables.
+ *
+ * Access bindings via the provided reactive 'cell' object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsCell = (props: ControlProps) => {
+  const { control, ...other } = useControl(
+    props,
+    mapStateToCellProps,
+    mapDispatchToControlProps
+  );
+  return { cell: control, ...other };
+};
+
+/**
+ * Provides bindings for enum cell elements. Cells are meant to show simple inputs,
+ * for example without error validation, within a larger structure like tables.
+ *
+ * Access bindings via the provided reactive 'cell' object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsEnumCell = (props: ControlProps) => {
+  const { control, ...other } = useControl(
+    props,
+    defaultMapStateToEnumCellProps,
+    mapDispatchToControlProps
+  );
+  return { cell: control, ...other };
+};
+
+/**
+ * Provides bindings for 'oneOf' enum cell elements. Cells are meant to show simple inputs,
+ * for example without error validation, within a larger structure like tables.
+ *
+ * Access bindings via the provided reactive 'cell' object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsOneOfEnumCell = (props: ControlProps) => {
+  const { control, ...other } = useControl(
+    props,
+    mapStateToOneOfEnumCellProps,
+    mapDispatchToControlProps
+  );
+  return { cell: control, ...other };
+};
+
+/**
+ * Provides bindings for a cell dispatcher. Cells are meant to show simple inputs,
+ * for example without error validation, within a larger structure like tables.
+ *
+ * Access bindings via the provided reactive 'cell' object.
+ * Dispatch changes via the provided `handleChange` method.
+ */
+export const useJsonFormsDispatchCell = (props: ControlProps) => {
+  const { control, ...other } = useControl(
+    props,
+    mapStateToDispatchCellProps,
+    mapDispatchToControlProps
+  );
+  return { cell: control, ...other };
+};
+
+/**
+ * Provides bindings for 'Categorization' elements.
+ *
+ * Access bindings via the provided `categories` array with reactive category objects.
+ */
+export const useJsonFormsCategorization = (props: LayoutProps) => {
+  const { layout, ...other } = useJsonFormsLayout(props);
+
+  const categories = (layout.value.uischema as Categorization).elements.map(
+    (category) => {
+      const categoryProps: LayoutProps = {
+        ...props,
+        uischema: category,
+      };
+
+      return useJsonFormsLayout(categoryProps).layout;
+    }
+  );
+
+  return { layout, categories, ...other };
+};
+
+/**
+ * Provides access to the JsonForms sub state.
+ *
+ * @returns The JsonForms sub state.
+ */
+export function useJsonForms(): JsonFormsSubStates;
+export function useJsonForms(optional: true): JsonFormsSubStates | undefined;
+export function useJsonForms(optional?: true) {
+  const jsonforms = inject<JsonFormsSubStates | undefined>(
+    'jsonforms',
+    undefined
+  );
+
+  if (!jsonforms && !optional) {
+    throw new Error(
+      "'jsonforms' couldn't be injected. Are you within JSON Forms?"
+    );
+  }
+
+  return jsonforms;
+}
+
+/**
+ * Provides access to the JsonForms dispatch function.
+ *
+ * @returns The JsonForms dispatch function.
+ */
+export function useDispatch(): Dispatch<CoreActions>;
+export function useDispatch(optional: true): Dispatch<CoreActions> | undefined;
+export function useDispatch(optional?: true) {
+  const dispatch = inject<Dispatch<CoreActions> | undefined>(
+    'dispatch',
+    undefined
+  );
+
+  if (!dispatch && !optional) {
+    throw new Error(
+      "'dispatch' couldn't be injected. Are you within JSON Forms?"
+    );
+  }
+
+  return dispatch;
+}
+
+/**
+ * Provides access to the JsonForms translator function.
+ * @returns The JsonForms translator function.
+ */
+export function useTranslator(): ComputedRef<Translator>;
+export function useTranslator(
+  optional: true
+): ComputedRef<Translator> | undefined;
+export function useTranslator(optional?: true) {
+  const jsonforms = optional === true ? useJsonForms(true) : useJsonForms();
+
+  if (!jsonforms?.i18n?.translate) {
+    if (optional) {
+      return undefined;
+    }
+
+    throw new Error(
+      "'jsonforms i18n' couldn't be injected. Are you within JSON Forms?"
+    );
+  }
+
+  const translate = computed<Translator>(() => {
+    const translator = jsonforms.i18n?.translate;
+    if (!translator) {
+      throw new Error(
+        "'jsonforms i18n' couldn't be injected. Are you within JSON Forms?"
+      );
+    }
+
+    return translator;
+  });
+
+  return translate;
+}
+
+/**
+ * Extracts Ajv from JSON Forms
+ */
+export function useAjv(): Ajv;
+export function useAjv(optional: true): Ajv | undefined;
+export function useAjv(optional?: true) {
+  const jsonforms = optional === true ? useJsonForms(true) : useJsonForms();
+
+  if (!optional && (!jsonforms?.core || !jsonforms.core.ajv)) {
+    throw new Error(
+      "'jsonforms ajv' couldn't be injected. Are you within JSON Forms?"
+    );
+  }
+
+  return jsonforms?.core?.ajv as Ajv;
+}

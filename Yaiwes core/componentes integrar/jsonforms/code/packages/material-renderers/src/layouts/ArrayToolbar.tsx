@@ -1,0 +1,88 @@
+import FormHelperText from '@mui/material/FormHelperText';
+import Grid from '@mui/material/Grid';
+import IconButton from '@mui/material/IconButton';
+import Stack from '@mui/material/Stack';
+import Toolbar from '@mui/material/Toolbar';
+import Tooltip from '@mui/material/Tooltip';
+import Typography from '@mui/material/Typography';
+import Add from '@mui/icons-material/Add';
+import React from 'react';
+import ValidationIcon from '../complex/ValidationIcon';
+import { ArrayTranslations } from '@jsonforms/core';
+export interface ArrayLayoutToolbarProps {
+  label: string;
+  description: string;
+  errors: string;
+  path: string;
+  enabled: boolean;
+  addItem(path: string, data: any): () => void;
+  createDefault(): any;
+  translations: ArrayTranslations;
+  disableAdd?: boolean;
+}
+export const ArrayLayoutToolbar = React.memo(function ArrayLayoutToolbar({
+  label,
+  description,
+  errors,
+  addItem,
+  path,
+  enabled,
+  createDefault,
+  translations,
+  disableAdd,
+}: ArrayLayoutToolbarProps) {
+  return (
+    <Toolbar disableGutters={true}>
+      <Stack sx={{ width: '100%' }}>
+        <Grid
+          container
+          sx={{ alignItems: 'center', justifyContent: 'space-between' }}
+        >
+          <Grid>
+            <Grid
+              container
+              sx={{ justifyContent: 'flex-start', alignItems: 'center' }}
+              spacing={2}
+            >
+              <Grid>
+                <Typography variant={'h6'}>{label}</Typography>
+              </Grid>
+              <Grid>
+                {errors.length !== 0 && (
+                  <Grid>
+                    <ValidationIcon
+                      id='tooltip-validation'
+                      errorMessages={errors}
+                    />
+                  </Grid>
+                )}
+              </Grid>
+            </Grid>
+          </Grid>
+          {enabled && !disableAdd && (
+            <Grid>
+              <Grid container>
+                <Grid>
+                  <Tooltip
+                    id='tooltip-add'
+                    title={translations.addTooltip}
+                    placement='bottom'
+                  >
+                    <IconButton
+                      aria-label={translations.addTooltip}
+                      onClick={addItem(path, createDefault())}
+                      size='large'
+                    >
+                      <Add />
+                    </IconButton>
+                  </Tooltip>
+                </Grid>
+              </Grid>
+            </Grid>
+          )}
+        </Grid>
+        {description && <FormHelperText>{description}</FormHelperText>}
+      </Stack>
+    </Toolbar>
+  );
+});
