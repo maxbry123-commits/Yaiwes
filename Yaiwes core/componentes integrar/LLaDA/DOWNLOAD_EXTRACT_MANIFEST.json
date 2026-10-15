@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 21012877,
+  "bundle_sha256": "b648b3e35fe4a2ef27b3c8f8b3df023495f0130cf630b28049697b05cf7259ba",
+  "extracted_tree": {
+    "bytes": 26250384,
+    "files": 1760,
+    "sha256": "3528466fe9480def614f31c39f7fffbafdf65bc9c638de16b8075e9fc587adb9"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "LLaDA.bundle.zip.part-0001",
+      "sha256": "d205f5f61d248bbca43fce37552115c168a333b1bdbc70c2fc4d1b7ecba662ef"
+    },
+    {
+      "bytes": 8429965,
+      "name": "LLaDA.bundle.zip.part-0002",
+      "sha256": "50eb226d8cbfa054ef2b1fe22c378dcf577d59558bde324d6d9c0cb65c8ecc69"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "LLaDA",
+  "source_bytes": 26250384,
+  "source_commit": "9182493720ed723ef8031210d85959364e51cbe0",
+  "source_files": 1760,
+  "source_ref": "main",
+  "source_repo": "ML-GSAI/LLaDA",
+  "source_tree": {
+    "bytes": 26250384,
+    "files": 1760,
+    "sha256": "3528466fe9480def614f31c39f7fffbafdf65bc9c638de16b8075e9fc587adb9"
+  }
+}
