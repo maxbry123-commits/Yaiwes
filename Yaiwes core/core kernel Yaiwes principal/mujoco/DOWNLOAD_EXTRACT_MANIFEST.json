@@ -1,65 +1,33 @@
 {
-  "bundle_bytes": 77506120,
-  "bundle_sha256": "0ae8ee11a97e626ff405c2c6bcd74e6678dda576d8fc82bdcba3f5bd910401a8",
-  "extracted_tree": {
-    "bytes": 116582548,
-    "files": 2314,
-    "sha256": "8b8623598c883c9526bfbb133a4fb0563560f8022213586cc54fcd5e23ab2b7d"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 12582912,
-      "name": "mujoco.bundle.zip.part-0001",
-      "sha256": "968f5207d4e38a3e2aef040dcf30cf6dea62b64b8406bf7c95dbfc35458f26fb"
-    },
-    {
-      "bytes": 12582912,
-      "name": "mujoco.bundle.zip.part-0002",
-      "sha256": "f84057a0f2f8fda7e54ffc7bbe524eba9e6c60332881fbe4fa2371e8477a4f70"
-    },
-    {
-      "bytes": 12582912,
-      "name": "mujoco.bundle.zip.part-0003",
-      "sha256": "2c70d34d75d15d9b37c5573c2a8e99e02c06fd6ebb8f9bf3e59d464244027922"
-    },
-    {
-      "bytes": 12582912,
-      "name": "mujoco.bundle.zip.part-0004",
-      "sha256": "495d35a9888030379babe623555a31d4fdedcf7696da864757e2a6d3c2cbd14c"
-    },
-    {
-      "bytes": 12582912,
-      "name": "mujoco.bundle.zip.part-0005",
-      "sha256": "c3e76c4e94eb12dff01781243ea3d17f0e56912e7272a9437c034f4bb7fcc82d"
-    },
-    {
-      "bytes": 12582912,
-      "name": "mujoco.bundle.zip.part-0006",
-      "sha256": "980e72f5558c7ce69191f7dd1551fe69e40e9068ff0721e25d72e4ad230bf61a"
-    },
-    {
-      "bytes": 2008648,
-      "name": "mujoco.bundle.zip.part-0007",
-      "sha256": "caaf7ff8167fcb10d106119b7b14a46ca0c571558f82aa75f75956bec2020f4e"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [],
-  "skipped_special_count": 0,
-  "slug": "mujoco",
-  "source_bytes": 116582548,
-  "source_commit": "30e4ab430b53b133e501e6d5253317fce2cc6899",
-  "source_files": 2314,
-  "source_ref": "main",
-  "source_repo": "google-deepmind/mujoco",
-  "source_tree": {
-    "bytes": 116582548,
-    "files": 2314,
-    "sha256": "8b8623598c883c9526bfbb133a4fb0563560f8022213586cc54fcd5e23ab2b7d"
-  }
+ "bundle_bytes": 77506120,
+ "bundle_sha256": "0ae8ee11a97e626ff405c2c6bcd74e6678dda576d8fc82bdcba3f5bd910401a8",
+ "extracted_tree": {
+  "bytes": 116582548,
+  "files": 2314,
+  "sha256": "8b8623598c883c9526bfbb133a4fb0563560f8022213586cc54fcd5e23ab2b7d"
+ },
+ "extraction_verified": true,
+ "max_github_blob_bytes": 99614720,
+ "no_lfs": true,
+ "part_size_limit_bytes": 12582912,
+ "reconstruction_verified": true,
+ "schema": "yaiwes.hf.download-extract.v1",
+ "skipped_special": [],
+ "skipped_special_count": 0,
+ "slug": "mujoco",
+ "source_bytes": 116582548,
+ "source_commit": "30e4ab430b53b133e501e6d5253317fce2cc6899",
+ "source_files": 2314,
+ "source_ref": "main",
+ "source_repo": "google-deepmind/mujoco",
+ "source_tree": {
+  "bytes": 116582548,
+  "files": 2314,
+  "sha256": "8b8623598c883c9526bfbb133a4fb0563560f8022213586cc54fcd5e23ab2b7d"
+ },
+ "archives_removed_after_motor_1_verification": true,
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "motor_1_matches_manifest": true,
+ "gitattributes_lfs_removed": [],
+ "route_completion": "engine _archives -> motor_1 (CRC + tree hash = manifiesto) -> motor_3 (sha256) -> git add -f (incluye archivos ignorados por el .gitignore del repo)"
 }
