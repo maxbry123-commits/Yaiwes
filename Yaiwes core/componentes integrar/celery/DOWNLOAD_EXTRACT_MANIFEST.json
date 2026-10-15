@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 2297759,
+  "bundle_sha256": "359c0981acdf704f30bbea0fb213fbf7cbe724df95691122126da633bc264709",
+  "extracted_tree": {
+    "bytes": 7024085,
+    "files": 852,
+    "sha256": "9c18430cff0efdb06d58243855452b68cb20a552e5381205c4158cbd14e688cb"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2297759,
+      "name": "celery.bundle.zip.part-0001",
+      "sha256": "359c0981acdf704f30bbea0fb213fbf7cbe724df95691122126da633bc264709"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "celery",
+  "source_bytes": 7024085,
+  "source_commit": "a5ac9c42c66c7c6d7eddca7dffd5f37712d8e1c2",
+  "source_files": 852,
+  "source_ref": "main",
+  "source_repo": "celery/celery",
+  "source_tree": {
+    "bytes": 7024085,
+    "files": 852,
+    "sha256": "9c18430cff0efdb06d58243855452b68cb20a552e5381205c4158cbd14e688cb"
+  }
+}
