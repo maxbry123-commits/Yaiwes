@@ -1,80 +1,24 @@
 {
-  "bundle_bytes": 122995726,
-  "bundle_sha256": "a370e6d9344ffaad5339faa5bb2e87f3b98b675aee98b544dc9183fadd285969",
-  "extracted_tree": {
-    "bytes": 141406186,
-    "files": 1687,
-    "sha256": "ba6aad402b2e38e9a42fc06f1eb99adb032deac2be259cbce4eda1888cea3351"
-  },
-  "extraction_verified": true,
-  "max_github_blob_bytes": 99614720,
-  "no_lfs": true,
-  "part_size_limit_bytes": 12582912,
-  "parts": [
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0001",
-      "sha256": "f0d85efe28be5e4a155c2636152b37b5e7f56dc5349233469af6f003ad5fc7fb"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0002",
-      "sha256": "786888467ffa6bac8ad73ac472b2be9831588be8b632e95880eda6cfa47e5644"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0003",
-      "sha256": "a68c14070324f6831e82fd1d6a0721d14056ea707765e018212545332f0c8e49"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0004",
-      "sha256": "c8362c16582909f11452cba048a8eec221d39f2b0e03e5c12519b4ddb2b89ddc"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0005",
-      "sha256": "d1b8aa8060e42e858f19cd87ed80c973fc48e31bf9a167d848ccf3080cd41b21"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0006",
-      "sha256": "fa55cf24b81760b3f6908ca8b63a69dfe8f189f6f03b92a692551195e55977b7"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0007",
-      "sha256": "b91336f21ded9bb40a0a7be09af334230381e95f988c0ab62a979e94d13a1817"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0008",
-      "sha256": "8dba4998b1d8eaf01c910603cafe29e7947310984ce72b404d7ac0d5ea0914cc"
-    },
-    {
-      "bytes": 12582912,
-      "name": "PWABuilder.bundle.zip.part-0009",
-      "sha256": "624026cdcaa1ba9975ea119a0114029de795afa30c8911274f70477c21ae2ec4"
-    },
-    {
-      "bytes": 9749518,
-      "name": "PWABuilder.bundle.zip.part-0010",
-      "sha256": "b6a626b1c8df754c668eba476c35ce1be8cfacc065e464eae6cb66cc444be2eb"
-    }
-  ],
-  "reconstruction_verified": true,
-  "schema": "yaiwes.hf.download-extract.v1",
-  "skipped_special": [],
-  "skipped_special_count": 0,
-  "slug": "PWABuilder",
-  "source_bytes": 141406186,
-  "source_commit": "5e1006bf0117e01c18a8cdb9e0cf2b67d64b5973",
-  "source_files": 1687,
-  "source_ref": "main",
-  "source_repo": "pwa-builder/PWABuilder",
-  "source_tree": {
-    "bytes": 141406186,
-    "files": 1687,
-    "sha256": "ba6aad402b2e38e9a42fc06f1eb99adb032deac2be259cbce4eda1888cea3351"
-  }
+ "schema": "yaiwes.core.lfs-free-reacquire.v1",
+ "source_repo": "pwa-builder/PWABuilder",
+ "source_commit": "5e1006bf0117e01c18a8cdb9e0cf2b67d64b5973",
+ "slug": "PWABuilder",
+ "route": "clon superficial local sin smudge LFS -> quitar punteros LFS y reglas filter=lfs -> ZIP -> motor_1 (CRC+tree hash) -> motor_3 (sha256 por archivo)",
+ "source_tree": {
+  "files": 1686,
+  "sha256": "b46289a9c345937052acb0ec9fd0939337a9304f740699293a3ab2f7bc683f38"
+ },
+ "extracted_tree": {
+  "files": 1686,
+  "sha256": "b46289a9c345937052acb0ec9fd0939337a9304f740699293a3ab2f7bc683f38"
+ },
+ "motor_1_verdict": "VERIFIED_CLOSED",
+ "extraction_verified": true,
+ "removed_lfs_pointer_files": [],
+ "gitattributes_lfs_removed": [
+  "apps/pwabuilder-microsoft-store/.gitattributes (archivo eliminado: solo tenía reglas LFS)"
+ ],
+ "excluded_non_lfs": {},
+ "skipped_symlinks": [],
+ "no_lfs": true
 }
