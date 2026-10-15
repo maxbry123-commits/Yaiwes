@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 2107894,
+  "bundle_sha256": "c6435b11b3b78ff56343ea14c5691135341997a4f9e73ee202c42714d969a00d",
+  "extracted_tree": {
+    "bytes": 11001546,
+    "files": 703,
+    "sha256": "8aa22a75b863d7a14fbcbeb99c583bd7c45383cb5aaa847da9452fc0fda14f78"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2107894,
+      "name": "sdk-python.bundle.zip.part-0001",
+      "sha256": "c6435b11b3b78ff56343ea14c5691135341997a4f9e73ee202c42714d969a00d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "sdk-python",
+  "source_bytes": 11001546,
+  "source_commit": "482e933f29fe670eec99e2a3b53418f68566c562",
+  "source_files": 703,
+  "source_ref": "main",
+  "source_repo": "temporalio/sdk-python",
+  "source_tree": {
+    "bytes": 11001546,
+    "files": 703,
+    "sha256": "8aa22a75b863d7a14fbcbeb99c583bd7c45383cb5aaa847da9452fc0fda14f78"
+  }
+}
