@@ -1,0 +1,37 @@
+{
+  "bundle_bytes": 85365,
+  "bundle_sha256": "1f3c72f9eff5a64783ee6460870f75c08376e51fb1f23dad87084b2828c40268",
+  "extracted_tree": {
+    "bytes": 258484,
+    "files": 96,
+    "sha256": "bb944af88b8e9e51057b061df679d439ed18f88f43b0ffa948bf9e9bdde0640b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 85365,
+      "name": "tenacity.bundle.zip.part-0001",
+      "sha256": "1f3c72f9eff5a64783ee6460870f75c08376e51fb1f23dad87084b2828c40268"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    "README.rst"
+  ],
+  "skipped_special_count": 1,
+  "slug": "tenacity",
+  "source_bytes": 258484,
+  "source_commit": "32ac68f0941319c0d2f4fb927f96e4ee29bb46c6",
+  "source_files": 96,
+  "source_ref": "main",
+  "source_repo": "jd/tenacity",
+  "source_tree": {
+    "bytes": 258484,
+    "files": 96,
+    "sha256": "bb944af88b8e9e51057b061df679d439ed18f88f43b0ffa948bf9e9bdde0640b"
+  }
+}
