@@ -1,4 +1,12 @@
-# README TRASPASOS — shark imput (T3-shark)
+# ÍNDICE — shark imput
+
+Handoff: [HANDOFF shark imput.md](./HANDOFF%20shark%20imput.md) · Índice maestro: [README-INDICE.md](./README-INDICE.md)
+
+Carpeta: https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput
+
+---
+
+## Registro de traspaso (antes `README TRASPASOS.md`) — shark imput (T3-shark)
 
 Fecha: 2026-10-15 ~00:30 COT. Autorizado por Antonio (t107u "Arranca").
 Origen: `maxbry123-commits/osquestador-auditor@main` = `89a14a2158f6b963b0ca667c1771af6666146c42` (origen NO modificado, nada borrado).

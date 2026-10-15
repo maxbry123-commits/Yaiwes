@@ -1,4 +1,12 @@
-# README TRASPASOS — memoria (T3)
+# ÍNDICE — memoria
+
+Handoff: [HANDOFF memoria.md](./HANDOFF%20memoria.md) · Índice maestro: [README-INDICE.md](./README-INDICE.md)
+
+Carpeta: https://github.com/maxbry123-commits/Yaiwes/tree/main/memoria
+
+---
+
+## Registro de traspaso (antes `README TRASPASOS.md`) — memoria (T3)
 
 - **Qué:** componentes de memoria y almacenamiento conservados (clasificación v3, `valor.json`) + núcleo propio de memoria del orquestador.
 - **Desde:** `maxbry123-commits/osquestador-auditor` @ `89a14a2158f6b963b0ca667c1771af6666146c42` (main). Origen NO modificado ni borrado.

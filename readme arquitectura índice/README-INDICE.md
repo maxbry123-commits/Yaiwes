@@ -1,10 +1,16 @@
-# README ÍNDICE TRASPASOS — Yaiwes
+# README ÍNDICE — readme arquitectura índice (Yaiwes)
 
-Índice único de los traspasos en curso (2026-10-14, America/Bogota).  
-Solo se usan los motores canónicos (motor_3 copia; motor_1 extracción ZIP si hace falta).  
-**Prohibido:** Hugging Face, Git LFS, GitHub Actions.
+Raíz única de índices y handoffs de los traspasos. Zona horaria: America/Bogota (UTC-5).
 
-Fuente de plan (box, no en este repo): `/workspace/migra-plan/` (`ORGANIZACION.md`, `CLASIFICACION-FINAL.md` v3, `valor.json`) y `/workspace/motores-review/GUIA.md`.
+## Índice por destino
+
+| Destino | Índice | Handoff | Carpeta |
+|---|---|---|---|
+| Yaiwes / shark imput | [INDICE shark imput](./INDICE%20shark%20imput.md) | [HANDOFF shark imput](./HANDOFF%20shark%20imput.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput |
+| Yaiwes / memoria | [INDICE memoria](./INDICE%20memoria.md) | [HANDOFF memoria](./HANDOFF%20memoria.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/memoria |
+| Yaiwes core / componentes integrar | [INDICE core componentes](./INDICE%20Yaiwes%20core%20componentes%20integrar.md) | [HANDOFF core componentes](./HANDOFF%20Yaiwes%20core%20componentes%20integrar.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/componentes%20integrar |
+| ui-yaiwes | https://github.com/maxbry123-commits/ui-yaiwes/blob/main/README%20TRASPASOS.md | (mismo archivo) | https://github.com/maxbry123-commits/ui-yaiwes |
+| yaiwes-factory-ui | https://github.com/maxbry123-commits/yaiwes-factory-ui/blob/main/README%20TRASPASOS.md | (mismo archivo) | https://github.com/maxbry123-commits/yaiwes-factory-ui |
 
 ---
 
@@ -90,61 +96,23 @@ Origen no se borra hasta OK final.
 
 ---
 
-## 4. README TRASPASOS por destino (memoria de trabajo / auditoría)
 
-Un README TRASPASOS por destino de segmento. Estado al crear este índice:
+## 4. Concurrencia en Yaiwes
 
-| Destino | Archivo | Estado |
-|---|---|---|
-| ui-yaiwes | https://github.com/maxbry123-commits/ui-yaiwes/blob/main/README%20TRASPASOS.md | **pendiente** (aún no existe en main) |
-| yaiwes-factory-ui | https://github.com/maxbry123-commits/yaiwes-factory-ui/blob/main/README%20TRASPASOS.md | **pendiente** |
-| Yaiwes / shark imput | https://github.com/maxbry123-commits/Yaiwes/blob/main/shark%20imput/README%20TRASPASOS.md | **pendiente** |
-| Yaiwes / memoria | https://github.com/maxbry123-commits/Yaiwes/blob/main/memoria/README%20TRASPASOS.md | **hecho** (10d492b; lotes 084eab5 + 4e84727) |
+Otros agentes empujan a `Yaiwes` main a la vez. Reglas:
 
-Cada uno debe registrar: origen repo@sha+ruta, destino, manifiesto archivos/bytes, sha256 tree, commits de lote, verdict motor (`VERIFIED_CLOSED`, failed=0, pending=0), read-back de main, checklist GUIA §§1–10.
+- Clone/sparse mínimo; tocar **solo** los archivos de esta tarea.
+- Antes de push: `git fetch origin main` + `git rebase origin/main` (o pull --rebase).
+- **Nunca** `git push --force`.
+- Si hay conflicto en archivos ajenos: no resolver inventando; rebase solo de estos dos docs / del segmento propio.
 
 ---
 
-## 5. Estado global
+## 5. Fuera de alcance hasta nuevo OK
 
-| Ítem | Valor |
-|---|---|
-| Método | motor_3 (copia); motor_1 solo si hay ZIP sin extraer en destino |
-| HF / LFS / Actions | no |
-| Borrado de origen | no (espera OK) |
-| Segmentos S1–S6 | **en curso** |
-| Segmentos S7–S8 (memoria) | **hecho** (084eab5, 4e84727, 10d492b) |
-| T4 core componentes | **en planificación** |
-| Autoauditoría | obligatoria antes de marcar PASS |
-
-Handoff cableado (cómo reanudar / auditar): [HANDOFF-TRASPASOS.md](./HANDOFF-TRASPASOS.md)
-
+- Borrar origen (frontend / osquestador-auditor) con motor_4 o `git rm`.
+- Mover `.github/` o raíces de motores (ya presentes en destino → no hace falta).
+- Publicar secretos (token GitHub, HF, passphrase): solo en entorno / `.secrets`, nunca en repo ni en estos markdown.
 
 ---
 
-## 6. core componentes
-
-Nueva tarea (T4) — descarga + extracción de **115** repos GitHub hacia:
-
-`Yaiwes/Yaiwes core/componentes integrar/`
-
-| Ítem | Valor |
-|---|---|
-| Destino | `Yaiwes core/componentes integrar/` (repo Yaiwes, main) |
-| Cantidad | 115 repos (lista canónica en box: `/workspace/descarga-115/lista.txt`) |
-| Rango | SoarGroup/SoarGroup.github.io … ctn-archive/spaun1.0 |
-| Sitios web resueltos a GitHub (9) | vespa.ai→vespa-engine/vespa; opensearch.org→opensearch-project/OpenSearch; solr.apache.org→apache/solr; elastic.co/elasticsearch→elastic/elasticsearch; qdrant.tech→qdrant/qdrant; milvus.io→milvus-io/milvus; weaviate.io→weaviate/weaviate; typesense.org→typesense/typesense; lucene.apache.org→apache/lucene |
-| Motores | **solo** `motor_2` (descarga) + **engine** + `motor_1` (extracción); **4 motores** en paralelo (lotes ~29 repos c/u) |
-| Prohibido | Hugging Face, Git LFS, GitHub Actions, force-push |
-| Estado | **en planificación** |
-
-Reparto previsto (4 motores / lotes):
-
-| Motor | Ítems lista.txt | Repos (aprox.) |
-|---|---|---|
-| M1 | 1–29 | SoarGroup … explosion/spaCy |
-| M2 | 30–58 | apache/uima-uimaj … usestrix/strix |
-| M3 | 59–87 | tree-sitter … ionic-team/capacitor |
-| M4 | 88–115 | pwa-builder/PWABuilder … ctn-archive/spaun1.0 |
-
-Handoff de reanudación / auditoría de esta tarea: [HANDOFF-TRASPASOS.md](./HANDOFF-TRASPASOS.md) § core componentes.
