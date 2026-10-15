@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 14674347,
+  "bundle_sha256": "718820f6d234eda743f71f273b4ce501660637ac0462510178cc6439acc70582",
+  "extracted_tree": {
+    "bytes": 113163707,
+    "files": 2292,
+    "sha256": "3b10a9c37202c3019b9c914ba18a7c624ac6be01e50b0db3eed05c118a6b78ed"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "sqlite.bundle.zip.part-0001",
+      "sha256": "4a93e90e1e08010b05b3b6047e4b980be530a1ec2c3914e81df872ca501a1bc4"
+    },
+    {
+      "bytes": 2091435,
+      "name": "sqlite.bundle.zip.part-0002",
+      "sha256": "c01a9ccadaad682068d5ccaec563383b48957b5b2987e52369fc39b8bf3d7064"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "sqlite",
+  "source_bytes": 113163707,
+  "source_commit": "90687aa700d1d0a7af8fe95f8a4c841df6fa15ba",
+  "source_files": 2292,
+  "source_ref": "master",
+  "source_repo": "sqlite/sqlite",
+  "source_tree": {
+    "bytes": 113163707,
+    "files": 2292,
+    "sha256": "3b10a9c37202c3019b9c914ba18a7c624ac6be01e50b0db3eed05c118a6b78ed"
+  }
+}
