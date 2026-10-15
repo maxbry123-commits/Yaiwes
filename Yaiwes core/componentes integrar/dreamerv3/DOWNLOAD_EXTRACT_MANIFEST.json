@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 6336241,
+  "bundle_sha256": "c561866857191dfec2840f2e9c373078a09409b343c64d87fed7df2cdbec9751",
+  "extracted_tree": {
+    "bytes": 6642526,
+    "files": 95,
+    "sha256": "10ff8cfda1067c71799a5538d3299574c28549e893f1e3b3d9f431345b100a6a"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 6336241,
+      "name": "dreamerv3.bundle.zip.part-0001",
+      "sha256": "c561866857191dfec2840f2e9c373078a09409b343c64d87fed7df2cdbec9751"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "dreamerv3",
+  "source_bytes": 6642526,
+  "source_commit": "e01491fad6434b2245a3b8ca201dd7faedcc458c",
+  "source_files": 95,
+  "source_ref": "main",
+  "source_repo": "danijar/dreamerv3",
+  "source_tree": {
+    "bytes": 6642526,
+    "files": 95,
+    "sha256": "10ff8cfda1067c71799a5538d3299574c28549e893f1e3b3d9f431345b100a6a"
+  }
+}
