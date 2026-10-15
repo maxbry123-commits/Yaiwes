@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1600028,
+  "bundle_sha256": "d0e5e379c63ca9fea886d55f070612004122f272f7ff4f97d4f71169595e4395",
+  "extracted_tree": {
+    "bytes": 4033907,
+    "files": 1059,
+    "sha256": "c391b79f777207b27352aaac2ff289fcdb0d87a9940f3f3473574b07dd6c9c3a"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1600028,
+      "name": "motion-canvas.bundle.zip.part-0001",
+      "sha256": "d0e5e379c63ca9fea886d55f070612004122f272f7ff4f97d4f71169595e4395"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "motion-canvas",
+  "source_bytes": 4033907,
+  "source_commit": "7b91435c301d530351dcf5ebb91dd139c002e405",
+  "source_files": 1059,
+  "source_ref": "main",
+  "source_repo": "motion-canvas/motion-canvas",
+  "source_tree": {
+    "bytes": 4033907,
+    "files": 1059,
+    "sha256": "c391b79f777207b27352aaac2ff289fcdb0d87a9940f3f3473574b07dd6c9c3a"
+  }
+}
