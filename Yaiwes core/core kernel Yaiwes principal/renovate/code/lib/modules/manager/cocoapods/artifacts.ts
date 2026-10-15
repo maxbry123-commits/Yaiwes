@@ -1,0 +1,122 @@
+import { quote } from 'shlex';
+import upath from 'upath';
+import { TEMPORARY_ERROR } from '../../../constants/error-messages.ts';
+import { logger } from '../../../logger/index.ts';
+import { exec } from '../../../util/exec/index.ts';
+import type { ExecOptions } from '../../../util/exec/types.ts';
+import {
+  ensureCacheDir,
+  getSiblingFileName,
+  readLocalFile,
+  writeLocalFile,
+} from '../../../util/fs/index.ts';
+import { collectFileChanges } from '../../../util/git/file-changes.ts';
+import { getRepoStatus } from '../../../util/git/index.ts';
+import { newlineRegex, regEx } from '../../../util/regex.ts';
+import type { UpdateArtifact, UpdateArtifactsResult } from '../types.ts';
+import {
+  artifactErrorResult,
+  fileAddition,
+  fileChangesToArtifactResults,
+} from '../util.ts';
+
+const pluginRegex = regEx(`^\\s*plugin\\s*(['"])(?<plugin>[^'"]+)(['"])`);
+
+function getPluginCommands(content: string): string[] {
+  const result = new Set<string>();
+  const lines: string[] = content.split(newlineRegex);
+  lines.forEach((line) => {
+    const match = pluginRegex.exec(line);
+    if (match?.groups) {
+      const { plugin } = match.groups;
+      result.add(`gem install ${quote(plugin)}`);
+    }
+  });
+  return [...result];
+}
+
+export async function updateArtifacts({
+  packageFileName,
+  updatedDeps,
+  newPackageFileContent,
+}: UpdateArtifact): Promise<UpdateArtifactsResult[] | null> {
+  logger.debug(`cocoapods.getArtifacts(${packageFileName})`);
+
+  if (updatedDeps.length < 1) {
+    logger.debug('CocoaPods: empty update - returning null');
+    return null;
+  }
+
+  const lockFileName = getSiblingFileName(packageFileName, 'Podfile.lock');
+
+  try {
+    await writeLocalFile(packageFileName, newPackageFileContent);
+  } catch (err) {
+    logger.warn({ err }, 'Podfile could not be written');
+    return artifactErrorResult(lockFileName, err);
+  }
+
+  const existingLockFileContent = await readLocalFile(lockFileName, 'utf8');
+  if (!existingLockFileContent) {
+    logger.debug(`Lockfile not found: ${lockFileName}`);
+    return null;
+  }
+
+  const match = regEx(/^COCOAPODS: (?<cocoapodsVersion>.*)$/m).exec(
+    existingLockFileContent,
+  );
+  const cocoapods = match?.groups?.cocoapodsVersion ?? null;
+
+  const cmd = [...getPluginCommands(newPackageFileContent), 'pod install'];
+  const execOptions: ExecOptions = {
+    cwdFile: packageFileName,
+    extraEnv: {
+      CP_HOME_DIR: await ensureCacheDir('cocoapods'),
+    },
+    docker: {},
+    toolConstraints: [
+      {
+        toolName: 'ruby',
+      },
+      {
+        toolName: 'cocoapods',
+        constraint: cocoapods,
+      },
+    ],
+  };
+
+  try {
+    await exec(cmd, execOptions);
+  } catch (err) {
+    /* v8 ignore if -- defensive rethrow, not reproduced in the cocoapods specs */
+    if (err.message === TEMPORARY_ERROR) {
+      throw err;
+    }
+    return artifactErrorResult(lockFileName, err);
+  }
+
+  const status = await getRepoStatus();
+  if (!status.modified.includes(lockFileName)) {
+    return null;
+  }
+  logger.debug(`Returning updated lockfile: ${lockFileName}`);
+  const lockFileContent = await readLocalFile(lockFileName);
+  const res: UpdateArtifactsResult[] = [
+    fileAddition(lockFileName, lockFileContent),
+  ];
+
+  const podsDir = upath.join(upath.dirname(packageFileName), 'Pods');
+  const podsManifestFileName = upath.join(podsDir, 'Manifest.lock');
+  if (await readLocalFile(podsManifestFileName, 'utf8')) {
+    res.push(
+      ...fileChangesToArtifactResults([
+        ...(await collectFileChanges(status, {
+          include: ['modified', 'not_added'],
+          filter: (f) => f.startsWith(podsDir),
+        })),
+        ...(await collectFileChanges(status, { include: ['deleted'] })),
+      ]),
+    );
+  }
+  return res;
+}

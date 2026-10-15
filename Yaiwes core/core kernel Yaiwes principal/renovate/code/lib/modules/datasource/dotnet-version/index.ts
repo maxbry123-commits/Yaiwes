@@ -1,0 +1,101 @@
+import { buildCacheKey } from '../../../util/cache/package/key.ts';
+import * as p from '../../../util/promises.ts';
+import { Datasource } from '../datasource.ts';
+import type { GetReleasesConfig, Release, ReleaseResult } from '../types.ts';
+import {
+  DotnetRuntimeReleases,
+  DotnetSdkReleases,
+  ReleasesIndex,
+} from './schema.ts';
+
+export class DotnetVersionDatasource extends Datasource {
+  static readonly id = 'dotnet-version';
+
+  constructor() {
+    super(DotnetVersionDatasource.id);
+  }
+
+  override supportsCustomRegistry(_packageName: string): boolean {
+    return false;
+  }
+
+  override getDefaultRegistryUrls(_packageName: string): string[] {
+    return [
+      'https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json',
+    ];
+  }
+
+  override releaseTimestampSupport = true;
+  override releaseTimestampNote =
+    'The release timestamp is determined from the `release-date` field in the results.';
+  override readonly sourceUrlSupport = 'package';
+  override readonly sourceUrlNote =
+    'We use the URL https://github.com/dotnet/sdk for the `dotnet-sdk` package and, the https://github.com/dotnet/runtime URL for the `dotnet-runtime` package.';
+
+  private async fetchReleases({
+    packageName,
+  }: GetReleasesConfig): Promise<ReleaseResult | null> {
+    if (!(packageName === 'dotnet-sdk' || packageName === 'dotnet-runtime')) {
+      return null;
+    }
+
+    try {
+      const registryUrl = this.getDefaultRegistryUrls('')[0];
+      const { body: urls } = await this.http.getJson(
+        registryUrl,
+        ReleasesIndex,
+      );
+
+      const channelReleases = await p.map(
+        urls,
+        (url) => this.getChannelReleases(url, packageName),
+        { concurrency: 1, stopOnError: true },
+      );
+      const releases = channelReleases.flat();
+
+      const sourceUrl =
+        packageName === 'dotnet-sdk'
+          ? 'https://github.com/dotnet/sdk'
+          : 'https://github.com/dotnet/runtime';
+
+      return { releases, sourceUrl };
+    } catch (err) {
+      this.handleGenericErrors(err);
+    }
+  }
+
+  getReleases(config: GetReleasesConfig): Promise<ReleaseResult | null> {
+    return this.cached(
+      {
+        key: config.packageName,
+        ttlMinutes: 1440,
+        fallback: true,
+        cacheable: true,
+      },
+      () => this.fetchReleases(config),
+    );
+  }
+
+  private async fetchChannelReleases(
+    releaseUrl: string,
+    packageName: string,
+  ): Promise<Release[]> {
+    const schema =
+      packageName === 'dotnet-sdk' ? DotnetSdkReleases : DotnetRuntimeReleases;
+    return this.fetchJson(releaseUrl, schema);
+  }
+
+  getChannelReleases(
+    releaseUrl: string,
+    packageName: string,
+  ): Promise<Release[]> {
+    return this.cached(
+      {
+        key: buildCacheKey(releaseUrl, packageName),
+        ttlMinutes: 1440,
+        cacheable: true,
+      },
+      () => this.fetchChannelReleases(releaseUrl, packageName),
+    );
+  }
+}

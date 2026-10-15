@@ -1,0 +1,102 @@
+import { withCache } from '../../../util/cache/package/with-cache.ts';
+import { regEx } from '../../../util/regex.ts';
+import { asTimestamp } from '../../../util/timestamp.ts';
+import * as gradleVersioning from '../../versioning/gradle/index.ts';
+import { Datasource } from '../datasource.ts';
+import type { GetReleasesConfig, Release, ReleaseResult } from '../types.ts';
+import { GradleReleases } from './schema.ts';
+
+export class GradleVersionDatasource extends Datasource {
+  static readonly id = 'gradle-version';
+
+  constructor() {
+    super(GradleVersionDatasource.id);
+  }
+
+  override getDefaultRegistryUrls(_packageName: string): string[] {
+    return ['https://services.gradle.org/versions/all'];
+  }
+
+  override readonly defaultVersioning = gradleVersioning.id;
+
+  override readonly registryStrategy = 'merge';
+
+  override readonly releaseTimestampSupport = true;
+  override readonly releaseTimestampNote =
+    'The release timestamp is determined from the `buildTime` field in the results.';
+  override readonly sourceUrlSupport = 'package';
+  override readonly sourceUrlNote =
+    'We use the URL: https://github.com/gradle/gradle.';
+
+  private async _getReleases({
+    registryUrl,
+  }: GetReleasesConfig): Promise<ReleaseResult | null> {
+    /* v8 ignore next -- should never happen */
+    if (!registryUrl) {
+      return null;
+    }
+
+    const body = await this.fetchJson(registryUrl, GradleReleases);
+    const releases = body
+      .filter((release) => !release.snapshot && !release.nightly)
+      .map((release) => {
+        const { version, buildTime } = release;
+
+        const gitRef = GradleVersionDatasource.getGitRef(release.version);
+
+        const releaseTimestamp = asTimestamp(buildTime);
+
+        const result: Release = { version, gitRef, releaseTimestamp };
+
+        if (release.broken) {
+          result.isDeprecated = true;
+        }
+
+        return result;
+      });
+
+    const res: ReleaseResult = {
+      releases,
+      homepage: 'https://gradle.org',
+      sourceUrl: 'https://github.com/gradle/gradle',
+    };
+    if (res.releases.length) {
+      return res;
+    }
+    return null;
+  }
+
+  getReleases(config: GetReleasesConfig): Promise<ReleaseResult | null> {
+    return withCache(
+      {
+        namespace: `datasource-${GradleVersionDatasource.id}`,
+        key: config.registryUrl!,
+        fallback: true,
+      },
+      () => this._getReleases(config),
+    );
+  }
+
+  /**
+   * Calculate `gitTag` based on `version`:
+   *   - `8.1.2` -> `v8.1.2`
+   *   - `8.2` -> `v8.2.0`
+   *   - `8.2-rc-1` -> `v8.2.0-RC1`
+   *   - `8.2-milestone-1` -> `v8.2.0-M1`
+   */
+  private static getGitRef(version: string): string {
+    const [versionPart, typePart, unstablePart] = version.split(
+      regEx(/-(?<type>[a-z]+)-/),
+    );
+
+    let suffix = '';
+    if (typePart === 'rc') {
+      suffix = `-RC${unstablePart}`;
+    } else if (typePart === 'milestone') {
+      suffix = `-M${unstablePart}`;
+    }
+
+    const [major, minor, patch = '0'] = versionPart.split('.');
+    return `v${major}.${minor}.${patch}${suffix}`;
+  }
+}

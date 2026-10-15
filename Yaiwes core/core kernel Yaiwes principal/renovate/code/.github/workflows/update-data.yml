@@ -1,0 +1,54 @@
+name: 'Update static data'
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Every Sunday at midnight
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: 24
+
+permissions: {}
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    if: github.repository == 'renovatebot/renovate'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Setup pnpm
+        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        with:
+          install: false
+          runtime: node@${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install mise
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        with:
+          # don't run `mise install`, but do install a version of `mise` itself
+          install: false
+
+      - name: Update static data
+        run: pnpm run update-static-data
+
+      - name: Run Prettier
+        run: pnpm prettier-fix
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          author: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
+          branch: 'chore/update-static-data'
+          commit-message: 'feat(data): automatic update of static data'
+          committer: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
+          title: 'feat(data): automatic update of static data'
+          assignees: viceice,secustor,jamietanna

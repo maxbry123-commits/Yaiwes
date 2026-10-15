@@ -1,0 +1,867 @@
+import { codeBlock } from 'common-tags';
+import { Fixtures } from '~test/fixtures.ts';
+import { fs } from '~test/util.ts';
+import { GitRefsDatasource } from '../../datasource/git-refs/index.ts';
+import { GithubReleasesDatasource } from '../../datasource/github-releases/index.ts';
+import { GithubTagsDatasource } from '../../datasource/github-tags/index.ts';
+import { PypiDatasource } from '../../datasource/pypi/index.ts';
+import { extractPackageFile } from './index.ts';
+
+vi.mock('../../../util/fs/index.ts');
+
+const pyproject1toml = Fixtures.get('pyproject.1.toml');
+const pyproject2toml = Fixtures.get('pyproject.2.toml');
+const pyproject3toml = Fixtures.get('pyproject.3.toml');
+const pyproject4toml = Fixtures.get('pyproject.4.toml');
+const pyproject5toml = Fixtures.get('pyproject.5.toml');
+const pyproject6toml = Fixtures.get('pyproject.6.toml');
+const pyproject7toml = Fixtures.get('pyproject.7.toml');
+const pyproject8toml = Fixtures.get('pyproject.8.toml');
+const pyproject9toml = Fixtures.get('pyproject.9.toml');
+
+// pyproject.10.toml use by artifacts
+const pyproject11toml = Fixtures.get('pyproject.11.toml');
+const pyproject11tomlLock = Fixtures.get('pyproject.11.toml.lock');
+
+const pyproject12toml = Fixtures.get('pyproject.12.toml');
+
+describe('modules/manager/poetry/extract', () => {
+  describe('extractPackageFile()', () => {
+    let filename: string;
+
+    beforeEach(() => {
+      filename = '';
+      vi.stubEnv('PIP_INDEX_URL', undefined);
+    });
+
+    it('returns null for empty', async () => {
+      await expect(
+        extractPackageFile('nothing here', filename),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null for parsed file without poetry section', async () => {
+      await expect(
+        extractPackageFile(pyproject5toml, filename),
+      ).resolves.toBeNull();
+    });
+
+    it('extracts multiple dependencies', async () => {
+      const res = await extractPackageFile(pyproject1toml, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          currentValue: '>=1.0',
+          depName: 'poetry',
+          depType: 'build-system.requires',
+        },
+        {
+          depName: 'wheel',
+          depType: 'build-system.requires',
+          skipReason: 'unspecified-version',
+        },
+        {
+          currentValue: '0.0.0',
+          depName: 'dep1_',
+          depType: 'dependencies',
+          packageName: 'dep1-',
+        },
+        { currentValue: '0.0.0', depName: 'dep1', depType: 'dependencies' },
+        { currentValue: '^0.6.0', depName: 'dep2', depType: 'dependencies' },
+        { currentValue: '^0.33.6', depName: 'dep3', depType: 'dependencies' },
+        {
+          currentValue: '~2.7 || ^3.4',
+          datasource: 'github-releases',
+          depName: 'python',
+          depType: 'dependencies',
+          packageName: 'containerbase/python-prebuild',
+        },
+        {
+          currentValue: '^3.0',
+          depName: 'dev_dep1',
+          depType: 'dev-dependencies',
+        },
+        {
+          currentValue: 'Invalid version.',
+          depName: 'dev_dep2',
+          depType: 'dev-dependencies',
+          skipReason: 'invalid-version',
+        },
+      ]);
+      expect(res?.extractedConstraints).toEqual({
+        python: '~2.7 || ^3.4',
+      });
+    });
+
+    it('extracts multiple dependencies (with dep = {version = "1.2.3"} case)', async () => {
+      const res = await extractPackageFile(pyproject2toml, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          currentValue: '>=1.0',
+          depName: 'poetry',
+          depType: 'build-system.requires',
+        },
+        {
+          depName: 'wheel',
+          depType: 'build-system.requires',
+          skipReason: 'unspecified-version',
+        },
+        { currentValue: '*', depName: 'dep1', depType: 'dependencies' },
+        { currentValue: '^0.6.0', depName: 'dep2', depType: 'dependencies' },
+        { depName: 'dep3', skipReason: 'path-dependency' },
+        { depName: 'dep4', skipReason: 'path-dependency' },
+        { depName: 'dep5', skipReason: 'unspecified-version' },
+        { currentValue: '^0.8.3', depName: 'extra_dep1', depType: 'extras' },
+        { currentValue: '^0.9.4', depName: 'extra_dep2', depType: 'extras' },
+        { currentValue: '^0.4.0', depName: 'extra_dep3', depType: 'extras' },
+        {
+          currentValue: '^3.0',
+          depName: 'required_dev_dep',
+          depType: 'dev-dependencies',
+        },
+        {
+          currentValue: '^3.0',
+          depName: 'optional_dev_dep',
+          depType: 'dev-dependencies',
+        },
+        {
+          currentValue: '^3.0',
+          depName: 'required_group_dep',
+          depType: 'group1',
+        },
+        {
+          currentValue: '^3.0',
+          depName: 'optional_group_dep',
+          depType: 'group1',
+        },
+      ]);
+    });
+
+    it('handles case with no dependencies', async () => {
+      const res = await extractPackageFile(pyproject3toml, filename);
+      expect(res).toBeNull();
+    });
+
+    it('handles multiple constraint dependencies', async () => {
+      const res = await extractPackageFile(pyproject4toml, filename);
+      expect(res?.deps).toMatchObject([
+        { currentValue: '>=1.1.2', depName: 'poetry' },
+        { depName: 'setuptools', skipReason: 'unspecified-version' },
+        {
+          depName: 'poetry-dynamic-versioning',
+          skipReason: 'unspecified-version',
+        },
+        { depName: 'foo', skipReason: 'multiple-constraint-dep' },
+      ]);
+    });
+
+    it('extracts build-system.requires dependencies', async () => {
+      const content = codeBlock`
+        [build-system]
+        requires = ["poetry-core>=1.0.0", "setuptools>=40.0"]
+        build-backend = "poetry.core.masonry.api"
+
+        [tool.poetry]
+        name = "test"
+        version = "1.0.0"
+
+        [tool.poetry.dependencies]
+        abc = "^5.5"
+      `;
+
+      const res = await extractPackageFile(content, 'pyproject.toml');
+
+      expect(res?.deps).toMatchObject([
+        {
+          depName: 'poetry-core',
+          currentValue: '>=1.0.0',
+          depType: 'build-system.requires',
+        },
+        {
+          depName: 'setuptools',
+          currentValue: '>=40.0',
+          depType: 'build-system.requires',
+        },
+        {
+          depName: 'abc',
+          currentValue: '^5.5',
+          depType: 'dependencies',
+        },
+      ]);
+    });
+
+    it('can parse TOML v1 heterogeneous arrays', async () => {
+      const res = await extractPackageFile(pyproject12toml, filename);
+      expect(res).not.toBeNull();
+      expect(res?.deps).toHaveLength(3);
+    });
+
+    it('extracts mixed versioning types', async () => {
+      const res = await extractPackageFile(pyproject9toml, filename);
+      const expectedVersions: [string, string][] = [
+        ['dep1', '0.2'],
+        ['dep2', '1.1.0'],
+        ['dep3', '1.0a1'],
+        ['dep4', '1.0b2'],
+        ['dep5', '1.0rc1'],
+        ['dep6', '1.0.dev4'],
+        ['dep7', '1.0c1'],
+        ['dep8', '2012.2'],
+        ['dep9', '1.0.dev456'],
+        ['dep10', '1.0a1'],
+        ['dep11', '1.0a2.dev456'],
+        ['dep12', '1.0a12.dev456'],
+        ['dep13', '1.0a12'],
+        ['dep14', '1.0b1.dev456'],
+        ['dep15', '1.0b2'],
+        ['dep16', '1.0b2.post345.dev456'],
+        ['dep17', '1.0b2.post345'],
+        ['dep18', '1.0rc1.dev456'],
+        ['dep19', '1.0rc1'],
+        ['dep20', '1.0'],
+        ['dep21', '1.0+abc.5'],
+        ['dep22', '1.0+abc.7'],
+        ['dep23', '1.0+5'],
+        ['dep24', '1.0.post456.dev34'],
+        ['dep25', '1.0.post456'],
+        ['dep26', '1.1.dev1'],
+        ['dep27', '~=3.1'],
+        ['dep28', '~=3.1.2'],
+        ['dep29', '~=3.1a1'],
+        ['dep30', '==3.1'],
+        ['dep31', '==3.1.*'],
+        ['dep32', '~=3.1.0, !=3.1.3'],
+        ['dep33', '<=2.0'],
+        ['dep34', '<2.0'],
+      ];
+      expect(res?.deps).toMatchObject(
+        expectedVersions.map(([depName, currentValue]) => ({
+          currentValue,
+          depName,
+        })),
+      );
+    });
+
+    it('extracts dependencies from dependency groups', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        dep = "^2.0"
+
+
+        [tool.poetry.group.dev.dependencies]
+        dev_dep = "^3.0"
+
+        [tool.poetry.group.typing.dependencies]
+        typing_dep = "^4.0"
+      `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          currentValue: '^2.0',
+          datasource: 'pypi',
+          depName: 'dep',
+          depType: 'dependencies',
+        },
+        {
+          currentValue: '^3.0',
+          datasource: 'pypi',
+          depName: 'dev_dep',
+          depType: 'dev',
+          packageName: 'dev-dep',
+        },
+        {
+          currentValue: '^4.0',
+          datasource: 'pypi',
+          depName: 'typing_dep',
+          depType: 'typing',
+          packageName: 'typing-dep',
+        },
+      ]);
+    });
+
+    it('resolves lockedVersions from the lockfile', async () => {
+      fs.readLocalFile.mockResolvedValue(pyproject11tomlLock);
+      const res = await extractPackageFile(pyproject11toml, filename);
+      expect(res).toMatchObject({
+        deps: [
+          { currentValue: '^3.9', depName: 'python' },
+          { depName: 'boto3', lockedVersion: '1.17.5' },
+        ],
+        extractedConstraints: { python: '^3.9' },
+      });
+    });
+
+    it('parses git dependencies long commit hashes on http urls', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        fastapi = {git = "https://github.com/tiangolo/fastapi.git", rev="6f5aa81c076d22e38afbe7d602db6730e28bc3cc"}
+        dep = "^2.0"
+      `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          depType: 'dependencies',
+          depName: 'fastapi',
+          datasource: GitRefsDatasource.id,
+          currentDigest: '6f5aa81c076d22e38afbe7d602db6730e28bc3cc',
+          replaceString: '6f5aa81c076d22e38afbe7d602db6730e28bc3cc',
+          packageName: 'https://github.com/tiangolo/fastapi.git',
+        },
+        {
+          depType: 'dependencies',
+          depName: 'dep',
+          datasource: PypiDatasource.id,
+          currentValue: '^2.0',
+        },
+      ]);
+    });
+
+    it('parses git dependencies short commit hashes on http urls', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        fastapi = {git = "https://github.com/tiangolo/fastapi.git", rev="6f5aa81"}
+        dep = "^2.0"
+      `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          depType: 'dependencies',
+          depName: 'fastapi',
+          datasource: GitRefsDatasource.id,
+          currentDigest: '6f5aa81',
+          replaceString: '6f5aa81',
+          packageName: 'https://github.com/tiangolo/fastapi.git',
+        },
+        {
+          depType: 'dependencies',
+          depName: 'dep',
+          datasource: PypiDatasource.id,
+          currentValue: '^2.0',
+        },
+      ]);
+    });
+
+    it('parses git dependencies long commit hashes on ssh urls', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        fastapi = {git = "git@github.com:tiangolo/fastapi.git", rev="6f5aa81c076d22e38afbe7d602db6730e28bc3cc"}
+        dep = "^2.0"
+      `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          depType: 'dependencies',
+          depName: 'fastapi',
+          datasource: GitRefsDatasource.id,
+          currentDigest: '6f5aa81c076d22e38afbe7d602db6730e28bc3cc',
+          replaceString: '6f5aa81c076d22e38afbe7d602db6730e28bc3cc',
+          packageName: 'git@github.com:tiangolo/fastapi.git',
+        },
+        {
+          depType: 'dependencies',
+          depName: 'dep',
+          datasource: PypiDatasource.id,
+          currentValue: '^2.0',
+        },
+      ]);
+    });
+
+    it('parses git dependencies long commit hashes on http urls with branch marker', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        fastapi = {git = "https://github.com/tiangolo/fastapi.git", branch="develop", rev="6f5aa81c076d22e38afbe7d602db6730e28bc3cc"}
+        dep = "^2.0"
+      `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          depType: 'dependencies',
+          depName: 'fastapi',
+          datasource: GitRefsDatasource.id,
+          currentValue: 'develop',
+          currentDigest: '6f5aa81c076d22e38afbe7d602db6730e28bc3cc',
+          replaceString: '6f5aa81c076d22e38afbe7d602db6730e28bc3cc',
+          packageName: 'https://github.com/tiangolo/fastapi.git',
+        },
+        {
+          depType: 'dependencies',
+          depName: 'dep',
+          datasource: PypiDatasource.id,
+          currentValue: '^2.0',
+        },
+      ]);
+    });
+
+    it('parses github dependencies tags on ssh urls', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        fastapi = {git = "git@github.com:tiangolo/fastapi.git", tag="1.2.3"}
+        werkzeug = ">=0.14"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res[0].depName).toBe('fastapi');
+      expect(res[0].packageName).toBe('tiangolo/fastapi');
+      expect(res[0].currentValue).toBe('1.2.3');
+      expect(res[0].skipReason).toBeUndefined();
+      expect(res[0].datasource).toBe(GithubTagsDatasource.id);
+      expect(res).toHaveLength(2);
+    });
+
+    it('parses github dependencies tags on http urls', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        fastapi = {git = "https://github.com/tiangolo/fastapi.git", tag="1.2.3"}
+        werkzeug = ">=0.14"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res[0].depName).toBe('fastapi');
+      expect(res[0].packageName).toBe('tiangolo/fastapi');
+      expect(res[0].currentValue).toBe('1.2.3');
+      expect(res[0].skipReason).toBeUndefined();
+      expect(res[0].datasource).toBe(GithubTagsDatasource.id);
+      expect(res).toHaveLength(2);
+    });
+
+    it('parses git dependencies with tags that are not on GitHub', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        aws-sam = {git = "https://gitlab.com/gitlab-examples/aws-sam.git", tag="1.2.3"}
+        platform-tools = {git = "https://some.company.com/platform-tools", tag="1.2.3"}
+      `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toMatchObject([
+        {
+          datasource: 'gitlab-tags',
+          depName: 'aws-sam',
+          packageName: 'gitlab-examples/aws-sam',
+          currentValue: '1.2.3',
+        },
+        {
+          datasource: 'git-tags',
+          depName: 'platform-tools',
+          packageName: 'https://some.company.com/platform-tools',
+          currentValue: '1.2.3',
+        },
+      ]);
+    });
+
+    it('skips git dependencies', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        flask = {git = "https://github.com/pallets/flask.git"}
+        werkzeug = ">=0.14"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res[0].depName).toBe('flask');
+      expect(res[0].skipReason).toBe('git-dependency');
+      expect(res).toHaveLength(2);
+    });
+
+    it('skips git dependencies with version', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        flask = {git = "https://github.com/pallets/flask.git", version="1.2.3"}
+        werkzeug = ">=0.14"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res[0].depName).toBe('flask');
+      expect(res[0].currentValue).toBe('1.2.3');
+      expect(res[0].skipReason).toBe('git-dependency');
+      expect(res).toHaveLength(2);
+    });
+
+    it('skips path dependencies', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        flask = {path = "/some/path/"}
+        werkzeug = ">=0.14"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res[0].depName).toBe('flask');
+      expect(res[0].skipReason).toBe('path-dependency');
+      expect(res).toHaveLength(2);
+    });
+
+    it('skips path dependencies with version', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        flask = {path = "/some/path/", version = "1.2.3"}
+        werkzeug = ">=0.14"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res[0].depName).toBe('flask');
+      expect(res[0].currentValue).toBe('1.2.3');
+      expect(res[0].skipReason).toBe('path-dependency');
+      expect(res).toHaveLength(2);
+    });
+
+    it('does not include registry url for dependency python', async () => {
+      const content = codeBlock`
+        [tool.poetry.dependencies]
+        python = "^3.11"
+
+        [[tool.poetry.source]]
+        name = "custom-source"
+        url = "https://example.com"
+        priority = "explicit"
+      `;
+      const res = (await extractPackageFile(content, filename))!.deps;
+      expect(res).toHaveLength(1);
+      expect(res[0]).toMatchObject({
+        depName: 'python',
+        packageName: 'containerbase/python-prebuild',
+        currentValue: '^3.11',
+        datasource: GithubReleasesDatasource.id,
+        commitMessageTopic: 'Python',
+        registryUrls: null,
+      });
+    });
+
+    describe('registry URLs', () => {
+      it('can parse empty registries', async () => {
+        const res = await extractPackageFile(pyproject7toml, filename);
+        expect(res?.registryUrls).toBeUndefined();
+      });
+
+      it('can parse missing registries', async () => {
+        const res = await extractPackageFile(pyproject1toml, filename);
+        expect(res?.registryUrls).toBeUndefined();
+      });
+
+      it('extracts registries', async () => {
+        const res = await extractPackageFile(pyproject6toml, filename);
+        expect(res?.registryUrls).toMatchObject([
+          'https://foo.bar/simple/',
+          'https://bar.baz/+simple/',
+        ]);
+      });
+
+      it.each`
+        lockHeader                                          | implicit
+        ${'# automatically @generated by Poetry 1.7.1'}     | ${true}
+        ${'# automatically @generated by Poetry 1.8.0'}     | ${false}
+        ${'# automatically @generated by Poetry 2.1.0'}     | ${false}
+        ${'package = []\n[metadata]\nlock-version = "2.0"'} | ${true}
+        ${'package = []\n[metadata]\nlock-version = "2.1"'} | ${false}
+      `(
+        'implicit PyPI secondary source with $lockHeader',
+        async ({ lockHeader, implicit }) => {
+          fs.readLocalFile.mockResolvedValueOnce(`${lockHeader}\n`);
+          const res = await extractPackageFile(pyproject6toml, filename);
+          expect(res?.registryUrls).toEqual(
+            implicit
+              ? [
+                  'https://foo.bar/simple/',
+                  'https://bar.baz/+simple/',
+                  'https://pypi.org/pypi/',
+                ]
+              : ['https://foo.bar/simple/', 'https://bar.baz/+simple/'],
+          );
+        },
+      );
+
+      it('inserts the implicit PyPI source before supplemental sources for Poetry < 1.8', async () => {
+        fs.readLocalFile.mockResolvedValueOnce(
+          '# This file is automatically @generated by Poetry 1.7.1 and should not be changed by hand.\n',
+        );
+        const res = await extractPackageFile(
+          codeBlock`
+            [tool.poetry.dependencies]
+            dep0 = "0.0.0"
+
+            [[tool.poetry.source]]
+            name = "supplemental"
+            priority = "supplemental"
+            url = "https://supplemental.com/simple/"
+
+            [[tool.poetry.source]]
+            name = "explicit"
+            priority = "explicit"
+            url = "https://explicit.com/simple/"
+
+            [[tool.poetry.source]]
+            name = "primary"
+            url = "https://primary.com/simple/"
+          `,
+          filename,
+        );
+        expect(res?.registryUrls).toEqual([
+          'https://primary.com/simple/',
+          'https://pypi.org/pypi/',
+          'https://supplemental.com/simple/',
+        ]);
+      });
+
+      it('dedupes registries', async () => {
+        const res = await extractPackageFile(pyproject8toml, filename);
+        expect(res?.registryUrls).toMatchObject([
+          'https://pypi.org/pypi/',
+          'https://bar.baz/+simple/',
+        ]);
+      });
+
+      it('source with priority="default" and implicit PyPI priority="primary"', async () => {
+        const content = codeBlock`
+          [tool.poetry.dependencies]
+          python = "^3.11"
+
+          [[tool.poetry.source]]
+          name = "foo"
+          url = "https://foo.bar/simple/"
+          priority = "default"
+
+          [[tool.poetry.source]]
+          name = "PyPI"
+        `;
+        const res = await extractPackageFile(content, filename);
+        expect(res?.registryUrls).toMatchObject([
+          'https://foo.bar/simple/',
+          'https://pypi.org/pypi/',
+        ]);
+      });
+
+      it('source with implicit priority and PyPI with priority="explicit"', async () => {
+        const content = codeBlock`
+          [tool.poetry.dependencies]
+          python = "^3.11"
+
+          [[tool.poetry.source]]
+          name = "foo"
+          url = "https://foo.bar/simple/"
+
+          [[tool.poetry.source]]
+          name = "PyPI"
+          priority = "explicit"
+        `;
+        const res = await extractPackageFile(content, filename);
+        expect(res?.registryUrls).toMatchObject(['https://foo.bar/simple/']);
+      });
+
+      it('supports dependencies with explicit source', async () => {
+        const content = codeBlock`
+        [tool.poetry.dependencies]
+        attrs = "^23.1.0"
+        typer = { version = "^0.9.0", source = "pypi" }
+        requests-cache = { version = "^1.1.0", source = "artifactory" }
+
+        [[tool.poetry.source]]
+        name = "artifactory"
+        url = "https://example.com"
+        priority = "explicit"
+      `;
+        const res = await extractPackageFile(content, filename);
+        expect(res?.deps).toMatchObject([
+          { depName: 'attrs', currentValue: '^23.1.0' },
+          {
+            depName: 'typer',
+            currentValue: '^0.9.0',
+            registryUrls: ['https://pypi.org/pypi/'],
+            managerData: {
+              sourceName: 'pypi',
+            },
+          },
+          {
+            depName: 'requests-cache',
+            currentValue: '^1.1.0',
+            registryUrls: ['https://example.com'],
+            managerData: {
+              sourceName: 'artifactory',
+            },
+          },
+        ]);
+      });
+    });
+
+    it('parses package file with template', async () => {
+      const content = codeBlock`
+            [tool.poetry]
+            name = "{{ name }}"
+            {# comment #}
+            [tool.poetry.dependencies]
+            python = "^3.9"
+            {{ foo }} = "{{ bar }}"
+            {% if foo %}
+            dep1 = "^1.0.0"
+            {% endif %}
+          `;
+      const res = await extractPackageFile(content, filename);
+      expect(res?.deps).toHaveLength(2);
+      expect(res?.deps[0].depName).toBe('python');
+      expect(res?.deps[1].depName).toBe('dep1');
+    });
+  });
+
+  describe('Poetry v2', () => {
+    it('extract dependencies from the project section', async () => {
+      const src = codeBlock`
+        [project]
+        name = "poetry-v2-support-reproduction"
+        version = "1.0.0"
+        description = "This is a minimal reproduction for the renovate bot discussion."
+        readme = "README.md"
+        requires-python = ">=3.11,<4.0"
+        dependencies = [
+            "algoliasearch==4.11.2",
+        ]
+
+        [project.optional-dependencies]
+        decouple = ["python-decouple==3.6"]
+
+        [[tool.poetry.packages]]
+        include = "minimal_reproduction"
+
+        [build-system]
+        requires = ["poetry-core==2.0.0"]
+        build-backend = "poetry.core.masonry.api"
+      `;
+
+      const res = await extractPackageFile(src, 'pyproject.toml');
+
+      expect(res).toEqual({
+        deps: [
+          {
+            currentValue: '==2.0.0',
+            currentVersion: '2.0.0',
+            datasource: 'pypi',
+            depName: 'poetry-core',
+            depType: 'build-system.requires',
+            packageName: 'poetry-core',
+          },
+          {
+            currentValue: '==4.11.2',
+            currentVersion: '4.11.2',
+            datasource: 'pypi',
+            depName: 'algoliasearch',
+            depType: 'project.dependencies',
+            packageName: 'algoliasearch',
+          },
+          {
+            currentValue: '==3.6',
+            currentVersion: '3.6',
+            datasource: 'pypi',
+            depName: 'python-decouple',
+            depType: 'project.optional-dependencies',
+            managerData: {
+              depGroup: 'decouple',
+            },
+            packageName: 'python-decouple',
+          },
+        ],
+        extractedConstraints: {},
+        packageFileVersion: undefined,
+      });
+    });
+  });
+
+  it('extracts dependencies from pep735 dependency-groups', async () => {
+    const content = codeBlock`
+        [dependency-groups]
+        typing = ["mypy==1.13.0", "types-requests"]
+        coverage = ["pytest-cov==5.0.0"]
+        all = [{include-group = "typing"}, {include-group = "coverage"}, "click==8.1.7"]
+      `;
+    const res = await extractPackageFile(content, 'pyproject.toml');
+    expect(res?.deps).toMatchObject([
+      {
+        packageName: 'mypy',
+        datasource: 'pypi',
+        depType: 'dependency-groups',
+        currentValue: '==1.13.0',
+        currentVersion: '1.13.0',
+        depName: 'mypy',
+        managerData: { depGroup: 'typing' },
+      },
+      {
+        packageName: 'types-requests',
+        datasource: 'pypi',
+        depType: 'dependency-groups',
+        skipReason: 'unspecified-version',
+        depName: 'types-requests',
+        managerData: { depGroup: 'typing' },
+      },
+      {
+        packageName: 'pytest-cov',
+        datasource: 'pypi',
+        depType: 'dependency-groups',
+        currentValue: '==5.0.0',
+        currentVersion: '5.0.0',
+        depName: 'pytest-cov',
+        managerData: { depGroup: 'coverage' },
+      },
+      {
+        packageName: 'click',
+        datasource: 'pypi',
+        depType: 'dependency-groups',
+        currentValue: '==8.1.7',
+        currentVersion: '8.1.7',
+        depName: 'click',
+        managerData: { depGroup: 'all' },
+      },
+    ]);
+  });
+
+  it('enriches pep621/pep735 dependencies with poetry managerData', async () => {
+    const content = codeBlock`
+        [project]
+        dependencies = ["click", "pytest-cov==5.0.0"]
+        [project.optional-dependencies]
+        other = ["zoom==1.0.0"]
+        [dependency-groups]
+        typing = ["mypy==1.13.0", "types-requests"]
+        [tool.poetry.dependencies]
+        click = { version="==1.0.0", source = "artifactory" }
+        pytest-cov = { version = "==5.0.0" }
+        zoom = { source = "artifactory" }
+        [tool.poetry.group.typing.dependencies]
+        types-requests = { source = "artifactory" }
+        [tool.poetry.group.typing.dependencies.mypy]
+        source = "artifactory"
+      `;
+    const res = await extractPackageFile(content, 'pyproject.toml');
+    expect(res?.deps).toMatchObject([
+      {
+        packageName: 'click',
+        datasource: 'pypi',
+        depType: 'project.dependencies',
+        currentValue: '==1.0.0',
+        depName: 'click',
+        managerData: { nestedVersion: true, sourceName: 'artifactory' },
+      },
+      {
+        currentValue: '==5.0.0',
+        currentVersion: '5.0.0',
+        datasource: 'pypi',
+        depName: 'pytest-cov',
+        depType: 'project.dependencies',
+        managerData: {},
+        packageName: 'pytest-cov',
+        skipReason: 'invalid-dependency-specification',
+      },
+      {
+        packageName: 'mypy',
+        datasource: 'pypi',
+        depType: 'dependency-groups',
+        currentValue: '==1.13.0',
+        currentVersion: '1.13.0',
+        depName: 'mypy',
+        managerData: { depGroup: 'typing', sourceName: 'artifactory' },
+      },
+      {
+        packageName: 'types-requests',
+        datasource: 'pypi',
+        depType: 'dependency-groups',
+        skipReason: 'unspecified-version',
+        depName: 'types-requests',
+        managerData: { depGroup: 'typing', sourceName: 'artifactory' },
+      },
+      {
+        packageName: 'zoom',
+        datasource: 'pypi',
+        depType: 'project.optional-dependencies',
+        currentValue: '==1.0.0',
+        currentVersion: '1.0.0',
+        depName: 'zoom',
+        managerData: { depGroup: 'other', sourceName: 'artifactory' },
+      },
+    ]);
+  });
+});

@@ -1,0 +1,151 @@
+import { quote } from 'shlex';
+import upath from 'upath';
+import { GlobalConfig } from '../../../config/global.ts';
+import { logger } from '../../../logger/index.ts';
+import type { ExecOptions } from '../../../util/exec/types.ts';
+import { statLocalFile } from '../../../util/fs/index.ts';
+import { withGitEnvironment } from '../../../util/git/exec.ts';
+import { collectFileChanges } from '../../../util/git/file-changes.ts';
+import { getRepoStatus, isFileModeEnabled } from '../../../util/git/index.ts';
+import type {
+  UpdateArtifact,
+  UpdateArtifactsConfig,
+  UpdateArtifactsResult,
+} from '../types.ts';
+import {
+  artifactError,
+  artifactErrorResult,
+  resolveToolConstraint,
+} from '../util.ts';
+
+const DEFAULT_COMMAND_OPTIONS = ['--skip-answered', '--defaults'];
+const ownerExecutePermission = 0o100;
+const gitExec = withGitEnvironment(['git-tags']);
+
+async function detectExecutable(
+  path: string,
+  canReadFileMode: boolean,
+): Promise<true | undefined> {
+  if (!canReadFileMode) {
+    return undefined;
+  }
+
+  const fileStats = await statLocalFile(path);
+  if (!fileStats?.isFile()) {
+    return undefined;
+  }
+
+  if ((fileStats.mode & ownerExecutePermission) === 0) {
+    return undefined;
+  }
+
+  // Git derives its executable flag from the owner's execute permission.
+  return true;
+}
+
+function buildCommand(
+  config: UpdateArtifactsConfig,
+  packageFileName: string,
+  newValue: string,
+): string {
+  const command = ['copier', 'update', ...DEFAULT_COMMAND_OPTIONS];
+  if (GlobalConfig.get('allowScripts') && !config.ignoreScripts) {
+    command.push('--trust');
+  }
+  command.push(
+    '--answers-file',
+    quote(upath.basename(packageFileName)),
+    '--vcs-ref',
+    quote(newValue),
+  );
+  return command.join(' ');
+}
+
+export async function updateArtifacts({
+  packageFileName,
+  updatedDeps,
+  config,
+}: UpdateArtifact): Promise<UpdateArtifactsResult[] | null> {
+  if (updatedDeps?.length !== 1) {
+    // Each answers file (~ packageFileName) has exactly one dependency to update.
+    return [
+      artifactError(
+        packageFileName,
+        `Unexpected number of dependencies: ${updatedDeps?.length} (should be 1)`,
+      ),
+    ];
+  }
+
+  const newValue = updatedDeps[0]?.newValue;
+  if (!newValue) {
+    return [
+      artifactError(
+        packageFileName,
+        'Missing copier template version to update to',
+      ),
+    ];
+  }
+
+  const command = buildCommand(config, packageFileName, newValue);
+  const execOptions: ExecOptions = {
+    cwdFile: packageFileName,
+    docker: {},
+    toolConstraints: [
+      {
+        toolName: 'python',
+        constraint: await resolveToolConstraint(config, 'python'),
+      },
+      {
+        toolName: 'copier',
+        constraint: await resolveToolConstraint(config, 'copier'),
+      },
+    ],
+  };
+  try {
+    await gitExec(command, execOptions);
+  } catch (err) {
+    logger.debug({ err }, `Failed to update copier template: ${err.message}`);
+    return artifactErrorResult(packageFileName, err);
+  }
+
+  const status = await getRepoStatus();
+  // If the answers file didn't change, Copier did not update anything.
+  if (!status.modified.includes(packageFileName)) {
+    return null;
+  }
+
+  const res: UpdateArtifactsResult[] = [];
+
+  if (status.conflicted.length > 0) {
+    // Sometimes, Copier erroneously reports conflicts.
+    const msg = `Updating the Copier template yielded ${status.conflicted.length} merge conflicts. Please check the proposed changes carefully! Conflicting files:\n  * ${status.conflicted.join('\n  * ')}`;
+    logger.debug({ packageFileName, depName: updatedDeps[0]?.depName }, msg);
+    res.push(artifactError(packageFileName, msg));
+  }
+
+  const canReadFileMode = await isFileModeEnabled();
+
+  // `git status` might detect a rename, which is then not contained
+  // in not_added/deleted. Ensure we respect renames as well if they happen.
+  const changes = await collectFileChanges(status, {
+    include: ['modified', 'not_added', 'conflicted', 'deleted', 'renamed'],
+    additionMetadata: async (f) => ({
+      isExecutable: await detectExecutable(f, canReadFileMode),
+    }),
+  });
+
+  for (const change of changes) {
+    const fileRes: UpdateArtifactsResult = { file: change };
+    if (change.type === 'addition' && status.conflicted.includes(change.path)) {
+      // Make the reviewer aware of the conflicts.
+      // This will be posted in a comment.
+      fileRes.notice = {
+        file: change.path,
+        message:
+          'This file had merge conflicts. Please check the proposed changes carefully!',
+      };
+    }
+    res.push(fileRes);
+  }
+  return res;
+}

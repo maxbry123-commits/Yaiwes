@@ -1,0 +1,259 @@
+import upath from 'upath';
+import { envMock, mockExecAll } from '~test/exec-util.ts';
+import { env, fs, git, partial } from '~test/util.ts';
+import { GlobalConfig } from '../../../config/global.ts';
+import type {
+  InternalGlobalConfigOptions,
+  RepoGlobalConfig,
+} from '../../../config/types.ts';
+import type { StatusResult } from '../../../util/git/types.ts';
+import type { UpdateArtifactsConfig } from '../types.ts';
+import { updateArtifacts } from './index.ts';
+
+vi.mock('../../../util/exec/env.ts');
+vi.mock('../../../util/fs/index.ts');
+
+const adminConfig: RepoGlobalConfig & InternalGlobalConfigOptions = {
+  // `join` fixes Windows CI
+  localDir: upath.join('/tmp/github/some/repo'),
+  cacheDir: upath.join('/tmp/renovate/cache'),
+  containerbaseDir: upath.join('/tmp/renovate/cache/containerbase'),
+  binarySource: 'global',
+};
+const config: UpdateArtifactsConfig = {};
+
+describe('modules/manager/jsonnet-bundler/artifacts', () => {
+  beforeEach(() => {
+    env.getChildProcessEnv.mockReturnValue(envMock.basic);
+
+    GlobalConfig.set(adminConfig);
+  });
+
+  it('returns null if jsonnetfile.lock does not exist', async () => {
+    fs.readLocalFile.mockResolvedValueOnce('');
+    await expect(
+      updateArtifacts({
+        packageFileName: 'jsonnetfile.json',
+        updatedDeps: [],
+        newPackageFileContent: '',
+        config,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it('returns null if there are no changes', async () => {
+    fs.readLocalFile.mockResolvedValueOnce('Current jsonnetfile.lock.json');
+    const execSnapshots = mockExecAll();
+    git.getRepoStatus.mockResolvedValueOnce(
+      partial<StatusResult>({
+        modified: [],
+        not_added: [],
+        deleted: [],
+        isClean(): boolean {
+          return true;
+        },
+      }),
+    );
+    await expect(
+      updateArtifacts({
+        packageFileName: 'jsonnetfile.json',
+        updatedDeps: [],
+        newPackageFileContent: '',
+        config,
+      }),
+    ).resolves.toBeNull();
+    expect(execSnapshots).toEqual([]);
+  });
+
+  it('updates the vendor dir when dependencies change', async () => {
+    fs.readLocalFile.mockResolvedValueOnce('Current jsonnetfile.lock.json');
+    const execSnapshots = mockExecAll();
+    git.getRepoStatus.mockResolvedValueOnce(
+      partial<StatusResult>({
+        not_added: ['vendor/foo/main.jsonnet', 'vendor/bar/main.jsonnet'],
+        modified: ['jsonnetfile.json', 'jsonnetfile.lock.json'],
+        deleted: ['vendor/baz/deleted.jsonnet'],
+        isClean(): boolean {
+          return false;
+        },
+      }),
+    );
+    fs.readLocalFile.mockResolvedValueOnce('Updated jsonnetfile.json');
+    fs.readLocalFile.mockResolvedValueOnce('Updated jsonnetfile.lock.json');
+    fs.readLocalFile.mockResolvedValueOnce('New foo/main.jsonnet');
+    fs.readLocalFile.mockResolvedValueOnce('New bar/main.jsonnet');
+    await expect(
+      updateArtifacts({
+        packageFileName: 'jsonnetfile.json',
+        updatedDeps: [
+          {
+            depName: 'github.com/foo/foo',
+            packageName: 'https://github.com/foo/foo.git',
+          },
+          {
+            depName: 'github.com/foo/foo',
+            packageName: 'ssh://git@github.com/foo/foo.git',
+            managerData: {
+              subdir: 'bar',
+            },
+          },
+        ],
+        newPackageFileContent: 'Updated jsonnetfile.json',
+        config,
+      }),
+    ).resolves.toMatchObject([
+      {
+        file: {
+          type: 'addition',
+          path: 'jsonnetfile.json',
+          contents: 'Updated jsonnetfile.json',
+        },
+      },
+      {
+        file: {
+          type: 'addition',
+          path: 'jsonnetfile.lock.json',
+          contents: 'Updated jsonnetfile.lock.json',
+        },
+      },
+      {
+        file: {
+          type: 'addition',
+          path: 'vendor/foo/main.jsonnet',
+          contents: 'New foo/main.jsonnet',
+        },
+      },
+      {
+        file: {
+          type: 'addition',
+          path: 'vendor/bar/main.jsonnet',
+          contents: 'New bar/main.jsonnet',
+        },
+      },
+      {
+        file: {
+          type: 'deletion',
+          path: 'vendor/baz/deleted.jsonnet',
+        },
+      },
+    ]);
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'jb update https://github.com/foo/foo.git ssh://git@github.com/foo/foo.git/bar',
+        options: { cwd: '/tmp/github/some/repo' },
+      },
+    ]);
+  });
+
+  it('performs lock file maintenance', async () => {
+    fs.readLocalFile.mockResolvedValueOnce('Current jsonnetfile.lock.json');
+    const execSnapshots = mockExecAll();
+    git.getRepoStatus.mockResolvedValueOnce(
+      partial<StatusResult>({
+        modified: ['jsonnetfile.lock.json'],
+        isClean(): boolean {
+          return false;
+        },
+      }),
+    );
+    fs.readLocalFile.mockResolvedValueOnce('Updated jsonnetfile.lock.json');
+    await expect(
+      updateArtifacts({
+        packageFileName: 'jsonnetfile.json',
+        updatedDeps: [],
+        newPackageFileContent: '',
+        config: {
+          ...config,
+          isLockFileMaintenance: true,
+        },
+      }),
+    ).resolves.toMatchObject([
+      {
+        file: {
+          type: 'addition',
+          path: 'jsonnetfile.lock.json',
+          contents: 'Updated jsonnetfile.lock.json',
+        },
+      },
+    ]);
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'jb update',
+        options: { cwd: '/tmp/github/some/repo' },
+      },
+    ]);
+  });
+
+  it('falls back to the extracted jb constraint', async () => {
+    vi.stubEnv('CONTAINERBASE', 'true');
+    GlobalConfig.set({ ...adminConfig, binarySource: 'install' });
+    fs.readLocalFile.mockResolvedValueOnce('Current jsonnetfile.lock.json');
+    const execSnapshots = mockExecAll();
+    git.getRepoStatus.mockResolvedValueOnce(
+      partial<StatusResult>({
+        modified: ['jsonnetfile.lock.json'],
+        isClean(): boolean {
+          return false;
+        },
+      }),
+    );
+    fs.readLocalFile.mockResolvedValueOnce('Updated jsonnetfile.lock.json');
+    await expect(
+      updateArtifacts({
+        packageFileName: 'jsonnetfile.json',
+        updatedDeps: [],
+        newPackageFileContent: '',
+        config: {
+          ...config,
+          isLockFileMaintenance: true,
+          extractedConstraints: { jb: '0.5.1' },
+        },
+      }),
+    ).resolves.not.toBeNull();
+    expect(execSnapshots).toMatchObject([
+      { cmd: 'install-tool jb 0.5.1' },
+      { cmd: 'jb update' },
+    ]);
+  });
+
+  it('returns error when jb update fails', async () => {
+    const execError = new Error();
+    (execError as any).stderr = 'jb released the magic smoke';
+
+    fs.readLocalFile.mockResolvedValueOnce('Current jsonnetfile.lock.json');
+    const execSnapshots = mockExecAll(execError);
+    git.getRepoStatus.mockResolvedValueOnce(
+      partial<StatusResult>({
+        modified: ['jsonnetfile.lock.json'],
+        isClean(): boolean {
+          return false;
+        },
+      }),
+    );
+    fs.readLocalFile.mockResolvedValueOnce('Updated jsonnetfile.lock.json');
+    await expect(
+      updateArtifacts({
+        packageFileName: 'jsonnetfile.json',
+        updatedDeps: [],
+        newPackageFileContent: '',
+        config: {
+          ...config,
+          isLockFileMaintenance: true,
+        },
+      }),
+    ).resolves.toMatchObject([
+      {
+        artifactError: {
+          fileName: 'jsonnetfile.lock.json',
+          stderr: 'jb released the magic smoke',
+        },
+      },
+    ]);
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'jb update',
+        options: { cwd: '/tmp/github/some/repo' },
+      },
+    ]);
+  });
+});

@@ -1,0 +1,73 @@
+import { logger } from '../../logger/index.ts';
+import type {
+  LookupUpdateConfig,
+  UpdateResult,
+} from '../../workers/repository/process/lookup/types.ts';
+import { getDatasourceFor } from './common.ts';
+import type { Release } from './types.ts';
+
+type Config = Partial<LookupUpdateConfig & UpdateResult>;
+
+export async function postprocessRelease(
+  config: Config,
+  release: Release,
+): Promise<Release | null> {
+  const { datasource } = config;
+
+  const ds = datasource && getDatasourceFor(datasource);
+  if (!ds) {
+    logger.once.warn(
+      { datasource },
+      'Failed to resolve datasource during release postprocessing',
+    );
+    return release;
+  }
+
+  if (!ds.postprocessRelease) {
+    return release;
+  }
+
+  const { packageName } = config;
+  if (!packageName) {
+    logger.once.warn(
+      { datasource },
+      'Release postprocessing is not supported for empty `packageName` field',
+    );
+    return release;
+  }
+
+  // Prefer the registry that actually reported this release (set by `mergeRegistries`
+  // for the `merge` registryStrategy) over the configured/default registry, otherwise
+  // we may probe a registry that never had this artifact and wrongly reject it.
+  const registryUrl =
+    release.registryUrl ??
+    config.registryUrl ??
+    config.registryUrls?.at(0) ??
+    null;
+
+  try {
+    const result = await ds.postprocessRelease(
+      { packageName, registryUrl },
+      release,
+    );
+
+    if (result === 'reject') {
+      logger.debug(
+        {
+          datasource,
+          packageName,
+          registryUrl,
+          version: release.version,
+          versionOrig: release.versionOrig,
+        },
+        'Rejected release',
+      );
+      return null;
+    }
+
+    return result;
+  } catch (err) {
+    logger.once.warn({ err, datasource }, 'Release interceptor failed');
+    return release;
+  }
+}

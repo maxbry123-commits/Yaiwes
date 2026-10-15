@@ -1,0 +1,15 @@
+{
+ "schema": "yaiwes.core.manual-nolfs-import.v1",
+ "source_repo": "renovatebot/renovate",
+ "source_commit": "ab622825b595f1c62544ff7cfaf9672f0c965410",
+ "imported_at": "2026-10-15T04:48:17.038624-05:00",
+ "method": "shallow clone depth=1 sin LFS (punteros LFS se dejan como punteros); index git directo; sin _archives",
+ "files": 3968,
+ "lfs_pointers_left_as_pointers": [],
+ "excluded": {
+  "docs/usage/docker.md": "GitHub push protection: Google Cloud Service Account Credentials (línea 409, ejemplo de documentación)"
+ },
+ "skipped_symlinks_submodules": [
+  "CLAUDE.md"
+ ]
+}

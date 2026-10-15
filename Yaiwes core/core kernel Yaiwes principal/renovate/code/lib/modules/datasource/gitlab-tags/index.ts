@@ -1,0 +1,152 @@
+import { logger } from '../../../logger/index.ts';
+import { buildCacheKey } from '../../../util/cache/package/key.ts';
+import {
+  defaultRegistryUrl,
+  getApiBaseUrl,
+  getDepHost,
+  getSourceUrl,
+} from '../../../util/gitlab/url.ts';
+import { GitlabHttp } from '../../../util/http/gitlab.ts';
+import { HttpError } from '../../../util/http/index.ts';
+import { asTimestamp } from '../../../util/timestamp.ts';
+import { joinUrlParts } from '../../../util/url.ts';
+import { Datasource } from '../datasource.ts';
+import type {
+  DigestConfig,
+  GetReleasesConfig,
+  ReleaseResult,
+} from '../types.ts';
+import { GitlabCommit, GitlabCommits, GitlabTags } from './schema.ts';
+
+export class GitlabTagsDatasource extends Datasource<GitlabHttp> {
+  static readonly id = 'gitlab-tags';
+
+  override readonly releaseTimestampSupport = true;
+  override readonly releaseTimestampNote =
+    'To get release timestamp we use the `created_at` field from the response.';
+  override readonly sourceUrlSupport = 'package';
+  override readonly sourceUrlNote =
+    'The source URL is determined by using the `packageName` and `registryUrl`.';
+
+  constructor() {
+    super(GitlabTagsDatasource.id, new GitlabHttp(GitlabTagsDatasource.id));
+  }
+
+  override getDefaultRegistryUrls(_packageName: string): string[] {
+    return [defaultRegistryUrl];
+  }
+
+  private async fetchReleases({
+    registryUrl,
+    packageName: repo,
+  }: GetReleasesConfig): Promise<ReleaseResult | null> {
+    const apiBaseUrl = getApiBaseUrl(registryUrl);
+
+    const urlEncodedRepo = encodeURIComponent(repo);
+
+    // tag
+    const url = joinUrlParts(
+      apiBaseUrl,
+      `projects`,
+      urlEncodedRepo,
+      `repository/tags?per_page=100`,
+    );
+
+    const gitlabTags = (
+      await this.http.getJson(url, { paginate: true }, GitlabTags)
+    ).body;
+
+    const dependency: ReleaseResult = {
+      sourceUrl: getSourceUrl(repo, registryUrl),
+      releases: [],
+    };
+    dependency.releases = gitlabTags.map(({ name, commit }) => ({
+      version: name,
+      gitRef: name,
+      releaseTimestamp: asTimestamp(commit.created_at),
+    }));
+
+    return dependency;
+  }
+
+  getReleases(config: GetReleasesConfig): Promise<ReleaseResult | null> {
+    return this.cached(
+      {
+        key: buildCacheKey(
+          'getReleases',
+          getDepHost(config.registryUrl),
+          config.packageName,
+        ),
+        fallback: true,
+      },
+      () => this.fetchReleases(config),
+    );
+  }
+
+  /**
+   * gitlab.getDigest
+   *
+   * Returs the latest commit hash of the repository.
+   */
+  private async fetchDigest(
+    { packageName: repo, registryUrl }: DigestConfig,
+    newValue?: string,
+  ): Promise<string | null> {
+    const apiBaseUrl = getApiBaseUrl(registryUrl);
+
+    const urlEncodedRepo = encodeURIComponent(repo);
+    let digest: string | null = null;
+
+    try {
+      if (newValue) {
+        const url = joinUrlParts(
+          apiBaseUrl,
+          `projects`,
+          urlEncodedRepo,
+          `repository/commits/`,
+          encodeURIComponent(newValue),
+        );
+        const gitlabCommit = await this.http.getJson(url, GitlabCommit);
+        digest = gitlabCommit.body.id;
+      } else {
+        const url = joinUrlParts(
+          apiBaseUrl,
+          `projects`,
+          urlEncodedRepo,
+          `repository/commits?per_page=1`,
+        );
+        const gitlabCommits = await this.http.getJson(url, GitlabCommits);
+        digest = gitlabCommits.body[0]?.id ?? null;
+      }
+    } catch (err) {
+      if (err instanceof HttpError && err.response?.statusCode === 404) {
+        logger.debug(
+          { gitlabRepo: repo, err, registryUrl },
+          'Gitlab repo or ref not found when getting commit',
+        );
+        return null;
+      }
+      this.handleGenericErrors(err);
+    }
+
+    return digest;
+  }
+
+  override getDigest(
+    config: DigestConfig,
+    newValue?: string,
+  ): Promise<string | null> {
+    return this.cached(
+      {
+        key: buildCacheKey(
+          'getDigest',
+          getDepHost(config.registryUrl),
+          config.packageName,
+          newValue,
+        ),
+        fallback: true,
+      },
+      () => this.fetchDigest(config, newValue),
+    );
+  }
+}

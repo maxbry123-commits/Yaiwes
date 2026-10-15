@@ -1,0 +1,415 @@
+import * as httpMock from '~test/http-mock.ts';
+import { partial } from '~test/util.ts';
+import { GlobalConfig } from '../../../../../config/global.ts';
+import { logger } from '../../../../../logger/index.ts';
+import * as githubActionsVersioning from '../../../../../modules/versioning/github-actions/index.ts';
+import * as semverVersioning from '../../../../../modules/versioning/semver/index.ts';
+import { ExternalHostError } from '../../../../../types/errors/external-host-error.ts';
+import * as githubGraphql from '../../../../../util/github/graphql/index.ts';
+import * as hostRules from '../../../../../util/host-rules.ts';
+import type { Timestamp } from '../../../../../util/timestamp.ts';
+import type { BranchConfig } from '../../../../types.ts';
+import api from './api.ts';
+import { getChangeLogJSON } from './index.ts';
+import * as releases from './releases.ts';
+
+vi.mock('../../../../../modules/datasource/npm/index.ts');
+vi.mock('../../../../../util/github/graphql/index.ts');
+vi.mock('./releases.ts', { spy: true });
+
+const githubApiHost = 'https://api.github.com';
+
+const githubTagsMock = vi.mocked(githubGraphql).queryTags;
+const githubReleasesMock = vi.mocked(githubGraphql).queryReleases;
+const getInRangeReleasesMock = vi.mocked(releases).getInRangeReleases;
+
+const upgrade = partial<BranchConfig>({
+  packageName: 'renovate',
+  versioning: semverVersioning.id,
+  currentVersion: '1.0.0',
+  newVersion: '3.0.0',
+  sourceUrl: 'https://github.com/chalk/chalk',
+  releases: [
+    { version: '0.9.0' },
+    { version: '1.0.0', gitRef: 'npm_1.0.0' },
+    {
+      version: '2.3.0',
+      gitRef: 'npm_2.3.0',
+      releaseTimestamp: '2017-10-24T03:20:46.238Z' as Timestamp,
+    },
+    { version: '2.2.2', gitRef: 'npm_2.2.2' },
+    {
+      version: '2.4.2',
+      releaseTimestamp: '2017-12-24T03:20:46.238Z' as Timestamp,
+    },
+    { version: '2.5.2' },
+  ],
+});
+
+function expectedChangeLog({
+  baseUrl = 'https://github.com/',
+  apiBaseUrl = 'https://api.github.com/',
+  sourceUrl = 'https://github.com/chalk/chalk',
+  packageName = 'renovate',
+} = {}) {
+  return {
+    hasReleaseNotes: true,
+    project: {
+      apiBaseUrl,
+      baseUrl,
+      packageName,
+      repository: 'chalk/chalk',
+      sourceUrl,
+      type: 'github',
+    },
+    versions: [
+      { version: '2.5.2' },
+      { version: '2.4.2' },
+      { version: '2.3.0' },
+      { version: '2.2.2' },
+    ],
+  };
+}
+
+describe('workers/repository/update/pr/changelog/index', () => {
+  describe('getChangeLogJSON', () => {
+    beforeEach(() => {
+      hostRules.add({
+        hostType: 'github',
+        matchHost: 'https://api.github.com/',
+        token: 'abc',
+      });
+    });
+
+    it('logs a warning when changelog fetching fails with an external host error', async () => {
+      const changeLogSource = api.get('github')!;
+      vi.spyOn(changeLogSource, 'getChangeLogJSON').mockRejectedValueOnce(
+        new ExternalHostError(new Error('some error')),
+      );
+
+      await expect(getChangeLogJSON({ ...upgrade })).resolves.toBeNull();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.anything(),
+        'getChangeLogJSON error',
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('logs an error when changelog fetching fails unexpectedly', async () => {
+      const changeLogSource = api.get('github')!;
+      vi.spyOn(changeLogSource, 'getChangeLogJSON').mockRejectedValueOnce(
+        new Error('some error'),
+      );
+
+      await expect(getChangeLogJSON({ ...upgrade })).resolves.toBeNull();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.anything(),
+        'getChangeLogJSON error',
+      );
+    });
+
+    it('returns null if @types', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          currentVersion: undefined,
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('handles unsupported changelog source', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'https://dev.azure.com/unknown-repo',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null if no currentVersion', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'https://github.com/DefinitelyTyped/DefinitelyTyped',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null if currentVersion equals newVersion', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          currentVersion: '1.0.0',
+          newVersion: '1.0.0',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('skips invalid repos', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'https://github.com/about',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('works without Github', async () => {
+      githubTagsMock.mockRejectedValue(new Error('Unknown'));
+      // 4 versions, so 4 calls without cache
+      githubReleasesMock
+        .mockRejectedValueOnce(new Error('Unknown'))
+        .mockRejectedValueOnce(new Error('Unknown'))
+        .mockRejectedValueOnce(new Error('Unknown'))
+        .mockRejectedValueOnce(new Error('Unknown'));
+      httpMock
+        .scope(githubApiHost)
+        .get('/repos/chalk/chalk')
+        .times(4)
+        .reply(500);
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+        }),
+      ).resolves.toMatchObject(expectedChangeLog());
+    });
+
+    it('uses GitHub tags', async () => {
+      httpMock.scope(githubApiHost).get(/.*/).reply(200, []).persist();
+      githubTagsMock.mockResolvedValue([
+        { version: '0.9.0' },
+        { version: '1.0.0' },
+        { version: '1.4.0' },
+        { version: 'v2.3.0' },
+        { version: '2.2.2' },
+        { version: 'v2.4.2' },
+      ] as never);
+      githubReleasesMock.mockResolvedValue([]);
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+        }),
+      ).resolves.toMatchObject(expectedChangeLog());
+    });
+
+    it('prefers a precise tag over a floating one resolving to the same version', async () => {
+      httpMock.scope(githubApiHost).get(/.*/).reply(200, []).persist();
+      githubTagsMock.mockResolvedValue([
+        { version: 'v7' },
+        { version: 'v7.0.0' },
+        { version: 'v7.0.1' },
+      ] as never);
+      githubReleasesMock.mockResolvedValue([]);
+      const res = await getChangeLogJSON({
+        ...upgrade,
+        packageName: 'actions/upload-artifact',
+        versioning: githubActionsVersioning.id,
+        currentVersion: '7.0.0',
+        newVersion: '7.0.1',
+        sourceUrl: 'https://github.com/actions/upload-artifact',
+        releases: [{ version: '7.0.0' }, { version: '7.0.1' }],
+      });
+      expect(res?.versions?.[0].compare.url).toBe(
+        'https://github.com/actions/upload-artifact/compare/v7.0.0...v7.0.1',
+      );
+    });
+
+    it('keeps the precise tag when a floating tag appears later in the list', async () => {
+      httpMock.scope(githubApiHost).get(/.*/).reply(200, []).persist();
+      githubTagsMock.mockResolvedValue([
+        { version: 'v6.0.0' },
+        { version: 'v7.0.0' },
+        { version: 'v7' },
+      ] as never);
+      githubReleasesMock.mockResolvedValue([]);
+      const res = await getChangeLogJSON({
+        ...upgrade,
+        packageName: 'actions/upload-artifact',
+        versioning: githubActionsVersioning.id,
+        currentVersion: '6.0.0',
+        newVersion: '7.0.0',
+        sourceUrl: 'https://github.com/actions/upload-artifact',
+        releases: [{ version: '6.0.0' }, { version: '7.0.0' }],
+      });
+      expect(res?.versions?.[0].compare.url).toBe(
+        'https://github.com/actions/upload-artifact/compare/v6.0.0...v7.0.0',
+      );
+    });
+
+    it('falls back to a floating tag when no precise tag exists', async () => {
+      httpMock.scope(githubApiHost).get(/.*/).reply(200, []).persist();
+      githubTagsMock.mockResolvedValue([
+        { version: 'v7' },
+        { version: 'v7.0.1' },
+      ] as never);
+      githubReleasesMock.mockResolvedValue([]);
+      const res = await getChangeLogJSON({
+        ...upgrade,
+        packageName: 'actions/upload-artifact',
+        versioning: githubActionsVersioning.id,
+        currentVersion: '7.0.0',
+        newVersion: '7.0.1',
+        sourceUrl: 'https://github.com/actions/upload-artifact',
+        releases: [{ version: '7.0.0' }, { version: '7.0.1' }],
+      });
+      expect(res?.versions?.[0].compare.url).toBe(
+        'https://github.com/actions/upload-artifact/compare/v7...v7.0.1',
+      );
+    });
+
+    it('filters unnecessary warns', async () => {
+      githubTagsMock.mockRejectedValue(new Error('Unknown Github Repo'));
+      githubReleasesMock.mockRejectedValueOnce(
+        new Error('Unknown Github Repo'),
+      );
+      httpMock.scope(githubApiHost).get(/.*/).reply(200, []).persist();
+      const res = await getChangeLogJSON({
+        ...upgrade,
+        packageName: '@renovate/no',
+      });
+      expect(res).toMatchObject(
+        expectedChangeLog({ packageName: '@renovate/no' }),
+      );
+    });
+
+    it('supports node engines', async () => {
+      githubTagsMock.mockResolvedValueOnce([]);
+      githubReleasesMock.mockResolvedValueOnce([]);
+      httpMock.scope(githubApiHost).get(/.*/).reply(200, []).persist();
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          depType: 'engines',
+        }),
+      ).resolves.toMatchObject(expectedChangeLog());
+    });
+
+    it('handles no sourceUrl', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: undefined,
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('handles invalid sourceUrl', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'http://example.com',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('handles missing Github token', async () => {
+      GlobalConfig.set({ githubTokenWarn: true });
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'https://github.com',
+        }),
+      ).resolves.toEqual({ error: 'MissingGithubToken' });
+    });
+
+    it('handles no releases', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          releases: [],
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('handles not enough releases', async () => {
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          releases: [{ version: '0.9.0' }],
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('will call getInRangeReleases when releases is undefined', async () => {
+      const param = {
+        ...upgrade,
+        releases: undefined,
+      };
+      await getChangeLogJSON(param);
+      expect(getInRangeReleasesMock).toHaveBeenCalledExactlyOnceWith(param);
+    });
+
+    it('supports github enterprise and github.com changelog', async () => {
+      githubTagsMock.mockRejectedValue([]);
+      githubReleasesMock.mockRejectedValue([]);
+      httpMock.scope(githubApiHost).persist().get(/.*/).reply(200, []);
+      hostRules.add({
+        hostType: 'github',
+        token: 'super_secret',
+        matchHost: 'https://github-enterprise.example.com/',
+      });
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+        }),
+      ).resolves.toMatchObject(expectedChangeLog());
+    });
+
+    it('supports github enterprise and github enterprise changelog', async () => {
+      githubTagsMock.mockRejectedValue([]);
+      githubReleasesMock.mockRejectedValue([]);
+      httpMock
+        .scope('https://github-enterprise.example.com')
+        .persist()
+        .get(/.*/)
+        .reply(200, []);
+      hostRules.add({
+        hostType: 'github',
+        matchHost: 'https://github-enterprise.example.com/',
+        token: 'abc',
+      });
+      vi.stubEnv('GITHUB_ENDPOINT', '');
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'https://github-enterprise.example.com/chalk/chalk',
+        }),
+      ).resolves.toMatchObject(
+        expectedChangeLog({
+          baseUrl: 'https://github-enterprise.example.com/',
+          apiBaseUrl: 'https://github-enterprise.example.com/api/v3/',
+          sourceUrl: 'https://github-enterprise.example.com/chalk/chalk',
+        }),
+      );
+    });
+
+    it('supports github.com and github enterprise changelog', async () => {
+      githubTagsMock.mockRejectedValue([]);
+      githubReleasesMock.mockRejectedValue([]);
+      httpMock
+        .scope('https://github-enterprise.example.com')
+        .persist()
+        .get(/.*/)
+        .reply(200, []);
+      hostRules.add({
+        hostType: 'github',
+        matchHost: 'https://github-enterprise.example.com/',
+        token: 'abc',
+      });
+      await expect(
+        getChangeLogJSON({
+          ...upgrade,
+          sourceUrl: 'https://github-enterprise.example.com/chalk/chalk',
+        }),
+      ).resolves.toMatchObject(
+        expectedChangeLog({
+          baseUrl: 'https://github-enterprise.example.com/',
+          apiBaseUrl: 'https://github-enterprise.example.com/api/v3/',
+          sourceUrl: 'https://github-enterprise.example.com/chalk/chalk',
+        }),
+      );
+    });
+  });
+});

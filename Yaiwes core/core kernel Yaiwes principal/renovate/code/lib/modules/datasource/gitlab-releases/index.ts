@@ -1,0 +1,79 @@
+import { buildCacheKey } from '../../../util/cache/package/key.ts';
+import { withCache } from '../../../util/cache/package/with-cache.ts';
+import {
+  defaultRegistryUrl,
+  getApiBaseUrl,
+  getSourceUrl,
+} from '../../../util/gitlab/url.ts';
+import { GitlabHttp } from '../../../util/http/gitlab.ts';
+import { asTimestamp } from '../../../util/timestamp.ts';
+import { joinUrlParts } from '../../../util/url.ts';
+import { Datasource } from '../datasource.ts';
+import type { GetReleasesConfig, Release, ReleaseResult } from '../types.ts';
+import { GitlabReleases } from './schema.ts';
+
+export class GitlabReleasesDatasource extends Datasource<GitlabHttp> {
+  static readonly id = 'gitlab-releases';
+
+  override getDefaultRegistryUrls(_packageName: string): string[] {
+    return [defaultRegistryUrl];
+  }
+
+  override readonly releaseTimestampSupport = true;
+  override readonly releaseTimestampNote =
+    'The release timestamp is determined from the `released_at` field in the results.';
+  override readonly sourceUrlSupport = 'package';
+  override readonly sourceUrlNote =
+    'The source URL is determined by using the `packageName` and `registryUrl`.';
+
+  constructor() {
+    super(
+      GitlabReleasesDatasource.id,
+      new GitlabHttp(GitlabReleasesDatasource.id),
+    );
+  }
+
+  private async _getReleases({
+    registryUrl,
+    packageName,
+  }: GetReleasesConfig): Promise<ReleaseResult | null> {
+    /* v8 ignore next -- should never happen */
+    if (!registryUrl) {
+      return null;
+    }
+
+    const urlEncodedRepo = encodeURIComponent(packageName);
+    const apiUrl = joinUrlParts(
+      getApiBaseUrl(registryUrl),
+      'projects',
+      urlEncodedRepo,
+      'releases',
+    );
+
+    const gitlabReleasesResponse = await this.fetchJson(apiUrl, GitlabReleases);
+
+    return {
+      sourceUrl: getSourceUrl(packageName, registryUrl),
+      releases: gitlabReleasesResponse.map(({ tag_name, released_at }) => {
+        const release: Release = {
+          registryUrl,
+          gitRef: tag_name,
+          version: tag_name,
+          releaseTimestamp: asTimestamp(released_at),
+        };
+        return release;
+      }),
+    };
+  }
+
+  getReleases(config: GetReleasesConfig): Promise<ReleaseResult | null> {
+    return withCache(
+      {
+        namespace: `datasource-${GitlabReleasesDatasource.id}`,
+        key: buildCacheKey(config.registryUrl, config.packageName),
+        fallback: true,
+      },
+      () => this._getReleases(config),
+    );
+  }
+}

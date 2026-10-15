@@ -1,0 +1,51 @@
+GIT
+  remote: https://github.com/ianheggie/health_check
+  revision: 0b799ead604f900ed50685e9b2d469cd2befba5b
+  ref: 0b799ead604f900ed50685e9b2d469cd2befba5b
+  specs:
+    health_check (4.0.0.pre)
+      rails (>= 4.0)
+
+GIT
+  remote: https://github.com/ruby-rdf/json-ld.git
+  revision: e742697a0906e74e8bb777ef98137bc3955d981d
+  ref: e742697a0906e74e8bb777ef98137bc3955d981d
+  specs:
+    json-ld (3.0.2)
+      link_header (~> 0.0, >= 0.0.8)
+
+GIT
+  remote: https://github.com/tmm1/http_parser.rb
+  revision: 54b17ba8c7d8d20a16dfc65d1775241833219cf2
+  ref: 54b17ba8c7d8d20a16dfc65d1775241833219cf2
+  submodules: true
+  specs:
+    http_parser.rb (0.6.1)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    aws-sdk-core (3.84.0)
+    aws-sdk-s3 (1.59.0)
+      aws-sdk-core (~> 3, >= 3.83.1)
+    concurrent-ruby (1.1.5)
+    devise_pam_authenticatable2 (9.2.0)
+    fabrication (2.21.0)
+    fog-core (2.1.0)
+    pkg-config (1.4.0)
+    private_address_check (0.5.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  aws-sdk-s3 (~> 1.59)
+  concurrent-ruby
+  devise_pam_authenticatable2 (~> 9.2)
+  fabrication (~> 2.21)
+  fog-core (<= 2.1.0)
+  health_check!
+  http_parser.rb (~> 0.6)!
+  json-ld!
+  pkg-config (~> 1.4)
+  private_address_check (~> 0.5)

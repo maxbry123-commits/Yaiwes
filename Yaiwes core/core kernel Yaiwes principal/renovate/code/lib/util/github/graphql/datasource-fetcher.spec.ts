@@ -1,0 +1,505 @@
+import * as httpMock from '~test/http-mock.ts';
+import { partial } from '~test/util.ts';
+import * as _packageCache from '../../../util/cache/package/index.ts';
+import type { Timestamp } from '../../../util/timestamp.ts';
+import type { GithubGraphqlResponse } from '../../http/github.ts';
+import { GithubHttp } from '../../http/github.ts';
+import { range } from '../../range.ts';
+import {
+  GithubGraphqlDatasourceFetcher as Datasource,
+  GithubGraphqlDatasourceFetcher,
+} from './datasource-fetcher.ts';
+import type {
+  GithubDatasourceItem,
+  GithubGraphqlDatasourceAdapter,
+  GithubGraphqlRepoResponse,
+} from './types.ts';
+
+vi.mock('../../../util/cache/package/index.ts');
+const packageCache = vi.mocked(_packageCache);
+
+interface TestAdapterInput {
+  version: string;
+  releaseTimestamp: string;
+  foo: string;
+}
+
+interface TestAdapterOutput extends GithubDatasourceItem {
+  bar: string;
+}
+
+const adapter: GithubGraphqlDatasourceAdapter<
+  TestAdapterInput,
+  TestAdapterOutput
+> = {
+  key: '_test-namespace',
+  query: `
+    items {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        version
+        releaseTimestamp
+        foo
+      }
+    }
+  `,
+  transform: ({
+    version,
+    releaseTimestamp,
+    foo,
+  }: TestAdapterInput): TestAdapterOutput | null =>
+    version && releaseTimestamp && foo
+      ? {
+          version,
+          releaseTimestamp: releaseTimestamp as Timestamp,
+          bar: foo,
+        }
+      : null,
+};
+
+function graphqlRequestBody(count: number, cursor: string | null) {
+  return {
+    query: adapter.query,
+    variables: { owner: 'foo', name: 'bar', count, cursor },
+  };
+}
+
+function resp(
+  isRepoPrivate: boolean | undefined,
+  nodes: TestAdapterInput[],
+  cursor?: string,
+): GithubGraphqlResponse<GithubGraphqlRepoResponse<TestAdapterInput>> {
+  const data: GithubGraphqlRepoResponse<TestAdapterInput> = {
+    repository: {
+      isRepoPrivate,
+      payload: { nodes },
+    },
+  };
+
+  if (cursor) {
+    data.repository.payload.pageInfo = {
+      endCursor: cursor,
+      hasNextPage: true,
+    };
+  }
+
+  return { data };
+}
+
+function err(
+  ...messages: string[]
+): GithubGraphqlResponse<GithubGraphqlRepoResponse<TestAdapterInput>> {
+  return {
+    errors: messages.map((message) => ({ message })),
+  };
+}
+
+async function catchError<T>(cb: () => Promise<T>): Promise<Error> {
+  try {
+    await cb();
+    throw Error('Callback was expected to throw');
+  } catch (err) {
+    return err;
+  }
+}
+
+describe('util/github/graphql/datasource-fetcher', () => {
+  describe('query', () => {
+    let http = new GithubHttp();
+
+    const v1 = '1.0.0';
+    const t1 = '01-01-2021';
+
+    const v2 = '2.0.0';
+    const t2 = '01-01-2022';
+
+    const v3 = '3.0.0';
+    const t3 = '01-01-2023';
+
+    beforeEach(() => {
+      http = new GithubHttp();
+    });
+
+    it('can perform query and receive result', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(
+          200,
+          resp(false, [{ version: v1, releaseTimestamp: t1, foo: '1' }]),
+        );
+
+      const res = await Datasource.query(
+        { packageName: 'foo/bar' },
+        http,
+        adapter,
+      );
+
+      expect(res).toEqual([
+        { bar: '1', releaseTimestamp: '01-01-2021', version: '1.0.0' },
+      ]);
+    });
+
+    it('performs query when persistence flag is set and cache is expired', async () => {
+      packageCache.get.mockResolvedValueOnce(true);
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(
+          200,
+          resp(false, [{ version: v1, releaseTimestamp: t1, foo: '1' }]),
+        );
+
+      const res = await Datasource.query(
+        { packageName: 'foo/bar' },
+        http,
+        adapter,
+      );
+
+      expect(res).toEqual([
+        { bar: '1', releaseTimestamp: '01-01-2021', version: '1.0.0' },
+      ]);
+    });
+
+    it('throws on unknown errors', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .replyWithError('unknown error');
+
+      await expect(() =>
+        Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+      ).rejects.toThrow('unknown error');
+    });
+
+    it('throws single GraphQL error wrapped into Error', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(200, err('single error'));
+
+      const res = await catchError(() =>
+        Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+      );
+
+      expect(res.message).toBe('single error');
+      expect(res.constructor.name).toBe('Error');
+    });
+
+    it('throws multiple GraphQL errors wrapped into AggregatedError', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(200, err('first error', 'second error'));
+
+      const res = (await catchError(() =>
+        Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+      )) as AggregateError;
+
+      expect(res).toBeInstanceOf(AggregateError);
+      expect(res.errors).toEqual([
+        new Error('first error'),
+        new Error('second error'),
+      ]);
+    });
+
+    it('throws when neither of data or errors were provided', async () => {
+      httpMock.scope('https://api.github.com/').post('/graphql').reply(200, {});
+
+      await expect(() =>
+        Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+      ).rejects.toThrow('GitHub GraphQL datasource: failed to obtain data');
+    });
+
+    it('throws when repository field is absent', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(200, { data: {} });
+
+      await expect(() =>
+        Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+      ).rejects.toThrow(
+        'GitHub GraphQL datasource: failed to obtain repository data',
+      );
+    });
+
+    it('throws when payload field is absent', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(200, { data: { repository: {} } });
+
+      await expect(() =>
+        Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+      ).rejects.toThrow(
+        'GitHub GraphQL datasource: failed to obtain repository payload data',
+      );
+    });
+
+    it('receives, transforms, and return data', async () => {
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(
+          200,
+          resp(false, [
+            { version: v3, releaseTimestamp: t3, foo: '3' },
+            { version: v2, releaseTimestamp: t2, foo: '2' },
+            partial<TestAdapterInput>(),
+            { version: v1, releaseTimestamp: t1, foo: '1' },
+          ]),
+        );
+
+      const res = await Datasource.query(
+        { packageName: 'foo/bar' },
+        http,
+        adapter,
+      );
+
+      expect(res).toEqual([
+        { version: v3, releaseTimestamp: t3, bar: '3' },
+        { version: v2, releaseTimestamp: t2, bar: '2' },
+        { version: v1, releaseTimestamp: t1, bar: '1' },
+      ]);
+    });
+
+    it('handles paginated data', async () => {
+      const page1 = resp(
+        false,
+        [{ version: v3, releaseTimestamp: t3, foo: '3' }],
+        'aaa',
+      );
+      const page2 = resp(
+        false,
+        [{ version: v2, releaseTimestamp: t2, foo: '2' }],
+        'bbb',
+      );
+      const page3 = resp(false, [
+        { version: v1, releaseTimestamp: t1, foo: '1' },
+      ]);
+      httpMock
+        .scope('https://api.github.com/')
+        .post('/graphql')
+        .reply(200, page1)
+        .post('/graphql')
+        .reply(200, page2)
+        .post('/graphql')
+        .reply(200, page3);
+
+      const res = await Datasource.query(
+        { packageName: 'foo/bar' },
+        http,
+        adapter,
+      );
+
+      expect(res).toEqual([
+        { version: v3, releaseTimestamp: t3, bar: '3' },
+        { version: v2, releaseTimestamp: t2, bar: '2' },
+        { version: v1, releaseTimestamp: t1, bar: '1' },
+      ]);
+    });
+
+    /**
+     * See: #16343, discussion #45248
+     */
+    describe('Page shrinking', () => {
+      const pageSizes = [100, 50, 25, 10, 5];
+
+      function generateItems(count: number): TestAdapterInput[] {
+        const indices = [...range(1, count)].map((x) => `${x}`);
+        return indices.map((idx) => ({
+          version: idx,
+          releaseTimestamp: idx,
+          foo: idx,
+        }));
+      }
+
+      function partitionBy<T>(input: T[], count: number): T[][] {
+        const output: T[][] = [];
+        for (let idx = 0; idx < input.length; idx += count) {
+          const slice = input.slice(idx, idx + count);
+          output.push(slice);
+        }
+        return output;
+      }
+
+      function generatePages(
+        items: TestAdapterInput[],
+        perPage: number,
+      ): GithubGraphqlResponse<GithubGraphqlRepoResponse<TestAdapterInput>>[] {
+        const partitions = partitionBy(items, perPage);
+        const pages = partitions.map((nodes, idx) =>
+          resp(false, nodes, `page-${idx + 2}`),
+        );
+        delete pages.at(-1)!.data?.repository.payload.pageInfo;
+        return pages;
+      }
+
+      it.each`
+        attempts | pageSize | itemCount
+        ${1}     | ${50}    | ${150}
+        ${2}     | ${25}    | ${100}
+        ${3}     | ${10}    | ${30}
+        ${4}     | ${5}     | ${15}
+      `(
+        'shrinks page size to $pageSize after $attempts failed attempt(s)',
+        async ({
+          attempts,
+          pageSize,
+          itemCount,
+        }: {
+          attempts: number;
+          pageSize: number;
+          itemCount: number;
+        }) => {
+          const items = generateItems(itemCount);
+          const pages = generatePages(items, pageSize);
+          const scope = httpMock.scope('https://api.github.com/');
+          pageSizes.slice(0, attempts).forEach((failedPageSize) => {
+            scope
+              .post('/graphql', graphqlRequestBody(failedPageSize, null))
+              .reply(
+                200,
+                err('Something went wrong while executing your query.'),
+              );
+          });
+          pages.forEach((page, idx) => {
+            scope
+              .post(
+                '/graphql',
+                graphqlRequestBody(
+                  pageSize,
+                  idx === 0 ? null : `page-${idx + 1}`,
+                ),
+              )
+              .reply(200, page);
+          });
+
+          const res = await Datasource.query(
+            { packageName: 'foo/bar' },
+            http,
+            adapter,
+          );
+
+          expect(res).toHaveLength(itemCount);
+          expect(res).toEqual(items.map(adapter.transform));
+        },
+      );
+
+      it('shrinks page size when a later page fails', async () => {
+        const items = generateItems(30);
+        httpMock
+          .scope('https://api.github.com/')
+          .post('/graphql', graphqlRequestBody(100, null))
+          .reply(200, resp(false, items.slice(0, 20), 'page-2'))
+          .post('/graphql', graphqlRequestBody(100, 'page-2'))
+          .reply(200, err('Something went wrong while executing your query.'))
+          .post('/graphql', graphqlRequestBody(50, 'page-2'))
+          .reply(200, resp(false, items.slice(20)));
+
+        const res = await Datasource.query(
+          { packageName: 'foo/bar' },
+          http,
+          adapter,
+        );
+
+        expect(res).toEqual(items.map(adapter.transform));
+      });
+
+      it('re-throws if shrinking did not help', async () => {
+        const scope = httpMock.scope('https://api.github.com/');
+        pageSizes.forEach((pageSize) => {
+          scope
+            .post('/graphql', graphqlRequestBody(pageSize, null))
+            .reply(
+              200,
+              err('Something went wrong while executing your query.'),
+            );
+        });
+
+        await expect(
+          Datasource.query({ packageName: 'foo/bar' }, http, adapter),
+        ).rejects.toThrow('Something went wrong while executing your query.');
+      });
+    });
+
+    describe('Cacheable flag', () => {
+      const data = [
+        { version: v3, releaseTimestamp: t3, foo: '3' },
+        { version: v2, releaseTimestamp: t2, foo: '2' },
+        { version: v1, releaseTimestamp: t1, foo: '1' },
+      ];
+
+      it.each`
+        isPrivate    | isPersistent
+        ${undefined} | ${false}
+        ${true}      | ${false}
+        ${false}     | ${true}
+      `(
+        'private=$isPrivate => isPersistent=$isPersistent',
+        async ({ isPrivate, isPersistent }) => {
+          httpMock
+            .scope('https://api.github.com/')
+            .post('/graphql')
+            .reply(200, resp(isPrivate, data, undefined));
+
+          const instance = new GithubGraphqlDatasourceFetcher(
+            { packageName: 'foo/bar' },
+            http,
+            adapter,
+          );
+          await instance.getItems();
+
+          expect(instance).toHaveProperty('isPersistent', isPersistent);
+        },
+      );
+    });
+
+    describe('maxItems limit', () => {
+      const adapterWithMaxItems: GithubGraphqlDatasourceAdapter<
+        TestAdapterInput,
+        TestAdapterOutput
+      > = {
+        ...adapter,
+        maxItems: 2,
+      };
+
+      it('stops pagination after maxItems', async () => {
+        // Set up 3 pages but only 2 items should be fetched due to maxItems: 2
+        httpMock
+          .scope('https://api.github.com/')
+          .post('/graphql', graphqlRequestBody(100, null))
+          .reply(
+            200,
+            resp(
+              false,
+              [{ version: v1, releaseTimestamp: t1, foo: '1' }],
+              'page-2',
+            ),
+          )
+          .post('/graphql', graphqlRequestBody(100, 'page-2'))
+          .reply(
+            200,
+            resp(
+              false,
+              [{ version: v2, releaseTimestamp: t2, foo: '2' }],
+              'page-3',
+            ),
+          );
+
+        const res = await Datasource.query(
+          { packageName: 'foo/bar' },
+          http,
+          adapterWithMaxItems,
+        );
+
+        // Should only have 2 items due to maxItems: 2
+        expect(res).toHaveLength(2);
+      });
+    });
+  });
+});

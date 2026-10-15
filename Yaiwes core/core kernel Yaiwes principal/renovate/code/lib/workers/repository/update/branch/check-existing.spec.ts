@@ -1,0 +1,75 @@
+import { partial, platform } from '~test/util.ts';
+import { logger } from '../../../../logger/index.ts';
+import type { Pr } from '../../../../modules/platform/index.ts';
+import type { BranchConfig } from '../../../types.ts';
+import { prAlreadyExisted } from './check-existing.ts';
+
+describe('workers/repository/update/branch/check-existing', () => {
+  describe('prAlreadyExisted', () => {
+    let config: BranchConfig;
+
+    beforeEach(() => {
+      config = {
+        baseBranch: 'base-branch',
+        manager: 'some-manager',
+        upgrades: [],
+        branchName: 'some-branch',
+        prTitle: 'some-title',
+      } satisfies BranchConfig;
+    });
+
+    it('returns false if recreating closed PRs', async () => {
+      config.recreateClosed = true;
+      await expect(prAlreadyExisted(config)).resolves.toBeNull();
+      expect(platform.findPr).toHaveBeenCalledTimes(0);
+    });
+
+    it('returns false if check misses', async () => {
+      config.recreateClosed = false;
+      await expect(prAlreadyExisted(config)).resolves.toBeNull();
+      expect(platform.findPr).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns true if first check hits', async () => {
+      platform.findPr.mockResolvedValueOnce(partial<Pr>({ number: 12 }));
+      platform.getPr.mockResolvedValueOnce(
+        partial<Pr>({
+          number: 12,
+          state: 'closed',
+        }),
+      );
+      await expect(prAlreadyExisted(config)).resolves.toEqual({ number: 12 });
+      expect(platform.findPr).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns true if second check hits', async () => {
+      config.branchPrefixOld = 'deps/';
+      platform.findPr.mockResolvedValueOnce(null);
+      platform.findPr.mockResolvedValueOnce(partial<Pr>({ number: 12 }));
+      platform.getPr.mockResolvedValueOnce(
+        partial<Pr>({
+          number: 12,
+          state: 'closed',
+        }),
+      );
+      await expect(prAlreadyExisted(config)).resolves.toEqual({ number: 12 });
+      expect(platform.findPr).toHaveBeenCalledTimes(2);
+
+      expect(logger.debug).toHaveBeenCalledWith(
+        `Found closed PR with current title`,
+      );
+    });
+
+    it('returns null if the branchPrefixOld check also misses', async () => {
+      config.branchPrefixOld = 'deps/';
+      platform.findPr.mockResolvedValue(null);
+
+      await expect(prAlreadyExisted(config)).resolves.toBeNull();
+
+      expect(platform.findPr).toHaveBeenCalledTimes(2);
+      expect(logger.debug).not.toHaveBeenCalledWith(
+        'Found closed PR with branchPrefixOld',
+      );
+    });
+  });
+});

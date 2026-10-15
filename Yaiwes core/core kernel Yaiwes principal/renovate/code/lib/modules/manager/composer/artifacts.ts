@@ -1,0 +1,274 @@
+import { isEmptyObject, isString } from '@sindresorhus/is';
+import { quote } from 'shlex';
+import { z } from 'zod/v4';
+import {
+  SYSTEM_INSUFFICIENT_DISK_SPACE,
+  TEMPORARY_ERROR,
+} from '../../../constants/error-messages.ts';
+import { logger } from '../../../logger/index.ts';
+import { coerceArray } from '../../../util/array.ts';
+import {
+  findGithubToken,
+  takePersonalAccessTokenIfPossible,
+} from '../../../util/check-token.ts';
+import { exec } from '../../../util/exec/index.ts';
+import type {
+  CommandWithOptions,
+  ExecOptions,
+  ToolConstraint,
+} from '../../../util/exec/types.ts';
+import {
+  deleteLocalFile,
+  ensureCacheDir,
+  ensureLocalDir,
+  getSiblingFileName,
+  localPathExists,
+  readLocalFile,
+  writeLocalFile,
+} from '../../../util/fs/index.ts';
+import { collectFileChanges } from '../../../util/git/file-changes.ts';
+import { getRepoStatus } from '../../../util/git/index.ts';
+import * as hostRules from '../../../util/host-rules.ts';
+import { Lazy } from '../../../util/lazy.ts';
+import { coerceObject } from '../../../util/object.ts';
+import { regEx } from '../../../util/regex.ts';
+import { Json } from '../../../util/schema-utils/index.ts';
+import { coerceString } from '../../../util/string.ts';
+import { GitTagsDatasource } from '../../datasource/git-tags/index.ts';
+import { PackagistDatasource } from '../../datasource/packagist/index.ts';
+import type { UpdateArtifact, UpdateArtifactsResult } from '../types.ts';
+import {
+  artifactErrorResult,
+  fileAddition,
+  fileChangesToArtifactResults,
+  resolveToolConstraint,
+} from '../util.ts';
+import { Lockfile, PackageFile } from './schema.ts';
+import type { AuthJson } from './types.ts';
+import {
+  extractConstraints,
+  getComposerArguments,
+  getComposerUpdateArguments,
+  isArtifactAuthEnabled,
+  requireComposerDependencyInstallation,
+} from './utils.ts';
+
+function getAuthJson(): string | null {
+  const authJson: AuthJson = {};
+
+  const githubHostRule = hostRules.find({
+    hostType: 'github',
+    url: 'https://api.github.com/',
+  });
+
+  const gitTagsHostRule = hostRules.find({
+    hostType: GitTagsDatasource.id,
+    url: 'https://github.com',
+  });
+
+  const selectedGithubToken = takePersonalAccessTokenIfPossible(
+    isArtifactAuthEnabled(githubHostRule)
+      ? findGithubToken(githubHostRule)
+      : undefined,
+    isArtifactAuthEnabled(gitTagsHostRule)
+      ? findGithubToken(gitTagsHostRule)
+      : undefined,
+  );
+
+  if (selectedGithubToken) {
+    authJson['github-oauth'] = {
+      'github.com': selectedGithubToken,
+    };
+  }
+
+  for (const gitlabHostRule of hostRules.findAll({ hostType: 'gitlab' })) {
+    if (!isArtifactAuthEnabled(gitlabHostRule)) {
+      continue;
+    }
+
+    // v8 ignore else -- a rule without a token does not pass the check above
+    if (gitlabHostRule?.token) {
+      const host = coerceString(gitlabHostRule.resolvedHost, 'gitlab.com');
+      authJson['gitlab-token'] = coerceObject(authJson['gitlab-token']);
+      authJson['gitlab-token'][host] = gitlabHostRule.token;
+      // https://getcomposer.org/doc/articles/authentication-for-private-packages.md#gitlab-token
+      authJson['gitlab-domains'] = [
+        host,
+        ...coerceArray(authJson['gitlab-domains']),
+      ];
+    }
+  }
+
+  for (const packagistHostRule of hostRules.findAll({
+    hostType: PackagistDatasource.id,
+  })) {
+    if (!isArtifactAuthEnabled(packagistHostRule)) {
+      continue;
+    }
+
+    const { resolvedHost, username, password, token } = packagistHostRule;
+    if (resolvedHost && username && password) {
+      authJson['http-basic'] = coerceObject(authJson['http-basic']);
+      authJson['http-basic'][resolvedHost] = { username, password };
+    } else if (resolvedHost && token) {
+      authJson.bearer = coerceObject(authJson.bearer);
+      authJson.bearer[resolvedHost] = token;
+    }
+  }
+
+  return isEmptyObject(authJson) ? null : JSON.stringify(authJson);
+}
+
+export async function updateArtifacts({
+  packageFileName,
+  updatedDeps,
+  newPackageFileContent,
+  config,
+}: UpdateArtifact): Promise<UpdateArtifactsResult[] | null> {
+  logger.debug(`composer.updateArtifacts(${packageFileName})`);
+
+  const file = Json.pipe(PackageFile).parse(newPackageFileContent);
+
+  const lockFileName = packageFileName.replace(regEx(/\.json$/), '.lock');
+  const lockfile = await z
+    .string()
+    .transform((f) => readLocalFile(f, 'utf8'))
+    .pipe(Json)
+    .pipe(Lockfile)
+    .nullable()
+    .catch(null)
+    .parseAsync(lockFileName);
+  if (!lockfile) {
+    logger.debug('Composer: unable to read lockfile');
+    return null;
+  }
+
+  const vendorDir = getSiblingFileName(packageFileName, 'vendor');
+  const commitVendorFiles = await localPathExists(vendorDir);
+  await ensureLocalDir(vendorDir);
+  try {
+    await writeLocalFile(packageFileName, newPackageFileContent);
+
+    // `extractConstraints()` re-reads the updated package file, so its values win
+    // over what extraction saw on the base branch. It only runs when a user
+    // constraint is missing for at least one of the tools.
+    const fileConstraints = new Lazy(() => extractConstraints(file, lockfile));
+
+    const composerToolConstraint: ToolConstraint = {
+      toolName: 'composer',
+      constraint: await resolveToolConstraint(
+        config,
+        'composer',
+        () => fileConstraints.getValue().composer,
+      ),
+    };
+
+    const phpToolConstraint: ToolConstraint = {
+      toolName: 'php',
+      constraint: await resolveToolConstraint(
+        config,
+        'php',
+        () => fileConstraints.getValue().php,
+      ),
+    };
+
+    const execOptions: ExecOptions = {
+      cwdFile: packageFileName,
+      extraEnv: {
+        COMPOSER_CACHE_DIR: await ensureCacheDir('composer'),
+        COMPOSER_AUTH: getAuthJson(),
+      },
+      toolConstraints: [phpToolConstraint, composerToolConstraint],
+      docker: {},
+    };
+
+    const commands: (string | CommandWithOptions)[] = [];
+
+    // Determine whether install is required before update
+    if (requireComposerDependencyInstallation(lockfile)) {
+      const preCmd = 'composer';
+      const preArgs = `install${getComposerArguments(config, composerToolConstraint)}`;
+      logger.trace({ preCmd, preArgs }, 'composer pre-update command');
+      commands.push('git stash -- composer.json');
+      commands.push(`${preCmd} ${preArgs}`);
+      commands.push({ command: ['git', 'stash', 'pop'], ignoreFailure: true });
+    }
+
+    if (config.isLockFileMaintenance) {
+      logger.debug(
+        `Removing ${lockFileName} first due to lock file maintenance upgrade`,
+      );
+      await deleteLocalFile(lockFileName);
+    }
+
+    const cmd = 'composer';
+    let args: string;
+    if (config.isLockFileMaintenance) {
+      args = 'update';
+    } else {
+      args =
+        (
+          'update ' +
+          updatedDeps
+            .map((dep) =>
+              dep.newVersion
+                ? quote(`${dep.depName}:${dep.newVersion}`)
+                : quote(dep.depName!),
+            )
+            .filter(isString)
+            .map((dep) => quote(dep))
+            .join(' ')
+        ).trim() +
+        (config.postUpdateOptions?.includes('composerWithAll')
+          ? ' --with-all-dependencies'
+          : ' --with-dependencies');
+    }
+    args += getComposerUpdateArguments(config, composerToolConstraint);
+    logger.trace({ cmd, args }, 'composer command');
+    commands.push(`${cmd} ${args}`);
+
+    await exec(commands, execOptions);
+    const status = await getRepoStatus();
+    if (!status.modified.includes(lockFileName)) {
+      return null;
+    }
+    logger.debug('Returning updated composer.lock');
+    const res: UpdateArtifactsResult[] = [
+      fileAddition(lockFileName, await readLocalFile(lockFileName)),
+    ];
+
+    if (!commitVendorFiles) {
+      return res;
+    }
+
+    logger.debug(`Committing vendor files in ${vendorDir}`);
+    res.push(
+      ...fileChangesToArtifactResults([
+        ...(await collectFileChanges(status, {
+          include: ['modified', 'not_added'],
+          filter: (f) => f.startsWith(vendorDir),
+        })),
+        ...(await collectFileChanges(status, { include: ['deleted'] })),
+      ]),
+    );
+
+    return res;
+  } catch (err) {
+    // istanbul ignore if
+    if (err.message === TEMPORARY_ERROR) {
+      throw err;
+    }
+    if (
+      err.message?.includes(
+        'Your requirements could not be resolved to an installable set of packages.',
+      )
+    ) {
+      logger.info('Composer requirements cannot be resolved');
+    } else if (err.message?.includes('write error (disk full?)')) {
+      throw new Error(SYSTEM_INSUFFICIENT_DISK_SPACE);
+    } else {
+      logger.debug({ err }, 'Failed to generate composer.lock');
+    }
+    return artifactErrorResult(lockFileName, err);
+  }
+}

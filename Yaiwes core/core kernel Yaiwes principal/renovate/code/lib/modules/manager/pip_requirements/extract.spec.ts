@@ -1,0 +1,332 @@
+import { codeBlock } from 'common-tags';
+import { Fixtures } from '~test/fixtures.ts';
+import { GlobalConfig } from '../../../config/global.ts';
+import { extractPackageFile } from './index.ts';
+
+const requirements1 = Fixtures.get('requirements1.txt');
+const requirements2 = Fixtures.get('requirements2.txt');
+const requirements3 = Fixtures.get('requirements3.txt');
+const requirements4 = Fixtures.get('requirements4.txt');
+const requirements5 = Fixtures.get('requirements5.txt');
+const requirements6 = Fixtures.get('requirements6.txt');
+const requirements7 = Fixtures.get('requirements7.txt');
+const requirements8 = Fixtures.get('requirements8.txt');
+const requirementsWithEnvMarkers = Fixtures.get('requirements-env-markers.txt');
+const requirementsGitPackages = Fixtures.get('requirements-git-packages.txt');
+
+describe('modules/manager/pip_requirements/extract', () => {
+  beforeEach(() => {
+    vi.stubEnv('PIP_TEST_TOKEN', undefined);
+    GlobalConfig.reset();
+  });
+
+  afterEach(() => {
+    vi.stubEnv('PIP_TEST_TOKEN', undefined);
+    GlobalConfig.reset();
+  });
+
+  describe('extractPackageFile()', () => {
+    beforeEach(() => {
+      vi.stubEnv('PIP_INDEX_URL', undefined);
+    });
+
+    it('returns null for empty', () => {
+      expect(extractPackageFile('nothing here')).toBeNull();
+    });
+
+    it('extracts dependencies', () => {
+      const res = extractPackageFile(requirements1);
+      expect(res?.deps).toMatchObject([
+        { currentValue: '==0.3.1', depName: 'some-package' },
+        { currentValue: '==1.0.0', depName: 'some-other-package' },
+        { depName: 'sphinx' },
+        {
+          currentValue: '==1.9',
+          depName: 'not_semver',
+          packageName: 'not-semver',
+        },
+      ]);
+      expect(res?.registryUrls).toEqual(['http://example.com/private-pypi/']);
+    });
+
+    it('extracts dependencies with --index-url short code', () => {
+      const requirements = codeBlock`
+        -i http://example.com/private-pypi/
+        some-package==0.3.1
+      `;
+
+      const res = extractPackageFile(requirements);
+
+      expect(res).toMatchObject({
+        deps: [
+          {
+            currentValue: '==0.3.1',
+            currentVersion: '0.3.1',
+            datasource: 'pypi',
+            depName: 'some-package',
+          },
+        ],
+      });
+    });
+
+    it('extracts --requirement short code option', () => {
+      const requirements = codeBlock`
+        -r base.txt
+        some-package==0.3.1
+      `;
+
+      const res = extractPackageFile(requirements);
+
+      expect(res).toHaveProperty('managerData', {
+        requirementsFiles: ['base.txt'],
+      });
+    });
+
+    it('extracts --constraints short code option', () => {
+      const requirements = codeBlock`
+        -c constrain.txt
+        some-package==0.3.1
+      `;
+
+      const res = extractPackageFile(requirements);
+
+      expect(res).toHaveProperty('managerData', {
+        constraintsFiles: ['constrain.txt'],
+      });
+    });
+
+    it('extracts multiple dependencies', () => {
+      const res = extractPackageFile(requirements2)?.deps;
+      expect(res).toMatchObject([
+        { currentValue: '==1', depName: 'Django' },
+        { currentValue: '==0.6.27', depName: 'distribute' },
+        { currentValue: '==0.2', depName: 'dj-database-url' },
+        { currentValue: '==2.4.5', depName: 'psycopg2' },
+        { currentValue: '==0.1.2', depName: 'wsgiref' },
+      ]);
+    });
+
+    it('handles comments and commands', () => {
+      const res = extractPackageFile(requirements3)?.deps;
+      expect(res).toMatchObject([
+        { currentValue: '==1.11.23', depName: 'Django' },
+        {
+          currentValue: '==0.6.27',
+          depName: 'distribute',
+          skipReason: 'ignored',
+        },
+        { currentValue: '==0.2', depName: 'dj-database-url' },
+        { currentValue: '==2.4.5', depName: 'psycopg2' },
+        { currentValue: '==0.1.2', depName: 'wsgiref' },
+      ]);
+    });
+
+    it('handles extras and complex index url', () => {
+      const res = extractPackageFile(requirements4);
+      expect(res?.deps).toMatchObject([
+        { currentValue: '==2.0.12', depName: 'Django' },
+        { currentValue: '==4.1.1', depName: 'celery' },
+        { currentValue: '== 3.2.1', depName: 'foo' },
+      ]);
+      expect(res?.registryUrls).toEqual([
+        'https://artifactory.company.com/artifactory/api/pypi/python/simple',
+      ]);
+    });
+
+    it('handles extra index url', () => {
+      const res = extractPackageFile(requirements5);
+      expect(res?.deps).toMatchObject([
+        { currentValue: '==2.0.12', depName: 'Django' },
+        { currentValue: '==4.1.1', depName: 'celery' },
+        { currentValue: '== 3.2.1', depName: 'foo' },
+        { currentValue: '==0.3.1', depName: 'some-package' },
+        { currentValue: '==1.0.0', depName: 'some-other-package' },
+        { currentValue: '==1.9', depName: 'not_semver' },
+      ]);
+      expect(res?.registryUrls).toEqual([
+        'https://artifactory.company.com/artifactory/api/pypi/python/simple',
+      ]);
+      expect(res?.additionalRegistryUrls).toEqual([
+        'http://example.com/private-pypi/',
+      ]);
+    });
+
+    it('handles extra index url and defaults without index to config', () => {
+      const res = extractPackageFile(requirements6);
+      expect(res?.registryUrls).toBeUndefined();
+      expect(res?.additionalRegistryUrls).toEqual([
+        'http://example.com/private-pypi/',
+      ]);
+      expect(res?.deps).toHaveLength(6);
+    });
+
+    it('handles extra index url and defaults without index to pypi', () => {
+      const res = extractPackageFile(requirements6);
+      expect(res?.registryUrls).toBeUndefined();
+      expect(res?.additionalRegistryUrls).toEqual([
+        'http://example.com/private-pypi/',
+      ]);
+      expect(res?.deps).toHaveLength(6);
+    });
+
+    it('handles extra spaces around pinned dependency equal signs', () => {
+      const res = extractPackageFile(requirements4);
+      expect(res?.deps[2]).toMatchObject({
+        currentValue: '== 3.2.1',
+        currentVersion: '3.2.1',
+        depName: 'foo',
+      });
+
+      expect(res?.deps[0].currentValue).toStartWith('==');
+      expect(res?.deps[0].currentVersion).toStartWith('2.0.12');
+      expect(res?.deps[1].currentValue).toStartWith('==');
+      expect(res?.deps[1].currentVersion).toStartWith('4.1.1');
+
+      expect(res?.deps).toHaveLength(3);
+    });
+
+    it('should not replace env vars in low trust mode', () => {
+      vi.stubEnv('PIP_TEST_TOKEN', 'its-a-secret');
+      const res = extractPackageFile(requirements7);
+      expect(res?.additionalRegistryUrls).toEqual([
+        'http://$PIP_TEST_TOKEN:example.com/private-pypi/',
+        'http://${PIP_TEST_TOKEN}:example.com/private-pypi/',
+        'http://$PIP_TEST_TOKEN:example.com/private-pypi/',
+        'http://${PIP_TEST_TOKEN1}:example.com/private-pypi/',
+      ]);
+    });
+
+    it('should replace env vars in high trust mode', () => {
+      vi.stubEnv('PIP_TEST_TOKEN', 'its-a-secret');
+      GlobalConfig.set({ exposeAllEnv: true });
+      const res = extractPackageFile(requirements7);
+      expect(res?.additionalRegistryUrls).toEqual([
+        'http://its-a-secret:example.com/private-pypi/',
+        'http://its-a-secret:example.com/private-pypi/',
+        'http://its-a-secret:example.com/private-pypi/',
+        'http://${PIP_TEST_TOKEN1}:example.com/private-pypi/',
+      ]);
+    });
+
+    it('should handle hashes', () => {
+      const res = extractPackageFile(requirements8);
+      expect(res?.deps).toMatchObject([
+        { currentValue: '==1.9.1', depName: 'Django' },
+        { currentValue: '==0.22.1', depName: 'bgg' },
+        { currentValue: '==2016.1.8', depName: 'html2text' },
+      ]);
+    });
+
+    it('should handle package with extras and no version specifiers', () => {
+      const res = extractPackageFile('Django[argon2]');
+      expect(res).toMatchObject({
+        deps: [
+          {
+            currentValue: undefined,
+            datasource: 'pypi',
+            depName: 'Django',
+            packageName: 'django',
+          },
+        ],
+      });
+    });
+
+    it('should handle dependency and ignore env markers', () => {
+      const res = extractPackageFile(requirementsWithEnvMarkers);
+      expect(res).toEqual({
+        deps: [
+          {
+            currentValue: '==20.3.0',
+            currentVersion: '20.3.0',
+            datasource: 'pypi',
+            depName: 'attrs',
+            packageName: 'attrs',
+          },
+        ],
+      });
+    });
+
+    it('should handle git packages', () => {
+      const res = extractPackageFile(requirementsGitPackages);
+      expect(res?.deps).toHaveLength(5);
+      expect(res).toEqual({
+        deps: [
+          {
+            depName: 'python-pip-setup-test',
+            currentValue: 'v1.1.0',
+            currentVersion: 'v1.1.0',
+            packageName: 'git@github.com:rwxd/python-pip-setup-test.git',
+            datasource: 'git-tags',
+          },
+          {
+            depName: 'test_package',
+            currentValue: '1.0.0',
+            currentVersion: '1.0.0',
+            packageName: 'git@github.com:rwxd/test_package',
+            datasource: 'git-tags',
+          },
+          {
+            depName: 'python-package',
+            currentValue: 'abcde',
+            currentVersion: 'abcde',
+            packageName: 'git@gitlab.company.com:rwxd/python-package.git',
+            datasource: 'git-tags',
+          },
+          {
+            depName: 'python-pip-setup-test',
+            currentValue: 'v0.9.0',
+            currentVersion: 'v0.9.0',
+            packageName:
+              'https://peter@github.com/rwxd/python-pip-setup-test.git',
+            datasource: 'git-tags',
+          },
+          {
+            depName: 'python-pip-setup-test',
+            currentValue: 'v0.9.0',
+            currentVersion: 'v0.9.0',
+            packageName: 'https://github.com/rwxd/python-pip-setup-test.git',
+            datasource: 'git-tags',
+          },
+        ],
+      });
+    });
+
+    it('extracts a file with only --index-url flags', () => {
+      const res = extractPackageFile('--index-url https://example.com/pypi');
+      expect(res).toMatchObject({
+        deps: [],
+        registryUrls: ['https://example.com/pypi'],
+      });
+    });
+
+    it('extracts a file with only --extra-index-url flags', () => {
+      const res = extractPackageFile(
+        '--extra-index-url https://example.com/pypi',
+      );
+      expect(res).toMatchObject({
+        deps: [],
+        additionalRegistryUrls: ['https://example.com/pypi'],
+      });
+    });
+
+    it('extracts a file with only -r flags', () => {
+      const res = extractPackageFile('-r requirements-other.txt');
+      expect(res).toMatchObject({
+        deps: [],
+        managerData: {
+          requirementsFiles: ['requirements-other.txt'],
+        },
+      });
+    });
+
+    it('extracts a file with only -c flags', () => {
+      const res = extractPackageFile('-c constraints.txt');
+      expect(res).toMatchObject({
+        deps: [],
+        managerData: {
+          constraintsFiles: ['constraints.txt'],
+        },
+      });
+    });
+  });
+});

@@ -1,0 +1,273 @@
+import { z } from 'zod/v4';
+import {
+  LooseArray,
+  LooseRecord,
+  Toml,
+} from '../../../util/schema-utils/index.ts';
+import { normalizePythonDepName } from '../../datasource/pypi/common.ts';
+import { PypiDatasource } from '../../datasource/pypi/index.ts';
+import { api as pep440 } from '../../versioning/pep440/index.ts';
+import type { PackageDependency } from '../types.ts';
+import type { Pep621ManagerData } from './types.ts';
+import { depTypes, pep508ToPackageDependency } from './utils.ts';
+
+type Pep508Dependency = z.ZodType<PackageDependency<Pep621ManagerData>>;
+
+function Pep508Dependency(depType: string): Pep508Dependency {
+  return z.string().transform((x, ctx) => {
+    const res = pep508ToPackageDependency(depType, x);
+
+    if (!res) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'should be a valid PEP508 dependency',
+        fatal: true,
+      });
+
+      return z.NEVER;
+    }
+
+    return res;
+  });
+}
+
+type DependencyGroup = z.ZodType<PackageDependency<Pep621ManagerData>[]>;
+
+export function DependencyGroup(depType: string): DependencyGroup {
+  return LooseRecord(LooseArray(Pep508Dependency(depType))).transform(
+    (depGroups) => {
+      const deps: PackageDependency<Pep621ManagerData>[] = [];
+      for (const [depGroup, groupDeps] of Object.entries(depGroups)) {
+        for (const dep of groupDeps) {
+          // v8 ignore else -- the parser always sets a package name on a group dep
+          if (dep.packageName) {
+            dep.depName = dep.packageName;
+          }
+          dep.managerData = { depGroup };
+          deps.push(dep);
+        }
+      }
+      return deps;
+    },
+  );
+}
+
+const PdmConfig = z
+  .object({
+    'dev-dependencies': DependencyGroup(depTypes.pdmDevDependencies).catch([]),
+    source: LooseArray(
+      z.object({
+        url: z.string(),
+        name: z.string(),
+      }),
+    )
+      .transform((pdmSource) => {
+        const registryUrls: string[] = [];
+
+        let containsPyPiUrl = false;
+        for (const source of pdmSource) {
+          if (source.name === 'pypi') {
+            containsPyPiUrl = true;
+          }
+
+          registryUrls.push(source.url);
+        }
+
+        // Add pypi default url, if there is no source declared with the name `pypi`
+        // @see https://daobook.github.io/pdm/pyproject/tool-pdm/#specify-other-sources-for-finding-packages
+        if (!containsPyPiUrl) {
+          registryUrls.unshift(PypiDatasource.defaultURL);
+        }
+
+        return registryUrls;
+      })
+      .optional()
+      .catch(undefined),
+  })
+  .transform(
+    ({ 'dev-dependencies': devDependencies, source: registryUrls }) => ({
+      devDependencies,
+      registryUrls,
+    }),
+  );
+
+const HatchConfig = z
+  .object({
+    envs: LooseRecord(
+      z.string(),
+      z.object({
+        dependencies: z.unknown().optional(),
+        'extra-dependencies': z.unknown().optional(),
+      }),
+    ),
+  })
+  .catch({ envs: {} })
+  .transform(({ envs }) => {
+    const deps: PackageDependency[] = [];
+    for (const [
+      envName,
+      { dependencies, 'extra-dependencies': extraDependencies },
+    ] of Object.entries(envs)) {
+      const depType = `tool.hatch.envs.${envName}`;
+      const HatchDependency = LooseArray(Pep508Dependency(depType)).catch([]);
+      deps.push(
+        ...HatchDependency.parse(dependencies),
+        ...HatchDependency.parse(extraDependencies),
+      );
+    }
+    return { deps };
+  });
+
+const UvIndexSource = z.object({
+  index: z.string(),
+});
+
+const UvGitSource = z.object({
+  git: z.string(),
+  rev: z.string().optional(),
+  tag: z.string().optional(),
+  branch: z.string().optional(),
+});
+export type UvGitSource = z.infer<typeof UvGitSource>;
+
+const UvUrlSource = z.object({
+  url: z.string(),
+});
+
+const UvPathSource = z.object({
+  path: z.string(),
+});
+
+const UvWorkspaceSource = z.object({
+  workspace: z.literal(true),
+});
+
+// https://docs.astral.sh/uv/concepts/dependencies/#dependency-sources
+const UvSource = z.union([
+  UvIndexSource,
+  UvGitSource,
+  UvUrlSource,
+  UvPathSource,
+  UvWorkspaceSource,
+]);
+export type UvSource = z.infer<typeof UvSource>;
+
+// A dependency can declare a single source or, when disambiguated by
+// environment markers, an array of sources. Normalize both to an array.
+// https://docs.astral.sh/uv/concepts/projects/dependencies/#multiple-sources
+const UvSources = z
+  .union([UvSource, z.array(UvSource).min(1)])
+  .transform((source) => (Array.isArray(source) ? source : [source]));
+
+const UvConfig = z.object({
+  'dev-dependencies': LooseArray(
+    Pep508Dependency(depTypes.uvDevDependencies),
+  ).catch([]),
+  'required-version': z.string().optional(),
+  sources: LooseRecord(
+    // uv applies the same normalization as for Python dependencies on sources
+    z.string().transform((source) => normalizePythonDepName(source)),
+    UvSources,
+  ).optional(),
+  index: z
+    .array(
+      z.object({
+        name: z.string().optional(),
+        url: z.string(),
+        default: z.boolean().default(false),
+        explicit: z.boolean().default(false),
+      }),
+    )
+    .optional(),
+});
+
+export const ProjectSection = z.object({
+  version: z.string().optional().catch(undefined),
+  'requires-python': z.string().optional().catch(undefined),
+  dependencies: LooseArray(Pep508Dependency(depTypes.dependencies)).catch([]),
+  'optional-dependencies': DependencyGroup(depTypes.optionalDependencies).catch(
+    [],
+  ),
+});
+
+const PixiMinimalConfig = z
+  .object({
+    project: z
+      .object({ 'requires-pixi': z.string().optional() })
+      .optional()
+      .catch(undefined),
+    workspace: z
+      .object({ 'requires-pixi': z.string().optional() })
+      .optional()
+      .catch(undefined),
+  })
+  .transform((val) => ({
+    /* v8 ignore start: needs a pixi manifest declaring the requirement only under workspace */
+    'requires-pixi':
+      val.project?.['requires-pixi'] ?? val.workspace?.['requires-pixi'],
+    /* v8 ignore stop */
+  }))
+  .optional()
+  .catch(undefined);
+
+export const PyProject = z.object({
+  project: ProjectSection.optional().catch(undefined),
+  'build-system': z
+    .object({
+      requires: LooseArray(
+        Pep508Dependency(depTypes.buildSystemRequires),
+      ).catch([]),
+      'build-backend': z.string().optional().catch(undefined),
+    })
+    .optional()
+    .catch(undefined),
+  'dependency-groups': DependencyGroup(depTypes.dependencyGroups).catch([]),
+  tool: z
+    .object({
+      pdm: PdmConfig.optional().catch(undefined),
+      hatch: HatchConfig.optional().catch(undefined),
+      uv: UvConfig.optional().catch(undefined),
+      pixi: PixiMinimalConfig,
+    })
+    .optional()
+    .catch(undefined),
+});
+export type PyProject = z.infer<typeof PyProject>;
+
+export const PdmLockfile = Toml.pipe(
+  z.object({
+    package: LooseArray(
+      z.object({
+        name: z.string(),
+        version: z.string(),
+      }),
+    ),
+  }),
+)
+  .transform(({ package: pkg }) =>
+    Object.fromEntries(
+      pkg.map(({ name, version }): [string, string] => [name, version]),
+    ),
+  )
+  .transform((lock) => ({ lock }));
+
+export const UvLockfile = Toml.pipe(
+  z.object({
+    package: LooseArray(
+      z.object({
+        name: z.string(),
+        version: z.string(),
+      }),
+    ),
+  }),
+).transform(({ package: pkgs }) => {
+  const pkgMap: Record<string, string> = {};
+
+  for (const { name, version } of pkgs) {
+    if (!(name in pkgMap) || pep440.isGreaterThan(pkgMap[name], version)) {
+      pkgMap[name] = version;
+    }
+  }
+
+  return pkgMap;
+});

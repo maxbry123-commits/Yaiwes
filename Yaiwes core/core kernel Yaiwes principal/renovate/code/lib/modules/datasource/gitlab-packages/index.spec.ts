@@ -1,0 +1,249 @@
+import * as httpMock from '~test/http-mock.ts';
+import { EXTERNAL_HOST_ERROR } from '../../../constants/error-messages.ts';
+import { getPkgReleases } from '../index.ts';
+import { datasource } from './common.ts';
+
+describe('modules/datasource/gitlab-packages/index', () => {
+  describe('getReleases', () => {
+    it('returns package from custom registry', async () => {
+      const body = [
+        {
+          version: '1.0.0',
+          created_at: '2020-03-04T12:01:37.000-06:00',
+          name: 'mypkg',
+          conan_package_name: null,
+        },
+        {
+          version: 'v1.1.0',
+          created_at: '2020-04-04T12:01:37.000-06:00',
+          name: 'mypkg',
+        },
+        {
+          version: 'v1.1.1',
+          created_at: '2020-05-04T12:01:37.000-06:00',
+          name: 'mypkg',
+        },
+        {
+          version: 'v2.0.0',
+          created_at: '2020-05-04T12:01:37.000-06:00',
+          name: 'otherpkg',
+        },
+      ];
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(200, body);
+      const res = await getPkgReleases({
+        datasource,
+        registryUrls: ['https://gitlab.com'],
+        packageName: 'user/project1:mypkg',
+      });
+      expect(res).toEqual({
+        registryUrl: 'https://gitlab.com',
+        releases: [
+          {
+            releaseTimestamp: '2020-03-04T18:01:37.000Z',
+            version: '1.0.0',
+          },
+          {
+            releaseTimestamp: '2020-04-04T18:01:37.000Z',
+            version: 'v1.1.0',
+          },
+          {
+            releaseTimestamp: '2020-05-04T18:01:37.000Z',
+            version: 'v1.1.1',
+          },
+        ],
+      });
+    });
+
+    it('returns package from custom registry with api path', async () => {
+      const body = [
+        {
+          version: '1.0.0',
+          created_at: '2020-03-04T12:01:37.000-06:00',
+          name: 'mypkg',
+        },
+      ];
+      httpMock
+        .scope('https://gitlab.company.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(200, body);
+
+      const res = await getPkgReleases({
+        datasource,
+        registryUrls: ['https://gitlab.company.com/api/v4/'],
+        packageName: 'user/project1:mypkg',
+      });
+
+      expect(res).toEqual({
+        registryUrl: 'https://gitlab.company.com/api/v4',
+        releases: [
+          {
+            releaseTimestamp: '2020-03-04T18:01:37.000Z',
+            version: '1.0.0',
+          },
+        ],
+      });
+    });
+
+    it('returns conan package from custom registry', async () => {
+      const body = [
+        {
+          version: '1.0.0',
+          created_at: '2020-03-04T12:01:37.000-06:00',
+          name: 'myconanpkg/1.0.0@mycompany/stable',
+          conan_package_name: 'myconanpkg',
+        },
+        {
+          version: 'v2.0.0',
+          created_at: '2020-05-04T12:01:37.000-06:00',
+          name: 'otherpkg/2.0.0@mycompany/stable',
+          conan_package_name: 'otherpkg',
+        },
+      ];
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'myconanpkg',
+          per_page: '100',
+        })
+        .reply(200, body);
+      const res = await getPkgReleases({
+        datasource,
+        registryUrls: ['https://gitlab.com'],
+        packageName: 'user/project1:myconanpkg',
+      });
+
+      expect(res?.releases).toMatchObject([
+        {
+          releaseTimestamp: '2020-03-04T18:01:37.000Z',
+          version: '1.0.0',
+        },
+      ]);
+    });
+
+    it('skips entries which fail schema validation', async () => {
+      const body = [
+        {
+          version: '1.0.0',
+          created_at: '2020-03-04T12:01:37.000-06:00',
+          name: 'mypkg',
+        },
+        {
+          created_at: '2020-04-04T12:01:37.000-06:00',
+          name: 'mypkg',
+        },
+        {
+          version: 42,
+          created_at: '2020-05-04T12:01:37.000-06:00',
+          name: 'mypkg',
+        },
+        'not-an-object',
+      ];
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(200, body);
+      const res = await getPkgReleases({
+        datasource,
+        registryUrls: ['https://gitlab.com'],
+        packageName: 'user/project1:mypkg',
+      });
+      expect(res).toEqual({
+        registryUrl: 'https://gitlab.com',
+        releases: [
+          {
+            releaseTimestamp: '2020-03-04T18:01:37.000Z',
+            version: '1.0.0',
+          },
+        ],
+      });
+    });
+
+    it('returns null when the response is not an array', async () => {
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(200, { message: 'unexpected' });
+      await expect(
+        getPkgReleases({
+          datasource,
+          registryUrls: ['https://gitlab.com'],
+          packageName: 'user/project1:mypkg',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null for 404', async () => {
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(404);
+      await expect(
+        getPkgReleases({
+          datasource,
+          registryUrls: ['https://gitlab.com'],
+          packageName: 'user/project1:mypkg',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null for empty 200 OK', async () => {
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(200, []);
+      await expect(
+        getPkgReleases({
+          datasource,
+          registryUrls: ['https://gitlab.com'],
+          packageName: 'user/project1:mypkg',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    it('throws for 5xx', async () => {
+      httpMock
+        .scope('https://gitlab.com')
+        .get('/api/v4/projects/user%2Fproject1/packages')
+        .query({
+          package_name: 'mypkg',
+          per_page: '100',
+        })
+        .reply(502);
+      await expect(
+        getPkgReleases({
+          datasource,
+          registryUrls: ['https://gitlab.com'],
+          packageName: 'user/project1:mypkg',
+        }),
+      ).rejects.toThrow(EXTERNAL_HOST_ERROR);
+    });
+  });
+});

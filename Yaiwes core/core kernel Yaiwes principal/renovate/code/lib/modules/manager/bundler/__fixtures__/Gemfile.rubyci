@@ -1,0 +1,18 @@
+source 'https://rubygems.org'
+
+ruby ENV['CUSTOM_RUBY_VERSION'] || '~> 2.6.5'
+
+gem 'rails', '~> 5.2.1'
+gem 'puma'
+
+gem 'sass-rails', '~> 5.0'
+
+group :development do
+  gem 'foreman'
+  gem 'sqlite3'
+end
+
+group :production do
+  gem 'pg'
+  gem 'sqreen', '< 1.17.2'
+end

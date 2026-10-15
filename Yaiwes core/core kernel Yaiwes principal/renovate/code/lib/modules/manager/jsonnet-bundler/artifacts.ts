@@ -1,0 +1,83 @@
+import { quote } from 'shlex';
+import { TEMPORARY_ERROR } from '../../../constants/error-messages.ts';
+import { logger } from '../../../logger/index.ts';
+import { exec } from '../../../util/exec/index.ts';
+import type { ExecOptions, ToolConstraint } from '../../../util/exec/types.ts';
+import { readLocalFile } from '../../../util/fs/index.ts';
+import { collectFileChanges } from '../../../util/git/file-changes.ts';
+import { getRepoStatus } from '../../../util/git/index.ts';
+import { regEx } from '../../../util/regex.ts';
+import type {
+  PackageDependency,
+  UpdateArtifact,
+  UpdateArtifactsResult,
+} from '../types.ts';
+import {
+  artifactErrorResult,
+  fileChangesToArtifactResults,
+  resolveToolConstraint,
+} from '../util.ts';
+import type { JsonnetBundlerManagerData } from './types.ts';
+
+function dependencyUrl(
+  dep: PackageDependency<JsonnetBundlerManagerData>,
+): string {
+  const url = dep.packageName!;
+  if (dep.managerData?.subdir) {
+    return url.concat('/', dep.managerData.subdir);
+  }
+  return url;
+}
+
+export async function updateArtifacts(
+  updateArtifact: UpdateArtifact<JsonnetBundlerManagerData>,
+): Promise<UpdateArtifactsResult[] | null> {
+  const { packageFileName, updatedDeps, config } = updateArtifact;
+  logger.trace({ packageFileName }, 'jsonnet-bundler.updateArtifacts()');
+
+  const lockFileName = packageFileName.replace(regEx(/\.json$/), '.lock.json');
+  const existingLockFileContent = await readLocalFile(lockFileName, 'utf8');
+
+  if (!existingLockFileContent) {
+    logger.debug('No jsonnetfile.lock.json found');
+    return null;
+  }
+
+  const jsonnetBundlerToolConstraint: ToolConstraint = {
+    toolName: 'jb',
+    constraint: await resolveToolConstraint(config, 'jb'),
+  };
+
+  const execOptions: ExecOptions = {
+    cwdFile: packageFileName,
+    docker: {},
+    toolConstraints: [jsonnetBundlerToolConstraint],
+  };
+
+  try {
+    if (config.isLockFileMaintenance) {
+      await exec('jb update', execOptions);
+    } else {
+      const dependencyUrls = updatedDeps.map(dependencyUrl);
+      if (dependencyUrls.length > 0) {
+        await exec(
+          `jb update ${dependencyUrls.map(quote).join(' ')}`,
+          execOptions,
+        );
+      }
+    }
+
+    const status = await getRepoStatus();
+
+    if (status.isClean()) {
+      return null;
+    }
+
+    return fileChangesToArtifactResults(await collectFileChanges(status));
+  } catch (err) /* istanbul ignore next */ {
+    if (err.message === TEMPORARY_ERROR) {
+      throw err;
+    }
+    return artifactErrorResult(lockFileName, err);
+  }
+}

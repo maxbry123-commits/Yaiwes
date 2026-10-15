@@ -1,0 +1,97 @@
+[
+  {
+    "version": "v16.9.0",
+    "date": "2021-09-07",
+    "files": [
+      "aix-ppc64",
+      "headers"
+    ],
+    "npm": "7.21.1",
+    "v8": "9.3.345.16",
+    "uv": "1.42.0",
+    "zlib": "1.2.11",
+    "openssl": "1.1.1l+quic",
+    "modules": "93",
+    "lts": false,
+    "security": false
+  },
+  {
+    "version": "v16.0.0",
+    "files": [
+      "aix-ppc64",
+      "headers"
+    ],
+    "npm": "7.10.0",
+    "v8": "9.0.257.17",
+    "uv": "1.41.0",
+    "zlib": "1.2.11",
+    "openssl": "1.1.1k+quic",
+    "modules": "93",
+    "lts": false,
+    "security": false
+  },
+  {
+    "version": "v14.17.6",
+    "date": "2021-08-30",
+    "files": [
+      "aix-ppc64",
+      "headers"
+    ],
+    "npm": "6.14.15",
+    "v8": "8.4.371.23",
+    "uv": "1.41.0",
+    "zlib": "1.2.11",
+    "openssl": "1.1.1l",
+    "modules": "83",
+    "lts": "Fermium",
+    "security": true
+  },
+  {
+    "version": "v14.15.0",
+    "date": "2020-10-27",
+    "files": [
+      "aix-ppc64",
+      "headers"
+    ],
+    "npm": "6.14.8",
+    "v8": "8.4.371.19",
+    "uv": "1.40.0",
+    "zlib": "1.2.11",
+    "openssl": "1.1.1g",
+    "modules": "83",
+    "lts": "Fermium",
+    "security": false
+  },
+  {
+    "version": "v14.14.0",
+    "date": "2020-10-15",
+    "files": [
+      "aix-ppc64",
+      "headers"
+    ],
+    "npm": "6.14.8",
+    "v8": "8.4.371.19",
+    "uv": "1.40.0",
+    "zlib": "1.2.11",
+    "openssl": "1.1.1g",
+    "modules": "83",
+    "lts": false,
+    "security": false
+  },
+  {
+    "version": "v14.0.0",
+    "date": "2020-04-21",
+    "files": [
+      "aix-ppc64",
+      "headers"
+    ],
+    "npm": "6.14.4",
+    "v8": "8.1.307.30",
+    "uv": "1.37.0",
+    "zlib": "1.2.11",
+    "openssl": "1.1.1f",
+    "modules": "83",
+    "lts": false,
+    "security": false
+  }
+]

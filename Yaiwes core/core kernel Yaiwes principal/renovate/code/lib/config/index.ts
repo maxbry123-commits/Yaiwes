@@ -1,0 +1,92 @@
+import { logger } from '../logger/index.ts';
+import { getDefaultConfig } from '../modules/datasource/index.ts';
+import { allManagersList, get } from '../modules/manager/index.ts';
+import * as options from './options/index.ts';
+import type {
+  AllConfig,
+  ManagerConfig,
+  RenovateConfig,
+  RenovateConfigStage,
+} from './types.ts';
+import { mergeChildConfig } from './utils.ts';
+
+export { mergeChildConfig };
+
+export function getManagerConfig(
+  config: RenovateConfig,
+  manager: string,
+): ManagerConfig {
+  let managerConfig: ManagerConfig = {
+    ...config,
+    manager,
+  };
+  const categories = get(manager, 'categories');
+  if (categories) {
+    managerConfig.categories = categories;
+  }
+  // TODO: fix types #22198
+  // @ts-expect-error -- not easily typed
+  managerConfig = mergeChildConfig(managerConfig, config[manager] as any);
+  for (const i of allManagersList) {
+    // @ts-expect-error -- not easily typed
+    delete managerConfig[i];
+  }
+  return managerConfig;
+}
+
+/**
+ * Merge the `defaultConfig` of `config.datasource` into `config`, where it wins over the values which are already there.
+ *
+ * The lookup config and the flattened branch upgrade are assembled separately, so both have to apply the datasource defaults themselves.
+ */
+export async function applyDatasourceDefaultConfig<
+  T extends { datasource?: string },
+>(config: T): Promise<T> {
+  if (!config.datasource) {
+    return config;
+  }
+  const defaultConfig = await getDefaultConfig(config.datasource);
+  return mergeChildConfig(config, defaultConfig);
+}
+
+export function removeGlobalConfig(
+  config: RenovateConfig,
+  keepInherited: boolean,
+): RenovateConfig {
+  const outputConfig: RenovateConfig = { ...config };
+  for (const option of options.getOptions()) {
+    if (keepInherited && option.inheritConfigSupport) {
+      continue;
+    }
+    if (option.globalOnly) {
+      // @ts-expect-error -- not easily typed
+      delete outputConfig[option.name];
+    }
+  }
+  return outputConfig;
+}
+
+export function filterConfig<T extends AllConfig = AllConfig>(
+  inputConfig: T,
+  targetStage: RenovateConfigStage,
+): T {
+  logger.trace({ config: inputConfig }, `filterConfig('${targetStage}')`);
+  const outputConfig: T = { ...inputConfig };
+  const stages: (string | undefined)[] = [
+    'global',
+    'inherit',
+    'repository',
+    'package',
+    'branch',
+    'pr',
+  ];
+  const targetIndex = stages.indexOf(targetStage);
+  for (const option of options.getOptions()) {
+    const optionIndex = stages.indexOf(option.stage);
+    if (optionIndex !== -1 && optionIndex < targetIndex) {
+      // @ts-expect-error -- not easily typed
+      delete outputConfig[option.name];
+    }
+  }
+  return outputConfig;
+}

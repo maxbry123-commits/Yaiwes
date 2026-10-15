@@ -1,0 +1,96 @@
+import { isNonEmptyString, isTruthy } from '@sindresorhus/is';
+import { logger } from '../../../logger/index.ts';
+import { regEx } from '../../../util/regex.ts';
+import { parseSingleYaml } from '../../../util/yaml.ts';
+import { HelmDatasource } from '../../datasource/helm/index.ts';
+import { getOciChartDep, isOCIRegistry } from '../helmv3/oci.ts';
+import type {
+  ExtractConfig,
+  PackageDependency,
+  PackageFileContent,
+} from '../types.ts';
+import type { HelmsmanDocument } from './types.ts';
+
+const chartRegex = regEx('^(?<registryRef>[^/]*)/(?<packageName>[^/]*)$');
+
+function createDep(
+  key: string,
+  doc: HelmsmanDocument,
+  registryAliases: Record<string, string> | undefined,
+): PackageDependency | null {
+  const dep: PackageDependency = {
+    depName: key,
+    datasource: HelmDatasource.id,
+  };
+  const anApp = doc.apps[key];
+  if (!anApp) {
+    return null;
+  }
+
+  if (!anApp.version) {
+    dep.skipReason = 'unspecified-version';
+    return dep;
+  }
+  dep.currentValue = anApp.version;
+
+  // in case of OCI repository, we need a PackageDependency with a DockerDatasource and a packageName
+  if (anApp.chart && isOCIRegistry(anApp.chart)) {
+    return {
+      ...dep,
+      ...getOciChartDep(anApp.chart, undefined, registryAliases),
+    };
+  }
+
+  const regexResult = anApp.chart ? chartRegex.exec(anApp.chart) : null;
+  if (!regexResult?.groups) {
+    dep.skipReason = 'invalid-url';
+    return dep;
+  }
+
+  if (!isNonEmptyString(regexResult.groups.packageName)) {
+    dep.skipReason = 'invalid-name';
+    return dep;
+  }
+  dep.packageName = regexResult.groups.packageName;
+
+  const registryUrl = doc.helmRepos[regexResult.groups.registryRef];
+  if (!isNonEmptyString(registryUrl)) {
+    dep.skipReason = 'no-repository';
+    return dep;
+  }
+  dep.registryUrls = [registryUrl];
+
+  return dep;
+}
+
+export function extractPackageFile(
+  content: string,
+  packageFile: string,
+  config: ExtractConfig,
+): PackageFileContent | null {
+  try {
+    // TODO: use schema (#9610)
+    const doc = parseSingleYaml<HelmsmanDocument>(content);
+    if (!doc.apps) {
+      logger.debug({ packageFile }, `Missing apps keys`);
+      return null;
+    }
+
+    const deps = Object.keys(doc.apps)
+      .map((key) => createDep(key, doc, config.registryAliases))
+      .filter(isTruthy); // filter null values
+
+    if (deps.length === 0) {
+      return null;
+    }
+
+    return { deps };
+  } catch (err) /* istanbul ignore next */ {
+    if (err.stack?.startsWith('YAMLException:')) {
+      logger.debug({ err, packageFile }, 'YAML exception extracting');
+    } else {
+      logger.debug({ err, packageFile }, 'Error extracting');
+    }
+    return null;
+  }
+}

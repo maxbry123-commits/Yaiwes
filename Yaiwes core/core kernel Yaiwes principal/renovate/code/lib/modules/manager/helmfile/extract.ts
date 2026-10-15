@@ -1,0 +1,169 @@
+import { isEmptyArray, isString } from '@sindresorhus/is';
+import { logger } from '../../../logger/index.ts';
+import { coerceArray } from '../../../util/array.ts';
+import { coerceObject } from '../../../util/object.ts';
+import { regEx } from '../../../util/regex.ts';
+import { parseYaml } from '../../../util/yaml.ts';
+import { DockerDatasource } from '../../datasource/docker/index.ts';
+import { HelmDatasource } from '../../datasource/helm/index.ts';
+import {
+  getOciChartDep,
+  isOCIRegistry,
+  removeOCIPrefix,
+} from '../helmv3/oci.ts';
+import { isLocalChartPath } from '../helmv3/utils.ts';
+import type {
+  ExtractConfig,
+  PackageDependency,
+  PackageFileContent,
+} from '../types.ts';
+import type { Doc, HelmRepository } from './schema.ts';
+import { Doc as Document } from './schema.ts';
+import {
+  kustomizationsKeysUsed,
+  localChartHasKustomizationsYaml,
+} from './utils.ts';
+
+function isValidChartName(name: string | undefined, oci: boolean): boolean {
+  if (oci) {
+    return !!name && !regEx(/[!@#$%^&*(),.?":{}|<>A-Z]/).test(name);
+  }
+  return !!name && !regEx(/[!@#$%^&*(),.?":{}/|<>A-Z]/).test(name);
+}
+
+export async function extractPackageFile(
+  content: string,
+  packageFile: string,
+  config: ExtractConfig,
+): Promise<PackageFileContent | null> {
+  const deps: PackageDependency[] = [];
+  let registryData: Record<string, HelmRepository> = {};
+  // Record kustomization usage for all deps, since updating artifacts is run on the helmfile.yaml as a whole.
+  let needKustomize = false;
+  const docs: Doc[] = parseYaml(content, {
+    customSchema: Document,
+    failureBehaviour: 'filter',
+    removeTemplates: true,
+  });
+
+  for (const doc of docs) {
+    // Always check for repositories in the current document and override the existing ones if any (as YAML does)
+    if (doc.repositories) {
+      registryData = {};
+      for (const repo of doc.repositories) {
+        if (repo.url?.startsWith('git+')) {
+          logger.debug(
+            { repo, packageFile },
+            `Skipping unsupported helm-git repository.`,
+          );
+          continue;
+        }
+        registryData[repo.name] = repo;
+      }
+      logger.debug(
+        { registryAliases: registryData, packageFile },
+        `repositories discovered.`,
+      );
+    }
+
+    for (const dep of [
+      ...coerceArray(doc.releases),
+      ...Object.values(coerceObject(doc.templates)),
+    ]) {
+      let depName = dep.chart;
+      let ociDep: PackageDependency | null = null;
+      let repoName: string | null = null;
+
+      // If it starts with ./ ../ or / then it's a local path
+      if (isLocalChartPath(dep.chart)) {
+        if (
+          kustomizationsKeysUsed(dep) ||
+          (await localChartHasKustomizationsYaml(dep, packageFile))
+        ) {
+          needKustomize = true;
+        }
+        deps.push({
+          depName: dep.name,
+          skipReason: 'local-chart',
+        });
+        continue;
+      }
+
+      if (isOCIRegistry(dep.chart)) {
+        depName = removeOCIPrefix(dep.chart);
+        ociDep = getOciChartDep(dep.chart, undefined, config.registryAliases);
+      } else {
+        if (dep.chart.includes('/')) {
+          const v = dep.chart.split('/');
+          repoName = v.shift()!;
+          depName = v.join('/');
+        } else {
+          repoName = dep.chart;
+        }
+        const registry = registryData[repoName];
+        if (registry?.oci) {
+          ociDep = getOciChartDep(
+            registry.url,
+            depName,
+            config.registryAliases,
+          );
+          repoName = null;
+        }
+      }
+
+      if (!isString(dep.version)) {
+        deps.push({
+          depName,
+          skipReason: 'invalid-version',
+        });
+        continue;
+      }
+
+      const res: PackageDependency = {
+        depName,
+        currentValue: dep.version,
+      };
+      if (kustomizationsKeysUsed(dep)) {
+        needKustomize = true;
+      }
+      if (ociDep) {
+        Object.assign(res, ociDep);
+      } else if (repoName) {
+        res.registryUrls = [registryData[repoName]?.url]
+          .concat([config.registryAliases?.[repoName]] as string[])
+          .filter(isString);
+      }
+
+      // By definition on helm the chart name should be lowercase letter + number + -
+      // However helmfile support templating of that field
+      if (
+        !isValidChartName(
+          isOCIRegistry(dep.chart)
+            ? depName.slice(depName.lastIndexOf('/') + 1)
+            : depName,
+          !!ociDep,
+        )
+      ) {
+        res.skipReason = 'unsupported-chart-type';
+      }
+
+      // Skip in case we cannot locate the registry
+      if (
+        res.datasource !== DockerDatasource.id &&
+        isEmptyArray(res.registryUrls)
+      ) {
+        res.skipReason = 'unknown-registry';
+      }
+
+      deps.push(res);
+    }
+  }
+
+  return deps.length
+    ? {
+        deps,
+        datasource: HelmDatasource.id,
+        ...(needKustomize && { managerData: { needKustomize } }),
+      }
+    : null;
+}

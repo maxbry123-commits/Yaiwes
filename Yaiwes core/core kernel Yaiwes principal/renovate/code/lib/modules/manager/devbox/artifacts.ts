@@ -1,0 +1,95 @@
+import { isNonEmptyArray } from '@sindresorhus/is';
+import semver from 'semver';
+import { quote } from 'shlex';
+import { logger } from '../../../logger/index.ts';
+import { exec } from '../../../util/exec/index.ts';
+import type { ExecOptions } from '../../../util/exec/types.ts';
+import { getSiblingFileName, readLocalFile } from '../../../util/fs/index.ts';
+import type { UpdateArtifact, UpdateArtifactsResult } from '../types.ts';
+import {
+  artifactErrorResult,
+  resolveToolConstraint,
+  updateLockFile,
+} from '../util.ts';
+
+export async function updateArtifacts({
+  config,
+  packageFileName,
+  updatedDeps,
+}: UpdateArtifact): Promise<UpdateArtifactsResult[] | null> {
+  const lockFileName = getSiblingFileName(packageFileName, 'devbox.lock');
+  const existingLockFileContent = await readLocalFile(lockFileName, 'utf8');
+  if (!existingLockFileContent) {
+    logger.debug('No devbox.lock found');
+    return null;
+  }
+
+  const nixConstraint = await resolveToolConstraint(config, 'nix');
+  const devboxConstraint = await resolveToolConstraint(config, 'devbox');
+
+  const supportsNoInstall = devboxConstraint
+    ? semver.intersects(devboxConstraint, '>=0.14.0')
+    : true;
+
+  const execOptions: ExecOptions = {
+    cwdFile: packageFileName,
+    toolConstraints: [
+      // we are required to install nix because devbox spawns nix commands internally
+      // https://github.com/renovatebot/renovate/discussions/35382
+      // https://github.com/jetify-com/devbox/issues/2585
+      {
+        toolName: 'nix',
+        constraint: nixConstraint,
+      },
+      {
+        toolName: 'devbox',
+        constraint: devboxConstraint,
+      },
+    ],
+    docker: {},
+  };
+
+  const cmd: string[] = [];
+  if (config.isLockFileMaintenance) {
+    cmd.push(
+      supportsNoInstall ? 'devbox update --no-install' : 'devbox update',
+    );
+  } else if (isNonEmptyArray(updatedDeps)) {
+    if (supportsNoInstall) {
+      const updateCommands: string[] = updatedDeps
+        .map(
+          (dep) =>
+            dep.depName && `devbox update ${quote(dep.depName)} --no-install`,
+        )
+        .filter((dep): dep is string => Boolean(dep));
+      if (updateCommands.length) {
+        cmd.push(...updateCommands);
+      } else {
+        logger.trace('No updated devbox packages - returning null');
+        return null;
+      }
+    } else {
+      cmd.push('devbox install');
+    }
+  } else {
+    logger.trace('No updated devbox packages - returning null');
+    return null;
+  }
+
+  const oldLockFileContent = await readLocalFile(lockFileName);
+  if (!oldLockFileContent) {
+    logger.trace(`No ${lockFileName} found`);
+    return null;
+  }
+
+  try {
+    return await updateLockFile({
+      lockFileName,
+      existingLockFileContent: oldLockFileContent,
+      run: () => exec(cmd, execOptions),
+    });
+  } catch (err) {
+    logger.warn({ err }, 'Error updating devbox.lock');
+    return artifactErrorResult(lockFileName, err);
+  }
+}

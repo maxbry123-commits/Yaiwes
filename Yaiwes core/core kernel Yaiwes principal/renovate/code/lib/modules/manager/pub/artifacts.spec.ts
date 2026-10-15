@@ -1,0 +1,409 @@
+import { codeBlock } from 'common-tags';
+import upath from 'upath';
+import { mockDeep } from 'vitest-mock-extended';
+import { envMock, mockExecAll } from '~test/exec-util.ts';
+import { env, fs } from '~test/util.ts';
+import { GlobalConfig } from '../../../config/global.ts';
+import type {
+  InternalGlobalConfigOptions,
+  RepoGlobalConfig,
+} from '../../../config/types.ts';
+import * as docker from '../../../util/exec/docker/index.ts';
+import * as _datasource from '../../datasource/index.ts';
+import type { UpdateArtifact, UpdateArtifactsConfig } from '../types.ts';
+import * as pub from './index.ts';
+
+vi.mock('../../../util/exec/env.ts');
+vi.mock('../../../util/fs/index.ts');
+vi.mock('../../../util/http/index.ts');
+vi.mock('../../datasource/index.ts', () => mockDeep());
+
+process.env.CONTAINERBASE = 'true';
+
+const lockFile = 'pubspec.lock';
+const oldLockFileContent = 'Old pubspec.lock';
+const newLockFileContent = 'New pubspec.lock';
+const depNames = ['dep1', 'dep2', 'dep3'];
+const depNamesWithSdks = [...depNames, 'dart', 'flutter'];
+const depNamesWithSpace = depNames.join(' ');
+
+const datasource = vi.mocked(_datasource);
+
+const adminConfig: RepoGlobalConfig & InternalGlobalConfigOptions = {
+  localDir: upath.join('/tmp/github/some/repo'),
+  cacheDir: upath.join('/tmp/cache'),
+  containerbaseDir: upath.join('/tmp/cache/containerbase'),
+  binarySource: 'global',
+};
+
+const config: UpdateArtifactsConfig = {};
+
+const updateArtifact: UpdateArtifact = {
+  packageFileName: 'pubspec.yaml',
+  updatedDeps: depNamesWithSdks.map((depName) => {
+    return { depName };
+  }),
+  newPackageFileContent: '',
+  config,
+};
+
+describe('modules/manager/pub/artifacts', () => {
+  beforeEach(() => {
+    env.getChildProcessEnv.mockReturnValue(envMock.basic);
+    GlobalConfig.set(adminConfig);
+    docker.resetPrefetchedImages();
+
+    datasource.getPkgReleases.mockResolvedValueOnce({
+      releases: [{ version: '2.10.5' }, { version: '3.3.9' }],
+    });
+  });
+
+  afterEach(() => {
+    GlobalConfig.set(adminConfig);
+  });
+
+  it('returns null if no pubspec.lock found', async () => {
+    await expect(pub.updateArtifacts(updateArtifact)).resolves.toBeNull();
+  });
+
+  it('returns null if updatedDeps is empty', async () => {
+    await expect(
+      pub.updateArtifacts({ ...updateArtifact, updatedDeps: [] }),
+    ).resolves.toBeNull();
+  });
+
+  it(`runs flutter pub get if only dart and flutter sdks are updated`, async () => {
+    const execSnapshots = mockExecAll();
+    fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+    fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+    fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+    await expect(
+      pub.updateArtifacts({
+        ...updateArtifact,
+        newPackageFileContent: codeBlock`
+          environment:
+            sdk: ^3.0.0
+            flutter: 2.0.0
+        `,
+        updatedDeps: [{ depName: 'dart' }, { depName: 'flutter' }],
+      }),
+    ).resolves.toEqual([
+      {
+        file: {
+          type: 'addition',
+          path: lockFile,
+          contents: newLockFileContent,
+        },
+      },
+    ]);
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'flutter pub get --no-precompile',
+      },
+    ]);
+  });
+
+  describe.each([
+    { sdk: 'dart', packageFileContent: '' },
+    { sdk: 'flutter', packageFileContent: 'sdk: flutter' },
+  ])('validates pub tools', (params) => {
+    it(`returns null for ${params.sdk} if unchanged`, async () => {
+      const execSnapshots = mockExecAll();
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+        }),
+      ).resolves.toBeNull();
+      expect(execSnapshots).toMatchObject([
+        {
+          cmd: `${params.sdk} pub upgrade ${depNamesWithSpace}`,
+        },
+      ]);
+    });
+
+    it(`returns updated ${params.sdk} pubspec.lock`, async () => {
+      const execSnapshots = mockExecAll();
+      fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+        }),
+      ).resolves.toEqual([
+        {
+          file: {
+            type: 'addition',
+            path: lockFile,
+            contents: newLockFileContent,
+          },
+        },
+      ]);
+      expect(execSnapshots).toMatchObject([
+        {
+          cmd: `${params.sdk} pub upgrade ${depNamesWithSpace}`,
+        },
+      ]);
+    });
+
+    it(`runs ${params.sdk} pub get if only the sdk is updated`, async () => {
+      const execSnapshots = mockExecAll();
+      fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+          updatedDeps: [{ depName: params.sdk }],
+        }),
+      ).resolves.toEqual([
+        {
+          file: {
+            type: 'addition',
+            path: lockFile,
+            contents: newLockFileContent,
+          },
+        },
+      ]);
+      expect(execSnapshots).toMatchObject([
+        {
+          cmd: `${params.sdk} pub get --no-precompile`,
+        },
+      ]);
+    });
+
+    it(`returns updated ${params.sdk} pubspec.lock for lockfile maintenance`, async () => {
+      const execSnapshots = mockExecAll();
+      fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+          config: { ...config, isLockFileMaintenance: true },
+        }),
+      ).resolves.toEqual([
+        {
+          file: {
+            type: 'addition',
+            path: lockFile,
+            contents: newLockFileContent,
+          },
+        },
+      ]);
+      expect(execSnapshots).toMatchObject([
+        {
+          cmd: `${params.sdk} pub upgrade`,
+        },
+      ]);
+    });
+
+    it(`supports ${params.sdk} docker mode`, async () => {
+      GlobalConfig.set({
+        ...adminConfig,
+        binarySource: 'docker',
+        dockerSidecarImage: 'ghcr.io/renovatebot/base-image',
+      });
+      const execSnapshots = mockExecAll();
+      fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+        }),
+      ).resolves.toEqual([
+        {
+          file: {
+            type: 'addition',
+            path: lockFile,
+            contents: newLockFileContent,
+          },
+        },
+      ]);
+      expect(execSnapshots).toMatchObject([
+        {
+          cmd: 'docker pull ghcr.io/renovatebot/base-image',
+        },
+        {
+          cmd: 'docker ps --filter name=renovate_sidecar -aq',
+        },
+        {
+          cmd:
+            'docker run --rm --name=renovate_sidecar --label=renovate_child ' +
+            '-v "/tmp/github/some/repo":"/tmp/github/some/repo" ' +
+            '-v "/tmp/cache":"/tmp/cache" ' +
+            '-e CI ' +
+            '-e CONTAINERBASE_CACHE_DIR ' +
+            '-w "/tmp/github/some/repo" ' +
+            'ghcr.io/renovatebot/base-image ' +
+            "bash -l -c '" +
+            `install-tool ${params.sdk} 3.3.9` +
+            ' && ' +
+            `${params.sdk} pub upgrade ${depNamesWithSpace}` +
+            "'",
+        },
+      ]);
+    });
+
+    it(`supports ${params.sdk} install mode`, async () => {
+      GlobalConfig.set({ ...adminConfig, binarySource: 'install' });
+      const execSnapshots = mockExecAll();
+      fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+          config: { ...config, constraints: { dart: '3.3.9' } },
+        }),
+      ).resolves.toEqual([
+        {
+          file: {
+            type: 'addition',
+            path: lockFile,
+            contents: newLockFileContent,
+          },
+        },
+      ]);
+      expect(execSnapshots).toMatchObject([
+        { cmd: `install-tool ${params.sdk} 3.3.9` },
+        { cmd: `${params.sdk} pub upgrade ${depNamesWithSpace}` },
+      ]);
+    });
+
+    it(`catches errors for ${params.sdk}`, async () => {
+      const stderr = 'not found';
+      fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+      fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+      fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+      fs.writeLocalFile.mockImplementationOnce(() => {
+        throw new Error(stderr);
+      });
+      await expect(
+        pub.updateArtifacts({
+          ...updateArtifact,
+          newPackageFileContent: params.packageFileContent,
+        }),
+      ).resolves.toEqual([{ artifactError: { fileName: lockFile, stderr } }]);
+    });
+  });
+
+  it('uses flutter constraint from pubspec.yaml', async () => {
+    GlobalConfig.set({ ...adminConfig, binarySource: 'install' });
+    const execSnapshots = mockExecAll();
+    const flutterVersion = '3.19.0';
+    const newPackageFileContent = codeBlock`
+      environment:
+        sdk: ">=3.0.0 <4.0.0"
+        flutter: ${flutterVersion}
+      dependencies:
+        flutter:
+          sdk: flutter
+    `;
+    fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+    fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+    fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+    await expect(
+      pub.updateArtifacts({
+        ...updateArtifact,
+        newPackageFileContent,
+      }),
+    ).resolves.toEqual([
+      {
+        file: {
+          type: 'addition',
+          path: lockFile,
+          contents: newLockFileContent,
+        },
+      },
+    ]);
+    expect(execSnapshots).toMatchObject([
+      { cmd: `install-tool flutter ${flutterVersion}` },
+      { cmd: `flutter pub upgrade ${depNamesWithSpace}` },
+    ]);
+  });
+
+  it('uses dart constraint from pubspec.yaml', async () => {
+    GlobalConfig.set({ ...adminConfig, binarySource: 'install' });
+    const execSnapshots = mockExecAll();
+    const dartVersion = '3.3.0';
+    const newPackageFileContent = codeBlock`
+      environment:
+        sdk: ${dartVersion}
+    `;
+    fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+    fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+    fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+    await expect(
+      pub.updateArtifacts({
+        ...updateArtifact,
+        newPackageFileContent,
+      }),
+    ).resolves.toEqual([
+      {
+        file: {
+          type: 'addition',
+          path: lockFile,
+          contents: newLockFileContent,
+        },
+      },
+    ]);
+    expect(execSnapshots).toMatchObject([
+      { cmd: `install-tool dart ${dartVersion}` },
+      { cmd: `dart pub upgrade ${depNamesWithSpace}` },
+    ]);
+  });
+
+  it('falls back to the extracted dart constraint', async () => {
+    GlobalConfig.set({ ...adminConfig, binarySource: 'install' });
+    const execSnapshots = mockExecAll();
+    fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+    fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+    fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+
+    await pub.updateArtifacts({
+      ...updateArtifact,
+      newPackageFileContent: codeBlock`
+        dependencies:
+          dep1: ^1.0.0
+      `,
+      config: { ...config, extractedConstraints: { dart: '3.3.0' } },
+    });
+
+    expect(execSnapshots).toMatchObject([
+      { cmd: 'install-tool dart 3.3.0' },
+      { cmd: `dart pub upgrade ${depNamesWithSpace}` },
+    ]);
+  });
+
+  it('prefers the pubspec constraint over the extracted one', async () => {
+    GlobalConfig.set({ ...adminConfig, binarySource: 'install' });
+    const execSnapshots = mockExecAll();
+    fs.getSiblingFileName.mockReturnValueOnce(lockFile);
+    fs.readLocalFile.mockResolvedValueOnce(oldLockFileContent);
+    fs.readLocalFile.mockResolvedValueOnce(newLockFileContent);
+
+    await pub.updateArtifacts({
+      ...updateArtifact,
+      newPackageFileContent: codeBlock`
+        environment:
+          sdk: 3.3.0
+      `,
+      config: { ...config, extractedConstraints: { dart: '2.0.0' } },
+    });
+
+    expect(execSnapshots).toMatchObject([
+      { cmd: 'install-tool dart 3.3.0' },
+      { cmd: `dart pub upgrade ${depNamesWithSpace}` },
+    ]);
+  });
+});

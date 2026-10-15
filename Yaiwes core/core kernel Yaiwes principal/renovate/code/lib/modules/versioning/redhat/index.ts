@@ -1,0 +1,37 @@
+import { isUndefined } from '@sindresorhus/is';
+import { regEx } from '../../../util/regex.ts';
+import { GenericVersioningApi } from '../generic.ts';
+import type { GenericVersion, VersioningApi } from '../types.ts';
+
+export const id = 'redhat';
+export const displayName = 'Red Hat';
+export const urls = [];
+export const supportsRanges = false;
+
+const pattern = regEx(
+  /^v?(?<major>\d+)(?:\.(?<minor>\d+))?(?:\.(?<patch>\d+))?(?:\.GA)?(?:-(?<releaseMajor>\d+)(?:\.(?<releaseMinor>\d+))?)?$/,
+);
+
+class RedhatVersioningApi extends GenericVersioningApi {
+  protected _parse(version: string): GenericVersion | null {
+    const matches = pattern.exec(version)?.groups;
+    if (!matches) {
+      return null;
+    }
+
+    const { major, minor, patch, releaseMajor, releaseMinor } = matches;
+    const release = [
+      Number.parseInt(major, 10),
+      isUndefined(minor) ? 0 : Number.parseInt(minor, 10),
+      isUndefined(patch) ? 0 : Number.parseInt(patch, 10),
+      isUndefined(releaseMajor) ? 0 : Number.parseInt(releaseMajor, 10),
+      isUndefined(releaseMinor) ? 0 : Number.parseInt(releaseMinor, 10),
+    ];
+
+    return { release, prerelease: '' };
+  }
+}
+
+export const api: VersioningApi = new RedhatVersioningApi();
+
+export default api;

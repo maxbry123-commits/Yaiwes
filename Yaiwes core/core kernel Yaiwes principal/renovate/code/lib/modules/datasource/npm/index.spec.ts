@@ -1,0 +1,433 @@
+import * as httpMock from '~test/http-mock.ts';
+import { GlobalConfig } from '../../../config/global.ts';
+import { EXTERNAL_HOST_ERROR } from '../../../constants/error-messages.ts';
+import * as hostRules from '../../../util/host-rules.ts';
+import { getPkgReleases } from '../index.ts';
+import { defaultRegistryUrl } from './common.ts';
+import { NpmDatasource, setNpmrc } from './index.ts';
+
+const datasource = NpmDatasource.id;
+
+let npmResponse: any;
+
+describe('modules/datasource/npm/index', () => {
+  beforeEach(() => {
+    GlobalConfig.reset();
+    setNpmrc();
+    npmResponse = {
+      name: 'foobar',
+      versions: {
+        '0.0.1': {
+          foo: 1,
+        },
+        '0.0.2': {
+          foo: 2,
+        },
+      },
+      repository: {
+        type: 'git',
+        url: 'git://github.com/renovateapp/dummy.git',
+        directory: 'src/a',
+      },
+      homepage: 'https://github.com/renovateapp/dummy',
+      'dist-tags': {
+        latest: '0.0.1',
+      },
+      time: {
+        '0.0.1': '2018-05-06T07:21:53+02:00',
+        '0.0.2': '2018-05-07T07:21:53+02:00',
+      },
+    };
+  });
+
+  it('should return null for no versions', async () => {
+    const missingVersions = { ...npmResponse };
+    missingVersions.versions = {};
+    httpMock
+      .scope(defaultRegistryUrl)
+      .get('/foobar')
+      .reply(200, missingVersions);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toBeNull();
+  });
+
+  it('should fetch package info from npm', async () => {
+    httpMock
+      .scope(defaultRegistryUrl)
+      .get('/foobar')
+      .reply(200, npmResponse, { 'Cache-Control': 'public, expires=300' });
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [
+        { version: '0.0.1', releaseTimestamp: '2018-05-06T05:21:53.000Z' },
+        { version: '0.0.2', releaseTimestamp: '2018-05-07T05:21:53.000Z' },
+      ],
+      sourceDirectory: 'src/a',
+      sourceUrl: 'https://github.com/renovateapp/dummy',
+      tags: { latest: '0.0.1' },
+    });
+    expect(res?.isPrivate).toBeUndefined();
+  });
+
+  it('should parse repo url', async () => {
+    const pkg = {
+      name: 'foobar',
+      versions: {
+        '0.0.1': {
+          foo: 1,
+        },
+      },
+      repository: {
+        type: 'git',
+        url: 'git:github.com/renovateapp/dummy',
+      },
+      'dist-tags': {
+        latest: '0.0.1',
+      },
+      time: {
+        '0.0.1': '2018-05-06T07:21:53+02:00',
+      },
+    };
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(200, pkg);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [{ version: '0.0.1' }],
+      sourceUrl: 'https://github.com/renovateapp/dummy',
+    });
+  });
+
+  it('should parse repo url (string)', async () => {
+    const pkg = {
+      name: 'foobar',
+      versions: {
+        '0.0.1': {
+          repository: 'git:github.com/renovateapp/dummy',
+        },
+      },
+      'dist-tags': {
+        latest: '0.0.1',
+      },
+      time: {
+        '0.0.1': '2018-05-06T07:21:53+02:00',
+      },
+    };
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(200, pkg);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [{ version: '0.0.1' }],
+      sourceUrl: 'https://github.com/renovateapp/dummy',
+    });
+  });
+
+  it('should return deprecated', async () => {
+    const deprecatedPackage = {
+      name: 'foobar',
+      versions: {
+        '0.0.1': {
+          foo: 1,
+        },
+        '0.0.2': {
+          foo: 2,
+          deprecated: 'This is deprecated',
+        },
+      },
+      repository: {
+        type: 'git',
+        url: 'git://github.com/renovateapp/dummy.git',
+      },
+      'dist-tags': {
+        latest: '0.0.2',
+      },
+      time: {
+        '0.0.1': '2018-05-06T07:21:53+02:00',
+        '0.0.2': '2018-05-07T07:21:53+02:00',
+      },
+    };
+    httpMock
+      .scope(defaultRegistryUrl)
+      .get('/foobar')
+      .reply(200, deprecatedPackage);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    const deprecationMessage =
+      'On registry `https://registry.npmjs.org`, the "latest" version of dependency `foobar` has the following deprecation notice:\n\n`This is deprecated`\n\nMarking the latest version of an npm package as deprecated results in the entire package being considered deprecated, so contact the package author you think this is a mistake.';
+    expect(res).toMatchObject({
+      deprecationMessage,
+      releases: [
+        { version: '0.0.1', isDeprecated: true },
+        { version: '0.0.2', isDeprecated: true },
+      ],
+    });
+  });
+
+  it('should return attestation', async () => {
+    const deprecatedPackage = {
+      name: 'foobar',
+      versions: {
+        '0.0.1': {
+          foo: 1,
+          dist: {
+            attestations: {
+              url: `${defaultRegistryUrl}/-/npm/v1/attestations/foobar@0.0.1`,
+            },
+          },
+        },
+        '0.0.2': {
+          foo: 2,
+          dist: {
+            attestations: {
+              url: `${defaultRegistryUrl}/-/npm/v1/attestations/foobar@0.0.2`,
+            },
+          },
+        },
+      },
+      repository: {
+        type: 'git',
+        url: 'git://github.com/renovateapp/dummy.git',
+      },
+      'dist-tags': {
+        latest: '0.0.2',
+      },
+      time: {
+        '0.0.1': '2018-05-06T07:21:53+02:00',
+        '0.0.2': '2018-05-07T07:21:53+02:00',
+      },
+    };
+    httpMock
+      .scope(defaultRegistryUrl)
+      .get('/foobar')
+      .reply(200, deprecatedPackage);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [
+        {
+          version: '0.0.1',
+          attestation: true,
+        },
+        {
+          version: '0.0.2',
+          attestation: true,
+        },
+      ],
+    });
+  });
+
+  it('should handle foobar', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(200, npmResponse);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+    expect(res?.isPrivate).toBeTrue();
+  });
+
+  it('should handle no time', async () => {
+    delete npmResponse.time['0.0.2'];
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(200, npmResponse);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [
+        { version: '0.0.1', releaseTimestamp: '2018-05-06T05:21:53.000Z' },
+        { version: '0.0.2' },
+      ],
+    });
+    expect(res?.releases[1].releaseTimestamp).toBeUndefined();
+  });
+
+  it('should return null if lookup fails 401', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(401);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toBeNull();
+  });
+
+  it('should return null if lookup fails', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(404);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toBeNull();
+  });
+
+  it('should throw error for unparseable', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(200, 'oops');
+    await expect(
+      getPkgReleases({ datasource, packageName: 'foobar' }),
+    ).rejects.toThrow('external-host-error');
+  });
+
+  it('should throw error for 429', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(429);
+    await expect(
+      getPkgReleases({ datasource, packageName: 'foobar' }),
+    ).rejects.toThrow('external-host-error');
+  });
+
+  it('should throw error for 5xx', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(503);
+    await expect(
+      getPkgReleases({ datasource, packageName: 'foobar' }),
+    ).rejects.toThrow(EXTERNAL_HOST_ERROR);
+  });
+
+  it('should throw error for 408', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(408);
+    await expect(
+      getPkgReleases({ datasource, packageName: 'foobar' }),
+    ).rejects.toThrow(EXTERNAL_HOST_ERROR);
+  });
+
+  it('should throw error for others', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(451);
+    await expect(
+      getPkgReleases({ datasource, packageName: 'foobar' }),
+    ).rejects.toThrow('external-host-error');
+  });
+
+  it('should not send an authorization header if public package', async () => {
+    httpMock
+      .scope(defaultRegistryUrl, {
+        badheaders: ['authorization'],
+      })
+      .get('/foobar')
+      .reply(200, npmResponse);
+    const res = await getPkgReleases({ datasource, packageName: 'foobar' });
+    expect(res).toMatchObject({
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+  });
+
+  it('should send an authorization header if provided', async () => {
+    httpMock
+      .scope(defaultRegistryUrl, {
+        reqheaders: { authorization: 'Basic 1234' },
+      })
+      .get('/@foobar%2Fcore')
+      .reply(200, { ...npmResponse, name: '@foobar/core' });
+    const res = await getPkgReleases({
+      datasource,
+      packageName: '@foobar/core',
+      npmrc: '_auth = 1234',
+    });
+    expect(res).toMatchObject({
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+  });
+
+  it('should use host rules by hostName if provided', async () => {
+    hostRules.add({
+      hostType: 'npm',
+      matchHost: 'npm.mycustomregistry.com',
+      token: 'abc',
+    });
+    httpMock
+      .scope('https://npm.mycustomregistry.com', {
+        reqheaders: { authorization: 'Bearer abc' },
+      })
+      .get('/foobar')
+      .reply(200, npmResponse);
+    const npmrc = 'registry=https://npm.mycustomregistry.com/';
+    const res = await getPkgReleases({
+      datasource,
+      packageName: 'foobar',
+      npmrc,
+    });
+    expect(res).toMatchObject({
+      registryUrl: 'https://npm.mycustomregistry.com',
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+  });
+
+  it('should use host rules by baseUrl if provided', async () => {
+    hostRules.add({
+      hostType: 'npm',
+      matchHost:
+        'https://npm.mycustomregistry.com/_packaging/mycustomregistry/npm/registry/',
+      token: 'abc',
+    });
+    httpMock
+      .scope(
+        'https://npm.mycustomregistry.com/_packaging/mycustomregistry/npm/registry',
+        {
+          reqheaders: { authorization: 'Bearer abc' },
+        },
+      )
+      .get('/foobar')
+      .reply(200, npmResponse);
+    const npmrc =
+      'registry=https://npm.mycustomregistry.com/_packaging/mycustomregistry/npm/registry/';
+    const res = await getPkgReleases({
+      datasource,
+      packageName: 'foobar',
+      npmrc,
+    });
+    expect(res).toMatchObject({
+      registryUrl:
+        'https://npm.mycustomregistry.com/_packaging/mycustomregistry/npm/registry',
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+  });
+
+  it('resets npmrc', () => {
+    const npmrcContent = 'something=something';
+    setNpmrc(npmrcContent);
+    setNpmrc(npmrcContent);
+    expect(setNpmrc()).toBeUndefined();
+  });
+
+  it('should use default registry if missing from npmrc', async () => {
+    httpMock.scope(defaultRegistryUrl).get('/foobar').reply(200, npmResponse);
+    const npmrc = 'foo=bar';
+    const res = await getPkgReleases({
+      datasource,
+      packageName: 'foobar',
+      npmrc,
+    });
+    expect(res).toMatchObject({
+      registryUrl: 'https://registry.npmjs.org',
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+  });
+
+  it('should fetch package info from custom registry', async () => {
+    httpMock
+      .scope('https://npm.mycustomregistry.com', {})
+      .get('/foobar')
+      .reply(200, npmResponse);
+    const npmrc = `registry=https://npm.mycustomregistry.com/`;
+    const res = await getPkgReleases({
+      datasource,
+      packageName: 'foobar',
+      npmrc,
+    });
+    expect(res).toMatchObject({
+      registryUrl: 'https://npm.mycustomregistry.com',
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+    expect(res?.isPrivate).toBeTrue();
+  });
+
+  it('should replace any environment variable in npmrc', async () => {
+    httpMock
+      .scope('https://registry.from-env.com')
+      .get('/foobar')
+      .reply(200, npmResponse);
+    vi.stubEnv('REGISTRY', 'https://registry.from-env.com');
+    GlobalConfig.set({ exposeAllEnv: true });
+
+    const npmrc = 'registry=${REGISTRY}';
+    const res = await getPkgReleases({
+      datasource,
+      packageName: 'foobar',
+      npmrc,
+    });
+    expect(res).toMatchObject({
+      registryUrl: 'https://registry.from-env.com',
+      releases: [{ version: '0.0.1' }, { version: '0.0.2' }],
+    });
+  });
+
+  it('should throw error if necessary env var is not present', () => {
+    GlobalConfig.set({ exposeAllEnv: true });
+
+    expect(() => setNpmrc('registry=${REGISTRY_MISSING}')).toThrow(
+      Error('env-replace'),
+    );
+  });
+});

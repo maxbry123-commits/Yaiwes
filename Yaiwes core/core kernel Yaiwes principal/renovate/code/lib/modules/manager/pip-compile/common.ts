@@ -1,0 +1,375 @@
+import { split } from 'shlex';
+import upath from 'upath';
+import { logger } from '../../../logger/index.ts';
+import { coerceArray, isNotNullOrUndefined } from '../../../util/array.ts';
+import type {
+  ExecOptions,
+  ExtraEnv,
+  ToolConstraint,
+} from '../../../util/exec/types.ts';
+import { ensureCacheDir } from '../../../util/fs/index.ts';
+import { ensureLocalPath } from '../../../util/fs/util.ts';
+import { regEx } from '../../../util/regex.ts';
+import { parseUrl } from '../../../util/url.ts';
+import { findPypiIndexCredentials } from '../../datasource/pypi/host-rules.ts';
+import type { PackageFileContent, UpdateArtifactsConfig } from '../types.ts';
+import { resolveToolConstraint } from '../util.ts';
+import type {
+  CommandType,
+  PipCompileArgs,
+  SupportedManagers,
+} from './types.ts';
+
+export async function getPythonVersionConstraint(
+  config: UpdateArtifactsConfig,
+  extractedPythonVersion: string | undefined,
+): Promise<string | undefined> {
+  return await resolveToolConstraint(config, 'python', () => {
+    if (extractedPythonVersion) {
+      logger.debug('Using python constraint extracted from the lock file');
+      return `==${extractedPythonVersion}`;
+    }
+
+    return undefined;
+  });
+}
+
+export async function getToolVersionConstraint(
+  config: UpdateArtifactsConfig,
+  commandType: CommandType,
+): Promise<ToolConstraint> {
+  if (commandType === 'uv') {
+    return {
+      toolName: 'uv',
+      constraint: await resolveToolConstraint(config, 'uv'),
+    };
+  }
+
+  return {
+    toolName: 'pip-tools',
+    constraint: await resolveToolConstraint(config, 'pipTools'),
+  };
+}
+
+export async function getExecOptions(
+  config: UpdateArtifactsConfig,
+  commandType: CommandType,
+  cwd: string,
+  extraEnv: ExtraEnv<string>,
+  extractedPythonVersion: string | undefined,
+): Promise<ExecOptions> {
+  const constraint = await getPythonVersionConstraint(
+    config,
+    extractedPythonVersion,
+  );
+  const execOptions: ExecOptions = {
+    cwd: ensureLocalPath(cwd),
+    docker: {},
+    toolConstraints: [
+      {
+        toolName: 'python',
+        constraint,
+      },
+      await getToolVersionConstraint(config, commandType),
+    ],
+    extraEnv: {
+      PIP_CACHE_DIR: await ensureCacheDir('pip'),
+      PIP_NO_INPUT: 'true', // ensure pip doesn't block forever waiting for credentials on stdin
+      PIP_KEYRING_PROVIDER: 'import',
+      PYTHON_KEYRING_BACKEND: 'keyrings.envvars.keyring.EnvvarsKeyring',
+      ...extraEnv,
+    },
+  };
+  return execOptions;
+}
+
+export const constraintLineRegex = regEx(
+  /^(?:#.*?\r?\n)+# {4}(?<command>\S*)(?<arguments> .*?)?\r?\n/,
+);
+
+export const disallowedPipOptions = [
+  '--no-header', // header is required by this manager
+];
+const commonOptionsWithArguments = [
+  '--output-file',
+  '--extra',
+  '--extra-index-url',
+];
+const pipOptionsWithArguments = [
+  '--resolver',
+  '--constraint',
+  ...commonOptionsWithArguments,
+];
+const uvOptionsWithArguments = [
+  '--constraints',
+  '--constraint', // singular alias accepted by uv
+  '--python-version',
+  '--no-emit-package',
+  '--prerelease',
+  '--format',
+  '--resolution',
+  '--fork-strategy',
+  '--exclude-newer',
+  '--exclude-newer-package',
+  '--group',
+  '--override',
+  '--overrides',
+  ...commonOptionsWithArguments,
+];
+export const optionsWithArguments = [
+  ...pipOptionsWithArguments,
+  ...uvOptionsWithArguments,
+];
+const allowedCommonOptions = [
+  '-v',
+  '--generate-hashes',
+  '--emit-index-url',
+  '--index-url',
+  '--all-extras',
+];
+export const allowedOptions: Record<CommandType, string[]> = {
+  'pip-compile': [
+    '--allow-unsafe',
+    '--generate-hashes',
+    '--no-emit-index-url',
+    '--strip-extras',
+    ...allowedCommonOptions,
+    ...pipOptionsWithArguments,
+  ],
+  uv: [
+    '--no-strip-extras',
+    '--universal',
+    ...allowedCommonOptions,
+    ...uvOptionsWithArguments,
+  ],
+  custom: [],
+};
+
+// TODO(not7cd): test on all correct headers, even with CUSTOM_COMPILE_COMMAND
+export function extractHeaderCommand(
+  content: string,
+  fileName: string,
+): PipCompileArgs {
+  const compileCommand = constraintLineRegex.exec(content);
+  if (compileCommand?.groups === undefined) {
+    throw new Error(
+      `Failed to extract command from header in ${fileName} ${content}`,
+    );
+  }
+  logger.trace(
+    `pip-compile: found header in ${fileName}: \n${compileCommand[0]}`,
+  );
+  const command = compileCommand.groups.command;
+  const argv = [command];
+  let commandType: CommandType;
+  if (command === 'pip-compile') {
+    commandType = 'pip-compile';
+  } else if (command === 'uv') {
+    commandType = 'uv';
+  } else {
+    commandType = 'custom';
+  }
+  // v8 ignore else -- a compile command always records its arguments
+  if (compileCommand.groups.arguments) {
+    argv.push(...split(compileCommand.groups.arguments));
+  }
+  logger.debug(
+    { fileName, argv, commandType },
+    `pip-compile: extracted command from header`,
+  );
+
+  const result: PipCompileArgs = {
+    argv,
+    command,
+    commandType,
+    outputFile: '',
+    sourceFiles: [],
+  };
+  for (const arg of argv.slice(1)) {
+    if (commandType === 'uv' && ['pip', 'compile'].includes(arg)) {
+      continue;
+    }
+    // TODO(not7cd): check for "--option -- argument" case
+    if (!arg.startsWith('-')) {
+      result.sourceFiles.push(arg);
+      continue;
+    }
+    throwForDisallowedOption(arg);
+    throwForNoEqualSignInOptionWithArgument(arg);
+    throwForUnknownOption(commandType, arg);
+
+    if (arg.includes('=')) {
+      const [option, value] = arg.split('=');
+      if (option === '--extra') {
+        result.extra = coerceArray(result.extra);
+        result.extra.push(value);
+      } else if (option === '--extra-index-url') {
+        result.extraIndexUrl = coerceArray(result.extraIndexUrl);
+        result.extraIndexUrl.push(value);
+        // TODO: add to secrets? next PR
+      } else if (['--constraint', '--constraints'].includes(option)) {
+        result.constraintsFiles = coerceArray(result.constraintsFiles);
+        result.constraintsFiles.push(value);
+      } else if (['--override', '--overrides'].includes(option)) {
+        result.overridesFiles = coerceArray(result.overridesFiles);
+        result.overridesFiles.push(value);
+      } else if (option === '--output-file') {
+        if (result.outputFile) {
+          throw new Error('Cannot use multiple --output-file options');
+        }
+        result.outputFile = upath.normalize(value);
+      } else if (option === '--python-version') {
+        result.pythonVersion = value;
+      } else if (option === '--index-url') {
+        if (result.indexUrl) {
+          throw new Error('Cannot use multiple --index-url options');
+        }
+        result.indexUrl = value;
+        // TODO: add to secrets? next PR
+      } else {
+        logger.debug({ option }, `pip-compile: option not handled`);
+      }
+      continue;
+    }
+    if (arg === '--no-emit-index-url') {
+      result.noEmitIndexUrl = true;
+      continue;
+    }
+    if (arg === '--emit-index-url') {
+      result.emitIndexUrl = true;
+      continue;
+    }
+    if (arg === '--all-extras') {
+      result.allExtras = true;
+      continue;
+    }
+
+    logger.debug({ option: arg }, `pip-compile: option not handled`);
+  }
+  logger.trace(
+    {
+      ...result,
+    },
+    'Parsed pip-compile command from header',
+  );
+  if (result.noEmitIndexUrl && result.emitIndexUrl) {
+    throw new Error('Cannot use both --no-emit-index-url and --emit-index-url');
+  }
+  if (result.sourceFiles.length === 0) {
+    throw new Error(
+      'No source files detected in command, pass at least one package file explicitly',
+    );
+  }
+  return result;
+}
+
+const pythonVersionRegex = regEx(
+  /^(?:#.*?\r?\n)*# This file is autogenerated by pip-compile with Python (?<pythonVersion>\d+(?:\.\d+)*)\s/,
+  'i',
+);
+
+export function extractPythonVersion(
+  content: string,
+  fileName: string,
+): string | undefined {
+  const match = pythonVersionRegex.exec(content);
+  if (match?.groups === undefined) {
+    logger.warn(
+      { fileName, content },
+      'pip-compile: failed to extract Python version from header in file',
+    );
+    return undefined;
+  }
+  logger.trace(
+    `pip-compile: found Python version header in ${fileName}: \n${match[0]}`,
+  );
+  const { pythonVersion } = match.groups;
+  logger.debug(
+    { fileName, pythonVersion },
+    `pip-compile: extracted Python version from header`,
+  );
+  return pythonVersion;
+}
+
+function throwForDisallowedOption(arg: string): void {
+  if (disallowedPipOptions.includes(arg)) {
+    throw new Error(`Option ${arg} not allowed for this manager`);
+  }
+}
+function throwForNoEqualSignInOptionWithArgument(arg: string): void {
+  if (optionsWithArguments.includes(arg)) {
+    throw new Error(
+      `Option ${arg} must have equal sign '=' separating it's argument`,
+    );
+  }
+}
+function throwForUnknownOption(commandType: CommandType, arg: string): void {
+  if (arg.includes('=')) {
+    const [option] = arg.split('=');
+    if (allowedOptions[commandType].includes(option)) {
+      return;
+    }
+  }
+  if (allowedOptions[commandType].includes(arg)) {
+    return;
+  }
+  throw new Error(`Option ${arg} not supported (yet)`);
+}
+
+async function getRegistryCredEnvVars(
+  url: URL,
+  index: number,
+): Promise<Record<string, string>> {
+  const { username, password } = await findPypiIndexCredentials(url.href);
+  const ret: Record<string, string> = {};
+  if (!!username || !!password) {
+    ret[`KEYRING_SERVICE_NAME_${index}`] = url.hostname;
+    ret[`KEYRING_SERVICE_USERNAME_${index}`] = username ?? '';
+    ret[`KEYRING_SERVICE_PASSWORD_${index}`] = password ?? '';
+  }
+  return ret;
+}
+
+export async function getRegistryCredVarsFromPackageFiles(
+  packageFiles: PackageFileContent[],
+): Promise<ExtraEnv<string>> {
+  const urls: string[] = [];
+  for (const packageFile of packageFiles) {
+    urls.push(
+      ...coerceArray(packageFile.registryUrls),
+      ...coerceArray(packageFile.additionalRegistryUrls),
+    );
+  }
+  logger.debug(urls, 'Extracted registry URLs from package files');
+
+  // The full URL is kept, so that a `matchHost` narrowed to a path still matches
+  const parsedUrls = urls.map(parseUrl).filter(isNotNullOrUndefined);
+
+  let allCreds: ExtraEnv<string> = {};
+  for (const [index, url] of parsedUrls.entries()) {
+    const hostCreds = await getRegistryCredEnvVars(url, index);
+    allCreds = {
+      ...allCreds,
+      ...hostCreds,
+    };
+  }
+
+  return allCreds;
+}
+
+export function matchManager(filename: string): SupportedManagers | 'unknown' {
+  if (filename.endsWith('setup.py')) {
+    return 'pip_setup';
+  }
+  if (filename.endsWith('setup.cfg')) {
+    return 'setup-cfg';
+  }
+  if (filename.endsWith('pyproject.toml')) {
+    return 'pep621';
+  }
+  // naive, could be improved, maybe use pip_requirements.managerFilePatterns
+  if (filename.endsWith('.in') || filename.endsWith('.txt')) {
+    return 'pip_requirements';
+  }
+  return 'unknown';
+}

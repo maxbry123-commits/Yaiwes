@@ -1,0 +1,209 @@
+import { quote } from 'shlex';
+import { TEMPORARY_ERROR } from '../../../../constants/error-messages.ts';
+import { logger } from '../../../../logger/index.ts';
+import type {
+  ExecOptions,
+  ToolConstraint,
+} from '../../../../util/exec/types.ts';
+import {
+  getSiblingFileName,
+  readLocalFile,
+} from '../../../../util/fs/index.ts';
+import { withGitEnvironment } from '../../../../util/git/exec.ts';
+import { Result } from '../../../../util/result.ts';
+import { PypiDatasource } from '../../../datasource/pypi/index.ts';
+import type {
+  PackageDependency,
+  UpdateArtifact,
+  UpdateArtifactsResult,
+  Upgrade,
+} from '../../types.ts';
+import {
+  artifactErrorResult,
+  resolveToolConstraint,
+  updateLockFile,
+} from '../../util.ts';
+import { PdmLockfile, type PyProject } from '../schema.ts';
+import type { Pep621ManagerData } from '../types.ts';
+import { depTypes } from '../utils.ts';
+import { BasePyProjectProcessor } from './abstract.ts';
+
+const pdmUpdateCMD = 'pdm update --no-sync --update-eager';
+const gitExec = withGitEnvironment(['pep621']);
+
+export class PdmProcessor extends BasePyProjectProcessor {
+  override lockfileName = 'pdm.lock';
+
+  process(project: PyProject, deps: PackageDependency[]): PackageDependency[] {
+    const devDependencies = project.tool?.pdm?.devDependencies;
+    if (devDependencies) {
+      deps.push(...devDependencies);
+    }
+
+    const registryUrls = project.tool?.pdm?.registryUrls;
+    if (registryUrls) {
+      for (const dep of deps) {
+        if (dep.datasource === PypiDatasource.id) {
+          dep.registryUrls = registryUrls;
+        }
+      }
+    }
+
+    return deps;
+  }
+
+  async extractLockedVersions(
+    project: PyProject,
+    deps: PackageDependency[],
+    packageFile: string,
+  ): Promise<PackageDependency[]> {
+    if (
+      !project.tool?.pdm &&
+      project['build-system']?.['build-backend'] !== 'pdm.backend'
+    ) {
+      return Promise.resolve(deps);
+    }
+
+    const lockFileName = getSiblingFileName(packageFile, 'pdm.lock');
+    const lockFileContent = await readLocalFile(lockFileName, 'utf8');
+    if (lockFileContent) {
+      const lockFileMapping = Result.parse(
+        lockFileContent,
+        PdmLockfile.transform(({ lock }) => lock),
+      ).unwrapOr({});
+
+      for (const dep of deps) {
+        const packageName = dep.packageName;
+        if (packageName && packageName in lockFileMapping) {
+          dep.lockedVersion = lockFileMapping[packageName];
+        }
+      }
+    }
+
+    return Promise.resolve(deps);
+  }
+
+  async updateArtifacts(
+    updateArtifact: UpdateArtifact<Pep621ManagerData>,
+    project: PyProject,
+  ): Promise<UpdateArtifactsResult[] | null> {
+    const { config, updatedDeps, packageFileName } = updateArtifact;
+
+    const { isLockFileMaintenance } = config;
+
+    // abort if no lockfile is defined
+    const lockFileName = getSiblingFileName(packageFileName, this.lockfileName);
+    try {
+      const existingLockFileContent = await readLocalFile(lockFileName, 'utf8');
+      if (!existingLockFileContent) {
+        logger.debug('No pdm.lock found');
+        return null;
+      }
+
+      const pythonConstraint: ToolConstraint = {
+        toolName: 'python',
+        constraint: await resolveToolConstraint(
+          config,
+          'python',
+          () => project.project?.['requires-python'],
+        ),
+      };
+      const pdmConstraint: ToolConstraint = {
+        toolName: 'pdm',
+        constraint: await resolveToolConstraint(config, 'pdm'),
+      };
+
+      const execOptions: ExecOptions = {
+        cwdFile: packageFileName,
+        docker: {},
+        toolConstraints: [pythonConstraint, pdmConstraint],
+      };
+
+      // on lockFileMaintenance do not specify any packages and update the complete lock file
+      // else only update specific packages
+      const cmds: string[] = [];
+      if (isLockFileMaintenance) {
+        cmds.push(pdmUpdateCMD);
+      } else {
+        cmds.push(...generateCMDs(updatedDeps));
+      }
+      return await updateLockFile({
+        lockFileName,
+        existingLockFileContent,
+        run: () => gitExec(cmds, execOptions),
+      });
+    } catch (err) {
+      if (err.message === TEMPORARY_ERROR) {
+        throw err;
+      }
+      logger.debug({ err }, 'Failed to update PDM lock file');
+      return artifactErrorResult(lockFileName, err);
+    }
+  }
+}
+
+function generateCMDs(updatedDeps: Upgrade<Pep621ManagerData>[]): string[] {
+  const cmds: string[] = [];
+  const packagesByCMD: Record<string, string[]> = {};
+  for (const dep of updatedDeps) {
+    switch (dep.depType) {
+      case depTypes.optionalDependencies: {
+        if (!dep.managerData?.depGroup) {
+          logger.once.warn(
+            { dep: dep.depName },
+            'Unexpected optional dependency without group',
+          );
+          continue;
+        }
+        addPackageToCMDRecord(
+          packagesByCMD,
+          `${pdmUpdateCMD} -G ${quote(dep.managerData.depGroup)}`,
+          dep.packageName!,
+        );
+        break;
+      }
+      case depTypes.dependencyGroups:
+      case depTypes.pdmDevDependencies: {
+        if (!dep.managerData?.depGroup) {
+          logger.once.warn(
+            { dep: dep.depName },
+            'Unexpected dev dependency without group',
+          );
+          continue;
+        }
+        addPackageToCMDRecord(
+          packagesByCMD,
+          `${pdmUpdateCMD} -dG ${quote(dep.managerData.depGroup)}`,
+          dep.packageName!,
+        );
+        break;
+      }
+      case depTypes.buildSystemRequires:
+        // build requirements are not locked in the lock files, no need to update.
+        // Reference: https://github.com/pdm-project/pdm/discussions/2869
+        break;
+      default: {
+        addPackageToCMDRecord(packagesByCMD, pdmUpdateCMD, dep.packageName!);
+      }
+    }
+  }
+
+  for (const commandPrefix in packagesByCMD) {
+    const packageList = packagesByCMD[commandPrefix].map(quote).join(' ');
+    const cmd = `${commandPrefix} ${packageList}`;
+    cmds.push(cmd);
+  }
+
+  return cmds;
+}
+
+function addPackageToCMDRecord(
+  packagesByCMD: Record<string, string[]>,
+  commandPrefix: string,
+  packageName: string,
+): void {
+  if (!packagesByCMD[commandPrefix]) {
+    packagesByCMD[commandPrefix] = [];
+  }
+  packagesByCMD[commandPrefix].push(packageName);
+}

@@ -1,0 +1,27 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+ruby '>= 2.4.0', '< 2.7.0'
+
+gem 'pkg-config', '~> 1.4'
+
+gem 'aws-sdk-s3', '~> 1.59', require: false
+gem 'fog-core', '<= 2.1.0'
+
+group :pam_authentication, optional: true do
+  gem 'devise_pam_authenticatable2', '~> 9.2'
+end
+
+gem 'health_check', git: 'https://github.com/ianheggie/health_check', ref: '0b799ead604f900ed50685e9b2d469cd2befba5b'
+gem 'http_parser.rb', '~> 0.6', git: 'https://github.com/tmm1/http_parser.rb', ref: '54b17ba8c7d8d20a16dfc65d1775241833219cf2', submodules: true
+gem 'json-ld', git: 'https://github.com/ruby-rdf/json-ld.git', ref: 'e742697a0906e74e8bb777ef98137bc3955d981d'
+
+group :development, :test do
+  gem 'fabrication', '~> 2.21'
+end
+
+group :production, :test do
+  gem 'private_address_check', '~> 0.5'
+end
+
+gem 'concurrent-ruby', require: false
