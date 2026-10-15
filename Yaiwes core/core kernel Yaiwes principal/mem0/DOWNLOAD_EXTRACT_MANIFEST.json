@@ -1,0 +1,52 @@
+{
+  "bundle_bytes": 21611905,
+  "bundle_sha256": "ea50b193ceb6cf3ea755337d8ec091d9a82e558c8131be4846209001cf35c5c8",
+  "extracted_tree": {
+    "bytes": 36756429,
+    "files": 1828,
+    "sha256": "29119f377dca13d7015ee2b4ee812951a5c5c85b4e1e0bf9ff684c5c543624c2"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "mem0.bundle.zip.part-0001",
+      "sha256": "8b6475158164214845e11cc58c048999eb382d199de8156f1742084860145886"
+    },
+    {
+      "bytes": 9028993,
+      "name": "mem0.bundle.zip.part-0002",
+      "sha256": "dae6ba984fc7521131cee95c1e36477bfd94812ccd35080e011a27113bdfae71"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".github/CLAUDE.md",
+    "CLAUDE.md",
+    "cli/node/CLAUDE.md",
+    "cli/python/CLAUDE.md",
+    "docs/CLAUDE.md",
+    "integrations/CLAUDE.md",
+    "mem0-ts/CLAUDE.md",
+    "mem0/CLAUDE.md",
+    "server/CLAUDE.md",
+    "skills/CLAUDE.md",
+    "tests/CLAUDE.md"
+  ],
+  "skipped_special_count": 11,
+  "slug": "mem0",
+  "source_bytes": 36756429,
+  "source_commit": "0724291bd864cf807e88ee8981c8226644e8fb42",
+  "source_files": 1828,
+  "source_ref": "main",
+  "source_repo": "mem0ai/mem0",
+  "source_tree": {
+    "bytes": 36756429,
+    "files": 1828,
+    "sha256": "29119f377dca13d7015ee2b4ee812951a5c5c85b4e1e0bf9ff684c5c543624c2"
+  }
+}
