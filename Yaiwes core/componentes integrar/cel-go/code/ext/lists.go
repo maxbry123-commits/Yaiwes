@@ -1,0 +1,1321 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ext
+
+import (
+	"fmt"
+	"math"
+	"sort"
+
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/cost"
+	"cel.dev/cel-go/common/decls"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
+	"cel.dev/cel-go/parser"
+)
+
+var comparableTypes = []*cel.Type{
+	cel.IntType,
+	cel.UintType,
+	cel.DoubleType,
+	cel.BoolType,
+	cel.DurationType,
+	cel.TimestampType,
+	cel.StringType,
+	cel.BytesType,
+}
+
+// Lists returns a cel.EnvOption to configure extended functions for list manipulation.
+// As a general note, all indices are zero-based.
+//
+// # Distinct
+//
+// Introduced in version: 2 (cost support in version 3)
+//
+// Returns the distinct elements of a list.
+//
+//	<list(T)>.distinct() -> <list(T)>
+//
+// Examples:
+//
+//	[1, 2, 2, 3, 3, 3].distinct() // return [1, 2, 3]
+//	["b", "b", "c", "a", "c"].distinct() // return ["b", "c", "a"]
+//	[1, "b", 2, "b"].distinct() // return [1, "b", 2]
+//
+// # Range
+//
+// Introduced in version: 2 (cost support in version 3)
+//
+// Returns a list of integers from 0 to n-1.
+//
+//	lists.range(<int>) -> <list(int)>
+//
+// Examples:
+//
+//	lists.range(5) -> [0, 1, 2, 3, 4]
+//
+// # Reverse
+//
+// Introduced in version: 2 (cost support in version 3)
+//
+// Returns the elements of a list in reverse order.
+//
+//	<list(T)>.reverse() -> <list(T)>
+//
+// Examples:
+//
+//	[5, 3, 1, 2].reverse() // return [2, 1, 3, 5]
+//
+// # Slice
+//
+// Introduced in version: 0 (cost support in version 3)
+//
+// Returns a new sub-list using the indexes provided.
+//
+//	<list>.slice(<int>, <int>) -> <list>
+//
+// Examples:
+//
+//	[1,2,3,4].slice(1, 3) // return [2, 3]
+//	[1,2,3,4].slice(2, 4) // return [3 ,4]
+//
+// # Flatten
+//
+// Introduced in version: 1 (cost support in version 3)
+//
+// Flattens a list recursively.
+// If an optional depth is provided, the list is flattened to a the specified level.
+// A negative depth value will result in an error.
+//
+//	<list>.flatten() -> <list>
+//	<list>.flatten(<int>) -> <list>
+//
+// Examples:
+//
+// [1,[2,3],[4]].flatten() // return [1, 2, 3, 4]
+// [1,[2,[3,4]]].flatten() // return [1, 2, [3, 4]]
+// [1,2,[],[],[3,4]].flatten() // return [1, 2, 3, 4]
+// [1,[2,[3,[4]]]].flatten(2) // return [1, 2, 3, [4]]
+// [1,[2,[3,[4]]]].flatten(-1) // error
+//
+// # Sort
+//
+// Introduced in version: 2 (cost support in version 3)
+//
+// Sorts a list with comparable elements. If the element type is not comparable
+// or the element types are not the same, the function will produce an error.
+//
+//	<list(T)>.sort() -> <list(T)>
+//	T in {int, uint, double, bool, duration, timestamp, string, bytes}
+//
+// Examples:
+//
+//	[3, 2, 1].sort() // return [1, 2, 3]
+//	["b", "c", "a"].sort() // return ["a", "b", "c"]
+//	[1, "b"].sort() // error
+//	[[1, 2, 3]].sort() // error
+//
+// # SortBy
+//
+// Introduced in version: 2 (cost support in version 3)
+//
+// Sorts a list by a key value, i.e., the order is determined by the result of
+// an expression applied to each element of the list.
+// The output of the key expression must be a comparable type, otherwise the
+// function will return an error.
+//
+//	<list(T)>.sortBy(<bindingName>, <keyExpr>) -> <list(T)>
+//	keyExpr returns a value in {int, uint, double, bool, duration, timestamp, string, bytes}
+//
+// Examples:
+//
+//	[
+//	  Player { name: "foo", score: 0 },
+//	  Player { name: "bar", score: -10 },
+//	  Player { name: "baz", score: 1000 },
+//	].sortBy(e, e.score).map(e, e.name)
+//	== ["bar", "foo", "baz"]
+//
+// # HasOnly
+//
+// Introduced in version: 5
+//
+// Returns whether every element of the target list is contained within the
+// argument list, i.e. whether the target is a subset of the argument. Standard
+// CEL equality is used to determine whether two elements are equal, and neither
+// list is required to contain unique elements. An empty target list always
+// returns true.
+//
+//	<list(T)>.hasOnly(<list(T)>) -> <bool>
+//
+// Examples:
+//
+//	[].hasOnly([1, 2]) // return true
+//	[1, 1, 2].hasOnly([1, 2, 3]) // return true
+//	[1, 2.0, 3u].hasOnly([1.0, 2u, 3]) // return true
+//	[1, 4].hasOnly([1, 2, 3]) // return false
+//	[1].hasOnly([]) // return false
+//
+// # HasAny
+//
+// Introduced in version: 5
+//
+// Returns whether the target list has at least one element which is equal to an
+// element of the argument list. If either list is empty, the result is false.
+//
+//	<list(T)>.hasAny(<list(T)>) -> <bool>
+//
+// Examples:
+//
+//	[1, 2, 3].hasAny([3, 4]) // return true
+//	[[1], [2, 3]].hasAny([[1, 2], [2, 3.0]]) // return true
+//	[1, 2].hasAny([3, 4]) // return false
+//	[1].hasAny([]) // return false
+//
+// # HasAll
+//
+// Introduced in version: 5
+//
+// Returns whether every element of the argument list is contained within the
+// target list, i.e. whether the target is a superset of the argument. An empty
+// argument list always returns true.
+//
+//	<list(T)>.hasAll(<list(T)>) -> <bool>
+//
+// Examples:
+//
+//	[1, 2, 3].hasAll([]) // return true
+//	[1, 2, 3, 4].hasAll([2, 3]) // return true
+//	[1, 2.0, 3u].hasAll([1.0, 2u, 3]) // return true
+//	[1, 2, 3].hasAll([2, 4]) // return false
+//
+// # HasExactly
+//
+// Introduced in version: 5
+//
+// Returns whether the target and argument lists are set equivalent, i.e. every
+// element of the target list is equal to an element of the argument list and
+// vice versa. The lists may differ in size since neither is guaranteed to hold
+// unique elements, so size does not factor into the computation.
+//
+//	<list(T)>.hasExactly(<list(T)>) -> <bool>
+//
+// Examples:
+//
+//	[].hasExactly([]) // return true
+//	[1].hasExactly([1, 1]) // return true
+//	[1].hasExactly([1u, 1.0]) // return true
+//	[1, 2, 3].hasExactly([3u, 2.0, 1]) // return true
+//	[1, 2].hasExactly([1, 2, 3]) // return false
+func Lists(options ...ListsOption) cel.EnvOption {
+	l := &listsLib{version: math.MaxUint32, maxRangeSize: defaultMaxRangeSize}
+	for _, o := range options {
+		l = o(l)
+	}
+	return cel.Lib(l)
+}
+
+const defaultMaxRangeSize = 1_000_000
+
+type listsLib struct {
+	version      uint32
+	maxRangeSize int64
+}
+
+// LibraryName implements the SingletonLibrary interface method.
+func (listsLib) LibraryName() string {
+	return "cel.lib.ext.lists"
+}
+
+// ListsOption is a functional interface for configuring the strings library.
+type ListsOption func(*listsLib) *listsLib
+
+// ListsVersion configures the version of the string library.
+//
+// The version limits which functions are available. Only functions introduced
+// below or equal to the given version included in the library. If this option
+// is not set, all functions are available.
+//
+// See the library documentation to determine which version a function was introduced.
+// If the documentation does not state which version a function was introduced, it can
+// be assumed to be introduced at version 0, when the library was first created.
+func ListsVersion(version uint32) ListsOption {
+	return func(lib *listsLib) *listsLib {
+		lib.version = version
+		return lib
+	}
+}
+
+// ListsMaxRangeSize sets the maximum number of elements lists.range() will
+// allocate. If not set, the default is 1,000,000. Setting this to zero
+// disables the limit (not recommended).
+func ListsMaxRangeSize(size int64) ListsOption {
+	return func(lib *listsLib) *listsLib {
+		lib.maxRangeSize = size
+		return lib
+	}
+}
+
+// CompileOptions implements the Library interface method.
+func (lib listsLib) CompileOptions() []cel.EnvOption {
+	listType := cel.ListType(cel.TypeParamType("T"))
+	listListType := cel.ListType(listType)
+	listDyn := cel.ListType(cel.DynType)
+	var adapt func() types.Adapter
+	captureAdapt := func(e *cel.Env) (*cel.Env, error) {
+		adapt = e.CELTypeAdapter
+		return e, nil
+	}
+	opts := []cel.EnvOption{
+		captureAdapt,
+		cel.Function("slice",
+			cel.MemberOverload("list_slice",
+				[]*cel.Type{listType, cel.IntType, cel.IntType}, listType,
+				cel.FunctionBinding(func(args ...ref.Val) ref.Val {
+					list := args[0].(traits.Lister)
+					start := args[1].(types.Int)
+					end := args[2].(types.Int)
+					result, err := slice(adapt(), list, start, end)
+					if err != nil {
+						return types.WrapErr(err)
+					}
+					return result
+				}),
+			),
+		),
+	}
+	if lib.version >= 1 {
+		opts = append(opts,
+			cel.Function("flatten",
+				cel.MemberOverload("list_flatten",
+					[]*cel.Type{listListType}, listType,
+					cel.UnaryBinding(func(arg ref.Val) ref.Val {
+						// double-check as type-guards disabled
+						list, ok := arg.(traits.Lister)
+						if !ok {
+							return types.ValOrErr(arg, "no such overload: %v.flatten()", arg.Type())
+						}
+						flatList, err := flatten(list, 1)
+						if err != nil {
+							return types.WrapErr(err)
+						}
+
+						return adapt().NativeToValue(flatList)
+					}),
+				),
+				cel.MemberOverload("list_flatten_int",
+					[]*cel.Type{listDyn, types.IntType}, listDyn,
+					cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
+						// double-check as type-guards disabled
+						list, ok := arg1.(traits.Lister)
+						if !ok {
+							return types.ValOrErr(arg1, "no such overload: %v.flatten(%v)", arg1.Type(), arg2.Type())
+						}
+						depth, ok := arg2.(types.Int)
+						if !ok {
+							return types.ValOrErr(arg1, "no such overload: %v.flatten(%v)", arg1.Type(), arg2.Type())
+						}
+						flatList, err := flatten(list, int64(depth))
+						if err != nil {
+							return types.WrapErr(err)
+						}
+
+						return adapt().NativeToValue(flatList)
+					}),
+				),
+				// To handle the case where a variable of just `list(T)` is provided at runtime
+				// with a graceful failure more, disable the type guards since the implementation
+				// can handle lists which are already flat.
+				decls.DisableTypeGuards(true),
+			),
+		)
+	}
+	if lib.version >= 2 {
+		sortDecl := cel.Function("sort",
+			append(
+				templatedOverloads(comparableTypes, func(t *cel.Type) cel.FunctionOpt {
+					return cel.MemberOverload(
+						fmt.Sprintf("list_%s_sort", t.TypeName()),
+						[]*cel.Type{cel.ListType(t)}, cel.ListType(t),
+					)
+				}),
+				cel.SingletonUnaryBinding(
+					func(arg ref.Val) ref.Val {
+						// validated by type-guards
+						list := arg.(traits.Lister)
+						sorted, err := sortList(adapt(), list)
+						if err != nil {
+							return types.WrapErr(err)
+						}
+
+						return sorted
+					},
+					// List traits
+					traits.ListerType,
+				),
+			)...,
+		)
+		opts = append(opts, sortDecl)
+		opts = append(opts, cel.Macros(cel.ReceiverMacro("sortBy", 2, sortByMacro)))
+		opts = append(opts, cel.Function("@sortByAssociatedKeys",
+			append(
+				templatedOverloads(comparableTypes, func(u *cel.Type) cel.FunctionOpt {
+					return cel.MemberOverload(
+						fmt.Sprintf("list_%s_sortByAssociatedKeys", u.TypeName()),
+						[]*cel.Type{listType, cel.ListType(u)}, listType,
+					)
+				}),
+				cel.SingletonBinaryBinding(
+					func(arg1, arg2 ref.Val) ref.Val {
+						// validated by type-guards
+						list := arg1.(traits.Lister)
+						keys := arg2.(traits.Lister)
+						sorted, err := sortListByAssociatedKeys(adapt(), list, keys)
+						if err != nil {
+							return types.WrapErr(err)
+						}
+
+						return sorted
+					},
+					// List traits
+					traits.ListerType,
+				),
+			)...,
+		))
+
+		maxRange := lib.maxRangeSize
+		opts = append(opts, cel.Function("lists.range",
+			cel.Overload("lists_range",
+				[]*cel.Type{cel.IntType}, cel.ListType(cel.IntType),
+				cel.UnaryBinding(func(n ref.Val) ref.Val {
+					result, err := genRange(adapt(), n.(types.Int), maxRange)
+					if err != nil {
+						return types.WrapErr(err)
+					}
+					return result
+				}),
+			),
+		))
+		opts = append(opts, cel.Function("reverse",
+			cel.MemberOverload("list_reverse",
+				[]*cel.Type{listType}, listType,
+				cel.UnaryBinding(func(list ref.Val) ref.Val {
+					result, err := reverseList(adapt(), list.(traits.Lister))
+					if err != nil {
+						return types.WrapErr(err)
+					}
+					return result
+				}),
+			),
+		))
+		opts = append(opts, cel.Function("distinct",
+			cel.MemberOverload("list_distinct",
+				[]*cel.Type{listType}, listType,
+				cel.UnaryBinding(func(list ref.Val) ref.Val {
+					result, err := distinctList(adapt(), list.(traits.Lister))
+					if err != nil {
+						return types.WrapErr(err)
+					}
+					return result
+				}),
+			),
+		))
+	}
+	if lib.version >= 3 {
+		estimators := []cost.CostOption{
+			cost.OverloadCostEstimate("list_slice", estimateListSlice),
+			cost.OverloadCostEstimate("lists_range", estimateListsRange),
+			cost.OverloadCostEstimate("list_reverse", estimateListReverse),
+		}
+		if lib.version == 3 {
+			estimators = append(estimators,
+				cost.OverloadCostEstimate("list_flatten", estimateListFlattenLegacy),
+				cost.OverloadCostEstimate("list_flatten_int", estimateListFlattenLegacy),
+				cost.OverloadCostEstimate("list_distinct", estimateListDistinctLegacy),
+			)
+			for _, t := range comparableTypes {
+				estimators = append(estimators,
+					cost.OverloadCostEstimate(
+						fmt.Sprintf("list_%s_sort", t.TypeName()),
+						estimateListSortLegacy(t),
+					),
+					cost.OverloadCostEstimate(
+						fmt.Sprintf("list_%s_sortByAssociatedKeys", t.TypeName()),
+						estimateListSortByLegacy(t),
+					),
+				)
+			}
+		} else {
+			estimators = append(estimators,
+				cost.OverloadCostEstimate("list_flatten", estimateListFlatten),
+				cost.OverloadCostEstimate("list_flatten_int", estimateListFlatten),
+				cost.OverloadCostEstimate("list_distinct", estimateListDistinct),
+			)
+			for _, t := range comparableTypes {
+				estimators = append(estimators,
+					cost.OverloadCostEstimate(
+						fmt.Sprintf("list_%s_sort", t.TypeName()),
+						estimateListSort(t),
+					),
+					cost.OverloadCostEstimate(
+						fmt.Sprintf("list_%s_sortByAssociatedKeys", t.TypeName()),
+						estimateListSortBy(t),
+					),
+				)
+			}
+		}
+		opts = append(opts, cel.CostEstimatorOptions(estimators...))
+	}
+	if lib.version >= 5 {
+		opts = append(opts,
+			cel.Function("hasOnly",
+				cel.MemberOverload("list_hasOnly_list",
+					[]*cel.Type{listType, listType}, cel.BoolType,
+					cel.BinaryBinding(listHasOnly),
+				),
+			),
+			cel.Function("hasAny",
+				cel.MemberOverload("list_hasAny_list",
+					[]*cel.Type{listType, listType}, cel.BoolType,
+					cel.BinaryBinding(listHasAny),
+				),
+			),
+			cel.Function("hasAll",
+				cel.MemberOverload("list_hasAll_list",
+					[]*cel.Type{listType, listType}, cel.BoolType,
+					cel.BinaryBinding(listHasAll),
+				),
+			),
+			cel.Function("hasExactly",
+				cel.MemberOverload("list_hasExactly_list",
+					[]*cel.Type{listType, listType}, cel.BoolType,
+					cel.BinaryBinding(listHasExactly),
+				),
+			),
+			cel.CostEstimatorOptions(
+				cost.OverloadCostEstimate("list_hasOnly_list", estimateListSetOp(1)),
+				cost.OverloadCostEstimate("list_hasAny_list", estimateListSetOp(1)),
+				cost.OverloadCostEstimate("list_hasAll_list", estimateListSetOp(1)),
+				// set equivalence requires up to two m*n comparisons to ensure each list contains the other
+				cost.OverloadCostEstimate("list_hasExactly_list", estimateListSetOp(2)),
+			),
+		)
+	}
+
+	return opts
+}
+
+// ProgramOptions implements the Library interface method.
+func (lib *listsLib) ProgramOptions() []cel.ProgramOption {
+	var opts []cel.ProgramOption
+	if lib.version >= 3 {
+		trackers := []cost.TrackerOption{
+			cost.OverloadTracker("list_slice", trackListOutputSize),
+			cost.OverloadTracker("lists_range", trackListOutputSize),
+			cost.OverloadTracker("list_reverse", trackListOutputSize),
+			cost.OverloadTracker("list_distinct", trackListDistinct),
+		}
+		if lib.version == 3 {
+			trackers = append(trackers,
+				cost.OverloadTracker("list_flatten", trackListFlattenLegacy),
+				cost.OverloadTracker("list_flatten_int", trackListFlattenLegacy),
+			)
+		} else {
+			trackers = append(trackers,
+				cost.OverloadTracker("list_flatten", trackListFlatten),
+				cost.OverloadTracker("list_flatten_int", trackListFlatten),
+			)
+		}
+		for _, t := range comparableTypes {
+			trackers = append(trackers,
+				cost.OverloadTracker(
+					fmt.Sprintf("list_%s_sort", t.TypeName()),
+					trackListSort,
+				),
+				cost.OverloadTracker(
+					fmt.Sprintf("list_%s_sortByAssociatedKeys", t.TypeName()),
+					trackListSortBy,
+				),
+			)
+		}
+		if lib.version >= 5 {
+			trackers = append(trackers,
+				cost.OverloadTracker("list_hasOnly_list", trackSetsCost(1)),
+				cost.OverloadTracker("list_hasAny_list", trackSetsCost(1)),
+				cost.OverloadTracker("list_hasAll_list", trackSetsCost(1)),
+				cost.OverloadTracker("list_hasExactly_list", trackSetsCost(2)),
+			)
+		}
+		opts = append(opts, cel.CostTrackerOptions(trackers...))
+	}
+	return opts
+}
+
+func genRange(adapt types.Adapter, n types.Int, maxSize int64) (ref.Val, error) {
+	if n < 0 {
+		return nil, fmt.Errorf("lists.range: size must be non-negative, got %d", n)
+	}
+	if maxSize > 0 && int64(n) > maxSize {
+		return nil, fmt.Errorf("lists.range: size %d exceeds maximum allowed (%d)", n, maxSize)
+	}
+	newList := make([]int, 0, n)
+	for i := range int(n) {
+		newList = append(newList, i)
+	}
+	return adapt.NativeToValue(newList), nil
+}
+
+func reverseList(adapt types.Adapter, list traits.Lister) (ref.Val, error) {
+	if reversed, ok := types.MaybeReverseList(adapt, list); ok {
+		return reversed, nil
+	}
+	listLength := list.Size().(types.Int)
+	newList := make([]ref.Val, 0, listLength)
+	for i := range listLength {
+		val := list.Get(listLength - i - 1)
+		newList = append(newList, val)
+	}
+	return adapt.NativeToValue(newList), nil
+}
+
+func slice(adapt types.Adapter, list traits.Lister, start, end types.Int) (ref.Val, error) {
+	listLength := list.Size().(types.Int)
+	if start < 0 || end < 0 {
+		return nil, fmt.Errorf("cannot slice(%d, %d), negative indexes not supported", start, end)
+	}
+	if start > end {
+		return nil, fmt.Errorf("cannot slice(%d, %d), start index must be less than or equal to end index", start, end)
+	}
+	if listLength < end {
+		return nil, fmt.Errorf("cannot slice(%d, %d), list is length %d", start, end, listLength)
+	}
+
+	if sliced, ok := types.MaybeSliceList(adapt, list, int(start), int(end)); ok {
+		return sliced, nil
+	}
+
+	newList := make([]ref.Val, 0, end-start)
+	for i := types.Int(start); i < end; i++ {
+		val := list.Get(i)
+		newList = append(newList, val)
+	}
+	return adapt.NativeToValue(newList), nil
+}
+
+func flatten(list traits.Lister, depth int64) ([]ref.Val, error) {
+	if depth < 0 {
+		return nil, fmt.Errorf("level must be non-negative")
+	}
+
+	listLength := list.Size().(types.Int)
+	newList := make([]ref.Val, 0, listLength)
+	return flattenInto(newList, list, depth)
+}
+
+func flattenInto(dst []ref.Val, list traits.Lister, depth int64) ([]ref.Val, error) {
+	listLength := list.Size().(types.Int)
+	for i := range listLength {
+		val := list.Get(i)
+		if depth == 0 {
+			dst = append(dst, val)
+			continue
+		}
+		if nestedList, isList := val.(traits.Lister); isList {
+			var err error
+			dst, err = flattenInto(dst, nestedList, depth-1)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			dst = append(dst, val)
+		}
+	}
+	return dst, nil
+}
+
+func sortList(adapt types.Adapter, list traits.Lister) (ref.Val, error) {
+	return sortListByAssociatedKeys(adapt, list, list)
+}
+
+// Internal function used for the implementation of sort() and sortBy().
+//
+// Sorts a list of arbitrary elements, according to the order produced by sorting
+// another list of comparable elements. If the element type of the keys is not
+// comparable or the element types are not the same, the function will produce an error.
+//
+//	<list(T)>.@sortByAssociatedKeys(<list(U)>) -> <list(T)>
+//	U in {int, uint, double, bool, duration, timestamp, string, bytes}
+//
+// Example:
+//
+//	["foo", "bar", "baz"].@sortByAssociatedKeys([3, 1, 2]) // return ["bar", "baz", "foo"]
+func sortListByAssociatedKeys(adapt types.Adapter, list, keys traits.Lister) (ref.Val, error) {
+	listLength := list.Size().(types.Int)
+	keysLength := keys.Size().(types.Int)
+	if listLength != keysLength {
+		return nil, fmt.Errorf(
+			"@sortByAssociatedKeys() expected a list of the same size as the associated keys list, but got %d and %d elements respectively",
+			listLength,
+			keysLength,
+		)
+	}
+	if listLength == 0 {
+		return list, nil
+	}
+	elem := keys.Get(types.IntZero)
+	if _, ok := elem.(traits.Comparer); !ok {
+		return nil, fmt.Errorf("list elements must be comparable")
+	}
+
+	sortedIndices := make([]ref.Val, 0, listLength)
+	for i := types.IntZero; i < listLength; i++ {
+		sortedIndices = append(sortedIndices, i)
+	}
+
+	var err error
+	sort.Slice(sortedIndices, func(i, j int) bool {
+		iKey := keys.Get(sortedIndices[i])
+		jKey := keys.Get(sortedIndices[j])
+		if iKey.Type() != elem.Type() || jKey.Type() != elem.Type() {
+			err = fmt.Errorf("list elements must have the same type")
+			return false
+		}
+		return iKey.(traits.Comparer).Compare(jKey) == types.IntNegOne
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sorted := make([]ref.Val, 0, listLength)
+	for _, sortedIdx := range sortedIndices {
+		sorted = append(sorted, list.Get(sortedIdx))
+	}
+	return adapt.NativeToValue(sorted), nil
+}
+
+// sortByMacro transforms an expression like:
+//
+//	mylistExpr.sortBy(e, -math.abs(e))
+//
+// into something equivalent to:
+//
+//	cel.bind(
+//	   __sortBy_input__,
+//	   myListExpr,
+//	   __sortBy_input__.@sortByAssociatedKeys(__sortBy_input__.map(e, -math.abs(e))
+//	)
+func sortByMacro(meh cel.MacroExprFactory, target ast.Expr, args []ast.Expr) (ast.Expr, *cel.Error) {
+	varIdent := meh.NewIdent("@__sortBy_input__")
+	varName := varIdent.AsIdent()
+
+	targetKind := target.Kind()
+	if targetKind != ast.ListKind &&
+		targetKind != ast.SelectKind &&
+		targetKind != ast.IdentKind &&
+		targetKind != ast.ComprehensionKind &&
+		targetKind != ast.CallKind {
+		return nil, meh.NewError(target.ID(), "sortBy can only be applied to a list, identifier, comprehension, call or select expression")
+	}
+
+	mapCompr, err := parser.MakeMap(meh, meh.Copy(varIdent), args)
+	if err != nil {
+		return nil, err
+	}
+	callExpr := meh.NewMemberCall("@sortByAssociatedKeys",
+		meh.Copy(varIdent),
+		mapCompr,
+	)
+
+	bindExpr := meh.NewComprehension(
+		meh.NewList(),
+		"#unused",
+		varName,
+		target,
+		meh.NewLiteral(types.False),
+		varIdent,
+		callExpr,
+	)
+
+	return bindExpr, nil
+}
+
+func distinctList(adapt types.Adapter, list traits.Lister) (ref.Val, error) {
+	listLength := list.Size().(types.Int)
+	if listLength == 0 {
+		return list, nil
+	}
+	uniqueList := make([]ref.Val, 0, listLength)
+	for i := types.IntZero; i < listLength; i++ {
+		val := list.Get(i)
+		seen := false
+		for j := types.IntZero; j < types.Int(len(uniqueList)); j++ {
+			if i == j {
+				continue
+			}
+			other := uniqueList[j]
+			if val.Equal(other) == types.True {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			uniqueList = append(uniqueList, val)
+		}
+	}
+
+	return adapt.NativeToValue(uniqueList), nil
+}
+
+// listHasOnly returns true if every element of the target list is contained within the argument list.
+func listHasOnly(list, other ref.Val) ref.Val {
+	return setsContains(other, list)
+}
+
+// listHasAny returns true if the target list and the argument list share at least one element.
+func listHasAny(list, other ref.Val) ref.Val {
+	return setsIntersects(list, other)
+}
+
+// listHasAll returns true if every element of the argument list is contained within the target list.
+func listHasAll(list, other ref.Val) ref.Val {
+	return setsContains(list, other)
+}
+
+// listHasExactly returns true if the target list and the argument list are set equivalent.
+func listHasExactly(list, other ref.Val) ref.Val {
+	return setsEquivalent(list, other)
+}
+
+func templatedOverloads(types []*cel.Type, template func(t *cel.Type) cel.FunctionOpt) []cel.FunctionOpt {
+	overloads := make([]cel.FunctionOpt, len(types))
+	for i, t := range types {
+		overloads[i] = template(t)
+	}
+	return overloads
+}
+
+// estimateListSetOp computes an O(m*n) comparison between the target list and its argument, scaled
+// by the number of passes the operation makes over the pair of lists.
+func estimateListSetOp(costFactor float64) cost.FunctionEstimator {
+	return func(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+		if target == nil || len(args) != 1 {
+			return nil
+		}
+		targetSize := cost.EstimateSize(estimator, *target)
+		argSize := cost.EstimateSize(estimator, args[0])
+		return cost.NewCallEstimate(targetSize.Multiply(argSize).MultiplyByCostFactor(costFactor).Add(cost.CallCostEstimate), nil)
+	}
+}
+
+func isUintLiteral(node cost.AstNode) bool {
+	if node == nil || node.Expr() == nil || node.Expr().Kind() != ast.LiteralKind {
+		return false
+	}
+	switch v := node.Expr().AsLiteral().(type) {
+	case types.Int:
+		return v >= 0
+	case types.Uint:
+		return true
+	default:
+		return false
+	}
+}
+
+// estimateListSlice computes an O(n) slice operation with a cost factor of 1.
+func estimateListSlice(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target == nil || len(args) != 2 {
+		return nil
+	}
+	sz := cost.EstimateSize(estimator, *target)
+	start := cost.NodeAsUintValue(args[0], 0)
+	end := cost.NodeAsUintValue(args[1], sz.Max)
+	var resSize cost.SizeEstimate
+	if cost.ModelVersionOf(estimator) >= 1 {
+		maxLen := cost.SafeSubtract(end, start)
+		if isUintLiteral(args[0]) && isUintLiteral(args[1]) {
+			resSize = cost.FixedSizeEstimate(maxLen)
+		} else {
+			resSize = cost.RangedSizeEstimate(0, maxLen)
+		}
+	} else {
+		resSize = cost.FixedSizeEstimate(end - start)
+	}
+	resSize.Elem = sz.Elem
+	return estimateAllocatingListCall(1, resSize)
+}
+
+// estimateListsRange computes an O(n) range operation with a cost factor of 1.
+func estimateListsRange(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target != nil || len(args) != 1 {
+		return nil
+	}
+	count := cost.NodeAsUintValue(args[0], math.MaxUint)
+	if cost.ModelVersionOf(estimator) >= 1 && !isUintLiteral(args[0]) {
+		return estimateAllocatingListCall(1, cost.RangedSizeEstimate(0, count))
+	}
+	return estimateAllocatingListCall(1, cost.FixedSizeEstimate(count))
+}
+
+// estimateListReverse computes an O(n) reverse operation with a cost factor of 1.
+func estimateListReverse(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target == nil || len(args) != 0 {
+		return nil
+	}
+	return estimateAllocatingListCall(1, cost.EstimateSize(estimator, *target))
+}
+
+// estimateListFlatten computes an O(n) flatten operation with a cost factor proportional to the total number of flattened items.
+func estimateListFlatten(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target == nil || len(args) > 1 {
+		return nil
+	}
+	depth := uint64(1)
+	if len(args) == 1 {
+		depth = cost.NodeAsUintValue(args[0], math.MaxUint)
+	}
+	var resSize cost.SizeEstimate
+	if (*target).Expr() != nil && isLiteralFlattenExpr((*target).Expr(), depth) {
+		szVal := estimateLiteralFlattenSize((*target).Expr(), depth)
+		resSize = cost.FixedSizeEstimate(szVal)
+		resSize.Elem = flattenedElemSize(cost.EstimateSize(estimator, *target), depth)
+	} else {
+		resSize = estimateFlattenSize(estimator, *target, depth)
+	}
+	if cost.ModelVersionOf(estimator) >= 1 && len(args) == 1 && !isUintLiteral(args[0]) {
+		minFlat := estimateFlattenSize(estimator, *target, 0)
+		if minFlat.Min < resSize.Min {
+			resSize.Min = minFlat.Min
+		}
+	}
+	c := resSize.AsCost()
+	return estimateListCallWithDirectCost(c, resSize, true)
+}
+
+func isLiteralFlattenExpr(expr ast.Expr, depth uint64) bool {
+	if expr == nil {
+		return false
+	}
+	if depth == 0 {
+		return expr.Kind() == ast.ListKind || expr.Kind() == ast.LiteralKind
+	}
+	if expr.Kind() != ast.ListKind {
+		return expr.Kind() == ast.LiteralKind
+	}
+	for _, el := range expr.AsList().Elements() {
+		if !isLiteralFlattenExpr(el, depth-1) {
+			return false
+		}
+	}
+	return true
+}
+
+func estimateListFlattenLegacy(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target == nil || len(args) > 1 {
+		return nil
+	}
+	depth := uint64(1)
+	if len(args) == 1 {
+		depth = cost.NodeAsUintValue(args[0], math.MaxUint)
+	}
+	sz := cost.EstimateSize(estimator, *target)
+	est := estimateAllocatingListCall(float64(depth), sz)
+	if cost.ModelVersionOf(estimator) >= 1 {
+		if len(args) == 1 && !isUintLiteral(args[0]) {
+			minEst := estimateAllocatingListCall(0, sz)
+			if minEst.Min < est.Min {
+				est.Min = minEst.Min
+			}
+		}
+		flatSize := estimateFlattenSize(estimator, *target, depth)
+		est.ResultSize = &flatSize
+	}
+	return est
+}
+
+func estimateFlattenSize(estimator cost.Estimator, node cost.AstNode, depth uint64) cost.SizeEstimate {
+	sz := cost.EstimateSize(estimator, node)
+	if depth == 0 {
+		return sz
+	}
+	tType := node.Type()
+	if tType.Kind() != types.ListKind || len(tType.Parameters()) == 0 {
+		return sz
+	}
+	elemType := tType.Parameters()[0]
+	var elemComputed *cost.SizeEstimate
+	if len(node.Path()) == 0 || (sz.Elem != nil && sz.Elem.Elem != nil) {
+		elemComputed = sz.Elem
+	}
+	elemNode := pathAstNode{
+		path:         append(append([]string(nil), node.Path()...), "@items"),
+		t:            elemType,
+		computedSize: elemComputed,
+	}
+	flatElemSize := estimateFlattenSize(estimator, elemNode, depth-1)
+	res := sz.Multiply(flatElemSize)
+	res.Key = nil
+	res.Elem = flattenedElemSize(sz, depth)
+	return res
+}
+
+// flattenedElemSize steps down depth list levels and returns the element size of the resulting
+// flattened list.
+func flattenedElemSize(sz cost.SizeEstimate, depth uint64) *cost.SizeEstimate {
+	cur := &sz
+	for i := uint64(0); i < depth && cur != nil; i++ {
+		cur = cur.Elem
+	}
+	if cur == nil {
+		return nil
+	}
+	return cur.Elem
+}
+
+func estimateLiteralFlattenSize(expr ast.Expr, depth uint64) uint64 {
+	if depth == 0 {
+		if expr.Kind() == ast.ListKind {
+			return uint64(expr.AsList().Size())
+		}
+		return 1
+	}
+	if expr.Kind() != ast.ListKind {
+		return 1
+	}
+	listExpr := expr.AsList()
+	totalSize := uint64(0)
+	for _, el := range listExpr.Elements() {
+		totalSize += estimateLiteralFlattenSize(el, depth-1)
+	}
+	return totalSize
+}
+
+// Compute an O(n^2) with a cost factor of 2, equivalent to sets.contains with a result list
+// which can vary in size from 1 element to the original list size.
+func estimateListDistinct(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target == nil || len(args) != 0 {
+		return nil
+	}
+	sz := cost.EstimateSize(estimator, *target)
+	elemType := types.DynType
+	tType := (*target).Type()
+	if tType.Kind() == types.ListKind && len(tType.Parameters()) > 0 {
+		elemType = tType.Parameters()[0]
+	}
+	itemSize := estimateItemSize(estimator, *target)
+	elemCost := estimateElementEqualityCost(estimator, elemType, itemSize)
+
+	costSize := sz.Multiply(sz)
+	c := costSize.MultiplyByCost(elemCost).MultiplyByCostFactor(2.0)
+	if cost.ModelVersionOf(estimator) >= 1 {
+		c = alignSelfCompareEstimate(c, costSize, elemType)
+	}
+
+	minSize := uint64(0)
+	if sz.Min > 0 {
+		minSize = 1
+	}
+	resultSize := cost.RangedSizeEstimate(minSize, sz.Max)
+	resultSize.Elem = sz.Elem
+	return estimateListCallWithDirectCost(c, resultSize, true)
+}
+
+// estimateListSort computes an O(n^2) sort operation with a cost factor of 2 for the equality
+// operations against the elements in the list against themselves which occur during the sort computation.
+func estimateListSort(t *types.Type) cost.FunctionEstimator {
+	return func(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+		if target == nil || len(args) != 0 {
+			return nil
+		}
+		return estimateListSortCost(estimator, *target, t)
+	}
+}
+
+// estimateListSortBy computes an O(n^2) sort operation with a cost factor of 2 for the equality
+// operations against the sort index list which occur during the sort computation.
+func estimateListSortBy(u *types.Type) cost.FunctionEstimator {
+	return func(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+		if target == nil || len(args) != 1 {
+			return nil
+		}
+		// Estimate the size of the list used as the sort index, using target to resolve item size hints.
+		return estimateListSortByCost(estimator, *target, args[0], u)
+	}
+}
+
+func estimateListSortByCost(estimator cost.Estimator, target cost.AstNode, keysNode cost.AstNode, elemType *types.Type) *cost.CallEstimate {
+	sz := cost.EstimateSize(estimator, keysNode)
+	targetSize := cost.EstimateSize(estimator, target)
+	itemSize := estimateItemSize(estimator, target)
+	elemCost := estimateElementEqualityCost(estimator, elemType, itemSize)
+
+	costSize := sz.Multiply(sz)
+	c := costSize.MultiplyByCost(elemCost).MultiplyByCostFactor(2.0)
+	if cost.ModelVersionOf(estimator) >= 1 {
+		c = alignSelfCompareEstimate(c, costSize, elemType)
+	}
+	resultSize := sz
+	resultSize.Key = nil
+	resultSize.Elem = targetSize.Elem
+	return estimateListCallWithDirectCost(c, resultSize, true)
+}
+
+// estimateListSortCost estimates an O(n^2) sort operation with a cost factor of 2 for the equality
+// operations which occur during the sort computation.
+func estimateListSortCost(estimator cost.Estimator, node cost.AstNode, elemType *types.Type) *cost.CallEstimate {
+	sz := cost.EstimateSize(estimator, node)
+	itemSize := estimateItemSize(estimator, node)
+	elemCost := estimateElementEqualityCost(estimator, elemType, itemSize)
+
+	costSize := sz.Multiply(sz)
+	c := costSize.MultiplyByCost(elemCost).MultiplyByCostFactor(2.0)
+	if cost.ModelVersionOf(estimator) >= 1 {
+		c = alignSelfCompareEstimate(c, costSize, elemType)
+	}
+	return estimateListCallWithDirectCost(c, sz, true)
+}
+
+func alignSelfCompareEstimate(c cost.CostEstimate, costSize cost.SizeEstimate, elemType *types.Type) cost.CostEstimate {
+	trackerFactor := 2.0
+	if elemType != nil {
+		switch elemType.Kind() {
+		case types.StringKind, types.BytesKind, types.DynKind:
+			trackerFactor += cost.StringTraversalCostFactor
+		}
+	}
+	trackerCost := cost.CostEstimate{
+		Min: cost.SafeMultiplyByFactorTrunc(costSize.Min, trackerFactor),
+		Max: cost.SafeMultiplyByFactorTrunc(costSize.Max, trackerFactor),
+	}
+	return c.Union(trackerCost)
+}
+
+// estimateAllocatingListCall computes cost as a function of the size of the result list with a
+// baseline cost for the call dispatch and the associated list allocation.
+func estimateAllocatingListCall(costFactor float64, listSize cost.SizeEstimate) *cost.CallEstimate {
+	return estimateListCallWithResultSize(costFactor, listSize, listSize, true)
+}
+
+// estimateListCallWithResultSize computes cost as a function of the size of the target list and whether the
+// call allocates memory, using a separate result size estimate for the output list.
+func estimateListCallWithResultSize(costFactor float64, costSize cost.SizeEstimate, resultSize cost.SizeEstimate, allocates bool) *cost.CallEstimate {
+	c := costSize.MultiplyByCostFactor(costFactor)
+	return estimateListCallWithDirectCost(c, resultSize, allocates)
+}
+
+// estimateListCallWithDirectCost computes cost using a pre-calculated CostEstimate and a separate result size estimate.
+func estimateListCallWithDirectCost(costVal cost.CostEstimate, resultSize cost.SizeEstimate, allocates bool) *cost.CallEstimate {
+	if allocates {
+		costVal = costVal.Add(cost.FixedCostEstimate(cost.ListCreateBaseCost))
+	}
+	costVal = costVal.Add(cost.CallCostEstimate)
+	return cost.NewCallEstimate(costVal, &resultSize)
+}
+
+// trackListOutputSize computes cost as a function of the size of the result list.
+func trackListOutputSize(_ []ref.Val, result ref.Val) *uint64 {
+	return trackAllocatingListCall(1, cost.ActualSize(result))
+}
+
+// trackListFlatten computes cost as a function of the size of the result list.
+func trackListFlatten(args []ref.Val, result ref.Val) *uint64 {
+	resSize := cost.ActualSize(result)
+	return trackAllocatingListCall(1.0, resSize)
+}
+
+func trackListFlattenLegacy(args []ref.Val, _ ref.Val) *uint64 {
+	depth := 1.0
+	if len(args) == 2 {
+		depth = float64(args[1].(types.Int))
+	}
+	inputSize := cost.ActualSize(args[0])
+	return trackAllocatingListCall(depth, inputSize)
+}
+
+// trackListDistinct computes costs as a worst-case O(n^2) operation over the input list.
+func trackListDistinct(args []ref.Val, _ ref.Val) *uint64 {
+	return trackListSelfCompare(args[0].(traits.Lister))
+}
+
+// trackListSort computes costs as a worst-case O(n^2) operation over the input list.
+func trackListSort(args []ref.Val, result ref.Val) *uint64 {
+	return trackListSelfCompare(args[0].(traits.Lister))
+}
+
+// trackListSortBy computes costs as a worst-case O(n^2) operation over the sort index list.
+func trackListSortBy(args []ref.Val, result ref.Val) *uint64 {
+	return trackListSelfCompare(args[1].(traits.Lister))
+}
+
+// trackListSelfCompare computes costs as a worst-case O(n^2) operation over the input list.
+func trackListSelfCompare(l traits.Lister) *uint64 {
+	sz := cost.ActualSize(l)
+	costFactor := 2.0
+	if sz == 0 {
+		return trackAllocatingListCall(costFactor, 0)
+	}
+	elem := l.Get(types.IntZero)
+	if elem.Type() == types.StringType || elem.Type() == types.BytesType {
+		costFactor += cost.StringTraversalCostFactor
+	}
+	return trackAllocatingListCall(costFactor, cost.SafeMultiply(sz, sz))
+}
+
+// trackAllocatingListCall computes costs as a function of the size of the result list with a baseline cost
+// for the call dispatch and the associated list allocation.
+func trackAllocatingListCall(costFactor float64, size uint64) *uint64 {
+	if costFactor < 0.0 {
+		costFactor = 1.0
+	}
+	// The scaled size is truncated, matching the historical cost for in-range values, but
+	// saturates rather than relying on a platform-defined out-of-range float conversion.
+	total := cost.SafeAdd(cost.SafeMultiplyByFactorTrunc(size, costFactor), cost.CallCost, cost.ListCreateBaseCost)
+	return &total
+}
+
+func estimateListDistinctLegacy(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+	if target == nil || len(args) != 0 {
+		return nil
+	}
+	sz := cost.EstimateSize(estimator, *target)
+	costFactor := 2.0
+	tType := (*target).Type()
+	if tType.Kind() == types.ListKind && len(tType.Parameters()) > 0 {
+		elemType := tType.Parameters()[0]
+		if elemType.Kind() == types.StringKind || elemType.Kind() == types.BytesKind {
+			costFactor += cost.StringTraversalCostFactor
+		}
+	}
+	costSize := sz.Multiply(sz)
+	est := estimateAllocatingListCall(costFactor, costSize)
+	if cost.ModelVersionOf(estimator) >= 1 {
+		minDirect := cost.SafeAdd(cost.SafeMultiplyByFactorTrunc(costSize.Min, costFactor), cost.ListCreateBaseCost, cost.CallCost)
+		if minDirect < est.Min {
+			est.Min = minDirect
+		}
+		minLen := uint64(0)
+		if sz.Min > 0 {
+			minLen = 1
+		}
+		resSize := cost.RangedSizeEstimate(minLen, sz.Max)
+		resSize.Elem = sz.Elem
+		est.ResultSize = &resSize
+	}
+	return est
+}
+
+func estimateListSortLegacy(t *types.Type) cost.FunctionEstimator {
+	return func(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+		if target == nil || len(args) != 0 {
+			return nil
+		}
+		return estimateListSortCostLegacy(estimator, *target, t)
+	}
+}
+
+func estimateListSortByLegacy(u *types.Type) cost.FunctionEstimator {
+	return func(estimator cost.Estimator, target *cost.AstNode, args []cost.AstNode) *cost.CallEstimate {
+		if target == nil || len(args) != 1 {
+			return nil
+		}
+		est := estimateListSortCostLegacy(estimator, args[0], u)
+		if est != nil && est.ResultSize != nil {
+			targetSize := cost.EstimateSize(estimator, *target)
+			est.ResultSize.Key = nil
+			est.ResultSize.Elem = targetSize.Elem
+		}
+		return est
+	}
+}
+
+func estimateListSortCostLegacy(estimator cost.Estimator, node cost.AstNode, elemType *types.Type) *cost.CallEstimate {
+	sz := cost.EstimateSize(estimator, node)
+	costFactor := 2.0
+	switch elemType {
+	case types.StringType, types.BytesType:
+		costFactor += cost.StringTraversalCostFactor
+	}
+	costSize := sz.Multiply(sz)
+	est := estimateAllocatingListCall(costFactor, costSize)
+	if cost.ModelVersionOf(estimator) >= 1 {
+		minDirect := cost.SafeAdd(cost.SafeMultiplyByFactorTrunc(costSize.Min, costFactor), cost.ListCreateBaseCost, cost.CallCost)
+		if minDirect < est.Min {
+			est.Min = minDirect
+		}
+		resSize := sz
+		est.ResultSize = &resSize
+	}
+	return est
+}
+
+type pathAstNode struct {
+	path         []string
+	t            *types.Type
+	computedSize *cost.SizeEstimate
+}
+
+func (p pathAstNode) Path() []string {
+	return p.path
+}
+
+func (p pathAstNode) Type() *types.Type {
+	return p.t
+}
+
+func (p pathAstNode) Expr() ast.Expr {
+	return nil
+}
+
+func (p pathAstNode) ComputedSize() *cost.SizeEstimate {
+	return p.computedSize
+}
+
+func estimateItemSize(estimator cost.Estimator, node cost.AstNode) cost.SizeEstimate {
+	if cost.ModelVersionOf(estimator) >= 1 {
+		if sz := node.ComputedSize(); sz != nil && sz.Elem != nil {
+			return *sz.Elem
+		}
+	}
+	path := node.Path()
+	if len(path) == 0 {
+		return cost.RangedSizeEstimate(0, math.MaxUint64)
+	}
+	elemType := types.DynType
+	tType := node.Type()
+	if tType.Kind() == types.ListKind && len(tType.Parameters()) > 0 {
+		elemType = tType.Parameters()[0]
+	}
+	itemNode := pathAstNode{
+		path: append(append([]string(nil), path...), "@items"),
+		t:    elemType,
+	}
+	if l := estimator.EstimateSize(itemNode); l != nil {
+		return *l
+	}
+	return cost.RangedSizeEstimate(0, math.MaxUint64)
+}
+
+func estimateElementEqualityCost(estimator cost.Estimator, elemType *types.Type, itemSize cost.SizeEstimate) cost.CostEstimate {
+	switch elemType.Kind() {
+	case types.StringKind, types.BytesKind:
+		return itemSize.MultiplyByCostFactor(cost.StringTraversalCostFactor)
+	case types.ListKind, types.MapKind, types.StructKind:
+		return cost.UnknownCostEstimate()
+	default:
+		return cost.FixedCostEstimate(1)
+	}
+}
