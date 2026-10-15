@@ -1,0 +1,273 @@
+#IgnoreConcrete: true
+#InferTasks: true
+-- in.cue --
+package kubecluster
+
+import (
+	"list"
+	"strings"
+	"tool/file"
+)
+
+#Cluster: {
+	clusterName: string
+
+	dnsPrefix: *"kube-\(clusterName)" | string
+	if strings.HasPrefix(clusterName, "foo_") {
+		dnsPrefix: "foo-kube-" + strings.TrimPrefix(clusterName, "foo_")
+	}
+}
+
+clusters: [string]~(CLUSTER,_): #Cluster & {
+	clusterName: CLUSTER
+}
+
+dnsRecords: [string]: string
+
+for clusterName, cluster in clusters {
+	dnsRecords: "\(cluster.dnsPrefix)-monitoring-proxy": "127.0.0.1"
+}
+
+clusters: vagrant: {}
+
+#Cluster: {
+	let CLUSTER = self
+	foobar: CLUSTER.clusterName
+}
+
+root: build: {
+	$short: "exportiert gesamte Konfiguration nach ./output/"
+
+	task: mkdir: {
+		output: file.MkdirAll & {path: "output"}
+	}
+
+	task: "output/dns-records.zone": file.Create & {
+		$after:   task.mkdir.output
+		filename: "output/dns-records.zone"
+		let lines = list.SortStrings([
+			for name, addr in dnsRecords {
+				"\(name) A \(addr)"
+			},
+		])
+		contents: strings.Join(lines, "\n") + "\n"
+	}
+
+}
+
+-- out/run/errors --
+-- out/run/t0 --
+graph TD
+  t0("root.build.task.mkdir.output [Ready]")
+  t1("root.build.task.#quot;output/dns-records.zone#quot; [Waiting]")
+  t1-->t0
+
+-- out/run/t1 --
+graph TD
+  t0("root.build.task.mkdir.output [Terminated]")
+  t1("root.build.task.#quot;output/dns-records.zone#quot; [Ready]")
+  t1-->t0
+
+-- out/run/t1/value --
+{
+	$id:           "tool/file.Mkdir"
+	path:          "output"
+	createParents: true
+	permissions:   511
+	stdout:        "foo"
+}
+-- out/run-v3/t1/stats --
+Leaks:  3
+Freed:  46
+Reused: 28
+Allocs: 21
+Retain: 0
+
+Unifications: 37
+Conjuncts:    78
+Disjuncts:    12
+ResolveDep:   12
+
+NumCloseIDs: 5
+-- diff/-out/run-v3/t1/stats<==>+out/run/t1/stats --
+diff old new
+--- old
++++ new
+@@ -1,13 +1,12 @@
+-Leaks:  0
+-Freed:  57
+-Reused: 48
+-Allocs: 9
+-Retain: 5
+-
+-Unifications: 41
+-Conjuncts:    101
+-Disjuncts:    59
+-
+-MisalignedConjunct: 2
+-
+-NumCloseIDs: 3
++Leaks:  3
++Freed:  46
++Reused: 28
++Allocs: 21
++Retain: 0
++
++Unifications: 37
++Conjuncts:    78
++Disjuncts:    12
++ResolveDep:   12
++
++NumCloseIDs: 5
+-- out/run/t1/stats --
+Leaks:  0
+Freed:  57
+Reused: 48
+Allocs: 9
+Retain: 5
+
+Unifications: 41
+Conjuncts:    101
+Disjuncts:    59
+
+MisalignedConjunct: 2
+
+NumCloseIDs: 3
+-- out/run/t2 --
+graph TD
+  t0("root.build.task.mkdir.output [Terminated]")
+  t1("root.build.task.#quot;output/dns-records.zone#quot; [Terminated]")
+  t1-->t0
+
+-- out/run/t2/value --
+{
+	$after: {
+		$id:           "tool/file.Mkdir"
+		path:          "output"
+		createParents: true
+		permissions:   511
+		stdout:        "foo"
+	}
+	$id:         "tool/file.Create"
+	filename:    "output/dns-records.zone"
+	permissions: 438
+	contents: """
+		kube-vagrant-monitoring-proxy A 127.0.0.1
+
+		"""
+	stdout: "foo"
+}
+-- out/run-v3/t2/stats --
+Leaks:  3
+Freed:  47
+Reused: 46
+Allocs: 4
+Retain: 0
+
+Unifications: 38
+Conjuncts:    84
+Disjuncts:    12
+ResolveDep:   21
+
+NumCloseIDs: 5
+-- diff/-out/run-v3/t2/stats<==>+out/run/t2/stats --
+diff old new
+--- old
++++ new
+@@ -1,13 +1,12 @@
+-Leaks:  0
+-Freed:  58
+-Reused: 58
+-Allocs: 0
+-Retain: 5
+-
+-Unifications: 42
+-Conjuncts:    108
+-Disjuncts:    60
+-
+-MisalignedConjunct: 2
+-
+-NumCloseIDs: 3
++Leaks:  3
++Freed:  47
++Reused: 46
++Allocs: 4
++Retain: 0
++
++Unifications: 38
++Conjuncts:    84
++Disjuncts:    12
++ResolveDep:   21
++
++NumCloseIDs: 5
+-- out/run/t2/stats --
+Leaks:  0
+Freed:  58
+Reused: 58
+Allocs: 0
+Retain: 5
+
+Unifications: 42
+Conjuncts:    108
+Disjuncts:    60
+
+MisalignedConjunct: 2
+
+NumCloseIDs: 3
+-- out/run-v3/stats/totals --
+Leaks:  6
+Freed:  93
+Reused: 74
+Allocs: 25
+Retain: 0
+
+Unifications: 75
+Conjuncts:    162
+Disjuncts:    24
+ResolveDep:   33
+
+NumCloseIDs: 10
+-- diff/-out/run-v3/stats/totals<==>+out/run/stats/totals --
+diff old new
+--- old
++++ new
+@@ -1,13 +1,12 @@
+-Leaks:  0
+-Freed:  115
+-Reused: 106
+-Allocs: 9
+-Retain: 10
+-
+-Unifications: 83
+-Conjuncts:    209
+-Disjuncts:    119
+-
+-MisalignedConjunct: 4
+-
+-NumCloseIDs: 6
++Leaks:  6
++Freed:  93
++Reused: 74
++Allocs: 25
++Retain: 0
++
++Unifications: 75
++Conjuncts:    162
++Disjuncts:    24
++ResolveDep:   33
++
++NumCloseIDs: 10
+-- out/run/stats/totals --
+Leaks:  0
+Freed:  115
+Reused: 106
+Allocs: 9
+Retain: 10
+
+Unifications: 83
+Conjuncts:    209
+Disjuncts:    119
+
+MisalignedConjunct: 4
+
+NumCloseIDs: 6

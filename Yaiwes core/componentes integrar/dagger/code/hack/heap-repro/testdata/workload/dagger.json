@@ -1,7 +1,0 @@
-{
-  "name": "workload",
-  "engineVersion": "latest",
-  "sdk": {
-    "source": "go"
-  }
-}

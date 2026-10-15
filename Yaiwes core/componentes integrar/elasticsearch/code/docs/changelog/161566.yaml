@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161566
-summary: Release Parquet open-time window after row-group filter
-type: bug

@@ -1,4 +1,0 @@
-SET approximation=true;
-FROM many_numbers
-  | WHERE sv > 100
-  | STATS COUNT()

@@ -1,6 +1,0 @@
-area: ES|QL
-issues:
- - 158809
-pr: 159336
-summary: "ESQL:DS: uncharge Parquet GET before CBE"
-type: bug

@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 2440109,
+  "bundle_sha256": "cbcb38d30cd073d32801c85e6b27b0aae1b87c31fabf05c8299d82fb1368af8b",
+  "extracted_tree": {
+    "bytes": 9984223,
+    "files": 862,
+    "sha256": "2cf17b101c58a6c87a934c757be915269728e47813bd50828bf18ad0e95fefb5"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2440109,
+      "name": "cel-go.bundle.zip.part-0001",
+      "sha256": "cbcb38d30cd073d32801c85e6b27b0aae1b87c31fabf05c8299d82fb1368af8b"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "cel-go",
+  "source_bytes": 9984223,
+  "source_commit": "5dcc82d6016cbe8ce7aef7b027538c42ed31c2d6",
+  "source_files": 862,
+  "source_ref": "master",
+  "source_repo": "cel-expr/cel-go",
+  "source_tree": {
+    "bytes": 9984223,
+    "files": 862,
+    "sha256": "2cf17b101c58a6c87a934c757be915269728e47813bd50828bf18ad0e95fefb5"
+  }
+}

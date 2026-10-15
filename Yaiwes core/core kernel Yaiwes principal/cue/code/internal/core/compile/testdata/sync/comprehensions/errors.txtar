@@ -1,0 +1,84 @@
+-- in.cue --
+circularIf: {
+	#list: {
+		tail: #list | *null
+		if tail != null {
+		}
+	}
+}
+
+circularFor: {
+	#list: {
+		tail: #list | *null
+		for x in tail != null {
+		}
+	}
+}
+
+// Print a bit more sensible error message than "empty disjunction" here.
+// Issue #465
+userError: {
+	a: string | *_|_
+	if a != "" {
+	}
+}
+
+intField: {
+	for i, _ in [1, 2] {
+		(i): {
+		}
+	}
+}
+
+// Issue #2403
+conflictRangingOverSelf: {
+	x: {
+		name: string
+		age:  int
+	}
+
+	x: {
+		for k, _ in x {
+			(k): k
+		}
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  circularIf: {
+    #list: {
+      tail: (〈1;#list〉|*null)
+      if (〈0;tail〉 != null) {}
+    }
+  }
+  circularFor: {
+    #list: {
+      tail: (〈1;#list〉|*null)
+      for _, x in (〈0;tail〉 != null) {}
+    }
+  }
+  userError: {
+    a: (string|*_|_(explicit error (_|_ literal) in source))
+    if (〈0;a〉 != "") {}
+  }
+  intField: {
+    for i, _ in [
+      1,
+      2,
+    ] {
+      〈1;i〉: {}
+    }
+  }
+  conflictRangingOverSelf: {
+    x: {
+      name: string
+      age: int
+    }
+    x: {
+      for k, _ in 〈1;x〉 {
+        〈1;k〉: 〈1;k〉
+      }
+    }
+  }
+}

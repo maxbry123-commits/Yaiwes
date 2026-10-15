@@ -1,5 +1,0 @@
-usage: vespa-security <tool> [TOOL OPTIONS]
-Where <tool> is one of: keygen, encrypt, decrypt, token-info,
-convert-base, reseal
- -h,--help   Show help
-Invoke vespa-security <tool> --help for tool-specific help

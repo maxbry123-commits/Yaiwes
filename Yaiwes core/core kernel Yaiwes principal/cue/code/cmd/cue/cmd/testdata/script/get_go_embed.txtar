@@ -1,0 +1,434 @@
+# Check that 'cue get go' translates embedded Go struct fields
+# like Go's encoding/json encodes them.
+
+exec cue get go --local ./decls
+cmp decls/p_go_gen.cue decls/p_go_gen.cue.golden
+
+# Marshal via Go's encoding/json and validate with the generated CUE schema.
+exec go run ./marshal
+cmp stdout go_marshal.json
+exec cue vet -c schema.cue go_marshal.json
+
+# Since v0.18.0, embedding a definition closes the struct to its fields,
+# so embedded definitions are opened to keep the struct's own fields.
+# The generated definitions must still reject unknown fields.
+cp module_v0.18.0.cue cue.mod/module.cue
+exec cue get go --local ./decls
+exec cue vet -c schema.cue go_marshal.json
+! exec cue vet -d '#Untagged' ./decls extra.json
+cmp stderr extra.stderr
+
+-- module_v0.18.0.cue --
+module: "mod.test"
+language: version: "v0.18.0"
+-- extra.json --
+{"kind": "k", "x": 1, "extra": 1}
+-- extra.stderr --
+extra: field not allowed:
+    ./extra.json:1:24
+-- schema.cue --
+package schema
+
+import "mod.test/decls"
+
+decls.#Root
+
+-- go.mod --
+module mod.test
+
+go 1.21
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.15.0"
+-- meta/meta.go --
+package meta
+
+type TypeMeta struct {
+	Kind       string `json:"kind"`
+	APIVersion string `json:"apiVersion"`
+}
+
+// Object has a field of an unexported type, and embeds one.
+type Object struct {
+	common
+	Kind   string `json:"kind"`
+	Status status `json:"status"`
+}
+
+type common struct {
+	Name string `json:"name"`
+}
+
+type status struct {
+	Phase string `json:"phase"`
+}
+-- decls/p.go --
+package decls
+
+import "mod.test/meta"
+
+type Base struct {
+	Kind string `json:"kind"`
+}
+
+type Other struct {
+	Other string `json:"other"`
+}
+
+type Str string
+
+type inner struct {
+	Hidden string `json:"hidden"`
+}
+
+type Untagged struct {
+	Base
+	X int `json:"x"`
+}
+
+type EmptyTag struct {
+	meta.TypeMeta `json:""`
+	X             int `json:"x"`
+}
+
+type Inline struct {
+	meta.TypeMeta `json:",inline"`
+	X             int `json:"x"`
+}
+
+type OmitEmpty struct {
+	Base `json:",omitempty"`
+	X    int `json:"x"`
+}
+
+type Named struct {
+	Base `json:"base"`
+	X    int `json:"x"`
+}
+
+type Ignored struct {
+	Base `json:"-"`
+	X    int `json:"x"`
+}
+
+type Pointer struct {
+	*Base
+	X int `json:"x"`
+}
+
+type NonStruct struct {
+	Str
+	X int `json:"x"`
+}
+
+type Unexported struct {
+	inner
+	X int `json:"x"`
+}
+
+// Shadowed hides the kind field of Base.
+type Shadowed struct {
+	Base
+	Other
+	Kind int `json:"kind"`
+}
+
+// Ambiguous drops the kind field, as it is embedded twice at the same depth.
+type Ambiguous struct {
+	Base
+	meta.TypeMeta
+}
+
+// ObjectShadowed hides the kind field of meta.Object, whose other fields
+// are promoted individually, even when their types are not exported.
+type ObjectShadowed struct {
+	meta.Object
+	Kind int `json:"kind"`
+}
+
+// Recursive embeds itself, whose fields are all hidden.
+type Recursive struct {
+	*Recursive
+	Value int `json:"value"`
+}
+
+type Mutual1 struct {
+	*Mutual2
+	X int `json:"x"`
+}
+
+type Mutual2 struct {
+	*Mutual1
+	Y int `json:"y"`
+}
+
+type Marshaler1 struct {
+	Kind string `json:"kind"`
+}
+
+func (Marshaler1) MarshalJSON() ([]byte, error) { return []byte(`"1"`), nil }
+
+type Marshaler2 struct {
+	Value string `json:"value"`
+}
+
+func (Marshaler2) MarshalJSON() ([]byte, error) { return []byte(`"2"`), nil }
+
+// ConflictingMethods has the fields of both embedded structs, as their
+// MarshalJSON methods conflict at the same depth, so neither is promoted.
+type ConflictingMethods struct {
+	Marshaler1
+	Marshaler2
+}
+
+type Root struct {
+	Untagged   Untagged
+	EmptyTag   EmptyTag
+	Inline     Inline
+	OmitEmpty  OmitEmpty
+	Named      Named
+	Ignored    Ignored
+	Pointer    Pointer
+	PointerNil Pointer
+	NonStruct  NonStruct
+	Unexported Unexported
+	Shadowed   Shadowed
+	Ambiguous  Ambiguous
+	Recursive  Recursive
+	Mutual     Mutual1
+
+	ObjectShadowed     ObjectShadowed
+	ConflictingMethods ConflictingMethods
+}
+-- marshal/main.go --
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"mod.test/decls"
+	"mod.test/meta"
+)
+
+func main() {
+	b := decls.Base{Kind: "k"}
+	tm := meta.TypeMeta{Kind: "K", APIVersion: "v1"}
+	r := decls.Root{
+		Untagged:   decls.Untagged{Base: b, X: 1},
+		EmptyTag:   decls.EmptyTag{TypeMeta: tm, X: 1},
+		Inline:     decls.Inline{TypeMeta: tm, X: 1},
+		OmitEmpty:  decls.OmitEmpty{Base: b, X: 1},
+		Named:      decls.Named{Base: b, X: 1},
+		Ignored:    decls.Ignored{Base: b, X: 1},
+		Pointer:    decls.Pointer{Base: &b, X: 1},
+		PointerNil: decls.Pointer{X: 1},
+		NonStruct:  decls.NonStruct{Str: "s", X: 1},
+		Unexported: decls.Unexported{X: 1},
+		Shadowed:   decls.Shadowed{Base: b, Other: decls.Other{Other: "o"}, Kind: 3},
+		Ambiguous:  decls.Ambiguous{Base: b, TypeMeta: tm},
+		Recursive:  decls.Recursive{Recursive: &decls.Recursive{Value: 2}, Value: 1},
+		Mutual:     decls.Mutual1{Mutual2: &decls.Mutual2{Y: 2}, X: 1},
+
+		ObjectShadowed: decls.ObjectShadowed{Kind: 3},
+		ConflictingMethods: decls.ConflictingMethods{
+			Marshaler1: decls.Marshaler1{Kind: "k"},
+			Marshaler2: decls.Marshaler2{Value: "v"},
+		},
+	}
+	// Mimic the formatting of `cue export` to be able to compare bytes.
+	data, err := json.MarshalIndent(r, "", "    ")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s\n", data)
+}
+-- go_marshal.json --
+{
+    "Untagged": {
+        "kind": "k",
+        "x": 1
+    },
+    "EmptyTag": {
+        "kind": "K",
+        "apiVersion": "v1",
+        "x": 1
+    },
+    "Inline": {
+        "kind": "K",
+        "apiVersion": "v1",
+        "x": 1
+    },
+    "OmitEmpty": {
+        "kind": "k",
+        "x": 1
+    },
+    "Named": {
+        "base": {
+            "kind": "k"
+        },
+        "x": 1
+    },
+    "Ignored": {
+        "x": 1
+    },
+    "Pointer": {
+        "kind": "k",
+        "x": 1
+    },
+    "PointerNil": {
+        "x": 1
+    },
+    "NonStruct": {
+        "Str": "s",
+        "x": 1
+    },
+    "Unexported": {
+        "hidden": "",
+        "x": 1
+    },
+    "Shadowed": {
+        "other": "o",
+        "kind": 3
+    },
+    "Ambiguous": {
+        "apiVersion": "v1"
+    },
+    "Recursive": {
+        "value": 1
+    },
+    "Mutual": {
+        "y": 2,
+        "x": 1
+    },
+    "ObjectShadowed": {
+        "name": "",
+        "status": {
+            "phase": ""
+        },
+        "kind": 3
+    },
+    "ConflictingMethods": {
+        "kind": "k",
+        "value": "v"
+    }
+}
+-- decls/p_go_gen.cue.golden --
+// Code generated by cue get go. DO NOT EDIT.
+
+//cue:generate cue get go mod.test/decls
+
+package decls
+
+import "mod.test/meta"
+
+#Base: kind: string @go(Kind)
+
+#Other: other: string @go(Other)
+
+#Str: string
+
+_#inner: hidden: string @go(Hidden)
+
+#Untagged: {
+	#Base
+	x: int @go(X)
+}
+
+#EmptyTag: {
+	meta.#TypeMeta
+	x: int @go(X)
+}
+
+#Inline: {
+	meta.#TypeMeta
+	x: int @go(X)
+}
+
+#OmitEmpty: {
+	#Base
+	x: int @go(X)
+}
+
+#Named: {
+	base: #Base @go(Base)
+	x:    int   @go(X)
+}
+
+#Ignored: x: int @go(X)
+
+#Pointer: {
+	kind?: string @go(Kind)
+	x:     int    @go(X)
+}
+
+#NonStruct: {
+	Str: #Str
+	x:   int @go(X)
+}
+
+#Unexported: {
+	_#inner
+	x: int @go(X)
+}
+
+// Shadowed hides the kind field of Base.
+#Shadowed: {
+	#Other
+	kind: int @go(Kind)
+}
+
+// Ambiguous drops the kind field, as it is embedded twice at the same depth.
+#Ambiguous: apiVersion: string @go(APIVersion)
+
+// ObjectShadowed hides the kind field of meta.Object, whose other fields
+// are promoted individually, even when their types are not exported.
+#ObjectShadowed: {
+	name:   string @go(Name)
+	status: _      @go(Status,meta.status)
+	kind:   int    @go(Kind)
+}
+
+// Recursive embeds itself, whose fields are all hidden.
+#Recursive: value: int @go(Value)
+
+#Mutual1: {
+	y?: int @go(Y)
+	x:  int @go(X)
+}
+
+#Mutual2: {
+	x?: int @go(X)
+	y:  int @go(Y)
+}
+
+#Marshaler1: _
+
+#Marshaler2: _
+
+// ConflictingMethods has the fields of both embedded structs, as their
+// MarshalJSON methods conflict at the same depth, so neither is promoted.
+#ConflictingMethods: {
+	kind:  string @go(Kind)
+	value: string @go(Value)
+}
+
+#Root: {
+	Untagged:           #Untagged
+	EmptyTag:           #EmptyTag
+	Inline:             #Inline
+	OmitEmpty:          #OmitEmpty
+	Named:              #Named
+	Ignored:            #Ignored
+	Pointer:            #Pointer
+	PointerNil:         #Pointer
+	NonStruct:          #NonStruct
+	Unexported:         #Unexported
+	Shadowed:           #Shadowed
+	Ambiguous:          #Ambiguous
+	Recursive:          #Recursive
+	Mutual:             #Mutual1
+	ObjectShadowed:     #ObjectShadowed
+	ConflictingMethods: #ConflictingMethods
+}

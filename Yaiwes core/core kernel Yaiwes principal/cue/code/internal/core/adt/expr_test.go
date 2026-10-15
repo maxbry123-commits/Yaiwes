@@ -1,0 +1,106 @@
+// Copyright 2020 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package adt
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestNilSource(t *testing.T) {
+	testCases := []Node{
+		&BasicType{},
+		&BinaryExpr{},
+		&Bool{},
+		&Bottom{},
+		&BoundExpr{},
+		&BoundValue{},
+		&Builtin{},
+		&BuiltinValidator{},
+		&BulkOptionalField{},
+		&Bytes{},
+		&CallExpr{},
+		&Comprehension{},
+		&Conjunction{},
+		&Disjunction{},
+		&DisjunctionExpr{},
+		&DynamicField{},
+		&DynamicReference{},
+		&Ellipsis{},
+		&Field{},
+		&FieldReference{},
+		&ForClause{},
+		&IfClause{},
+		&ImportReference{},
+		&IndexExpr{},
+		&Interpolation{},
+		&LabelReference{},
+		&LetClause{},
+		&LetField{},
+		&LetReference{},
+		&ListLit{},
+		&ListMarker{},
+		&NodeLink{},
+		&Null{},
+		&Num{},
+		&SelectorExpr{},
+		&SliceExpr{},
+		&String{},
+		&StructLit{},
+		&StructMarker{},
+		&Top{},
+		&UnaryExpr{},
+		&Vertex{},
+	}
+	for _, x := range testCases {
+		t.Run(fmt.Sprintf("%T", x), func(t *testing.T) {
+			if x.Source() != nil {
+				t.Error("nil source did not return nil")
+			}
+		})
+	}
+}
+
+func TestNumBigInt(t *testing.T) {
+	// The evaluator keeps integers with a zero exponent, but an integer
+	// decimal need not have one, so BigInt must scale by it. See
+	// https://cuelang.org/issue/2649 and https://cuelang.org/issue/3787 for
+	// the two ways such values used to arise.
+	testCases := []struct {
+		decimal string
+		want    string
+	}{
+		{"8", "8"},
+		{"-8", "-8"},
+		{"8.0", "8"},
+		{"-8.0", "-8"},
+		{"80E-1", "8"},
+		{"1.0E+2", "100"},
+		{"1E+35", "100000000000000000000000000000000000"},
+		{"-1E+35", "-100000000000000000000000000000000000"},
+		{"0.0", "0"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.decimal, func(t *testing.T) {
+			n := &Num{K: IntKind}
+			if _, _, err := n.X.SetString(tc.decimal); err != nil {
+				t.Fatal(err)
+			}
+			if got := n.BigInt(nil).String(); got != tc.want {
+				t.Errorf("BigInt() = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}

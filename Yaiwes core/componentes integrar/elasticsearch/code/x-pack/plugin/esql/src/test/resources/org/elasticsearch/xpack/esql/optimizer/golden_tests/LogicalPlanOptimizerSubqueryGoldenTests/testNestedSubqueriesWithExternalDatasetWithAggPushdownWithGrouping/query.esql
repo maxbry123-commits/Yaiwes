@@ -1,3 +1,0 @@
-FROM employees,
-     (FROM heavy_a, heavy_b)
-| STATS c = COUNT(*), mx = MAX(salary) BY dept

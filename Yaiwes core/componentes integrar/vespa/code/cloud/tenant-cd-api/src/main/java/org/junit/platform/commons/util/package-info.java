@@ -1,9 +1,0 @@
-// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
-/**
- * @author jonmv
- */
-@ExportPackage(version = @Version(major = 1, minor = 10, micro = 1))
-package org.junit.platform.commons.util;
-
-import com.yahoo.osgi.annotation.ExportPackage;
-import com.yahoo.osgi.annotation.Version;

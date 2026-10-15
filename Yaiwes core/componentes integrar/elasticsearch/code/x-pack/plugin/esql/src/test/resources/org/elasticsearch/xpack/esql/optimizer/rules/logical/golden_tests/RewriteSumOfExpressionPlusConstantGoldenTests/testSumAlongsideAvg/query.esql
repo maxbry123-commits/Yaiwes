@@ -1,2 +1,0 @@
-FROM employees
-| STATS s1 = SUM(salary + 1), s2 = SUM(salary + 2), a = AVG(salary)

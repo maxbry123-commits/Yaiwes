@@ -1,7 +1,0 @@
-area: ES|QL
-issues:
- - 156173
-pr: 156585
-summary: "ESQL: Optimize `unmaped_fields` blob away during analysis if there are unpatterned\
-  \ KEEPs"
-type: feature

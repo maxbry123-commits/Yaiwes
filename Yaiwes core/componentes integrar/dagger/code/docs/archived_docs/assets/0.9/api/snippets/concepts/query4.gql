@@ -1,7 +1,0 @@
-query {
-  container(id: "YOUR-ID-HERE") {
-    withExec(args: ["ls", "/tmp"]) {
-      stdout
-    }
-  }
-}

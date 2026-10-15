@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 158906
-summary: "ES|QL|DS: Decline mixed-type dataset filter pushdown"
-type: bug

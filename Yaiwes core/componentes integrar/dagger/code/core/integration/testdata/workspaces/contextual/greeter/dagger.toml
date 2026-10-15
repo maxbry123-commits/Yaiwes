@@ -1,2 +1,0 @@
-[modules.greeter]
-source = ".dagger/modules/greeter"

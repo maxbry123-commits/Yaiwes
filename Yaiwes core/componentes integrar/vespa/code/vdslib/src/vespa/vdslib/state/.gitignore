@@ -1,9 +1,0 @@
-*.lo
-.*.swp
-.depend
-.depend.NEW
-.deps
-.libs
-Makefile
-config-*.cpp
-config-*.h

@@ -1,0 +1,27 @@
+#inlinetest:exclude skip — compile errors.
+-- in.cue --
+// A float literal's exponent is limited to what decimal arithmetic supports.
+maxExp:      1e100000
+minExp:      1e-100000
+zeroExp:     0e100001
+fracExp:     0.1e-99999
+overExp:     1e100001
+underExp:    1e-100020
+overAdjExp:  123e99999
+overExpExpr: 9e200000 + 1
+hugeExp:     1e2147483648
+// The exponent of the last digit is also limited, as arithmetic fails beyond it.
+fracUnderExp: 1.5e-100000
+-- out/evalalpha --
+overExp: error converting number to decimal: exponent out of range in number "1e100001":
+    ./in.cue:6:14
+underExp: error converting number to decimal: exponent out of range in number "1e-100020":
+    ./in.cue:7:14
+overAdjExp: error converting number to decimal: exponent out of range in number "123e99999":
+    ./in.cue:8:14
+overExpExpr: error converting number to decimal: exponent out of range in number "9e200000":
+    ./in.cue:9:14
+hugeExp: error converting number to decimal: exponent out of range in number "1e2147483648":
+    ./in.cue:10:14
+fracUnderExp: error converting number to decimal: exponent out of range in number "1.5e-100000":
+    ./in.cue:12:15

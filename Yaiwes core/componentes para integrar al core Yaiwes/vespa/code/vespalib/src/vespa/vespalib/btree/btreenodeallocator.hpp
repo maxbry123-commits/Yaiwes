@@ -1,0 +1,319 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include "btreenodeallocator.h"
+#include "btreenodestore.hpp"
+#include "btreerootbase.h"
+
+#include <vespa/check_require.h>
+#include <vespa/vespalib/stllike/asciistream.h>
+
+#include <vespa/vespalib/util/array.hpp>
+
+namespace vespalib::btree {
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::BTreeNodeAllocator()
+    : _nodeStore(),
+      _internalToFreeze(),
+      _leafToFreeze(),
+      _treeToFreeze(),
+      _internalHoldUntilFreeze(),
+      _leafHoldUntilFreeze() {
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::~BTreeNodeAllocator() {
+    CHECK(_internalToFreeze.empty());
+    CHECK(_leafToFreeze.empty());
+    CHECK(_treeToFreeze.empty());
+    CHECK(_internalHoldUntilFreeze.empty());
+    CHECK(_leafHoldUntilFreeze.empty());
+    auto stats = _nodeStore.getMemStats();
+    CHECK(stats._usedBytes == stats._deadBytes);
+    CHECK(stats._holdBytes == 0);
+    (void)stats;
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+typename BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::InternalNodeTypeRefPair
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::allocInternalNode(uint8_t level) {
+    if (_internalHoldUntilFreeze.empty()) {
+        InternalNodeTypeRefPair nodeRef = _nodeStore.allocInternalNode();
+        CHECK(nodeRef.ref.valid());
+        _internalToFreeze.push_back(nodeRef.ref);
+        nodeRef.data->setLevel(level);
+        return nodeRef;
+    }
+    BTreeNode::Ref nodeRef = _internalHoldUntilFreeze.back();
+    _internalHoldUntilFreeze.pop_back();
+    InternalNodeType* node = mapInternalRef(nodeRef);
+    CHECK(!node->getFrozen());
+    node->setLevel(level);
+    return InternalNodeTypeRefPair(nodeRef, node);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+typename BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::LeafNodeTypeRefPair
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::allocLeafNode() {
+    if (_leafHoldUntilFreeze.empty()) {
+        LeafNodeTypeRefPair nodeRef = _nodeStore.allocLeafNode();
+        _leafToFreeze.push_back(nodeRef.ref);
+        return nodeRef;
+    }
+    BTreeNode::Ref nodeRef = _leafHoldUntilFreeze.back();
+    _leafHoldUntilFreeze.pop_back();
+    LeafNodeType* node = mapLeafRef(nodeRef);
+    CHECK(!node->getFrozen());
+    return LeafNodeTypeRefPair(nodeRef, node);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+typename BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::InternalNodeTypeRefPair
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::thawNode(BTreeNode::Ref    nodeRef,
+                                                                             InternalNodeType* node) {
+    if (_internalHoldUntilFreeze.empty()) {
+        InternalNodeTypeRefPair retNodeRef = _nodeStore.allocInternalNodeCopy(*node);
+        CHECK(retNodeRef.data->getFrozen());
+        retNodeRef.data->unFreeze();
+        CHECK(retNodeRef.ref.valid());
+        _internalToFreeze.push_back(retNodeRef.ref);
+        holdNode(nodeRef, node);
+        return retNodeRef;
+    }
+    BTreeNode::Ref    retNodeRef = _internalHoldUntilFreeze.back();
+    InternalNodeType* retNode = mapInternalRef(retNodeRef);
+    _internalHoldUntilFreeze.pop_back();
+    CHECK(!retNode->getFrozen());
+    *retNode = static_cast<const InternalNodeType&>(*node);
+    CHECK(retNode->getFrozen());
+    retNode->unFreeze();
+    holdNode(nodeRef, node);
+    return InternalNodeTypeRefPair(retNodeRef, retNode);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+typename BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::LeafNodeTypeRefPair
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::thawNode(BTreeNode::Ref nodeRef,
+                                                                             LeafNodeType*  node) {
+    if (_leafHoldUntilFreeze.empty()) {
+        LeafNodeTypeRefPair retNodeRef = _nodeStore.allocLeafNodeCopy(*node);
+        CHECK(retNodeRef.data->getFrozen());
+        retNodeRef.data->unFreeze();
+        _leafToFreeze.push_back(retNodeRef.ref);
+        holdNode(nodeRef, node);
+        return retNodeRef;
+    }
+    BTreeNode::Ref retNodeRef = _leafHoldUntilFreeze.back();
+    LeafNodeType*  retNode = mapLeafRef(retNodeRef);
+    _leafHoldUntilFreeze.pop_back();
+    CHECK(!retNode->getFrozen());
+    *retNode = static_cast<const LeafNodeType&>(*node);
+    CHECK(retNode->getFrozen());
+    retNode->unFreeze();
+    holdNode(nodeRef, node);
+    return LeafNodeTypeRefPair(retNodeRef, retNode);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+BTreeNode::Ref BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::thawNode(BTreeNode::Ref node) {
+    return isLeafRef(node) ? thawNode(node, mapLeafRef(node)).ref : thawNode(node, mapInternalRef(node)).ref;
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::holdNode(BTreeNode::Ref    nodeRef,
+                                                                                  InternalNodeType* node) {
+    if (node->getFrozen()) {
+        _nodeStore.hold_entry(nodeRef);
+    } else {
+        node->clean();
+        _internalHoldUntilFreeze.push_back(nodeRef);
+    }
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::holdNode(BTreeNode::Ref nodeRef,
+                                                                                  LeafNodeType*  node) {
+    if (node->getFrozen()) {
+        _nodeStore.hold_entry(nodeRef);
+    } else {
+        node->clean();
+        _leafHoldUntilFreeze.push_back(nodeRef);
+    }
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::freeze() {
+    // Freeze nodes.
+
+    if (!_internalToFreeze.empty() || !_leafToFreeze.empty()) {
+        {
+            for (auto& i : _internalToFreeze) {
+                CHECK(i.valid());
+                mapInternalRef(i)->freeze();
+            }
+            _internalToFreeze.clear();
+        }
+        {
+            for (auto& i : _leafToFreeze) {
+                CHECK(i.valid());
+                mapLeafRef(i)->freeze();
+            }
+            _leafToFreeze.clear();
+        }
+    }
+
+    // Freeze trees.
+
+    if (!_treeToFreeze.empty()) {
+        for (auto& i : _treeToFreeze) {
+            i->freeze(*this);
+        }
+        _treeToFreeze.clear();
+    }
+
+    // Free nodes that were only held due to freezing.
+
+    {
+        for (auto& i : _internalHoldUntilFreeze) {
+            CHECK(!isLeafRef(i));
+            InternalNodeType* inode = mapInternalRef(i);
+            (void)inode;
+            CHECK(inode->getFrozen());
+            _nodeStore.hold_entry(i);
+        }
+        _internalHoldUntilFreeze.clear();
+    }
+    {
+        for (auto& i : _leafHoldUntilFreeze) {
+            CHECK(isLeafRef(i));
+            LeafNodeType* lnode = mapLeafRef(i);
+            (void)lnode;
+            CHECK(lnode->getFrozen());
+            _nodeStore.hold_entry(i);
+        }
+        _leafHoldUntilFreeze.clear();
+    }
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::needFreeze(BTreeRootBaseType* tree) {
+    _treeToFreeze.push_back(tree);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::reclaim_memory(Generation oldest_used_gen) {
+    _nodeStore.reclaim_memory(oldest_used_gen);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::assign_generation(Generation current_gen) {
+    _nodeStore.assign_generation(current_gen);
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+void BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::reclaim_all_memory() {
+    _nodeStore.reclaim_all_memory();
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+typename BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::InternalNodeTypeRefPair
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::moveInternalNode(const InternalNodeType* node) {
+    InternalNodeTypeRefPair iPair;
+    iPair = _nodeStore.allocNewInternalNodeCopy(*node);
+    CHECK(iPair.ref.valid());
+    _internalToFreeze.push_back(iPair.ref);
+    return iPair;
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+typename BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::LeafNodeTypeRefPair
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::moveLeafNode(const LeafNodeType* node) {
+    LeafNodeTypeRefPair lPair;
+    lPair = _nodeStore.allocNewLeafNodeCopy(*node);
+    _leafToFreeze.push_back(lPair.ref);
+    return lPair;
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+uint32_t
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::validLeaves(BTreeNode::Ref ref) const noexcept {
+    return isLeafRef(ref) ? mapLeafRef(ref)->validSlots() : mapInternalRef(ref)->validLeaves();
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+uint32_t
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::getLevel(BTreeNode::Ref ref) const noexcept {
+    return isLeafRef(ref) ? BTreeNode::LEAF_LEVEL : mapInternalRef(ref)->getLevel();
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+const KeyT&
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::getLastKey(BTreeNode::Ref node) const noexcept {
+    return isLeafRef(node) ? mapLeafRef(node)->getLastKey() : mapInternalRef(node)->getLastKey();
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+const AggrT& BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::getAggregated(
+    BTreeNode::Ref node) const noexcept {
+    if (!node.valid()) {
+        return LeafNodeType::getEmptyAggregated();
+    }
+    if (isLeafRef(node)) {
+        return mapLeafRef(node)->getAggregated();
+    } else {
+        return mapInternalRef(node)->getAggregated();
+    }
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+vespalib::MemoryUsage
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::getMemoryUsage() const noexcept {
+    return _nodeStore.getMemoryUsage();
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+std::string BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::toString(BTreeNode::Ref ref) const {
+    if (!isValidRef(ref)) {
+        return "NULL";
+    }
+    if (isLeafRef(ref)) {
+        return toString(mapLeafRef(ref));
+    } else {
+        return toString(mapInternalRef(ref));
+    }
+}
+
+template <typename KeyT, typename DataT, typename AggrT, size_t INTERNAL_SLOTS, size_t LEAF_SLOTS>
+std::string
+BTreeNodeAllocator<KeyT, DataT, AggrT, INTERNAL_SLOTS, LEAF_SLOTS>::toString(const BTreeNode* node) const {
+    if (node == nullptr) {
+        return "NULL";
+    }
+    vespalib::asciistream ss;
+    if (node->isLeaf()) {
+        const auto* lnode = static_cast<const LeafNodeType*>(node);
+        ss << "L: keys(" << lnode->validSlots() << ")[";
+        for (uint32_t i = 0; i < lnode->validSlots(); ++i) {
+            if (i > 0) {
+                ss << ",";
+            }
+            ss << lnode->getKey(i);
+        }
+        ss << "]";
+    } else {
+        const auto* inode = static_cast<const InternalNodeType*>(node);
+        ss << "I: validLeaves(" << inode->validLeaves() << "), keys(" << inode->validSlots() << ")[";
+        for (uint32_t i = 0; i < inode->validSlots(); ++i) {
+            if (i > 0) {
+                ss << ",";
+            }
+            ss << inode->getKey(i);
+        }
+        ss << "]";
+    }
+    return ss.str();
+}
+
+} // namespace vespalib::btree

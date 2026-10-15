@@ -1,2 +1,0 @@
-SET unmapped_fields="load"; TS k8s
-| STATS f = FIRST_OVER_TIME(does_not_exist::DOUBLE) BY tbucket(1 hour)

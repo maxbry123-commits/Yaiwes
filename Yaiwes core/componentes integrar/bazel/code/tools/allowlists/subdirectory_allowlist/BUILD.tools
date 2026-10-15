@@ -1,7 +1,0 @@
-# Description:
-#   Package group restricting access to declare_subdirectory in map_directory.
-
-package_group(
-    name = "subdirectory_allowlist",
-    packages = [],
-)

@@ -1,9 +1,0 @@
-type: metric
-
-tests:
-  skip_context_propagation: true
-
-status:
-  class: processor
-  stability:
-    beta: [traces, logs, metrics]

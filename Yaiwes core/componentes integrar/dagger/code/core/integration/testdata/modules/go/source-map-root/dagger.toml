@@ -1,3 +1,0 @@
-[modules.test]
-source = "."
-entrypoint = true

@@ -1,5 +1,0 @@
-type HelloWorld {
-  pub greet(name: String! = "world"): String! {
-    "hello, " + name + "!"
-  }
-}

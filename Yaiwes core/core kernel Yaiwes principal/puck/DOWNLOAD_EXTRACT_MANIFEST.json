@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 982246,
+  "bundle_sha256": "d89e8cad91abd3efef57a9af8cfee1fd72ff98724315545b6490fbb4ec2e4d26",
+  "extracted_tree": {
+    "bytes": 2716215,
+    "files": 810,
+    "sha256": "d4fcd161b8922a5eaa2df6501f3171d269dbd3995e979358b99261a231ae0f50"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 982246,
+      "name": "puck.bundle.zip.part-0001",
+      "sha256": "d89e8cad91abd3efef57a9af8cfee1fd72ff98724315545b6490fbb4ec2e4d26"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "puck",
+  "source_bytes": 2716215,
+  "source_commit": "c842cd0ba43775a2d19daea76fe3a618efb579e8",
+  "source_files": 810,
+  "source_ref": "main",
+  "source_repo": "puckeditor/puck",
+  "source_tree": {
+    "bytes": 2716215,
+    "files": 810,
+    "sha256": "d4fcd161b8922a5eaa2df6501f3171d269dbd3995e979358b99261a231ae0f50"
+  }
+}

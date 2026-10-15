@@ -1,6 +1,0 @@
-{
-  "index": {
-    "number_of_shards": 2,
-    "translog.flush_threshold_size": "1mb"
-  }
-}

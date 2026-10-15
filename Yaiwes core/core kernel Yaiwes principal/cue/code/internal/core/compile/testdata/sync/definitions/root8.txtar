@@ -1,0 +1,41 @@
+# Pinned to v0.17.0: root-embedding series, covering how a closed
+# embedding constrains its siblings before explicitopen is stable.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- in.cue --
+root: input: foo: {
+    metadata: name: *"foo" | string
+    id: "id-\(metadata.name)"
+    #deps: [string]: _
+    #deps: root: {}
+    spec: replicas: 1
+}
+{root.input.foo.#deps}
+
+-- out/compile --
+--- in.cue
+{
+  root: {
+    input: {
+      foo: {
+        metadata: {
+          name: (*"foo"|string)
+        }
+        id: "id-\(〈0;metadata〉.name)"
+        #deps: {
+          [string]: _
+        }
+        #deps: {
+          root: {}
+        }
+        spec: {
+          replicas: 1
+        }
+      }
+    }
+  }
+  {
+    〈1;root〉.input.foo.#deps
+  }
+}

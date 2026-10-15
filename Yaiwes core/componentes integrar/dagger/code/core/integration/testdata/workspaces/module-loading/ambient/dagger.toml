@@ -1,9 +1,0 @@
-[modules.ci]
-source = ".dagger/modules/ci"
-entrypoint = true
-
-[modules.lint]
-source = ".dagger/modules/lint"
-
-[modules.test]
-source = ".dagger/modules/test"

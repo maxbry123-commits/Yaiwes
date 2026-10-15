@@ -1,4 +1,0 @@
-SET unmapped_fields="load"; FROM text_state_mapped, text_state_unmapped, text_state_nonexistent METADATA _index
-| WHERE match(txt, "Faulkner") OR txt IS NULL
-| KEEP _index, doc_id, txt
-| SORT _index

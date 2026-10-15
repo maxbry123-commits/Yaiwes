@@ -1,0 +1,43 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import org.elasticsearch.gradle.internal.AbstractDependenciesTask
+
+apply plugin: 'elasticsearch.build'
+apply plugin: 'elasticsearch.publish'
+apply plugin: 'com.gradleup.shadow'
+
+dependencies {
+  implementation "org.opensaml:opensaml-security-api:${versions.opensaml}"
+  compileOnly "org.opensaml:opensaml-core-api:${versions.opensaml}"
+  compileOnly "org.opensaml:opensaml-core-impl:${versions.opensaml}"
+  // Embed cryptacular with a patched CertUtil (see CertUtil.java for details).
+  // BC jars are excluded to avoid bundling them in the shadow jar.
+  implementation ("org.cryptacular:cryptacular:1.3.0") {
+    exclude group: 'org.bouncycastle'
+  }
+  // Needed to compile the patched CertUtil against org.bouncycastle.asn1.x509 types.
+  compileOnly "org.bouncycastle:bcprov-jdk18on:${versions.bouncycastle}"
+}
+
+['jarHell', 'thirdPartyAudit', 'splitPackagesAudit', 'forbiddenApisMain', 'licenseHeaders', 'checkstyleMain'].each {
+  tasks.named(it).configure {
+    enabled = false
+  }
+}
+
+tasks.withType(AbstractDependenciesTask).configureEach {
+  mapping from: /opensaml-.*/, to: 'shibboleth'
+  mapping from: /cryptacular.*/, to: 'cryptacular'
+}
+
+tasks.named("shadowJar").configure {
+  manifest {
+    attributes 'Automatic-Module-Name': 'org.opensaml.security'
+  }
+  exclude 'META-INF/services/org.opensaml.security.crypto.ec.NamedCurve'
+}

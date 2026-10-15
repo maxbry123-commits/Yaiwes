@@ -1,6 +1,0 @@
-area: ES|QL
-issues:
- - 159886
-pr: 159887
-summary: Fix LENGTH of mapped non-indexed field
-type: bug

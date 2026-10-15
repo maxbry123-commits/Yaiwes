@@ -1,7 +1,0 @@
-title: Security Manager should handle symlink on /tmp
-type: fixed
-authors:
-- name: Kevin Risden
-links:
-- name: SOLR-17800
-  url: https://issues.apache.org/jira/browse/SOLR-17800

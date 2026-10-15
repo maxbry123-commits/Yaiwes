@@ -1,5 +1,0 @@
-*.exe
-*.ilk
-*.pdb
-.depend*
-Makefile

@@ -1,6 +1,0 @@
-# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
-namespace=vespa.config.content.core
-
-## The maximum clock skew allowed in the system. Any messages received 
-## that have a timestamp longer in the future than this will be failed.
-max_clock_skew_seconds int default=5

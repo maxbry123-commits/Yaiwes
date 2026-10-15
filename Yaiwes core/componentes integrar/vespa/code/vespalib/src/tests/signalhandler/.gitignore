@@ -1,6 +1,0 @@
-.depend
-Makefile
-signalhandler_test
-victim
-vespalib_signalhandler_test_app
-vespalib_victim_app

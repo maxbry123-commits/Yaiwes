@@ -1,3 +1,0 @@
-FROM employees
-| ENRICH _remote:languages_remote ON first_name
-| LIMIT 5 BY language_name

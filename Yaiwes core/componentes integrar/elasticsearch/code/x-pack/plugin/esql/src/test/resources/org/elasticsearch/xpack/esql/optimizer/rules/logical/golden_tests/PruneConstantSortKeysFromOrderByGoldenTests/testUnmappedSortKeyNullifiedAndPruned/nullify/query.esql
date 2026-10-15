@@ -1,4 +1,0 @@
-SET unmapped_fields="nullify"; FROM employees
-| KEEP emp_no, does_not_exist
-| SORT does_not_exist, emp_no
-| LIMIT 20

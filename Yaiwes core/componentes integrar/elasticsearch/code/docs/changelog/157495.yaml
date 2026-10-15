@@ -1,5 +1,0 @@
-area: Snapshot/Restore
-issues: []
-pr: 157495
-summary: Add monotonically increasing snapshot end times
-type: enhancement

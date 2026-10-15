@@ -1,2 +1,0 @@
-    FROM employees
-    | WHERE mv_in_range(first_name, "A", "M")

@@ -1,0 +1,191 @@
+# Tests that hidden fields with disjunctions (close({y!: z?: _}) | _) work
+# correctly when exposed through embedding. The key behavior is that _a unifies
+# with close({y!: ...}) correctly even when exposed via {X} or X.
+# Issue: https://cuelang.org/issue/3834
+-- in.cue --
+// expose at top level
+X: {
+	_a: foo: true
+	_a: _ | close({y!: z?: _})
+	_b: _a & {y: {}}
+	concrete: _b.y
+	isTrue: concrete != _|_
+}
+{X}
+
+
+sub: t1: {
+	X: {
+		_a: foo: true
+		_a: _ | close({y!: z?: _})
+		_b: _a & {y: {}}
+		concrete: _b.y
+	}
+	{X}
+
+}
+sub: t2: {
+	X: {
+		_a: foo: true
+		_a: _ | close({y!: z?: _})
+		_b: _a & {y: {}}
+		concrete: _b.y
+	}
+	X
+
+}
+sub: t3: {
+	#X: {
+		_a: foo: true
+		_a: _ | close({y!: z?: _})
+		_b: _a & {y: {}}
+		concrete: _b.y
+	}
+	{#X}
+
+}
+sub: t4: {
+	#X: {
+		_a: foo: true
+		_a: _ | close({y!: z?: _})
+		_b: _a & {y: {}}
+		concrete: _b.y
+	}
+	#X
+
+}
+
+full: {
+	#Foo: {
+		_data: Foo: true
+		_data: _ | close({Extra!: optional?: _})
+
+		_dataWithExtra: _data & {Extra: {}}
+
+		out: _dataWithExtra.Extra != _|_
+	}
+
+	{#Foo}
+
+}
+-- out/compile --
+--- in.cue
+{
+  X: {
+    _a: {
+      foo: true
+    }
+    _a: (_|close({
+      y!: {
+        z?: _
+      }
+    }))
+    _b: (〈0;_a〉 & {
+      y: {}
+    })
+    concrete: 〈0;_b〉.y
+    isTrue: (〈0;concrete〉 != _|_(explicit error (_|_ literal) in source))
+  }
+  {
+    〈1;X〉
+  }
+  sub: {
+    t1: {
+      X: {
+        _a: {
+          foo: true
+        }
+        _a: (_|close({
+          y!: {
+            z?: _
+          }
+        }))
+        _b: (〈0;_a〉 & {
+          y: {}
+        })
+        concrete: 〈0;_b〉.y
+      }
+      {
+        〈1;X〉
+      }
+    }
+  }
+  sub: {
+    t2: {
+      X: {
+        _a: {
+          foo: true
+        }
+        _a: (_|close({
+          y!: {
+            z?: _
+          }
+        }))
+        _b: (〈0;_a〉 & {
+          y: {}
+        })
+        concrete: 〈0;_b〉.y
+      }
+      〈0;X〉
+    }
+  }
+  sub: {
+    t3: {
+      #X: {
+        _a: {
+          foo: true
+        }
+        _a: (_|close({
+          y!: {
+            z?: _
+          }
+        }))
+        _b: (〈0;_a〉 & {
+          y: {}
+        })
+        concrete: 〈0;_b〉.y
+      }
+      {
+        〈1;#X〉
+      }
+    }
+  }
+  sub: {
+    t4: {
+      #X: {
+        _a: {
+          foo: true
+        }
+        _a: (_|close({
+          y!: {
+            z?: _
+          }
+        }))
+        _b: (〈0;_a〉 & {
+          y: {}
+        })
+        concrete: 〈0;_b〉.y
+      }
+      〈0;#X〉
+    }
+  }
+  full: {
+    #Foo: {
+      _data: {
+        Foo: true
+      }
+      _data: (_|close({
+        Extra!: {
+          optional?: _
+        }
+      }))
+      _dataWithExtra: (〈0;_data〉 & {
+        Extra: {}
+      })
+      out: (〈0;_dataWithExtra〉.Extra != _|_(explicit error (_|_ literal) in source))
+    }
+    {
+      〈1;#Foo〉
+    }
+  }
+}

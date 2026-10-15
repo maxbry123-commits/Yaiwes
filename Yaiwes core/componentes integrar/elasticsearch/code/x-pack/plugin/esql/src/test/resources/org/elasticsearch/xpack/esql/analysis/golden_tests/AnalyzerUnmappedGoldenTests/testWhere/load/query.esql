@@ -1,2 +1,0 @@
-SET unmapped_fields="load"; FROM employees
-| WHERE does_not_exist::LONG > 0

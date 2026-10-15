@@ -1,0 +1,108 @@
+-- in.cue --
+// Basic usage of __closeAll - makes structs recursively closed
+a: __closeAll({
+	field1: 1
+	nested: {
+		field2: "hello"
+	}
+})
+
+// Test that extra fields are not allowed (should error)
+b: {
+	err: a & {extra: "not allowed"}
+}
+
+// Test that nested extra fields are not allowed (should error)
+c: {
+	err: a & {
+		field1: 1
+		nested: {
+			field2: "hello"
+			extra: "not allowed"
+		}
+	}
+}
+
+// Test with non-struct should error
+d: {
+	err: __closeAll("not a struct")
+}
+
+// Test with empty struct
+e: __closeAll({})
+f: {
+	err: e & {extra: "not allowed"}  // should error
+}
+
+
+#A: a: int
+g: {
+	err: __closeAll(#A)
+}
+
+// The closing applies to each disjunct of a struct which embeds a
+// disjunction.
+embeddedDisjunction: {
+	#A: {a: 1}
+	#B: {b: 1}
+	v: __closeAll({(#A | #B)..., c: 2})
+	t1: v & {a: 1}
+	t2: v & {d: 3}
+}
+-- out/compile --
+--- in.cue
+{
+  a: __closeAll({
+    field1: 1
+    nested: {
+      field2: "hello"
+    }
+  })
+  b: {
+    err: (〈1;a〉 & {
+      extra: "not allowed"
+    })
+  }
+  c: {
+    err: (〈1;a〉 & {
+      field1: 1
+      nested: {
+        field2: "hello"
+        extra: "not allowed"
+      }
+    })
+  }
+  d: {
+    err: __closeAll("not a struct")
+  }
+  e: __closeAll({})
+  f: {
+    err: (〈1;e〉 & {
+      extra: "not allowed"
+    })
+  }
+  #A: {
+    a: int
+  }
+  g: {
+    err: __closeAll(〈1;#A〉)
+  }
+  embeddedDisjunction: {
+    #A: {
+      a: 1
+    }
+    #B: {
+      b: 1
+    }
+    v: __closeAll({
+      (〈1;#A〉|〈1;#B〉)...
+      c: 2
+    })
+    t1: (〈0;v〉 & {
+      a: 1
+    })
+    t2: (〈0;v〉 & {
+      d: 3
+    })
+  }
+}

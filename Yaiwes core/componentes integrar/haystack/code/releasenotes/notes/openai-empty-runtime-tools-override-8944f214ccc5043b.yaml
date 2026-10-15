@@ -1,4 +1,0 @@
-fixes:
-  - |
-    Fixed ``OpenAIChatGenerator`` and ``OpenAIResponsesChatGenerator`` so that an empty runtime ``tools`` list
-    overrides tools configured at initialization.

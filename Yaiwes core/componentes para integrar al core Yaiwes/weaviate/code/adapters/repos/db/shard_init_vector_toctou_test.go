@@ -1,0 +1,261 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package db
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"github.com/weaviate/weaviate/entities/models"
+	schemaConfig "github.com/weaviate/weaviate/entities/schema/config"
+	"github.com/weaviate/weaviate/entities/storagestate"
+	enthnsw "github.com/weaviate/weaviate/entities/vectorindex/hnsw"
+)
+
+// Re-initialising an existing target vector must not replace and orphan its
+// queue. This is the outcome of two concurrent UpdateVectorIndexConfigs calls
+// that both observe the target absent before either creates it; reproduced here
+// sequentially.
+func TestInitTargetVector_Idempotent_DoesNotOrphanQueue(t *testing.T) {
+	ctx := context.Background()
+	shardLike, _ := testShard(t, ctx, "ToctouDoubleCreate")
+	shard := underlyingShard(t, shardLike)
+
+	cfg := enthnsw.UserConfig{Skip: true}
+
+	require.NoError(t, shard.initTargetVector(ctx, "v1", cfg, false))
+	q1, releaseQ1, _ := shard.AcquireVectorIndexQueue("v1")
+	defer releaseQ1()
+	require.NotNil(t, q1)
+
+	require.NoError(t, shard.initTargetVector(ctx, "v1", cfg, false))
+
+	q2, releaseQ2, _ := shard.AcquireVectorIndexQueue("v1")
+	defer releaseQ2()
+
+	assert.Same(t, q1, q2,
+		"re-initialising an existing target vector must not silently replace and "+
+			"orphan its queue; the first queue is leaked (never Dropped)")
+}
+
+// TestInitTargetVector_ShutsDownIndexWhenQueueCreationFails pins that a vector
+// index whose queue fails to be created is shut down rather than orphaned,
+// leaking its cache goroutine. The cancelled-ctx case guards that the shutdown
+// uses s.shutCtx and not the caller's (possibly cancelled) ctx.
+func TestInitTargetVector_ShutsDownIndexWhenQueueCreationFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		callerCtx func() context.Context
+	}{
+		{name: "valid caller ctx", callerCtx: context.Background},
+		{
+			name: "cancelled caller ctx",
+			callerCtx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shardLike, index := testShard(t, context.Background(), "VecQueueOrphan")
+			s := underlyingShard(t, shardLike)
+			// enable async only after NewShard so that NewVectorIndexQueue, not the
+			// shard constructor, is what calls q.Init().
+			index.AsyncIndexingEnabled = true
+
+			const target = "orphanTarget"
+			// a file where the queue dir must go makes q.Init() fail
+			queueDir := filepath.Join(s.path(), fmt.Sprintf("%s.queue.d", s.vectorIndexID(target)))
+			require.NoError(t, os.WriteFile(queueDir, []byte("x"), 0o600))
+
+			// the HNSW cache goroutine only exits on Shutdown/Drop
+			watchers := func() int {
+				buf := make([]byte, 1<<20)
+				for {
+					n := runtime.Stack(buf, true)
+					if n < len(buf) {
+						return strings.Count(string(buf[:n]), "watchForDeletion")
+					}
+					buf = make([]byte, 2*len(buf))
+				}
+			}
+			baseline := watchers()
+
+			err := s.initTargetVector(tt.callerCtx(), target, enthnsw.NewDefaultUserConfig(), false)
+			require.Error(t, err)
+			require.ErrorContains(t, err, "cannot create index queue")
+
+			_, stored := s.vectors.get(target)
+			require.False(t, stored, "orphaned index must not be stored")
+
+			require.Eventually(t, func() bool { return watchers() <= baseline }, 5*time.Second, 20*time.Millisecond,
+				"orphaned HNSW index was not shut down (cache goroutine leaked)")
+		})
+	}
+}
+
+// TestUpdateVectorIndexConfigs_FailedInitRestoresStatus pins that a failed
+// vector-index creation does not leave the shard read-only: the goroutine that
+// restores StatusReady must run even when initTargetVector returns an error.
+func TestUpdateVectorIndexConfigs_FailedInitRestoresStatus(t *testing.T) {
+	shardLike, index := testShard(t, context.Background(), "VecQueueReadonly")
+	s := underlyingShard(t, shardLike)
+	// enable async only after NewShard (see the sibling test).
+	index.AsyncIndexingEnabled = true
+
+	const target = "newTarget"
+	// a file where the queue dir must go makes q.Init() fail
+	queueDir := filepath.Join(s.path(), fmt.Sprintf("%s.queue.d", s.vectorIndexID(target)))
+	require.NoError(t, os.WriteFile(queueDir, []byte("x"), 0o600))
+
+	err := s.UpdateVectorIndexConfigs(context.Background(),
+		map[string]schemaConfig.VectorIndexConfig{target: enthnsw.NewDefaultUserConfig()})
+	require.Error(t, err)
+
+	require.Eventually(t, func() bool { return s.GetStatus() == storagestate.StatusReady }, 5*time.Second, 20*time.Millisecond,
+		"shard left read-only after a failed vector index creation")
+}
+
+// Shard init must snapshot the index vector configs under
+// vectorIndexUserConfigLock. Ranging the live vectorIndexUserConfigs map while
+// updateVectorIndexConfigs writes it aborts the process with "concurrent map
+// read and map write" — a fatal error no recover can catch.
+func TestInitShardVectors_ConcurrentConfigUpdate(t *testing.T) {
+	ctx := context.Background()
+	shardLike, idx := testShard(t, ctx, "VectorConfigRace")
+	shard := underlyingShard(t, shardLike)
+
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	var applied atomic.Int64
+	go func() {
+		defer close(writerDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// UpdateVectorIndexConfigs flips the shard read-only and restores it
+			// asynchronously, so back-to-back calls legitimately bounce off it.
+			// Only the calls that get through reach the map write we care about.
+			if err := idx.updateVectorIndexConfigs(ctx, map[string]schemaConfig.VectorIndexConfig{
+				fmt.Sprintf("v%d", i%4): enthnsw.UserConfig{Skip: true},
+			}); err == nil {
+				applied.Add(1)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// initShardVectors finds its slots in place after the first call and
+	// returns at once, so a fixed number of iterations can finish before the
+	// writer lands a single update; keep reading until one has.
+	deadline := time.Now().Add(5 * time.Second)
+	for i := 0; i < 200 || (applied.Load() == 0 && time.Now().Before(deadline)); i++ {
+		require.NoError(t, shard.initShardVectors(ctx))
+	}
+
+	close(stop)
+	<-writerDone
+	require.NotZero(t, applied.Load(), "no config update ever landed, so nothing raced the reads")
+}
+
+// underlyingShard returns the concrete *Shard behind a ShardLike, loading it if
+// the test helper handed back a lazy-load wrapper (the default differs across
+// release branches, so handle both).
+func underlyingShard(t *testing.T, sl ShardLike) *Shard {
+	t.Helper()
+	switch s := sl.(type) {
+	case *Shard:
+		return s
+	case *LazyLoadShard:
+		shard, _, err := s.loadIfCold(context.Background())
+		require.NoError(t, err)
+		return shard
+	default:
+		t.Fatalf("unexpected ShardLike type %T", sl)
+		return nil
+	}
+}
+
+// TestDropVectorIndex_FailedTeardownKeepsTheIndexForCleanup pins that a drop
+// whose index teardown fails leaves the shard owning the index: a retried
+// drop and the shard's own shutdown still reach it through the slots. With
+// the old maps each entry stayed until its own teardown succeeded.
+func TestDropVectorIndex_FailedTeardownKeepsTheIndexForCleanup(t *testing.T) {
+	ctx := context.Background()
+	shardLike, _ := testShardWithSettings(t, ctx, &models.Class{Class: "test"}, enthnsw.UserConfig{}, false, false, func(idx *Index) {
+		idx.vectorIndexUserConfig = nil
+		idx.vectorIndexUserConfigs = map[string]schemaConfig.VectorIndexConfig{
+			"named": enthnsw.NewDefaultUserConfig(),
+		}
+	})
+	shard := underlyingShard(t, shardLike)
+
+	// swap a mock in for the real index, which the test shuts down itself
+	real, release, ok := shard.AcquireVectorIndex("named")
+	require.True(t, ok)
+	release()
+	t.Cleanup(func() { real.Shutdown(ctx) })
+
+	failing := NewMockVectorIndex(t)
+	failing.On("Drop", mock.Anything, false).Return(assert.AnError).Once()
+	failing.On("Drop", mock.Anything, false).Return(nil).Once()
+	require.True(t, shard.vectors.Replace("named", failing))
+	// the first load recorded the vector ready
+	named := vectorIndexRecord{PhysicalID: "vectors_named", IndexType: "hnsw", State: "ready"}
+
+	err := shard.DropVectorIndex(ctx, "named")
+	require.ErrorIs(t, err, assert.AnError)
+
+	var owned []VectorIndex
+	require.NoError(t, shard.ForEachVectorIndex(func(targetVector string, index VectorIndex) error {
+		if targetVector == "named" {
+			owned = append(owned, index)
+		}
+		return nil
+	}))
+	require.Len(t, owned, 1, "the index whose teardown failed must stay reachable for cleanup")
+	assert.Same(t, failing, owned[0])
+	records, _, err := shard.mapping.Load()
+	require.NoError(t, err)
+	dropping := named
+	dropping.State = vectorIndexStateDropping
+	assert.Equal(t, map[string]vectorIndexRecord{"named": dropping}, records,
+		"the record outlives a failed teardown, marked dropping: the retry needs it")
+
+	require.NoError(t, shard.DropVectorIndex(ctx, "named"), "a retried drop tears the same index down")
+	owned = nil
+	require.NoError(t, shard.ForEachVectorIndex(func(targetVector string, index VectorIndex) error {
+		owned = append(owned, index)
+		return nil
+	}))
+	assert.Empty(t, owned)
+	records, _, err = shard.mapping.Load()
+	require.NoError(t, err)
+	assert.Empty(t, records, "the retried drop deleted the record")
+}

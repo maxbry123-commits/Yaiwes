@@ -1,4 +1,0 @@
----
-fixes:
-  - |
-    Fix ``FileSystemToolResultStore`` altering line endings in text results on Windows.

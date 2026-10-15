@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161148
-summary: Keep text parse live under pool pin
-type: enhancement

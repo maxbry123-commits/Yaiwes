@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 158858
-summary: "ES|QL|DS: first_file_wins warm COUNT/MIN/MAX must match the scan"
-type: bug

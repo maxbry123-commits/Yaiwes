@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 157247
-summary: Stop wrapping Parquet I/O as HTTP 400 IAE
-type: bug

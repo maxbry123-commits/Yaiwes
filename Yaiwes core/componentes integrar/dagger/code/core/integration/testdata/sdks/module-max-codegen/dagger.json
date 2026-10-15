@@ -1,7 +1,0 @@
-{
-  "name": "module-max-codegen",
-  "engineVersion": "latest",
-  "sdk": {
-    "source": "dang"
-  }
-}

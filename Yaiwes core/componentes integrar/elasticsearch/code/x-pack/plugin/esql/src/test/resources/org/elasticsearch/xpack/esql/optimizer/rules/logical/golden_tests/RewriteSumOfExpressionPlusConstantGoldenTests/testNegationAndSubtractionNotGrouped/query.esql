@@ -1,2 +1,0 @@
-FROM employees
-| STATS s1 = SUM(-salary + 1), s2 = SUM(1 - salary)

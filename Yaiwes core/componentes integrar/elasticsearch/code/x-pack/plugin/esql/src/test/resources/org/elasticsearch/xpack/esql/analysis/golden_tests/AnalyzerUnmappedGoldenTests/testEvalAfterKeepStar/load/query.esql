@@ -1,4 +1,0 @@
-SET unmapped_fields="load"; FROM employees
-| KEEP *
-| EVAL x = emp_no + 1
-| EVAL y = does_not_exist_field::DOUBLE + 2

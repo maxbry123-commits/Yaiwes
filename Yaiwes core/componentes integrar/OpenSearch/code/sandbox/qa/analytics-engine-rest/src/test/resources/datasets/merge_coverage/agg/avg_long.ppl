@@ -1,1 +1,0 @@
-source=%INDEX% | stats avg(big_amount)

@@ -1,3 +1,0 @@
-FROM employees
-| SORT salary DESC
-| LIMIT 5 BY languages * 2, 42

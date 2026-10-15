@@ -1,0 +1,817 @@
+# Tests unification of CUE function values with function types (bodyless
+# signatures, possibly partial/open) and of function types with each other.
+# Static checks at unification time cover only what is decidable from the
+# compiled signatures: parameter names, positions, closedness, and whether a
+# parameter declares a default. Requiredness combines as for struct fields
+# and is enforced when a call omits a parameter. Parameter and
+# result constraint conflicts and missing arguments remain dynamic and
+# surface when the function is called; two declared defaults for the same
+# parameter are unified when the signatures are.
+-- in.cue --
+@experiment(functions)
+
+tighten: {
+	T: func(a: int, ...) -> number
+
+	// The value declares an extra parameter b; T's signature is open, so
+	// the extra parameter is allowed and kept.
+	f: T & (func(a: int, b: int) -> int: a + b)
+	x: f(1, 2)
+	y: f(1)
+
+	// Order of unification does not matter.
+	fRev: (func(a: int, b: int) -> int: a + b) & T
+	xRev: fRev(1, 2)
+
+	// The type's result constraint is enforced on calls through the
+	// tightened value.
+	r: (T & (func(a: int) -> int: a))(3)
+	retConflict: ((func(a: int, ...) -> string) & (func(a: int) -> int: a))(3)
+
+	// A parameter constraint conflict (int versus string) is not decidable
+	// from the signature shapes alone and surfaces when called, not when
+	// the type and value are unified.
+	s:    T & (func(a: string) -> int: 1)
+	sErr: s(1)
+}
+
+closed: {
+	U: func(a: int) -> number
+
+	// An exact signature match tightens.
+	g:  U & (func(a: int) -> int: a)
+	gx: g(1)
+
+	// A named type may add its contract label to an otherwise unnamed
+	// positional implementation slot.
+	gN:       U & (func(_~v: int) -> int: v)
+	gNx:      gN(1)
+	gNByName: gN(a: 2)
+
+	// Two different contract labels for the same positional slot conflict.
+	badName: U & (func(b: int) -> int: b)
+
+	// The value requires an extra parameter b, which callers going through
+	// the closed type U can never provide.
+	bad2: U & (func(a: int, b: int) -> int: a+b)
+
+	// An extra optional parameter is allowed even for a closed type.
+	ok3:  U & (func(a: int, b?: int) -> int: a)
+	ok3x: ok3(1)
+}
+
+anonymous: {
+	// An anonymous type parameter matches the value's positional parameter
+	// in the same position, and its constraint applies to calls.
+	A:  func(int, ...) -> int
+	h:  A & (func(n: int) -> int: n + 1)
+	hx: h(1)
+	he: h("x")
+
+	// A named type parameter is positional too, so it is satisfied by an
+	// anonymous value parameter in the same position.
+	B:   func(m: int) -> int
+	bOk: B & (func(int) -> int: 1)
+	bx:  bOk(1)
+
+	// A named positional parameter of the value may be covered by an
+	// anonymous parameter of a closed type in the same position.
+	C:   func(int) -> int
+	cOk: C & (func(n: int) -> int: n)
+	cx:  cOk(5)
+
+	// A type constraint matched to an anonymous positional parameter of
+	// the value is enforced per call: the argument is bound to a synthetic
+	// parameter slot even though the body cannot reference it.
+	D:    func(<10, ...) -> int
+	d:    D & (func(int) -> int: 1)
+	dOk:  d(5)
+	dOob: d(15)
+
+	// The value's own constraint on an anonymous parameter is enforced on
+	// its argument as well.
+	f:    func(int) -> int: 1
+	fOk:  f(1)
+	fBad: f("x")
+
+	// Arity errors take precedence: missing and surplus arguments for
+	// anonymous parameters are still reported as such.
+	few:  f()
+	many: f(1, 2)
+}
+
+contractLabels: {
+	// An attached signature supplies the contract label of the
+	// implementation's otherwise unnamed positional slot. The implementation
+	// may keep a separate body-local name.
+	add1: func(_~x: int) -> int: x + 1
+	add1: func(x: int) -> int
+	byLabel: add1(x: 2)
+	byPosition: add1(2)
+
+	// Another compatible signature may repeat the same contract label.
+	add1: func(x: <10) -> int
+	byRepeatedName: add1(x: 3)
+
+	// Named and unnamed bodyless signatures compose in either order. Once a
+	// concrete implementation is attached, the single contract label names
+	// their shared slot.
+	Named:       func(x: int) -> int
+	Unnamed:     func(int) -> int
+	identity:    func(_~v: int) -> int: v
+	namedFirst:  Named & Unnamed & identity
+	unnamedFirst: Unnamed & Named & identity
+	namedCall:   namedFirst(x: 6)
+	reverseCall: unnamedFirst(x: 7)
+
+	// A constraint from a named signature attached to an unnamed slot follows
+	// the same positional match as its contract label.
+	limited: func(_~n: int) -> int: n
+	limited: func(input: <10) -> int
+	limitedOK: limited(input: 5)
+
+	// A contributed contract label also binds partial applications.
+	sum: func(_~a: int, _~b: int) -> int: a + b
+	sum: func(x: int, y: int) -> int
+	addLeft: sum(x: 1, ...)
+	partial: addLeft(y: 2)
+}
+
+meet: {
+	// The meet of two open types carries both signatures; the result is
+	// open only in the sense that both constituents are open.
+	n: (func(a: number, ...) -> number) & (func(a: int, ...) -> int)
+
+	// Calling a type, met or not, remains an error.
+	nc: n(1)
+
+	// A value unified with the meet is constrained by both signatures.
+	v:  n & (func(a: int) -> int: a)
+	vx: v(3)
+
+	// Both types' parameter constraints apply on calls: a string conflicts
+	// with both, a float only with the int signature.
+	w:   n & (func(a: _) -> _: a)
+	wx:  w("x")
+	wx2: w(0.5)
+
+	// Positional parameters align by ordinal, but two different contract
+	// labels for the same slot are incompatible.
+	badName: (func(a: int) -> int) & (func(b: int) -> int)
+	badNameRev: (func(b: int) -> int) & (func(a: int) -> int)
+
+	// A required or optional parameter and a positional parameter with the
+	// same label are the same parameter, in either signature. Requiredness
+	// combines as for struct fields: a plain parameter is stricter than a
+	// required one, which is stricter than an optional one.
+	reqNamed:     (func(a!: int) -> int) & (func(a: int, ...) -> int)
+	reqNamedV:    (reqNamed & (func(a: int) -> int: a))(2)
+	optNamed:     (func(a: int) -> int) & (func(a?: int) -> int)
+	optNamedV:    (optNamed & (func(a: int) -> int: a))(a: 3)
+	optNamedOmit: (optNamed & (func(a: int) -> int: a))()
+	optReq:       (func(a?: int) -> int) & (func(a!: int) -> int)
+	optReqV:      (optReq & (func(a?: int) -> int: [if a != _|_ {a}, 0][0]))(a: 4)
+	optReqOmit:   (optReq & (func(a?: int) -> int: [if a != _|_ {a}, 0][0]))()
+
+	// The result does not depend on the order of unification.
+	T1:     func(a: int) -> int
+	T2:     func(a?: int) -> int
+	vA:     func(a: int) -> int: a
+	orderL: ((T1 & T2) & vA)(1)
+	orderR: (T1 & (T2 & vA))(1)
+	orderV: ((T2 & vA) & T1)(1)
+
+	// A positional parameter of a type still needs a positional parameter of
+	// the value, which decides how the function can be called.
+	posNameOnly: (func(a: int) -> int) & (func(a?: int) -> int: 1)
+
+	// A parameter present in only one signature is allowed if the other
+	// signature is open.
+	wider:  (func(a: int, ...) -> int) & (func(a: int, b: int, ...) -> int)
+	widerV: wider & (func(a: int, b: int, c?: int) -> int: a + b)
+	widerX: widerV(1, 2)
+}
+
+// An extra parameter is admitted against a closed signature iff it is
+// optional (?): while unmatched it contributes no parameter, but no call
+// needs it either. A sibling positional signature may expose the same label
+// and carry its constraint to a slot. One rule governs function tightening
+// (both directions), function type meets, and subsumption (see
+// internal/core/subsume); see builtins.txtar for builtins.
+optionalExtra: {
+	// Tightening: an extra optional parameter of the value against a
+	// closed type (also covered by closed.ok3).
+	V:   func(a: int) -> number
+	v1:  V & (func(a: int, b?: int) -> int: a)
+	v1x: v1(1)
+
+	// Tightening: an extra optional parameter of the type against a
+	// closed value signature.
+	W:   func(a: int, b?: int) -> number
+	w1:  W & (func(a: int) -> int: a)
+	w1x: w1(1)
+
+	// Tightening: an extra plain parameter remains rejected in both
+	// directions (see closed.bad2), as does a required one.
+	badT: (func(a: int, b: int) -> number) & (func(a: int) -> int: a)
+	badV: (func(a: int) -> number) & (func(a: int, b: int) -> int: a)
+	badR: (func(a: int) -> number) & (func(a: int, b!: int) -> int: a)
+
+	// Meet: an extra optional parameter of one closed signature is
+	// admitted by the other; an extra plain parameter is not.
+	m1:   (func(a: int) -> number) & (func(a: int, b?: int) -> int)
+	m2:   (func(a: int, b?: int) -> int) & (func(a: int) -> number)
+	mBad: (func(a: int) -> number) & (func(a: int, b: int) -> int)
+
+	// A value unified with the meet is checked against, and calls are
+	// constrained by, both signatures, regardless of the meet's order.
+	m1v:  m1 & (func(a: int) -> int: a)
+	m1vx: m1v(1)
+	m2v:  m2 & (func(a: int) -> int: a)
+	m2vx: m2v(1)
+
+	// Against an open signature, any extra parameter is admitted.
+	o1:  (func(a: int, ...) -> number) & (func(a: int, b: int, ...) -> int)
+	o1v: o1 & (func(a: int, b: int, c?: int) -> int: a + b)
+	o1x: o1v(1, 2)
+	o2:  (func(a: int, ...) -> number) & (func(a: int, b?: int) -> int: a)
+	o2x: o2(1)
+}
+
+values: {
+	f: func(a: int) -> int: a
+	g: func(a: int) -> int: a
+
+	// Distinct function values compose (see compose below).
+	composed:  f & g
+	composedX: composed(1)
+
+	// A function value unifies with itself.
+	same:  f & f
+	sameX: same(1)
+
+	// Values tightened by the same type are equal and unify; the type
+	// constraint is recorded once.
+	T:     func(a: int, ...) -> number
+	t1:    T & f
+	t2:    T & f
+	both:  t1 & t2
+	bothX: both(1)
+
+	// Equality of tightened values also holds for disjunction
+	// deduplication: t1 | t2 collapses to a single callable value.
+	pick:  t1 | t2
+	pickX: pick(1)
+
+	// The order in which types tighten a value does not matter: the
+	// recorded type constraints compare as a set, so both orders unify
+	// and deduplicate in a disjunction.
+	U:      func(a: number, ...) -> number
+	o1:     T & U & f
+	o2:     U & T & f
+	both2:  o1 & o2
+	both2X: both2(1)
+	pick2:  o1 | o2
+	pick2X: pick2(1)
+}
+
+// Tightening must preserve all structural cycle semantics: the cycle
+// anchor and call-site identity remain those of the function value being
+// called.
+// Distinct function values with compatible signatures compose: a call
+// evaluates every implementation and unifies the results.
+compose: {
+	f: func(a: int) -> _: {in: a}
+	g: func(a~x: int) -> _: {out: x + 1}
+
+	fg:     f & g
+	fgX:    fg(1)
+	fgL:    fg(a: 2)
+	gf:     g & f
+	gfX:    gf(1)
+	three:  f & g & (func(_~v: int) -> _: {w: v})
+	threeX: three(3)
+
+	// Composing a function again, in any order, does not add it twice.
+	again:  fg & gf & f
+	againX: again(1)
+	pick:   fg | gf
+	pickX:  pick(1)
+
+	// Two evaluations of the same literal in different environments are
+	// different values that compose: both give the same result.
+	_x: h: func(a: int) -> int: a + 1
+	envs:  _x.h & {_x}.h
+	envsX: envs(1)
+
+	// Results that do not unify make the call fail, not the composition.
+	inc:     func(a: int) -> int: a + 1
+	id:      func(a: int) -> int: a
+	clash:   inc & id
+	clashX:  clash(1)
+
+	// All constraints apply to every implementation.
+	lt:  func(a: <10) -> _: {lt: a}
+	ltf: lt & f
+	ltX: ltf(3)
+	ltE: ltf(30)
+
+	// A defaulted parameter of one function cannot be bound, as the other
+	// does not declare it: its default applies.
+	d:    func(a: int, b: int = 3, c?: int) -> _: {sum: a + b}
+	df:   d & f
+	dfX:  df(1)
+	dfB:  df(1, 2)
+	dfC:  df(1, c: 2)
+	fd:   f & d
+	fdX:  fd(1)
+	fdB:  fd(1, 2)
+	fdC:  fd(1, c: 2)
+
+	// Requiredness combines as for types.
+	req:    func(n!: int) -> _: {n1: n}
+	opt:    func(n?: int) -> _: {n2: n}
+	ro:     req & opt
+	roX:    ro(n: 4)
+	roOmit: ro()
+
+	// A type tightens all implementations.
+	T:     func(a: int) -> {in: int, ...}
+	tfg:   T & fg
+	tfgX:  tfg(1)
+
+	// Signatures must be compatible.
+	labels: f & (func(b: int) -> int: b)
+	arity:  f & (func(a: int, b: int) -> int: a)
+	// Calls bind positional arguments through either function, so a
+	// positional parameter must match a positional one.
+	named:  f & (func(a!: int) -> int: a)
+
+	// Builtins do not compose with function values.
+	builtin: (func(x: number) -> number: x) & len
+}
+
+cycles: {
+	T: func(n: int, ...) -> number
+
+	recursive: {
+		fn:  T & (func(n: int) -> int: fn(n))
+		out: fn(1)
+	}
+
+	nesting: {
+		sum:   func(a: int, b: int) -> int: a + b
+		twice: T & (func(n: int) -> int: sum(n, n))
+		out:   twice(twice(2))
+		deep:  twice(twice(twice(2)))
+	}
+}
+
+// Tightening narrows the values a call accepts and returns, beyond mere
+// kind checks: bounds and struct restrictions of the type apply to every
+// call of the tightened value.
+narrow: {
+	// The type narrows the parameter to a bound, resolved in the type's
+	// own scope.
+	lim: 10
+	T:   func(n: <lim, ...) -> number
+	f:   T & (func(n: int) -> int: n + 1)
+
+	ok:  f(5)
+	oob: f(15)
+
+	// The type narrows the result: the value's result must satisfy it per
+	// call.
+	R:  func(n: int, ...) -> <100
+	sq: R & (func(n: int) -> int: n * n)
+
+	small: sq(5)
+	big:   sq(20)
+
+	// The type restricts a struct parameter: a required field with a
+	// narrower type than the value itself demands.
+	S:    func(cfg: {name: string, port: >0 & <65536}, ...) -> string
+	srv:  S & (func(cfg: {...}) -> string: cfg.name)
+
+	good: srv({name: "db", port: 5432})
+	badField: srv({name: 42, port: 80})
+	badPort:  srv({name: "db", port: 0})
+
+	// Narrowing stacks across a chain of tightenings.
+	N:  func(n: >=0, ...) -> number
+	M:  func(n: <10, ...) -> number
+	g:  N & M & (func(n: int) -> int: n)
+
+	mid: g(5)
+	neg: g(-1)
+	hi:  g(11)
+}
+// Declared defaults are part of a signature. A default on one side carries
+// over to a call; defaults on both sides must unify and conflict when the
+// signatures are unified; a defaulted parameter is admitted beyond a closed
+// type like an optional one; a partial application keeps the defaults of the
+// parameters it leaves unbound.
+defaults: {
+	T: func(a: int = 2) -> int
+
+	// The type's default fills a value parameter that declares none.
+	fill:  T & (func(a: int) -> int: a)
+	fillX: fill()
+	fillS: fill(5)
+
+	// Order of unification does not matter.
+	fillRev:  (func(a: int) -> int: a) & T
+	fillRevX: fillRev()
+
+	// Equal defaults agree.
+	same:  T & (func(a: int = 2) -> int: a)
+	sameX: same()
+
+	// Differing defaults conflict when the signatures are unified.
+	differ: T & (func(a: int = 3) -> int: a)
+	differRev: (func(a: int = 3) -> int: a) & T
+
+	// Two types with defaults for different parameters: each one-sided
+	// default carries over, and a value's own default must agree with the
+	// type's for the same parameter.
+	A:      func(a: int = 2, ...) -> string
+	B:      func(a: int, b: string = "x") -> string
+	three:  A & B & (func(a: int, b: string) -> string: "\(a)\(b)")
+	threeX: three()
+	threeRev:  B & (func(a: int, b: string) -> string: "\(a)\(b)") & A
+	threeRevX: threeRev()
+	threeBad:  A & (func(a: int = 4, b: string) -> string: "\(a)\(b)") & B
+
+	// A value's extra defaulted parameter is admitted beyond a closed type,
+	// as an optional one is: no call through the type ever needs it.
+	C:      func(a: int) -> int
+	extra:  C & (func(a: int, b: int = 2) -> int: a + b)
+	extraX: extra(1)
+	extraBad: C & (func(a: int, b: int) -> int: a + b)
+
+	// The reverse: a type's defaulted parameter that the value does not
+	// declare is admitted like an optional one.
+	D:      func(a: int, b: int = 2) -> int
+	lacks:  D & (func(a: int) -> int: a)
+	lacksX: lacks(1)
+
+	// A partial application binds arguments, not defaults: bound parameters
+	// lose their default, the remaining ones keep it until completion.
+	add3: func(a: int, b: int = 10, c: int = 100) -> int: a + b + c
+	f:    add3(1, ...)
+	all:  f()
+	one:  f(2)
+	lab:  f(c: 3)
+	two:  add3(1, 2, ...)()
+
+	// Agreement does not depend on the operand order, also when a named
+	// and a positional-only parameter share a slot.
+	Bn:     func(_~x: int = 3) -> int
+	orderX: T & Bn
+	orderY: Bn & T
+
+	// Admission beyond a closed type depends on the value's own declaration.
+	// A default declared only by another attached type does not admit the
+	// parameter, so the outcome does not depend on the order in which the
+	// signatures are attached: a closed type restricts the value whatever
+	// else is attached, as a closed struct restricts its fields.
+	v2:      func(a: int, b: int) -> int: a + b
+	D2:      func(a: int, b: int = 2) -> int
+	C2:      func(a: int) -> int
+	orderDC: (v2 & D2) & C2
+	orderCD: (v2 & C2) & D2
+	orderTV: C2 & D2 & v2
+
+	// The value's own default admits it, in any order, and the two types
+	// agree with each other on their own: D2's default admits b beyond C2.
+	v3:    func(a: int, b: int = 2) -> int: a + b
+	ownDC: ((v3 & D2) & C2)(1)
+	ownCD: ((v3 & C2) & D2)(1)
+	ownTV: ((C2 & D2) & v3)(1)
+
+	// A default attached by a type carries into a call made as the argument
+	// of another call.
+	id:           func(x: int) -> int: x
+	nestedDirect: fill()
+	nestedCall:   id(fill())
+}
+-- out/compile --
+--- in.cue
+{
+  tighten: {
+    T: func(a: int, ...) -> number
+    f: (〈0;T〉 & func(a: int, b: int) -> int: (〈0;a〉 + 〈0;b〉))
+    x: 〈0;f〉(1, 2)
+    y: 〈0;f〉(1)
+    fRev: (func(a: int, b: int) -> int: (〈0;a〉 + 〈0;b〉) & 〈0;T〉)
+    xRev: 〈0;fRev〉(1, 2)
+    r: (〈0;T〉 & func(a: int) -> int: 〈0;a〉)(3)
+    retConflict: (func(a: int, ...) -> string & func(a: int) -> int: 〈0;a〉)(3)
+    s: (〈0;T〉 & func(a: string) -> int: 1)
+    sErr: 〈0;s〉(1)
+  }
+  closed: {
+    U: func(a: int) -> number
+    g: (〈0;U〉 & func(a: int) -> int: 〈0;a〉)
+    gx: 〈0;g〉(1)
+    gN: (〈0;U〉 & func(int) -> int: 〈0;v〉)
+    gNx: 〈0;gN〉(1)
+    gNByName: 〈0;gN〉(a: 2)
+    badName: (〈0;U〉 & func(b: int) -> int: 〈0;b〉)
+    bad2: (〈0;U〉 & func(a: int, b: int) -> int: (〈0;a〉 + 〈0;b〉))
+    ok3: (〈0;U〉 & func(a: int, b?: int) -> int: 〈0;a〉)
+    ok3x: 〈0;ok3〉(1)
+  }
+  anonymous: {
+    A: func(int, ...) -> int
+    h: (〈0;A〉 & func(n: int) -> int: (〈0;n〉 + 1))
+    hx: 〈0;h〉(1)
+    he: 〈0;h〉("x")
+    B: func(m: int) -> int
+    bOk: (〈0;B〉 & func(int) -> int: 1)
+    bx: 〈0;bOk〉(1)
+    C: func(int) -> int
+    cOk: (〈0;C〉 & func(n: int) -> int: 〈0;n〉)
+    cx: 〈0;cOk〉(5)
+    D: func(<10, ...) -> int
+    d: (〈0;D〉 & func(int) -> int: 1)
+    dOk: 〈0;d〉(5)
+    dOob: 〈0;d〉(15)
+    f: func(int) -> int: 1
+    fOk: 〈0;f〉(1)
+    fBad: 〈0;f〉("x")
+    few: 〈0;f〉()
+    many: 〈0;f〉(1, 2)
+  }
+  contractLabels: {
+    add1: func(int) -> int: (〈0;x〉 + 1)
+    add1: func(x: int) -> int
+    byLabel: 〈0;add1〉(x: 2)
+    byPosition: 〈0;add1〉(2)
+    add1: func(x: <10) -> int
+    byRepeatedName: 〈0;add1〉(x: 3)
+    Named: func(x: int) -> int
+    Unnamed: func(int) -> int
+    identity: func(int) -> int: 〈0;v〉
+    namedFirst: ((〈0;Named〉 & 〈0;Unnamed〉) & 〈0;identity〉)
+    unnamedFirst: ((〈0;Unnamed〉 & 〈0;Named〉) & 〈0;identity〉)
+    namedCall: 〈0;namedFirst〉(x: 6)
+    reverseCall: 〈0;unnamedFirst〉(x: 7)
+    limited: func(int) -> int: 〈0;n〉
+    limited: func(input: <10) -> int
+    limitedOK: 〈0;limited〉(input: 5)
+    sum: func(int, int) -> int: (〈0;a〉 + 〈0;b〉)
+    sum: func(x: int, y: int) -> int
+    addLeft: 〈0;sum〉(x: 1)
+    partial: 〈0;addLeft〉(y: 2)
+  }
+  meet: {
+    n: (func(a: number, ...) -> number & func(a: int, ...) -> int)
+    nc: 〈0;n〉(1)
+    v: (〈0;n〉 & func(a: int) -> int: 〈0;a〉)
+    vx: 〈0;v〉(3)
+    w: (〈0;n〉 & func(a: _) -> _: 〈0;a〉)
+    wx: 〈0;w〉("x")
+    wx2: 〈0;w〉(0.5)
+    badName: (func(a: int) -> int & func(b: int) -> int)
+    badNameRev: (func(b: int) -> int & func(a: int) -> int)
+    reqNamed: (func(a!: int) -> int & func(a: int, ...) -> int)
+    reqNamedV: (〈0;reqNamed〉 & func(a: int) -> int: 〈0;a〉)(2)
+    optNamed: (func(a: int) -> int & func(a?: int) -> int)
+    optNamedV: (〈0;optNamed〉 & func(a: int) -> int: 〈0;a〉)(a: 3)
+    optNamedOmit: (〈0;optNamed〉 & func(a: int) -> int: 〈0;a〉)()
+    optReq: (func(a?: int) -> int & func(a!: int) -> int)
+    optReqV: (〈0;optReq〉 & func(a?: int) -> int: [
+      if (〈1;a〉 != _|_(explicit error (_|_ literal) in source)) {
+        〈2;a〉
+      },
+      0,
+    ][0])(a: 4)
+    optReqOmit: (〈0;optReq〉 & func(a?: int) -> int: [
+      if (〈1;a〉 != _|_(explicit error (_|_ literal) in source)) {
+        〈2;a〉
+      },
+      0,
+    ][0])()
+    T1: func(a: int) -> int
+    T2: func(a?: int) -> int
+    vA: func(a: int) -> int: 〈0;a〉
+    orderL: ((〈0;T1〉 & 〈0;T2〉) & 〈0;vA〉)(1)
+    orderR: (〈0;T1〉 & (〈0;T2〉 & 〈0;vA〉))(1)
+    orderV: ((〈0;T2〉 & 〈0;vA〉) & 〈0;T1〉)(1)
+    posNameOnly: (func(a: int) -> int & func(a?: int) -> int: 1)
+    wider: (func(a: int, ...) -> int & func(a: int, b: int, ...) -> int)
+    widerV: (〈0;wider〉 & func(a: int, b: int, c?: int) -> int: (〈0;a〉 + 〈0;b〉))
+    widerX: 〈0;widerV〉(1, 2)
+  }
+  optionalExtra: {
+    V: func(a: int) -> number
+    v1: (〈0;V〉 & func(a: int, b?: int) -> int: 〈0;a〉)
+    v1x: 〈0;v1〉(1)
+    W: func(a: int, b?: int) -> number
+    w1: (〈0;W〉 & func(a: int) -> int: 〈0;a〉)
+    w1x: 〈0;w1〉(1)
+    badT: (func(a: int, b: int) -> number & func(a: int) -> int: 〈0;a〉)
+    badV: (func(a: int) -> number & func(a: int, b: int) -> int: 〈0;a〉)
+    badR: (func(a: int) -> number & func(a: int, b!: int) -> int: 〈0;a〉)
+    m1: (func(a: int) -> number & func(a: int, b?: int) -> int)
+    m2: (func(a: int, b?: int) -> int & func(a: int) -> number)
+    mBad: (func(a: int) -> number & func(a: int, b: int) -> int)
+    m1v: (〈0;m1〉 & func(a: int) -> int: 〈0;a〉)
+    m1vx: 〈0;m1v〉(1)
+    m2v: (〈0;m2〉 & func(a: int) -> int: 〈0;a〉)
+    m2vx: 〈0;m2v〉(1)
+    o1: (func(a: int, ...) -> number & func(a: int, b: int, ...) -> int)
+    o1v: (〈0;o1〉 & func(a: int, b: int, c?: int) -> int: (〈0;a〉 + 〈0;b〉))
+    o1x: 〈0;o1v〉(1, 2)
+    o2: (func(a: int, ...) -> number & func(a: int, b?: int) -> int: 〈0;a〉)
+    o2x: 〈0;o2〉(1)
+  }
+  values: {
+    f: func(a: int) -> int: 〈0;a〉
+    g: func(a: int) -> int: 〈0;a〉
+    composed: (〈0;f〉 & 〈0;g〉)
+    composedX: 〈0;composed〉(1)
+    same: (〈0;f〉 & 〈0;f〉)
+    sameX: 〈0;same〉(1)
+    T: func(a: int, ...) -> number
+    t1: (〈0;T〉 & 〈0;f〉)
+    t2: (〈0;T〉 & 〈0;f〉)
+    both: (〈0;t1〉 & 〈0;t2〉)
+    bothX: 〈0;both〉(1)
+    pick: (〈0;t1〉|〈0;t2〉)
+    pickX: 〈0;pick〉(1)
+    U: func(a: number, ...) -> number
+    o1: ((〈0;T〉 & 〈0;U〉) & 〈0;f〉)
+    o2: ((〈0;U〉 & 〈0;T〉) & 〈0;f〉)
+    both2: (〈0;o1〉 & 〈0;o2〉)
+    both2X: 〈0;both2〉(1)
+    pick2: (〈0;o1〉|〈0;o2〉)
+    pick2X: 〈0;pick2〉(1)
+  }
+  compose: {
+    f: func(a: int) -> _: {
+      in: 〈1;a〉
+    }
+    g: func(a: int) -> _: {
+      out: (〈1;x〉 + 1)
+    }
+    fg: (〈0;f〉 & 〈0;g〉)
+    fgX: 〈0;fg〉(1)
+    fgL: 〈0;fg〉(a: 2)
+    gf: (〈0;g〉 & 〈0;f〉)
+    gfX: 〈0;gf〉(1)
+    three: ((〈0;f〉 & 〈0;g〉) & func(int) -> _: {
+      w: 〈1;v〉
+    })
+    threeX: 〈0;three〉(3)
+    again: ((〈0;fg〉 & 〈0;gf〉) & 〈0;f〉)
+    againX: 〈0;again〉(1)
+    pick: (〈0;fg〉|〈0;gf〉)
+    pickX: 〈0;pick〉(1)
+    _x: {
+      h: func(a: int) -> int: (〈0;a〉 + 1)
+    }
+    envs: (〈0;_x〉.h & {
+      〈1;_x〉
+    }.h)
+    envsX: 〈0;envs〉(1)
+    inc: func(a: int) -> int: (〈0;a〉 + 1)
+    id: func(a: int) -> int: 〈0;a〉
+    clash: (〈0;inc〉 & 〈0;id〉)
+    clashX: 〈0;clash〉(1)
+    lt: func(a: <10) -> _: {
+      lt: 〈1;a〉
+    }
+    ltf: (〈0;lt〉 & 〈0;f〉)
+    ltX: 〈0;ltf〉(3)
+    ltE: 〈0;ltf〉(30)
+    d: func(a: int, b: int = 3, c?: int) -> _: {
+      sum: (〈1;a〉 + 〈1;b〉)
+    }
+    df: (〈0;d〉 & 〈0;f〉)
+    dfX: 〈0;df〉(1)
+    dfB: 〈0;df〉(1, 2)
+    dfC: 〈0;df〉(1, c: 2)
+    fd: (〈0;f〉 & 〈0;d〉)
+    fdX: 〈0;fd〉(1)
+    fdB: 〈0;fd〉(1, 2)
+    fdC: 〈0;fd〉(1, c: 2)
+    req: func(n!: int) -> _: {
+      n1: 〈1;n〉
+    }
+    opt: func(n?: int) -> _: {
+      n2: 〈1;n〉
+    }
+    ro: (〈0;req〉 & 〈0;opt〉)
+    roX: 〈0;ro〉(n: 4)
+    roOmit: 〈0;ro〉()
+    T: func(a: int) -> {
+      in: int
+      ...
+    }
+    tfg: (〈0;T〉 & 〈0;fg〉)
+    tfgX: 〈0;tfg〉(1)
+    labels: (〈0;f〉 & func(b: int) -> int: 〈0;b〉)
+    arity: (〈0;f〉 & func(a: int, b: int) -> int: 〈0;a〉)
+    named: (〈0;f〉 & func(a!: int) -> int: 〈0;a〉)
+    builtin: (func(x: number) -> number: 〈0;x〉 & len)
+  }
+  cycles: {
+    T: func(n: int, ...) -> number
+    recursive: {
+      fn: (〈1;T〉 & func(n: int) -> int: 〈1;fn〉(〈0;n〉))
+      out: 〈0;fn〉(1)
+    }
+    nesting: {
+      sum: func(a: int, b: int) -> int: (〈0;a〉 + 〈0;b〉)
+      twice: (〈1;T〉 & func(n: int) -> int: 〈1;sum〉(〈0;n〉, 〈0;n〉))
+      out: 〈0;twice〉(〈0;twice〉(2))
+      deep: 〈0;twice〉(〈0;twice〉(〈0;twice〉(2)))
+    }
+  }
+  narrow: {
+    lim: 10
+    T: func(n: <〈0;lim〉, ...) -> number
+    f: (〈0;T〉 & func(n: int) -> int: (〈0;n〉 + 1))
+    ok: 〈0;f〉(5)
+    oob: 〈0;f〉(15)
+    R: func(n: int, ...) -> <100
+    sq: (〈0;R〉 & func(n: int) -> int: (〈0;n〉 * 〈0;n〉))
+    small: 〈0;sq〉(5)
+    big: 〈0;sq〉(20)
+    S: func(cfg: {
+      name: string
+      port: (>0 & <65536)
+    }, ...) -> string
+    srv: (〈0;S〉 & func(cfg: {
+      ...
+    }) -> string: 〈0;cfg〉.name)
+    good: 〈0;srv〉({
+      name: "db"
+      port: 5432
+    })
+    badField: 〈0;srv〉({
+      name: 42
+      port: 80
+    })
+    badPort: 〈0;srv〉({
+      name: "db"
+      port: 0
+    })
+    N: func(n: >=0, ...) -> number
+    M: func(n: <10, ...) -> number
+    g: ((〈0;N〉 & 〈0;M〉) & func(n: int) -> int: 〈0;n〉)
+    mid: 〈0;g〉(5)
+    neg: 〈0;g〉(-1)
+    hi: 〈0;g〉(11)
+  }
+  defaults: {
+    T: func(a: int = 2) -> int
+    fill: (〈0;T〉 & func(a: int) -> int: 〈0;a〉)
+    fillX: 〈0;fill〉()
+    fillS: 〈0;fill〉(5)
+    fillRev: (func(a: int) -> int: 〈0;a〉 & 〈0;T〉)
+    fillRevX: 〈0;fillRev〉()
+    same: (〈0;T〉 & func(a: int = 2) -> int: 〈0;a〉)
+    sameX: 〈0;same〉()
+    differ: (〈0;T〉 & func(a: int = 3) -> int: 〈0;a〉)
+    differRev: (func(a: int = 3) -> int: 〈0;a〉 & 〈0;T〉)
+    A: func(a: int = 2, ...) -> string
+    B: func(a: int, b: string = "x") -> string
+    three: ((〈0;A〉 & 〈0;B〉) & func(a: int, b: string) -> string: "\(〈0;a〉)\(〈0;b〉)")
+    threeX: 〈0;three〉()
+    threeRev: ((〈0;B〉 & func(a: int, b: string) -> string: "\(〈0;a〉)\(〈0;b〉)") & 〈0;A〉)
+    threeRevX: 〈0;threeRev〉()
+    threeBad: ((〈0;A〉 & func(a: int = 4, b: string) -> string: "\(〈0;a〉)\(〈0;b〉)") & 〈0;B〉)
+    C: func(a: int) -> int
+    extra: (〈0;C〉 & func(a: int, b: int = 2) -> int: (〈0;a〉 + 〈0;b〉))
+    extraX: 〈0;extra〉(1)
+    extraBad: (〈0;C〉 & func(a: int, b: int) -> int: (〈0;a〉 + 〈0;b〉))
+    D: func(a: int, b: int = 2) -> int
+    lacks: (〈0;D〉 & func(a: int) -> int: 〈0;a〉)
+    lacksX: 〈0;lacks〉(1)
+    add3: func(a: int, b: int = 10, c: int = 100) -> int: ((〈0;a〉 + 〈0;b〉) + 〈0;c〉)
+    f: 〈0;add3〉(1)
+    all: 〈0;f〉()
+    one: 〈0;f〉(2)
+    lab: 〈0;f〉(c: 3)
+    two: 〈0;add3〉(1, 2)()
+    Bn: func(int = 3) -> int
+    orderX: (〈0;T〉 & 〈0;Bn〉)
+    orderY: (〈0;Bn〉 & 〈0;T〉)
+    v2: func(a: int, b: int) -> int: (〈0;a〉 + 〈0;b〉)
+    D2: func(a: int, b: int = 2) -> int
+    C2: func(a: int) -> int
+    orderDC: ((〈0;v2〉 & 〈0;D2〉) & 〈0;C2〉)
+    orderCD: ((〈0;v2〉 & 〈0;C2〉) & 〈0;D2〉)
+    orderTV: ((〈0;C2〉 & 〈0;D2〉) & 〈0;v2〉)
+    v3: func(a: int, b: int = 2) -> int: (〈0;a〉 + 〈0;b〉)
+    ownDC: ((〈0;v3〉 & 〈0;D2〉) & 〈0;C2〉)(1)
+    ownCD: ((〈0;v3〉 & 〈0;C2〉) & 〈0;D2〉)(1)
+    ownTV: ((〈0;C2〉 & 〈0;D2〉) & 〈0;v3〉)(1)
+    id: func(x: int) -> int: 〈0;x〉
+    nestedDirect: 〈0;fill〉()
+    nestedCall: 〈0;id〉(〈0;fill〉())
+  }
+}

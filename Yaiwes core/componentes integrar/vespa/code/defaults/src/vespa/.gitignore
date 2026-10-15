@@ -1,4 +1,0 @@
-Makefile
-.depend
-lib*.so*
-config.h

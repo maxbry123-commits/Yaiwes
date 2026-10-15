@@ -1,2 +1,0 @@
-FROM (FROM employees | SORT first_name), (FROM employees | WHERE emp_no > 0)
-| WHERE first_name:"Meditation"

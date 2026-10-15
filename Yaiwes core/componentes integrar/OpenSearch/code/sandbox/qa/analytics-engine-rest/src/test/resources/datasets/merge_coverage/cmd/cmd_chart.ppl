@@ -1,1 +1,0 @@
-source=%INDEX% | chart count() by category

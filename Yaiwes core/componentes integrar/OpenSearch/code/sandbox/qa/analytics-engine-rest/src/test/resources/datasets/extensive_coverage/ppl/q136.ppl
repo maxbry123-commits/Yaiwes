@@ -1,1 +1,0 @@
-source=test_data | eval month_name = monthname(timestamp) | fields timestamp, month_name | head 3

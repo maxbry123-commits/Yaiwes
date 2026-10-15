@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 649900,
+  "bundle_sha256": "b25e3cff94063d33ef368dda049ce802ac316b7b433d830a999d0c43edfed4ae",
+  "extracted_tree": {
+    "bytes": 2130801,
+    "files": 281,
+    "sha256": "5a5d0397ad16c9e8a50afe0b2abd25a8c32b9638c5c536a7037e36c7c2cf20d1"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 649900,
+      "name": "nengo.bundle.zip.part-0001",
+      "sha256": "b25e3cff94063d33ef368dda049ce802ac316b7b433d830a999d0c43edfed4ae"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "nengo",
+  "source_bytes": 2130801,
+  "source_commit": "440db6363f690ea4df52be29b2fa01a5a41399f8",
+  "source_files": 281,
+  "source_ref": "main",
+  "source_repo": "nengo/nengo",
+  "source_tree": {
+    "bytes": 2130801,
+    "files": 281,
+    "sha256": "5a5d0397ad16c9e8a50afe0b2abd25a8c32b9638c5c536a7037e36c7c2cf20d1"
+  }
+}

@@ -1,2 +1,0 @@
-FROM all_types
-| WHERE ip IN (FROM all_types | KEEP ip)

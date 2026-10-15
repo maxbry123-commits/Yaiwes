@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 158258
-summary: Abort leftover object-store I/O
-type: enhancement

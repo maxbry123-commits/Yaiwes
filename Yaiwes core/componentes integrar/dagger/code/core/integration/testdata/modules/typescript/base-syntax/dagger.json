@@ -1,7 +1,0 @@
-{
-  "name": "syntax",
-  "engineVersion": "latest",
-  "sdk": {
-    "source": "typescript"
-  }
-}

@@ -1,3 +1,0 @@
-FROM employees
-| STATS cnt = COUNT(*) WHERE emp_no IN (FROM employees | KEEP emp_no),
-        mx = MAX(salary) WHERE emp_no IN (FROM employees | KEEP emp_no)

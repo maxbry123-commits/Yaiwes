@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 135186,
+  "bundle_sha256": "e2758520b926c7718a2c33088283d0124bbc134acfe4f051907224c25e2ab40e",
+  "extracted_tree": {
+    "bytes": 227873,
+    "files": 26,
+    "sha256": "f76244cd8bf35b241b76367388eeb21fefb0ff542ea6ea227d1d52d798671b57"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 135186,
+      "name": "HRM.bundle.zip.part-0001",
+      "sha256": "e2758520b926c7718a2c33088283d0124bbc134acfe4f051907224c25e2ab40e"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "HRM",
+  "source_bytes": 227873,
+  "source_commit": "ac15626f8db096a63c775b84c9dc868776a6feda",
+  "source_files": 26,
+  "source_ref": "main",
+  "source_repo": "sapientinc/HRM",
+  "source_tree": {
+    "bytes": 227873,
+    "files": 26,
+    "sha256": "f76244cd8bf35b241b76367388eeb21fefb0ff542ea6ea227d1d52d798671b57"
+  }
+}

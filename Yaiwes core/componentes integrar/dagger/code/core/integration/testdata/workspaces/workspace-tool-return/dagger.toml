@@ -1,2 +1,0 @@
-[modules.swapper]
-source = ".dagger/modules/swapper"

@@ -1,3 +1,0 @@
-FROM employees
-| KEEP emp_no
-| LIMIT 1 BY emp_no + 5, 1

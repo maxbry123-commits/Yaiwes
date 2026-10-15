@@ -1,5 +1,0 @@
-area: Snapshot/Restore
-issues: []
-pr: 160682
-summary: Allowing restore in place to change number of shards
-type: enhancement

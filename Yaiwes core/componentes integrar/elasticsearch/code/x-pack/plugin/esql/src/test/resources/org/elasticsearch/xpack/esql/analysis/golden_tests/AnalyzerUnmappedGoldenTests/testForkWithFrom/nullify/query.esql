@@ -1,5 +1,0 @@
-SET unmapped_fields="nullify"; FROM employees
-| FORK (where foo != 84) (where true)
-| WHERE _fork == "fork1"
-| DROP _fork
-| eval y = coalesce(bar, baz)

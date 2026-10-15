@@ -1,6 +1,0 @@
-[build_info]
-apps = "deps/*"
-deps = ""
-
-[eqwalizer]
-enable_all = false

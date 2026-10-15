@@ -1,2 +1,0 @@
-FROM (TS k8s-downsampled | STATS m = sum(last_over_time(network.bytes_in))),
-  (FROM sample_data | EVAL m = 1.5)

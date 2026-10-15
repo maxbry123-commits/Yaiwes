@@ -1,0 +1,75 @@
+{
+  "bundle_bytes": 106636924,
+  "bundle_sha256": "437af7b36f81969c45d2242333b45b55348a8ab66635f7c77f436018e78fbc3c",
+  "extracted_tree": {
+    "bytes": 135560783,
+    "files": 2455,
+    "sha256": "fa082ecf9887fa2356aa5334c097ff18ba141d452c032bf09255742bd81d0a37"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0001",
+      "sha256": "17731f361f7d328cbdb4892caa42fb8e0c8e21b21630ccfb9e300cc7dd92e515"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0002",
+      "sha256": "4110a1168f5916b9af6e7807d7b6a2cf771657bb82c8f7199c8f9c44971ef9ed"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0003",
+      "sha256": "78aa69568668233366c92d1653e2285e4492b7a9fb0b01ca3f5ca6a13d2e09c4"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0004",
+      "sha256": "31f835515680e8e21794bbdad02a6ac2076e638784b2f1d8267b9fa13341e17d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0005",
+      "sha256": "a4077e515dfd1a4c065e0090e3cee02dde152464ad401baac30c7e979d3ad0dd"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0006",
+      "sha256": "2adb0fd0231a675e773038feafae6f10c84c61422420edd7f0ca5bff0d619cfb"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0007",
+      "sha256": "2bfacf80cd22a55baa35dc1945035c370a3d64a3c134e13d1fbb92cc72d36e66"
+    },
+    {
+      "bytes": 12582912,
+      "name": "PaddleOCR.bundle.zip.part-0008",
+      "sha256": "81c9717c561d2ff2ba7f48a785fc7c1a2300e488ffdcd9814b45429bde8cb11d"
+    },
+    {
+      "bytes": 5973628,
+      "name": "PaddleOCR.bundle.zip.part-0009",
+      "sha256": "46c9fe0e242e0378efca193939c785f77602658b6e0d7bf434d01421e2295dff"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "PaddleOCR",
+  "source_bytes": 135560783,
+  "source_commit": "dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf",
+  "source_files": 2455,
+  "source_ref": "main",
+  "source_repo": "PaddlePaddle/PaddleOCR",
+  "source_tree": {
+    "bytes": 135560783,
+    "files": 2455,
+    "sha256": "fa082ecf9887fa2356aa5334c097ff18ba141d452c032bf09255742bd81d0a37"
+  }
+}

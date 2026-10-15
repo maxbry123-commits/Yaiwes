@@ -1,3 +1,0 @@
-:- include('Driver').
-
-go :- lrtc('1Y','Data/chain').

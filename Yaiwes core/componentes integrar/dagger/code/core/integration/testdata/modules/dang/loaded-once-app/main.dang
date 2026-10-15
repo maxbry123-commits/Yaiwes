@@ -1,5 +1,0 @@
-type App {
-  pub message: String! {
-    "loaded once"
-  }
-}

@@ -1,1 +1,0 @@
-source=otel_logs | where severityNumber >= 13 | stats count() as c by serviceName | sort - c

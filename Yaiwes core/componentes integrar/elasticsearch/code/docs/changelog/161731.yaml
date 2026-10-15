@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161731
-summary: Wake a producer parked on `waitForReady()` when its buffer is finished
-type: bug

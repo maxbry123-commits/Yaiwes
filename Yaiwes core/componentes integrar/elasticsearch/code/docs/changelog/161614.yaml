@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161614
-summary: Release Parquet pre-warm after row filter
-type: bug

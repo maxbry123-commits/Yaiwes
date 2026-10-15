@@ -1,3 +1,0 @@
-FROM employees
-| FORK ( WHERE emp_no == 1 )
-       ( WHERE emp_no == 2 )

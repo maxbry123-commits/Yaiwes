@@ -1,7 +1,0 @@
-title: Fix race condition when checking distrib async cmd status
-type: fixed
-authors:
-- name: Houston Putman
-links:
-- name: SOLR-17709
-  url: https://issues.apache.org/jira/browse/SOLR-17709

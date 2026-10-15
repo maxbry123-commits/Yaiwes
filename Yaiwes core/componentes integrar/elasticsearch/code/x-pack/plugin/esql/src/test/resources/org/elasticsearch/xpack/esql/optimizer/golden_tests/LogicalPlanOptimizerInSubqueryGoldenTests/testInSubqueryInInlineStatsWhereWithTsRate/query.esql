@@ -1,3 +1,0 @@
-FROM employees
-| EVAL s = to_double(salary)
-| INLINE STATS c = COUNT(*) WHERE s IN (TS k8s | STATS r = max(rate(network.total_bytes_in)) BY cluster | KEEP r)

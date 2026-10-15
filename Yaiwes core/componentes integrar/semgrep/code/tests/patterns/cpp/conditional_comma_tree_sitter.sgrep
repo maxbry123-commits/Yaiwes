@@ -1,1 +1,0 @@
-namespace [[gnu::visibility("default")]] $NS { void $F(bool $COND) { int $VALUE = $COND ? $FIRST, selected() : $OTHER; } }

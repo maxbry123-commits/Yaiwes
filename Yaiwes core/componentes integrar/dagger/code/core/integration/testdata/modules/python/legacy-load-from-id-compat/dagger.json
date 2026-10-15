@@ -1,6 +1,0 @@
-{
-  "name": "test",
-  "sdk": "python",
-  "source": ".",
-  "engineVersion": "v0.20.6"
-}

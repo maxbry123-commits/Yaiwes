@@ -1,3 +1,0 @@
-FROM employees, (FROM employees)
-| RENAME emp_no AS id
-| EVAL id_str = to_string(id)

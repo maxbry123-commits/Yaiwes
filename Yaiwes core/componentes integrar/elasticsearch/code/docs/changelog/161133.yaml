@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161133
-summary: Bind partition columns on a concrete file
-type: enhancement

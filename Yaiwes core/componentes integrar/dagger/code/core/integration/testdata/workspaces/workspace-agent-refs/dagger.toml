@@ -1,5 +1,0 @@
-[modules.roster]
-source = ".dagger/modules/roster"
-
-[modules.git-tools]
-source = ".dagger/modules/git-tools"

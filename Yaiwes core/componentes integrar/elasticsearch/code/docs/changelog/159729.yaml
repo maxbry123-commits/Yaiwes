@@ -1,6 +1,0 @@
-area: ES|QL
-issues:
- - 159699
-pr: 159729
-summary: Fail fast on expired S3 tokens
-type: enhancement

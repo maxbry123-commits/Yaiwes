@@ -1,7 +1,0 @@
-[modules.alpha]
-source = ".dagger/modules/alpha"
-entrypoint = true
-
-[modules.beta]
-source = ".dagger/modules/beta"
-entrypoint = true

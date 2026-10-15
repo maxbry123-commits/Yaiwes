@@ -1,3 +1,0 @@
-FROM web_logs
-| USER_AGENT ua = user_agent
-| LIMIT 1 BY ua.name, domain

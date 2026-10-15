@@ -1,2 +1,0 @@
-SET unmapped_fields="load"; FROM employees_gender_text, employees_no_gender
-| KEEP gender

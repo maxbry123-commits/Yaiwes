@@ -1,3 +1,0 @@
-    FROM employees
-    | KEEP salary
-    | WHERE mv_less(salary, 30000)

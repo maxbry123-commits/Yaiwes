@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160504
-summary: Fold external file stats one file at a time
-type: enhancement

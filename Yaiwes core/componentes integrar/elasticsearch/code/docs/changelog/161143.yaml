@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161143
-summary: "ESQL:DS: Truncate long vals in NDJSON coercion err"
-type: enhancement

@@ -1,3 +1,0 @@
-FROM sample_data METADATA _index
-| WHERE _index LIKE ("sample*", "no_match*")
-| KEEP message

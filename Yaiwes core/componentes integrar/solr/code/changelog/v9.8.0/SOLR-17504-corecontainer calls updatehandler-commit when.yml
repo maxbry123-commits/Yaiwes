@@ -1,7 +1,0 @@
-title: CoreContainer calls UpdateHandler.commit when closing a read-only core
-type: other
-authors:
-- name: Bruno Roustant
-links:
-- name: SOLR-17504
-  url: https://issues.apache.org/jira/browse/SOLR-17504

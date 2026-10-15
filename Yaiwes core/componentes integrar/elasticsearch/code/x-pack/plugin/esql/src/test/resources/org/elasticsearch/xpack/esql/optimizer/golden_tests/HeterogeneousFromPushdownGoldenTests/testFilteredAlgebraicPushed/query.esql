@@ -1,1 +1,0 @@
-FROM heavy_a, heavy_b | STATS s = SUM(salary) WHERE salary > 0

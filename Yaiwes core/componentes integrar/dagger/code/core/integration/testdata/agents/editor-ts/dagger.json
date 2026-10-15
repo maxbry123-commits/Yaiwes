@@ -1,7 +1,0 @@
-{
-  "name": "editor-ts",
-  "engineVersion": "v1.0.0",
-  "sdk": {
-    "source": "typescript"
-  }
-}

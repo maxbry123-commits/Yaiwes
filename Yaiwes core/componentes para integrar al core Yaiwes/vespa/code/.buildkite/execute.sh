@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+#
+# Executes a build step, logs output, and reports errors to Buildkite.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+if [[ -n "${DEBUG:-}" ]]; then
+    set -o xtrace
+fi
+
+if [[ $# != 1 ]]; then
+  echo "Usage: $0 <Step name>"
+  exit 1
+fi
+
+MYDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )"
+readonly STEP=$1
+readonly VERBOSE=${VERBOSE:-}
+
+function report()
+{
+  echo "Reporting...."
+  if [[ $BUILDKITE == true ]]; then
+      if [[ -f $LOG_DIR/error-$STEP.log ]]; then
+          # Read by the factory-reporter plugin, which shows it in Factory
+          buildkite-agent meta-data set "failure-description-${BUILDKITE_JOB_ID:-}" \
+              "$("$MYDIR/failure-summary.sh" --short "$STEP" "$LOG_DIR/error-$STEP.log")" \
+          || echo "Failed to set failure description"
+          # Per step and make target, so parallel jobs and targets don't overwrite each other
+          "$MYDIR/failure-summary.sh" "$STEP" "$LOG_DIR/error-$STEP.log" \
+          | buildkite-agent annotate --style 'error' --context "ctx-error-${BUILDKITE_STEP_KEY:-${BUILDKITE_JOB_ID:-}}-$STEP" \
+          || echo "Failed to create failure annotation"
+      fi
+  fi
+}
+trap report EXIT
+
+echo "--- 🚀 Executing step: $STEP"
+START=$(date '+%s')
+/usr/bin/time -v -p "$MYDIR/$STEP.sh" &> "$LOG_DIR/$STEP.log" || (cp -a "$LOG_DIR/$STEP.log" "$LOG_DIR/error-$STEP.log" && cat "$LOG_DIR/$STEP.log" && echo "^^^ +++" && false)
+
+if [[ -n $VERBOSE ]]; then
+    cat "$LOG_DIR/$STEP.log"
+fi
+
+DURATION=$(( $(date '+%s') - START ))
+echo "STEPTIMER=$STEP:$START,${DURATION}s"
+echo "✅ Finished $STEP in $DURATION seconds. Log saved in $LOG_DIR/$STEP.log."

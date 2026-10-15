@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160779
-summary: Charge Parquet window on first read, before the cold-tail GET
-type: enhancement

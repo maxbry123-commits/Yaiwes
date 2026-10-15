@@ -1,3 +1,0 @@
-SET approximation={"rows": 99999};
-FROM many_numbers
-  | STATS COUNT(mv) BY mv

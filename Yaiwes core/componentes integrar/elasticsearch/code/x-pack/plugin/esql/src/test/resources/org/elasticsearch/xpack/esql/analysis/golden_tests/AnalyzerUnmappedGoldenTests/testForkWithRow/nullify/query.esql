@@ -1,4 +1,0 @@
-SET unmapped_fields="nullify"; ROW a = 1
-| FORK (where true)
-| WHERE a == 1
-| KEEP bar

@@ -1,0 +1,150 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "bitvectoridxfile.h"
+
+#include <vespa/check_require.h>
+#include <vespa/fastlib/io/bufferedfile.h>
+#include <vespa/searchlib/common/fileheadercontext.h>
+#include <vespa/searchlib/common/fileheadertags.h>
+#include <vespa/searchlib/index/bitvectorkeys.h>
+#include <vespa/searchlib/util/file_settings.h>
+#include <vespa/vespalib/data/fileheader.h>
+#include <vespa/vespalib/util/size_literals.h>
+
+namespace search::diskindex {
+
+using search::common::FileHeaderContext;
+using search::index::BitVectorWordSingleKey;
+using namespace tags;
+
+namespace {
+
+void readHeader(vespalib::FileHeader& h, const std::string& name) {
+    Fast_BufferedFile file(32_Ki);
+    file.ReadOpenExisting(name.c_str());
+    h.readFile(file);
+}
+
+} // namespace
+
+BitVectorIdxFileWrite::BitVectorIdxFileWrite(BitVectorKeyScope scope)
+    : _idxFile(), _numKeys(0), _docIdLimit(0), _idxHeaderLen(0), _scope(scope) {
+}
+
+BitVectorIdxFileWrite::~BitVectorIdxFileWrite() = default;
+
+uint64_t BitVectorIdxFileWrite::idxSize() const {
+    return _idxHeaderLen + static_cast<int64_t>(_numKeys) * sizeof(BitVectorWordSingleKey);
+}
+
+void BitVectorIdxFileWrite::open(const std::string& name, uint32_t docIdLimit, const TuneFileSeqWrite& tuneFileWrite,
+                                 const FileHeaderContext& fileHeaderContext) {
+    if (_numKeys != 0) {
+        CHECK(docIdLimit == _docIdLimit);
+    } else {
+        _docIdLimit = docIdLimit;
+    }
+    std::string idxname = name + getBitVectorKeyScopeSuffix(_scope);
+
+    CHECK(!_idxFile);
+    _idxFile = std::make_unique<Fast_BufferedFile>();
+    if (tuneFileWrite.getWantSyncWrites()) {
+        _idxFile->EnableSyncWrites();
+    }
+    if (tuneFileWrite.getWantDirectIO()) {
+        _idxFile->EnableDirectIO();
+    }
+
+    _idxFile->WriteOpen(idxname.c_str());
+
+    if (_idxHeaderLen == 0) {
+        CHECK(_numKeys == 0);
+        makeIdxHeader(fileHeaderContext);
+    }
+
+    int64_t pos = idxSize();
+
+    int64_t oldidxsize = _idxFile->getSize();
+    CHECK(oldidxsize >= pos);
+    (void)oldidxsize;
+
+    _idxFile->SetSize(pos);
+
+    CHECK(pos == _idxFile->getPosition());
+}
+
+void BitVectorIdxFileWrite::makeIdxHeader(const FileHeaderContext& fileHeaderContext) {
+    vespalib::FileHeader h(FileSettings::DIRECTIO_ALIGNMENT);
+    using Tag = vespalib::GenericHeader::Tag;
+    fileHeaderContext.addTags(h, _idxFile->GetFileName());
+    h.putTag(Tag(ENTRY_SIZE, (int64_t)BitVector::getFileBytes(_docIdLimit)));
+    h.putTag(Tag(DOCID_LIMIT, _docIdLimit));
+    h.putTag(Tag(NUM_KEYS, _numKeys));
+    h.putTag(Tag(FROZEN, 0));
+    if (_scope != BitVectorKeyScope::SHARED_WORDS) {
+        h.putTag(Tag(FILE_BIT_SIZE, 0));
+    }
+    h.putTag(Tag(DESC, "Bitvector dictionary file, single words"));
+    _idxFile->SetPosition(0);
+    _idxHeaderLen = h.writeFile(*_idxFile);
+    _idxFile->Flush();
+}
+
+void BitVectorIdxFileWrite::updateIdxHeader(uint64_t fileBitSize) {
+    vespalib::FileHeader h(FileSettings::DIRECTIO_ALIGNMENT);
+    using Tag = vespalib::GenericHeader::Tag;
+    readHeader(h, _idxFile->GetFileName());
+    FileHeaderContext::setFreezeTime(h);
+    h.putTag(Tag(NUM_KEYS, _numKeys));
+    h.putTag(Tag(FROZEN, 1));
+    if (_scope != BitVectorKeyScope::SHARED_WORDS) {
+        h.putTag(Tag(FILE_BIT_SIZE, fileBitSize));
+    }
+    bool sync_ok = _idxFile->Sync();
+    CHECK(sync_ok);
+    CHECK(h.getSize() == _idxHeaderLen);
+    _idxFile->SetPosition(0);
+    h.writeFile(*_idxFile);
+    sync_ok = _idxFile->Sync();
+    CHECK(sync_ok);
+}
+
+void BitVectorIdxFileWrite::addWordSingle(uint64_t wordNum, uint32_t numDocs) {
+    BitVectorWordSingleKey key;
+    key._wordNum = wordNum;
+    key._numDocs = numDocs;
+    _idxFile->WriteBuf(&key, sizeof(key));
+    ++_numKeys;
+}
+
+void BitVectorIdxFileWrite::flush() {
+    _idxFile->Flush();
+
+    uint64_t pos = _idxFile->getPosition();
+    CHECK(pos == idxSize());
+    (void)pos;
+}
+
+void BitVectorIdxFileWrite::syncCommon() {
+    bool sync_ok = _idxFile->Sync();
+    CHECK(sync_ok);
+}
+
+void BitVectorIdxFileWrite::sync() {
+    flush();
+    syncCommon();
+}
+
+void BitVectorIdxFileWrite::close() {
+    if (_idxFile && _idxFile->IsOpened()) {
+        uint64_t pos = _idxFile->getPosition();
+        CHECK(pos == idxSize());
+        _idxFile->alignEndForDirectIO();
+        updateIdxHeader(pos * 8);
+        bool close_ok = _idxFile->Close();
+        CHECK(close_ok);
+    }
+    _idxFile.reset();
+}
+
+} // namespace search::diskindex

@@ -1,7 +1,0 @@
-title: Solr Admin UI properly supports multiple facet.field parameters
-type: fixed
-authors:
-  - name: Umut Saribiyik
-links:
-  - name: SOLR-18246
-    url: https://issues.apache.org/jira/browse/SOLR-18246

@@ -1,4 +1,0 @@
-dir /usr
-obj
-obj /usr/bin/foo
-obj /usr/bin/bar abc123 1600000000

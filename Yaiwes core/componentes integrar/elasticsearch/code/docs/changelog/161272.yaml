@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161272
-summary: Pace text parse buffers and resume GETs
-type: enhancement

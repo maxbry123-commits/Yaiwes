@@ -1,2 +1,0 @@
-# Use Unix line endings for Freemarker templates for consistency across platforms.
-**/*.ftl	text eol=lf

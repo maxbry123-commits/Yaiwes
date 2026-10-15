@@ -1,2 +1,0 @@
-SET unmapped_fields="load"; FROM k8s-downsampled, k8s_unmapped
-| KEEP network.eth0.tx

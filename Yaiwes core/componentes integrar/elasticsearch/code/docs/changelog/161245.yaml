@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161245
-summary: "ESQL:DS: Read bare numbers in `date_nanos` columns as epoch millis"
-type: enhancement

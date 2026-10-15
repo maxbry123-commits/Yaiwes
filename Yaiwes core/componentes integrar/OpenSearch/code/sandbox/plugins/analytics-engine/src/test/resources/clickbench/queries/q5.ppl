@@ -1,4 +1,0 @@
-/*
-SELECT COUNT(DISTINCT UserID) FROM hits;
-*/
-source=hits | stats dc(UserID)

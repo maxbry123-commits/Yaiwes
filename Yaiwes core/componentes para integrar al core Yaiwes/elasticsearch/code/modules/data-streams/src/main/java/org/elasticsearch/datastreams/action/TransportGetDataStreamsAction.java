@@ -1,0 +1,469 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+package org.elasticsearch.datastreams.action;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.datastreams.DataStreamsActionUtil;
+import org.elasticsearch.action.datastreams.DataStreamsStatsAction;
+import org.elasticsearch.action.datastreams.GetDataStreamAction;
+import org.elasticsearch.action.datastreams.GetDataStreamAction.Response.IndexProperties;
+import org.elasticsearch.action.datastreams.GetDataStreamAction.Response.ManagedBy;
+import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.ChannelActionListener;
+import org.elasticsearch.action.support.local.TransportLocalProjectMetadataAction;
+import org.elasticsearch.client.internal.Client;
+import org.elasticsearch.client.internal.OriginSettingClient;
+import org.elasticsearch.cluster.ProjectState;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.health.ClusterStateHealth;
+import org.elasticsearch.cluster.metadata.ComposableIndexTemplate;
+import org.elasticsearch.cluster.metadata.DataStream;
+import org.elasticsearch.cluster.metadata.DataStreamFailureStoreSettings;
+import org.elasticsearch.cluster.metadata.DataStreamLifecycle;
+import org.elasticsearch.cluster.metadata.DataStreamLifecycleSettings;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
+import org.elasticsearch.cluster.metadata.MetadataCreateDataStreamService;
+import org.elasticsearch.cluster.metadata.MetadataDataStreamsService;
+import org.elasticsearch.cluster.metadata.MetadataIndexTemplateService;
+import org.elasticsearch.cluster.metadata.ProjectMetadata;
+import org.elasticsearch.cluster.project.ProjectResolver;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.core.Tuple;
+import org.elasticsearch.core.UpdateForV10;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.IndexMode;
+import org.elasticsearch.index.IndexSettingProviders;
+import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.indices.SystemDataStreamDescriptor;
+import org.elasticsearch.indices.SystemIndices;
+import org.elasticsearch.injection.guice.Inject;
+import org.elasticsearch.tasks.CancellableTask;
+import org.elasticsearch.tasks.Task;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
+
+import java.io.IOException;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static org.elasticsearch.index.IndexSettings.PREFER_ILM_SETTING;
+
+public class TransportGetDataStreamsAction extends TransportLocalProjectMetadataAction<
+    GetDataStreamAction.Request,
+    GetDataStreamAction.Response> {
+
+    private static final Logger LOGGER = LogManager.getLogger(TransportGetDataStreamsAction.class);
+    private static final Set<String> EXPOSED_INDEX_SETTINGS = Set.of(
+        IndexSettings.MODE.getKey(),
+        IndexMetadata.LIFECYCLE_NAME,
+        IndexSettings.PREFER_ILM_SETTING.getKey()
+    );
+    private final IndexNameExpressionResolver indexNameExpressionResolver;
+    private final SystemIndices systemIndices;
+    private final ClusterSettings clusterSettings;
+    private final DataStreamLifecycleSettings dataStreamLifecycleSettings;
+    private final DataStreamFailureStoreSettings dataStreamFailureStoreSettings;
+    private final IndexSettingProviders indexSettingProviders;
+    private final Client client;
+    private final MetadataDataStreamsService metadataDataStreamsService;
+
+    /**
+     * NB prior to 9.0 this was a TransportMasterNodeReadAction so for BwC it must be registered with the TransportService until
+     * we no longer need to support calling this action remotely.
+     */
+    @UpdateForV10(owner = UpdateForV10.Owner.STORAGE_ENGINE)
+    @SuppressWarnings("this-escape")
+    @Inject
+    public TransportGetDataStreamsAction(
+        TransportService transportService,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        ActionFilters actionFilters,
+        ProjectResolver projectResolver,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        SystemIndices systemIndices,
+        DataStreamLifecycleSettings dataStreamLifecycleSettings,
+        DataStreamFailureStoreSettings dataStreamFailureStoreSettings,
+        IndexSettingProviders indexSettingProviders,
+        Client client,
+        MetadataDataStreamsService metadataDataStreamsService
+    ) {
+        super(
+            GetDataStreamAction.NAME,
+            actionFilters,
+            transportService.getTaskManager(),
+            clusterService,
+            threadPool.executor(ThreadPool.Names.MANAGEMENT),
+            projectResolver
+        );
+        this.indexNameExpressionResolver = indexNameExpressionResolver;
+        this.systemIndices = systemIndices;
+        this.dataStreamLifecycleSettings = dataStreamLifecycleSettings;
+        clusterSettings = clusterService.getClusterSettings();
+        this.dataStreamFailureStoreSettings = dataStreamFailureStoreSettings;
+        this.indexSettingProviders = indexSettingProviders;
+        this.client = new OriginSettingClient(client, "stack");
+        this.metadataDataStreamsService = metadataDataStreamsService;
+
+        transportService.registerRequestHandler(
+            actionName,
+            executor,
+            false,
+            true,
+            GetDataStreamAction.Request::new,
+            (request, channel, task) -> executeDirect(task, request, new ChannelActionListener<>(channel))
+        );
+    }
+
+    @Override
+    protected void localClusterStateOperation(
+        Task task,
+        GetDataStreamAction.Request request,
+        ProjectState state,
+        ActionListener<GetDataStreamAction.Response> listener
+    ) throws Exception {
+        ((CancellableTask) task).ensureNotCancelled();
+        if (request.verbose()) {
+            DataStreamsStatsAction.Request req = new DataStreamsStatsAction.Request();
+            req.indices(request.indices());
+            client.execute(DataStreamsStatsAction.INSTANCE, req, new ActionListener<>() {
+                @Override
+                public void onResponse(DataStreamsStatsAction.Response response) {
+                    ((CancellableTask) task).ensureNotCancelled();
+                    final Map<String, Long> maxTimestamps = Arrays.stream(response.getDataStreams())
+                        .collect(
+                            Collectors.toMap(
+                                DataStreamsStatsAction.DataStreamStats::getDataStream,
+                                DataStreamsStatsAction.DataStreamStats::getMaximumTimestamp
+                            )
+                        );
+                    listener.onResponse(
+                        innerOperation(
+                            state,
+                            request,
+                            indexNameExpressionResolver,
+                            systemIndices,
+                            clusterSettings,
+                            dataStreamLifecycleSettings,
+                            dataStreamFailureStoreSettings,
+                            indexSettingProviders,
+                            maxTimestamps,
+                            metadataDataStreamsService
+                        )
+                    );
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    listener.onFailure(e);
+                }
+            });
+        } else {
+            listener.onResponse(
+                innerOperation(
+                    state,
+                    request,
+                    indexNameExpressionResolver,
+                    systemIndices,
+                    clusterSettings,
+                    dataStreamLifecycleSettings,
+                    dataStreamFailureStoreSettings,
+                    indexSettingProviders,
+                    null,
+                    metadataDataStreamsService
+                )
+            );
+        }
+    }
+
+    /**
+     * Resolves the settings the next backing index of the given data stream would be created with, as far as they can be determined
+     * without the mappings: the settings from the additional setting providers, with the given template and data stream settings
+     * applied on top of them.
+     */
+    static Settings resolveEffectiveSettings(
+        ProjectState state,
+        IndexSettingProviders indexSettingProviders,
+        DataStream dataStream,
+        Settings settings,
+        ComposableIndexTemplate indexTemplate
+    ) {
+        return IndexSettingProviders.collectAdditionalSettings(
+            indexSettingProviders.getIndexSettingProviders(),
+            MetadataIndexTemplateService.VALIDATE_INDEX_NAME,
+            dataStream.getName(),
+            state.metadata().retrieveIndexModeFromTemplate(indexTemplate),
+            indexTemplate.isRegistryInstalled(),
+            state.metadata(),
+            Instant.now(),
+            settings,
+            List.of(),
+            state.metadata().index(dataStream.getWriteIndex()).getCreationVersion(),
+            EXPOSED_INDEX_SETTINGS
+        ).applyTo(settings);
+    }
+
+    static GetDataStreamAction.Response innerOperation(
+        ProjectState state,
+        GetDataStreamAction.Request request,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        SystemIndices systemIndices,
+        ClusterSettings clusterSettings,
+        DataStreamLifecycleSettings dataStreamLifecycleSettings,
+        DataStreamFailureStoreSettings dataStreamFailureStoreSettings,
+        IndexSettingProviders indexSettingProviders,
+        @Nullable Map<String, Long> maxTimestamps,
+        MetadataDataStreamsService metadataDataStreamsService
+    ) {
+        List<DataStream> dataStreams = getDataStreams(state.metadata(), indexNameExpressionResolver, request);
+        List<GetDataStreamAction.Response.DataStreamInfo> dataStreamInfos = new ArrayList<>(dataStreams.size());
+        boolean minimumLifecycleEnabled = dataStreamLifecycleSettings.minimumLifecycleEnabled();
+
+        for (DataStream dataStream : dataStreams) {
+            // For this action, we are returning whether the failure store is effectively enabled, either in metadata or by cluster setting.
+            // Users can use the get data stream options API to find out whether it is explicitly enabled in metadata.
+            boolean failureStoreEffectivelyEnabled = dataStream.isFailureStoreEffectivelyEnabled(dataStreamFailureStoreSettings);
+            final String indexTemplate;
+            boolean indexTemplatePreferIlmValue = true;
+            String ilmPolicyName = null;
+            IndexMode indexMode = dataStream.getIndexMode();
+            if (dataStream.isSystem()) {
+                SystemDataStreamDescriptor dataStreamDescriptor = systemIndices.findMatchingDataStreamDescriptor(dataStream.getName());
+                indexTemplate = dataStreamDescriptor != null ? dataStreamDescriptor.getDataStreamName() : null;
+                if (dataStreamDescriptor != null) {
+                    Settings settings = MetadataIndexTemplateService.resolveSettings(
+                        dataStreamDescriptor.getComposableIndexTemplate(),
+                        dataStreamDescriptor.getComponentTemplates()
+                    );
+                    Settings effectiveSettings = resolveEffectiveSettings(
+                        state,
+                        indexSettingProviders,
+                        dataStream,
+                        settings,
+                        dataStreamDescriptor.getComposableIndexTemplate()
+                    );
+                    ilmPolicyName = effectiveSettings.get(IndexMetadata.LIFECYCLE_NAME);
+                    indexMode = IndexMode.fromIndexSettingsWithoutValidation(effectiveSettings);
+                    indexTemplatePreferIlmValue = PREFER_ILM_SETTING.get(effectiveSettings);
+                }
+            } else {
+                indexTemplate = MetadataIndexTemplateService.findV2Template(state.metadata(), dataStream.getName(), false);
+                if (indexTemplate != null) {
+                    /*
+                     * Here we intentionally avoid the full MetadataDataStreamService::getEffectiveSettings and instead do a shortcut that
+                     * does not merge all mappings together in order to fetch the settings from additional settings providers. The reason
+                     * is that this code can be called fairly frequently, and we do not need that information here -- we get settings from
+                     * additional settings providers below in resolveEffectiveSettings, and those settings do not require any information
+                     * from mappings.
+                     */
+                    ComposableIndexTemplate template = MetadataCreateDataStreamService.lookupTemplateForDataStream(
+                        dataStream.getName(),
+                        state.metadata()
+                    );
+                    Settings templateSettings = MetadataIndexTemplateService.resolveSettings(
+                        template,
+                        state.metadata().componentTemplates()
+                    );
+                    final Settings settings = templateSettings.merge(dataStream.getSettings());
+                    Settings effectiveSettings = settings;
+                    if (state.metadata().templatesV2().get(indexTemplate) != null) {
+                        try {
+                            effectiveSettings = resolveEffectiveSettings(
+                                state,
+                                indexSettingProviders,
+                                dataStream,
+                                settings,
+                                dataStream.getEffectiveIndexTemplate(state.metadata())
+                            );
+                        } catch (IOException e) {
+                            throw new RuntimeException("Failed to determine settings for data stream: " + dataStream.getName(), e);
+                        }
+                    }
+                    ilmPolicyName = effectiveSettings.get(IndexMetadata.LIFECYCLE_NAME);
+                    indexMode = IndexMode.fromIndexSettingsWithoutValidation(effectiveSettings);
+                    indexTemplatePreferIlmValue = PREFER_ILM_SETTING.get(effectiveSettings);
+                } else {
+                    LOGGER.warn(
+                        "couldn't find any matching template for data stream [{}]. has it been restored (and possibly renamed)"
+                            + "from a snapshot?",
+                        dataStream.getName()
+                    );
+                }
+            }
+
+            ClusterStateHealth streamHealth = new ClusterStateHealth(
+                state.cluster(),
+                dataStream.getIndices().stream().map(Index::getName).toArray(String[]::new),
+                state.projectId()
+            );
+
+            Map<Index, IndexProperties> backingIndicesSettingsValues = new HashMap<>();
+            ProjectMetadata metadata = state.metadata();
+            collectIndexSettingsValues(
+                dataStream,
+                backingIndicesSettingsValues,
+                metadata,
+                dataStream.getIndices(),
+                minimumLifecycleEnabled
+            );
+            if (dataStream.getFailureIndices().isEmpty() == false) {
+                collectIndexSettingsValues(
+                    dataStream,
+                    backingIndicesSettingsValues,
+                    metadata,
+                    dataStream.getFailureIndices(),
+                    minimumLifecycleEnabled
+                );
+            }
+
+            GetDataStreamAction.Response.TimeSeries timeSeries = null;
+            if (IndexMode.isTsdb(dataStream.getIndexMode())) {
+                record IndexInfo(String name, Instant timeSeriesStart, Instant timeSeriesEnd) implements Comparable<IndexInfo> {
+                    @Override
+                    public int compareTo(IndexInfo o) {
+                        return Comparator.comparing(IndexInfo::timeSeriesStart).thenComparing(IndexInfo::timeSeriesEnd).compare(this, o);
+                    }
+                }
+
+                List<Tuple<Instant, Instant>> mergedRanges = new ArrayList<>();
+                Tuple<Instant, Instant> currentMergedRange = null;
+                IndexInfo previous = null;
+
+                // We need indices to be sorted by time series range
+                // to produce temporal ranges.
+                // But it is not enforced in API, so we explicitly sort here.
+                var sortedRanges = dataStream.getIndices()
+                    .stream()
+                    .map(metadata::index)
+                    .filter(m -> IndexMode.isTsdb(m.getIndexMode()))
+                    .map(m -> new IndexInfo(m.getIndex().getName(), m.getTimeSeriesStart(), m.getTimeSeriesEnd()))
+                    .sorted()
+                    .toList();
+
+                for (var info : sortedRanges) {
+                    Instant start = info.timeSeriesStart();
+                    Instant end = info.timeSeriesEnd();
+
+                    if (currentMergedRange == null) {
+                        currentMergedRange = new Tuple<>(start, end);
+                    } else if (currentMergedRange.v2().compareTo(start) == 0) {
+                        currentMergedRange = new Tuple<>(currentMergedRange.v1(), end);
+                    } else if (currentMergedRange.v2().compareTo(start) < 0) {
+                        mergedRanges.add(currentMergedRange);
+                        currentMergedRange = new Tuple<>(start, end);
+                    } else {
+                        String message = "previous backing index ["
+                            + previous.name()
+                            + "] range ["
+                            + previous.timeSeriesStart()
+                            + "/"
+                            + previous.timeSeriesEnd()
+                            + "] range is colliding with current backing ["
+                            + info.name()
+                            + "] index range ["
+                            + start
+                            + "/"
+                            + end
+                            + "]";
+                        assert currentMergedRange.v2().compareTo(start) < 0 : message;
+                    }
+                    previous = info;
+                }
+                if (currentMergedRange != null) {
+                    mergedRanges.add(currentMergedRange);
+                }
+                timeSeries = new GetDataStreamAction.Response.TimeSeries(mergedRanges);
+            }
+
+            dataStreamInfos.add(
+                new GetDataStreamAction.Response.DataStreamInfo(
+                    dataStream,
+                    failureStoreEffectivelyEnabled,
+                    streamHealth.getStatus(),
+                    indexTemplate,
+                    ilmPolicyName,
+                    timeSeries,
+                    backingIndicesSettingsValues,
+                    indexTemplatePreferIlmValue,
+                    maxTimestamps == null ? null : maxTimestamps.get(dataStream.getName()),
+                    indexMode,
+                    minimumLifecycleEnabled
+                )
+            );
+        }
+        return new GetDataStreamAction.Response(
+            dataStreamInfos,
+            request.includeDefaults() ? clusterSettings.get(DataStreamLifecycle.CLUSTER_LIFECYCLE_DEFAULT_ROLLOVER_SETTING) : null,
+            dataStreamLifecycleSettings.getGlobalRetention(false),
+            dataStreamLifecycleSettings.getGlobalRetention(true)
+        );
+    }
+
+    private static void collectIndexSettingsValues(
+        DataStream dataStream,
+        Map<Index, IndexProperties> backingIndicesSettingsValues,
+        ProjectMetadata metadata,
+        List<Index> backingIndices,
+        boolean minimumLifecycleEnabled
+    ) {
+        for (Index index : backingIndices) {
+            IndexMetadata indexMetadata = metadata.index(index);
+            if (indexMetadata == null) {
+                // This should never happen that the index metadata is null,
+                // but protect against it defensively to prevent an NPE below regardless
+                String message = "backing index [" + index.getName() + "] has null metadata in data stream [" + dataStream.getName() + "]";
+                LOGGER.warn(message);
+                assert false : message;
+                backingIndicesSettingsValues.put(index, new IndexProperties(true, null, ManagedBy.UNMANAGED, null));
+                continue;
+            }
+            Boolean preferIlm = PREFER_ILM_SETTING.get(indexMetadata.getSettings());
+            assert preferIlm != null : "must use the default prefer ilm setting value, if nothing else";
+            IndexMode indexMode = indexMetadata.getIndexMode() == null ? IndexMode.STANDARD : indexMetadata.getIndexMode();
+            ManagedBy managedBy = ManagedBy.fromLifecycleManagedBy(
+                DataStream.lifecycleManagedBy(
+                    indexMetadata.getLifecyclePolicyName(),
+                    dataStream.getEffectiveLifecycleForIndex(index, minimumLifecycleEnabled),
+                    indexMetadata.getSettings(),
+                    indexMode
+                )
+            );
+            backingIndicesSettingsValues.put(
+                index,
+                new IndexProperties(preferIlm, indexMetadata.getLifecyclePolicyName(), managedBy, indexMode.getName())
+            );
+        }
+    }
+
+    static List<DataStream> getDataStreams(ProjectMetadata project, IndexNameExpressionResolver iner, GetDataStreamAction.Request request) {
+        List<String> results = DataStreamsActionUtil.getDataStreamNames(iner, project, request.getNames(), request.indicesOptions());
+        Map<String, DataStream> dataStreams = project.dataStreams();
+
+        return results.stream().map(dataStreams::get).sorted(Comparator.comparing(DataStream::getName)).toList();
+    }
+
+    @Override
+    protected ClusterBlockException checkBlock(GetDataStreamAction.Request request, ProjectState state) {
+        return state.blocks().globalBlockedException(state.projectId(), ClusterBlockLevel.METADATA_WRITE);
+    }
+}

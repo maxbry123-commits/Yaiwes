@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160942
-summary: Abort leftover S3 GETs on close
-type: enhancement

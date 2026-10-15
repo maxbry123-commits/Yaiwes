@@ -1,5 +1,0 @@
-area: Inference
-issues: []
-pr: 160882
-summary: "[Inference API] URL format for non-text inputs to embedding/rerank models"
-type: enhancement

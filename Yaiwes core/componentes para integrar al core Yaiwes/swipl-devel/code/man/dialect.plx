@@ -1,0 +1,308 @@
+\chapter{Compatibility with other Prolog dialects}
+\label{sec:dialect}
+
+\index{YAP,prolog}%
+\index{XSB,prolog}%
+\index{SICStus,prolog}%
+\index{IF,prolog}%
+\index{portable,prolog code}%
+This chapter explains issues for writing portable Prolog programs. It
+was started after discussion with Vitor Santos Costa, the leading
+developer of YAP Prolog\footnote{\url{http://yap.sourceforge.net/}} YAP
+and SWI-Prolog have expressed the ambition to enhance the portability
+beyond the trivial Prolog examples, including complex libraries
+involving foreign code.
+
+Although it is our aim to enhance compatibility, we are still faced
+with many incompatibilities between the dialects. As a first step both
+YAP and SWI will provide some instruments that help developing portable
+code. A first release of these tools appeared in SWI-Prolog 5.6.43.
+Some of the facilities are implemented in the base system, others in the
+library \pllib{dialect.pl}.
+
+\begin{itemize}
+    \item The Prolog flag \prologflag{dialect} is an unambiguous and fast way to
+    find out which Prolog dialect executes your program. It has the
+    value \const{swi} for SWI-Prolog and \const{yap} on YAP.
+
+    \item The Prolog flag \prologflag{version_data} is bound to a term
+    \term{swi}{Major, Minor, Patch, Extra}
+
+    \item Conditional compilation using \exam{:- if(Condition)} \ldots
+    \exam{:- endif} is supported.  See \secref{conditionalcompilation}.
+
+    \item The predicate expects_dialect/1 allows for specifying for
+    which Prolog system the code was written.
+
+    \item The predicates exists_source/1 and source_exports/2 can be
+    used to query the library content.  The require/1 directive can
+    be used to get access to predicates without knowing their location.
+
+    \item The module predicates use_module/1, use_module/2 have been
+    extended with a notion for `import-except' and `import-as'.  This
+    is particularly useful together with reexport/1 and reexport/2 to
+    compose modules from other modules and mapping names.
+
+    \item Foreign code can expect \const{__SWI_PROLOG__} when compiled
+    for SWI-Prolog and \const{__YAP_PROLOG__} when compiled on YAP.
+\end{itemize}
+
+\begin{description}
+    \directive{expects_dialect}{1}{+Dialect}
+This directive states that the code following the directive is written
+for the given Prolog \arg{Dialect}. See also \prologflag{dialect}. The
+declaration holds until the end of the file in which it appears. The
+current dialect is available using prolog_load_context/2.
+
+The exact behaviour of this predicate is still subject to discussion. Of
+course, if \arg{Dialect} matches the running dialect the directive has
+no effect. Otherwise we check for the existence of
+\term{library}{dialect/Dialect} and load it if the file is found.
+Currently, this file has this functionality:
+
+\begin{itemize}
+    \item Define system predicates of the requested dialect we do not
+    have.
+
+    \item Apply goal_expansion/2 rules that map conflicting predicates
+    to versions emulating the requested dialect. These expansion rules
+    reside in the dialect compatibility module, but are
+    applied if prolog_load_context(dialect, Dialect) is active.
+
+    \item Modify the search path for library directories, putting
+    libraries compatible with the target dialect before the native
+    libraries.
+
+    \item Setup support for the default filename extension of the
+    dialect.
+\end{itemize}
+
+    \predicate{source_exports}{2}{+Spec, +Export}
+Is true if source \arg{Spec} exports \arg{Export}, a predicate
+indicator.  Fails without error otherwise.
+\end{description}
+
+
+\section{Some considerations for writing portable code}
+\label{sec:portabilitystrategies}
+
+The traditional way to write portable code is to define custom
+predicates for all potentially non-portable code and define these
+separately for all Prolog dialects one wishes to support.  Here
+are some considerations.
+
+\begin{itemize}
+    \item Probably the best reason for this is that it allows to
+    define minimal semantics required by the application
+    for the portability predicates.  Such functionality can often
+    be mapped efficiently to the target dialect.  Contrary, if
+    code was written for dialect $X$, the defined semantics are
+    those of dialect $X$. Emulating all extreme cases and full
+    error handling compatibility may be tedious and result in a
+    much slower implementation than needed.  Take for example
+    call_cleanup/2.  The SICStus definition is fundamentally
+    different from the SWI definition, but 99\% of the applications
+    just want to make calls like below to guarantee \arg{StreamIn}
+    is closed, even if \nopredref{process}{1} misbehaves.
+
+\begin{code}
+	call_cleanup(process(StreamIn), close(In))
+\end{code}
+
+    \item As a drawback, the code becomes full of \textit{my_call_cleanup},
+    etc.\ and every potential portability conflict needs to be
+    abstracted.  It is hard for people who have to maintain such code
+    later to grasp the exact semantics of the \textit{my_*} predicates
+    and applications that combine multiple libraries using this
+    compatibility approach are likely to encounter conflicts between
+    the portability layers.  A good start is not to use \textit{my_*},
+    but a prefix derived from the library or application name or names
+    that explain the intended semantics more precisely.
+
+    \item Another problem is that most code is initially not written
+    with portability in mind.  Instead, ports are requested by users
+    or arise from the desire to switch Prolog dialect.  Typically, we
+    want to achieve compatibility with the new Prolog dialect with
+    minimal changes, often keeping compatibility with the original
+    dialect(s).  This problem is well known from the C/Unix world
+    and we advise anyone to study the philosophy of
+    \href{http://www.gnu.org/software/autoconf/}{GNU autoconf}, from
+    which we will illustrate some highlights below.
+\end{itemize}
+
+The GNU autoconf suite, known to most people as \program{configure}, was
+an answer to the frustrating life of Unix/C programmers when Unix
+dialects were about as abundant and poorly standardised as Prolog
+dialects today. Writing a portable C program can only be achieved using
+cpp, the C preprocessor. The C preprocessor performs two tasks: macro
+expansion and conditional compilation. Prolog realises macro expansion
+through term_expansion/2 and goal_expansion/2. Conditional compilation
+is achieved using \exam{:- if(Condition)} as explained in
+\secref{conditionalcompilation}. The situation appears similar.
+
+The important lesson learned from GNU autoconf is that the \emph{last}
+resort for conditional compilation to achieve portability is to switch
+on the platform or dialect. Instead, GNU autoconf allows you to write
+tests for specific properties of the platform. Most of these are whether
+or not some function or file is available. Then there are some standard
+tests for difficult-to-write-portable situations and finally there is a
+framework that allows you to write arbitrary C programs and check
+whether they can be compiled and/or whether they show the intended
+behaviour. Using a separate \program{configure} program is needed in C,
+as you cannot perform C compilation step or run C programs from the C
+preprocessor. In most Prolog environments we do not need this
+distinction as the compiler is integrated into the runtime environment
+and Prolog has excellent reflexion capabilities.
+
+We must learn from the distinction to test for features instead of
+platform (dialect), as this makes the platform-specific code robust for
+future changes of the dialect. Suppose we need compare/3 as defined in
+this manual. The compare/3 predicate is not part of the ISO standard,
+but many systems support it and it is not unlikely it will become ISO
+standard or the intended dialect will start supporting it. GNU autoconf
+strongly advises to test for the availability:
+
+\begin{code}
+:- if(\+current_predicate(_, compare(_,_,_))).
+compare(<, Term1, Term2) :-
+	Term1 @< Term2, !.
+compare(>, Term1, Term2) :-
+	Term1 @> Term2, !.
+compare(=, Term1, Term2) :-
+	Term1 == Term2.
+:- endif.
+\end{code}
+
+This code is \textbf{much} more robust against changes to the intended
+dialect and, possibly at least as important, will provide compatibility
+with dialects you didn't even consider porting to right now.
+
+In a more challenging case, the target Prolog has compare/3, but the
+semantics are different. What to do? One option is to write a
+my_compare/3 and change all occurrences in the code. Alternatively you
+can rename calls using goal_expansion/2 like below. This construct will
+not only deal with Prolog dialects lacking compare/3 as well as those that
+only implement it for numeric comparison or have changed the argument
+order. Of course, writing rock-solid code would require a complete
+test-suite, but this example will probably cover all Prolog dialects
+that allow for conditional compilation, have core ISO facilities and
+provide goal_expansion/2, the things we claim a Prolog dialect should
+have to start writing portable code for it.
+
+\begin{code}
+:- if(\+catch(compare(<,a,b), _, fail)).
+compare_standard_order(<, Term1, Term2) :-
+	Term1 @< Term2, !.
+compare_standard_order(>, Term1, Term2) :-
+	Term1 @> Term2, !.
+compare_standard_order(=, Term1, Term2) :-
+	Term1 == Term2.
+
+goal_expansion(compare(Order, Term1, Term2),
+	       compare_standard_order(Order, Term1, Term2)).
+:- endif.
+\end{code}
+
+\section{Notes on specific dialects}
+\label{sec:dialect-notes}
+
+The level of maturity of the various dialect emulation implementations
+varies enormously. All of them have been developed to realise
+portability for one or more, often large, programs.  This section
+provides some notes on emulating a particular dialect.
+
+
+\subsection{Notes on specific dialects}
+\label{sec:dialect-xsb}
+
+\href{http://xsb.sourceforge.net/}{XSB} Prolog compatibility emerged
+from a project to integrate XSB's advanced tabling support in SWI-Prolog
+(see \secref{tabling}). This project has been made possible by
+\href{https://kyndi.com/}{Kyndi}.\footnote{This project was initiated by
+Benjamin Grosof and carried out in cooperation with Theresa Swift, David
+S. Warren and Fabrizio Riguzzi.} The XSB dialect implementation has been
+created to share as much as possible of the XSB test suite as well as
+some larger programs to evaluate both tabling implementations. The
+dialect emulation was extended to support
+\href{https://github.com/cmu-sei/pharos}{Pharos}.\footnote{Pharos was
+used to evaluate \jargon{incremental tabling}
+(\secref{tabling-incremental}), a protect with Edward Schwatz and Cory
+Cohen from CMU}.
+
+Emulating XSB is relatively complicated due to the large distance from
+the Quintus descendant Prolog systems. Notably XSB's name based module
+system is hard to map on SWI-Prolog's predicate based module system. As
+a result, only non-modular projects or projects with basic usage of
+modules are supported. For the development of new projects that require
+modules more advanced module support we suggest using
+\href{https://logtalk.org/}{Logtalk}.
+
+\subsubsection{Loading XSB source files}
+\label{sec:xsb-source}
+
+SWI-Prolog's emulation of XSB depends on the XSB preferred file name
+extension \fileext{P}. This extension is used by
+\pllib{dialect/xsb/source} to initiate a two phase loading process based
+on term_expansion/2 of the virtual term \const{begin_of_file}.
+
+\begin{enumerate}
+    \item In the first phase the file is read with XSB compatible
+    operator declarations and all directives (:- Term) are extracted.
+    The directives are used to determine that the file defines a
+    module (iff the file contains an export/1 directive) and construct
+    a SWI-Prolog compatible module declaration.  As XSB has a two phase
+    compiler where SWI has a single phase compiler, this is also used to
+    move some directives to the start of the file.
+
+    \item The second phase loads the file as normal.
+\end{enumerate}
+
+To load a project in both XSB and SWI-Prolog it is advised to make sure
+all source files use the \fileext{P} file name extension.  Next, write a
+SWI-Prolog loader in a \fileext{pl} file that contains e.g.,
+
+\begin{code}
+:- use_module(library(dialect/xsb/source)).
+
+:- [main_file].
+\end{code}
+
+It is also possible to put the able use_module/1 directive in your
+personal initialization file (see \secref{initfile}), after which
+XSB files can be loaded as normal SWI-Prolog files using
+
+\begin{code}
+% swipl file.P
+\end{code}
+
+\index{gpp,XSB proprocessor}%
+XSB code may depend on the \program{gpp} preprocessor.  We do not
+provide \program{gpp}.  It is however possible to send XSB source
+files through \program{gpp} by loading \pllib{library/dialect/xsb/gpp}.
+This require \program{gpp} to be accessible through the environment
+variable \env{PATH} or the file_search_path/2 alias \const{path}.
+We refer to the \const{gpp} library for details.
+
+
+\subsection{The XSB import directive}
+\label{sec:xsb-import}
+
+The XSB import directive takes the form as below.
+
+\begin{code}
+:- import p/1, q/2, ... from <lib>.
+\end{code}
+
+This import directive is resolved as follows:
+
+\begin{itemize}
+    \item If the referenced library is found as a local file,
+it is loaded and the requested predicates are imported.
+    \item Otherwise, the referenced library is searched for in
+the \file{dialect/xsb} directory of the SWI-Prolog library.
+If found, the predicates are imported from this library.
+    \item The referenced predicates are searched for in SWI-Prolog
+built-in predicates and the SWI-Prolog library.  If found, they are
+made available if necessary.
+\end{itemize}
+

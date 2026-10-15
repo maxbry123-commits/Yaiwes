@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 155315
-summary: Support options for runtime `match_phrase`
-type: enhancement

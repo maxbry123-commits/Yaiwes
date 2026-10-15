@@ -1,1 +1,0 @@
-source=otel_logs | dedup serviceName, `resource.cloud.region` | stats count()

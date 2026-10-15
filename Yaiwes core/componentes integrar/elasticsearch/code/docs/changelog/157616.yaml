@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 157616
-summary: Reuse heap dest for Parquet page decompress
-type: enhancement

@@ -1,2 +1,0 @@
-FROM employees
-| EVAL a = emp_no + 10000, z = a * 2, a = salary IN (FROM employees | KEEP salary)

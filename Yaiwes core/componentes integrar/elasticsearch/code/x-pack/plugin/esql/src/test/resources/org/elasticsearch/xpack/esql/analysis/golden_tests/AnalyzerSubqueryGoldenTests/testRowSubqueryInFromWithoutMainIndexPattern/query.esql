@@ -1,2 +1,0 @@
-FROM (ROW x = 1 | EVAL y = x + 1)
-| WHERE y > 0

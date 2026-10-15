@@ -1,2 +1,0 @@
-FROM employees
-| WHERE (1, 1) IN (FROM employees | KEEP emp_no, languages)

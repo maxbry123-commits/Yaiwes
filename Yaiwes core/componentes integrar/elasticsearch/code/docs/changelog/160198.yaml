@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160198
-summary: "ES|QL|DS: refuse non-whole decimals in whole-number reads"
-type: bug

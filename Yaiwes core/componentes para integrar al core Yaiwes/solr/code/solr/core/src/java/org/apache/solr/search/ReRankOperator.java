@@ -1,0 +1,60 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.solr.search;
+
+import java.util.Locale;
+import java.util.function.DoubleBinaryOperator;
+import org.apache.solr.common.SolrException;
+
+public enum ReRankOperator implements DoubleBinaryOperator {
+  ADD((firstPass, secondPass) -> firstPass + secondPass),
+  MULTIPLY((firstPass, secondPass) -> firstPass * secondPass),
+  REPLACE((firstPass, secondPass) -> secondPass);
+
+  /**
+   * The operators we use <em>are</em> immutable, even if we can't annotate them as such, and
+   * errorprone's "TIP" of using abstract methods would make this enum declaration 5 times longer --
+   * so no thanks.
+   */
+  @SuppressWarnings("ImmutableEnumChecker")
+  private final DoubleBinaryOperator op;
+
+  private ReRankOperator(final DoubleBinaryOperator op) {
+    this.op = op;
+  }
+
+  @Override
+  public double applyAsDouble(final double firstPass, final double secondPass) {
+    return op.applyAsDouble(firstPass, secondPass);
+  }
+
+  public static ReRankOperator get(String p) {
+    if (p != null) {
+      try {
+        return ReRankOperator.valueOf(p.toUpperCase(Locale.ROOT));
+      } catch (Exception ex) {
+        throw new SolrException(
+            SolrException.ErrorCode.BAD_REQUEST, "Invalid reRankOperator: " + p);
+      }
+    }
+    return null;
+  }
+
+  public String toLower() {
+    return toString().toLowerCase(Locale.ROOT);
+  }
+}

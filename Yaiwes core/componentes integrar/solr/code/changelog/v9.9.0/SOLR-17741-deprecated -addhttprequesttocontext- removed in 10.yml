@@ -1,7 +1,0 @@
-title: Deprecated 'addHttpRequestToContext', removed in 10.
-type: other
-authors:
-- name: David Smiley
-links:
-- name: SOLR-17741
-  url: https://issues.apache.org/jira/browse/SOLR-17741

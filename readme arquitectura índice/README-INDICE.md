@@ -8,7 +8,8 @@ Raíz única de índices y handoffs de los traspasos. Zona horaria: America/Bogo
 |---|---|---|---|
 | Yaiwes / shark imput | [INDICE shark imput](./INDICE%20shark%20imput.md) | [HANDOFF shark imput](./HANDOFF%20shark%20imput.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput |
 | Yaiwes / memoria | [INDICE memoria](./INDICE%20memoria.md) | [HANDOFF memoria](./HANDOFF%20memoria.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/memoria |
-| Yaiwes core / componentes integrar | [INDICE core componentes](./INDICE%20Yaiwes%20core%20componentes%20integrar.md) | [HANDOFF core componentes](./HANDOFF%20Yaiwes%20core%20componentes%20integrar.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/componentes%20integrar |
+| Yaiwes core / core kernel Yaiwes principal | [INDICE core kernel](./INDICE%20core%20kernel%20Yaiwes%20principal.md) | [HANDOFF core kernel](./HANDOFF%20core%20kernel%20Yaiwes%20principal.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal |
+| Yaiwes core / componentes para integrar al core Yaiwes | [INDICE core componentes](./INDICE%20Yaiwes%20core%20componentes%20para%20integrar%20al%20core%20Yaiwes.md) | [HANDOFF core componentes](./HANDOFF%20Yaiwes%20core%20componentes%20para%20integrar%20al%20core%20Yaiwes.md) | https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/componentes%20para%20integrar%20al%20core%20Yaiwes |
 | ui-yaiwes | https://github.com/maxbry123-commits/ui-yaiwes/blob/main/README%20TRASPASOS.md | (mismo archivo) | https://github.com/maxbry123-commits/ui-yaiwes |
 | yaiwes-factory-ui | https://github.com/maxbry123-commits/yaiwes-factory-ui/blob/main/README%20TRASPASOS.md | (mismo archivo) | https://github.com/maxbry123-commits/yaiwes-factory-ui |
 

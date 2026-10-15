@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161740
-summary: Expose ES|QL datasource admission stats and fail wait-with-untracked
-type: enhancement

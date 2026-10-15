@@ -1,0 +1,4 @@
+zensical==0.0.*
+# Custom Pygments fork adds the `soar` lexer used in fenced code blocks.
+pygments @ git+https://github.com/moschmdt/pygments@feature/soar
+pre-commit==3.8.*

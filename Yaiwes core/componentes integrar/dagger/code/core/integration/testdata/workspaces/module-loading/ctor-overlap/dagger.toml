@@ -1,3 +1,0 @@
-[modules.ci]
-source = ".dagger/modules/ci"
-entrypoint = true

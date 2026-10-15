@@ -1,3 +1,0 @@
-FROM employees
-| WHERE emp_no IN (FROM employees | KEEP emp_no) AND false
-| KEEP emp_no, first_name

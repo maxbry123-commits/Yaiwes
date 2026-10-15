@@ -1,1 +1,0 @@
-FROM k8s-downsampled | STATS m = min(network.eth0.tx)

@@ -1,1 +1,0 @@
-source=test_data | eval type_val = typeof(value) | fields value, type_val | head 3

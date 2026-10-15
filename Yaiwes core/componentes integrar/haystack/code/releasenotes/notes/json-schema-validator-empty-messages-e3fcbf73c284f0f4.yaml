@@ -1,5 +1,0 @@
----
-fixes:
-  - |
-    ``JsonSchemaValidator.run()`` now raises a ``ValueError`` saying the message list is empty when it receives no
-    messages, instead of an ``IndexError`` from reading the last message.

@@ -1,1 +1,0 @@
-source=%INDEX% | lookup merge_coverage_lookup category | stats count()

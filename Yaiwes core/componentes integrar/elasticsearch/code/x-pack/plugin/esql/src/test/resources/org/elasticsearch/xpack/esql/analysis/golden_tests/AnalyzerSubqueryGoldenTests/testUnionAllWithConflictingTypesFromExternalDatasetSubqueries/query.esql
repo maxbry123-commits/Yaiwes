@@ -1,2 +1,0 @@
-FROM (FROM salaries_int), (FROM salaries_long)
-| KEEP salary

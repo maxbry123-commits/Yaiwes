@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1124685,
+  "bundle_sha256": "0d0a91e967c31e19a64b9d97d4746e58813261d886c87abe9b07d64fbcc22ea0",
+  "extracted_tree": {
+    "bytes": 6054648,
+    "files": 109,
+    "sha256": "bb7e43f08bdce39d9f65c6c944a927ea4909753de800df7fae5c96bed909c6e1"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1124685,
+      "name": "quickjs.bundle.zip.part-0001",
+      "sha256": "0d0a91e967c31e19a64b9d97d4746e58813261d886c87abe9b07d64fbcc22ea0"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "quickjs",
+  "source_bytes": 6054648,
+  "source_commit": "84e723f1ace5e3823cef8149dd0f890fe74b77ce",
+  "source_files": 109,
+  "source_ref": "master",
+  "source_repo": "bellard/quickjs",
+  "source_tree": {
+    "bytes": 6054648,
+    "files": 109,
+    "sha256": "bb7e43f08bdce39d9f65c6c944a927ea4909753de800df7fae5c96bed909c6e1"
+  }
+}

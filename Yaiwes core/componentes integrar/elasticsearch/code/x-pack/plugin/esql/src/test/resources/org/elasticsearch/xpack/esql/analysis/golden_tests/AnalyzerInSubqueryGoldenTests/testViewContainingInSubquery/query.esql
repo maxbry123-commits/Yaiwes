@@ -1,3 +1,0 @@
-FROM employeesInEmployees
-| WHERE salary > 50000
-| KEEP emp_no

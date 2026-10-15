@@ -1,9 +1,0 @@
-{
-  "schema": [
-    {"name": "c", "type": "bigint"},
-    {"name": "serviceName", "type": "string"}
-  ],
-  "datarows": [],
-  "total": 0,
-  "size": 0
-}

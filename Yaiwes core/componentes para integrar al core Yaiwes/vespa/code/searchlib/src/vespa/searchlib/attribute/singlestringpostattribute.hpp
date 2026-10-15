@@ -1,0 +1,146 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#pragma once
+
+#include "single_string_enum_search_context.h"
+#include "singlestringpostattribute.h"
+#include "string_direct_posting_store_adapter.hpp"
+#include "string_matcher_factory.h"
+#include "string_posting_search_context.hpp"
+#include "string_range_posting_search_context.h"
+#include "string_range_posting_search_context.hpp"
+
+#include <vespa/searchcommon/attribute/config.h>
+#include <vespa/searchlib/query/query_term_ucs4.h>
+
+#include <type_traits>
+
+namespace search {
+
+template <typename B>
+SingleValueStringPostingAttributeT<B>::SingleValueStringPostingAttributeT(const std::string&             name,
+                                                                          const AttributeVector::Config& c)
+    : SingleValueStringAttributeT<B>(name, c),
+      PostingParent(*this, this->getEnumStore()),
+      _posting_store_adapter(this->get_posting_store(), this->_enumStore, this->getIsFilter()) {
+}
+
+template <typename B>
+SingleValueStringPostingAttributeT<B>::SingleValueStringPostingAttributeT(const std::string& name)
+    : SingleValueStringPostingAttributeT<B>(name, AttributeVector::Config(AttributeVector::BasicType::STRING)) {
+}
+
+template <typename B> SingleValueStringPostingAttributeT<B>::~SingleValueStringPostingAttributeT() {
+    this->disableFreeLists();
+    this->disable_entry_hold_list();
+    clearAllPostings();
+}
+
+template <typename B> void SingleValueStringPostingAttributeT<B>::freezeEnumDictionary() {
+    this->getEnumStore().freeze_dictionary();
+}
+
+template <typename B> void SingleValueStringPostingAttributeT<B>::mergeMemoryStats(vespalib::MemoryUsage& total) {
+    auto& compaction_strategy = this->getConfig().getCompactionStrategy();
+    total.merge(this->_posting_store.update_stat(compaction_strategy));
+}
+
+template <typename B>
+void SingleValueStringPostingAttributeT<B>::applyUpdateValueChange(const Change& c, EnumStore& enumStore,
+                                                                   std::map<DocId, EnumIndex>& currEnumIndices) {
+    EnumIndex newIdx;
+    if (c.has_entry_ref()) {
+        newIdx = EnumIndex(vespalib::datastore::EntryRef(c.get_entry_ref()));
+    } else {
+        enumStore.find_index(c._data.raw(), newIdx);
+    }
+
+    currEnumIndices[c._doc] = newIdx;
+}
+
+template <typename B>
+void SingleValueStringPostingAttributeT<B>::makePostingChange(const vespalib::datastore::EntryComparator& cmpa,
+                                                              IEnumStoreDictionary&                       dictionary,
+                                                              const std::map<DocId, EnumIndex>& currEnumIndices,
+                                                              PostingMap&                       changePost) {
+    for (const auto& elem : currEnumIndices) {
+        uint32_t  docId = elem.first;
+        EnumIndex oldIdx = this->_enumIndices[docId].load_relaxed();
+        EnumIndex newIdx = elem.second;
+
+        // add new posting
+        auto remapped_new_idx = dictionary.remap_index(newIdx);
+        changePost[EnumPostingPair(remapped_new_idx, &cmpa)].add(docId, 1);
+
+        // remove old posting
+        if (oldIdx.valid()) {
+            auto remapped_old_idx = dictionary.remap_index(oldIdx);
+            changePost[EnumPostingPair(remapped_old_idx, &cmpa)].remove(docId);
+        }
+    }
+}
+
+template <typename B> void SingleValueStringPostingAttributeT<B>::applyValueChanges(EnumStoreBatchUpdater& updater) {
+    EnumStore&            enumStore = this->getEnumStore();
+    IEnumStoreDictionary& dictionary = enumStore.get_dictionary();
+    PostingMap            changePost;
+
+    // used to make sure several arithmetic operations on the same document in a single commit works
+    std::map<DocId, EnumIndex> currEnumIndices;
+
+    for (const auto& change : this->_changes.getInsertOrder()) {
+        auto      enumIter = currEnumIndices.find(change._doc);
+        EnumIndex oldIdx;
+        if (enumIter != currEnumIndices.end()) {
+            oldIdx = enumIter->second;
+        } else {
+            oldIdx = this->_enumIndices[change._doc].load_relaxed();
+        }
+        if (change._type == ChangeBase::UPDATE) {
+            applyUpdateValueChange(change, enumStore, currEnumIndices);
+        } else if (change._type == ChangeBase::CLEARDOC) {
+            currEnumIndices[change._doc] = enumStore.get_default_value_ref().load_relaxed();
+        }
+    }
+
+    makePostingChange(enumStore.get_lookup_source(), dictionary, currEnumIndices, changePost);
+
+    this->updatePostings(changePost);
+
+    SingleValueStringAttributeT<B>::applyValueChanges(updater);
+}
+
+template <typename B>
+void SingleValueStringPostingAttributeT<B>::reclaim_memory(vespalib::Generation oldest_used_gen) {
+    SingleValueStringAttributeT<B>::reclaim_memory(oldest_used_gen);
+    _posting_store.reclaim_memory(oldest_used_gen);
+}
+
+template <typename B>
+void SingleValueStringPostingAttributeT<B>::before_inc_generation(vespalib::Generation current_gen) {
+    _posting_store.freeze();
+    SingleValueStringAttributeT<B>::before_inc_generation(current_gen);
+    _posting_store.assign_generation(current_gen);
+}
+
+template <typename B>
+std::unique_ptr<attribute::SearchContext>
+SingleValueStringPostingAttributeT<B>::getSearch(QueryTermSimpleUP                     qTerm,
+                                                 const attribute::SearchContextParams& params) const {
+    bool cased = this->get_match_is_cased();
+    auto docid_limit = this->getCommittedDocIdLimit();
+    return attribute::StringMatcherFactory::create_and_apply(
+        std::move(qTerm), cased, params.fuzzy_matching_algorithm(),
+        [&]<typename Matcher>(Matcher&& matcher) -> std::unique_ptr<attribute::SearchContext> {
+            using BaseSC = attribute::SingleStringEnumSearchContextT<Matcher>;
+            using SC = std::conditional_t<
+                std::is_same_v<Matcher, attribute::StringRangeMatcher>,
+                attribute::StringRangePostingSearchContext<BaseSC, SelfType, vespalib::btree::BTreeNoLeafData>,
+                attribute::StringPostingSearchContext<BaseSC, SelfType, vespalib::btree::BTreeNoLeafData>>;
+            BaseSC base_sc(std::move(matcher), *this, this->_enumIndices.make_read_view(docid_limit),
+                           this->_enumStore);
+            return std::make_unique<SC>(std::move(base_sc), params.useBitVector(), *this);
+        });
+}
+
+} // namespace search

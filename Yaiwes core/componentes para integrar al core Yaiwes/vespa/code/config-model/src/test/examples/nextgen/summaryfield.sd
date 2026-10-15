@@ -1,0 +1,25 @@
+# Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+search summaryfield {
+    document summaryfield {
+        field foo type string {
+            indexing: index | summary
+            summary bar: full
+        }
+        field mytags type array<string> {
+            indexing: index
+        }
+    }
+    document-summary baz {
+        summary cox {
+            source: foo
+        }
+        summary alltags {
+            source: mytags
+        }
+        summary sometags {
+            source: mytags
+            matched-elements-only
+        }
+    }
+}
+

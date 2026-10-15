@@ -1,1 +1,0 @@
-source=exception_logs | stats count() as occurrence_count by level | sort occurrence_count | head 5

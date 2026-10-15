@@ -1,0 +1,10 @@
+apply plugin: 'elasticsearch.internal-java-rest-test'
+
+dependencies {
+  javaRestTestImplementation(testArtifact(project(xpackModule('core'))))
+
+  clusterModules project(xpackModule('shutdown'))
+  // Required by SecuritySystemIndices: the .security index mappings use the pattern_capture token
+  // filter, which is registered by analysis-common.
+  clusterModules project(':modules:analysis-common')
+}

@@ -1,0 +1,94 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+
+#include "tensor_attribute_saver.h"
+
+#include "dense_tensor_store.h"
+#include "nearest_neighbor_index_saver.h"
+#include "tensor_attribute_constants.h"
+
+#include <vespa/check_require.h>
+#include <vespa/searchlib/attribute/iattributesavetarget.h>
+#include <vespa/searchlib/util/bufferwriter.h>
+#include <vespa/vespalib/objects/nbostream.h>
+
+using vespalib::GenerationGuard;
+
+namespace search::tensor {
+
+TensorAttributeSaver::TensorAttributeSaver(GenerationGuard&& guard, const attribute::AttributeHeader& header,
+                                           attribute::EntryRefVectorSnapshot&& ref_vector_snapshot,
+                                           const TensorStore& tensor_store, IndexSaverUP index_saver)
+    : AttributeSaver(std::move(guard), header),
+      _ref_vector_snapshot(std::move(ref_vector_snapshot)),
+      _tensor_store(tensor_store),
+      _index_saver(std::move(index_saver)) {
+}
+
+TensorAttributeSaver::~TensorAttributeSaver() = default;
+
+std::string TensorAttributeSaver::index_file_suffix() {
+    return "nnidx";
+}
+
+bool TensorAttributeSaver::onSave(IAttributeSaveTarget& saveTarget) {
+    if (_index_saver) {
+        if (!saveTarget.setup_writer(index_file_suffix(), "Binary data file for nearest neighbor index")) {
+            return false;
+        }
+
+        auto& index_file_writer = saveTarget.get_writer(index_file_suffix());
+        auto  index_writer = index_file_writer.allocBufferWriter();
+        // Note: Implementation of save() is responsible to call BufferWriter::flush().
+        _index_saver->save(*index_writer);
+        index_file_writer.close();
+        _index_saver.reset();
+    }
+
+    auto dat_writer = saveTarget.datWriter().allocBufferWriter();
+    auto dense_tensor_store = _tensor_store.as_dense();
+    if (dense_tensor_store != nullptr) {
+        save_dense_tensor_store(*dat_writer, *dense_tensor_store);
+    } else {
+        save_tensor_store(*dat_writer);
+    }
+    return true;
+}
+
+void TensorAttributeSaver::save_tensor_store(BufferWriter& writer) const {
+    CHECK(get_header_version() == TENSOR_ATTRIBUTE_VERSION);
+    auto                refs_span = _ref_vector_snapshot.span();
+    const uint32_t      docid_limit(refs_span.size());
+    vespalib::nbostream stream;
+    for (uint32_t lid = 0; lid < docid_limit; ++lid) {
+        if (_tensor_store.encode_stored_tensor(refs_span[lid], stream)) {
+            uint32_t sz = stream.size();
+            writer.write(&sz, sizeof(sz));
+            writer.write(stream.peek(), stream.size());
+            stream.clear();
+        } else {
+            uint32_t sz = 0;
+            writer.write(&sz, sizeof(sz));
+        }
+    }
+    writer.flush();
+}
+
+void TensorAttributeSaver::save_dense_tensor_store(BufferWriter&           writer,
+                                                   const DenseTensorStore& dense_tensor_store) const {
+    CHECK(get_header_version() == DENSE_TENSOR_ATTRIBUTE_VERSION);
+    auto           raw_size = dense_tensor_store.getBufSize();
+    auto           refs_span = _ref_vector_snapshot.span();
+    const uint32_t docid_limit(refs_span.size());
+    for (uint32_t lid = 0; lid < docid_limit; ++lid) {
+        if (refs_span[lid].valid()) {
+            auto raw = dense_tensor_store.getRawBuffer(refs_span[lid]);
+            writer.write(&tensorIsPresent, sizeof(tensorIsPresent));
+            writer.write(static_cast<const char*>(raw), raw_size);
+        } else {
+            writer.write(&tensorIsNotPresent, sizeof(tensorIsNotPresent));
+        }
+    }
+    writer.flush();
+}
+
+} // namespace search::tensor

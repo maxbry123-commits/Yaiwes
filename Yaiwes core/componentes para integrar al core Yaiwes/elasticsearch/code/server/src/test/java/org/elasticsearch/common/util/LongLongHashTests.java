@@ -1,0 +1,175 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.common.util;
+
+import org.elasticsearch.common.breaker.CircuitBreaker;
+import org.elasticsearch.common.breaker.CircuitBreakingException;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.indices.CrankyCircuitBreakerService;
+import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+import org.elasticsearch.test.ESTestCase;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.hamcrest.Matchers.equalTo;
+
+public class LongLongHashTests extends ESTestCase {
+    private BigArrays randombigArrays() {
+        return new MockBigArrays(new MockPageCacheRecycler(Settings.EMPTY), new NoneCircuitBreakerService());
+    }
+
+    private LongLongHash randomHash() {
+        // Test high load factors to make sure that collision resolution works fine
+        final float maxLoadFactor = 0.6f + randomFloat() * 0.39f;
+        return new LongLongHash(randomIntBetween(0, 100), maxLoadFactor, randombigArrays());
+    }
+
+    public void testAddDiscardsKeyRefusedByCircuitBreaker() {
+        // add() grows the table and the key array together. If the table grows first and resizing the keys is
+        // then refused, the table accepts ids the key array cannot hold and the next add() writes past its end.
+        CrankyCircuitBreakerService breakerService = new CrankyCircuitBreakerService();
+        BigArrays bigArrays = new MockBigArrays(new MockPageCacheRecycler(Settings.EMPTY), breakerService, true);
+        // Only the adds that grow allocate, so a single pass can see no trip at all. A key array left short of
+        // maxSize is read out of bounds by the very next add, so a handful of passes is enough to land on it.
+        for (int attempt = 0; attempt < 20; attempt++) {
+            List<Long> expected = new ArrayList<>();
+            try (LongLongHash hash = new LongLongHash(1, bigArrays)) {
+                for (long key = 0; key < 2000; key++) {
+                    try {
+                        assertThat(hash.add(key, key + 1), equalTo((long) expected.size()));
+                        expected.add(key);
+                    } catch (CircuitBreakingException e) {
+                        // the key must be rejected outright, leaving the hash exactly as it was
+                        assertThat(e.getMessage(), equalTo(CrankyCircuitBreakerService.ERROR_MESSAGE));
+                    }
+                }
+                assertThat(hash.size(), equalTo((long) expected.size()));
+                for (int i = 0; i < expected.size(); i++) {
+                    assertThat(hash.getKey1(i), equalTo(expected.get(i)));
+                    assertThat(hash.getKey2(i), equalTo(expected.get(i) + 1));
+                    assertThat(hash.find(expected.get(i), expected.get(i) + 1), equalTo((long) i));
+                }
+            } catch (CircuitBreakingException e) {
+                // constructing the hash can trip too, which leaves nothing to verify on this pass
+                assertThat(e.getMessage(), equalTo(CrankyCircuitBreakerService.ERROR_MESSAGE));
+            }
+        }
+        assertThat(breakerService.getBreaker(CircuitBreaker.REQUEST).getUsed(), equalTo(0L));
+    }
+
+    public void testSimple() {
+        try (LongLongHash hash = randomHash()) {
+            assertThat(hash.add(0, 0), equalTo(0L));
+            assertThat(hash.add(0, 1), equalTo(1L));
+            assertThat(hash.add(0, 2), equalTo(2L));
+            assertThat(hash.add(1, 0), equalTo(3L));
+            assertThat(hash.add(1, 1), equalTo(4L));
+
+            assertThat(hash.add(0, 0), equalTo(-1L));
+            assertThat(hash.add(0, 2), equalTo(-3L));
+            assertThat(hash.add(1, 1), equalTo(-5L));
+
+            assertThat(hash.getKey1(0), equalTo(0L));
+            assertThat(hash.getKey2(0), equalTo(0L));
+            assertThat(hash.getKey1(4), equalTo(1L));
+            assertThat(hash.getKey2(4), equalTo(1L));
+        }
+    }
+
+    public void testDuel() {
+        try (LongLongHash hash = randomHash()) {
+            int iters = scaledRandomIntBetween(100, 100000);
+            Key[] values = randomArray(1, iters, Key[]::new, () -> new Key(randomLong(), randomLong()));
+            Map<Key, Integer> keyToId = new HashMap<>();
+            List<Key> idToKey = new ArrayList<>();
+            for (int i = 0; i < iters; ++i) {
+                Key key = randomFrom(values);
+                if (keyToId.containsKey(key)) {
+                    assertEquals(-1 - keyToId.get(key), hash.add(key.key1, key.key2));
+                } else {
+                    assertEquals(keyToId.size(), hash.add(key.key1, key.key2));
+                    keyToId.put(key, keyToId.size());
+                    idToKey.add(key);
+                }
+            }
+
+            assertEquals(keyToId.size(), hash.size());
+            for (Map.Entry<Key, Integer> entry : keyToId.entrySet()) {
+                assertEquals(entry.getValue().longValue(), hash.find(entry.getKey().key1, entry.getKey().key2));
+            }
+
+            assertEquals(idToKey.size(), hash.size());
+            for (long i = 0; i < hash.capacity(); i++) {
+                long id = hash.id(i);
+                if (id >= 0) {
+                    Key key = idToKey.get((int) id);
+                    assertEquals(key.key1, hash.getKey1(id));
+                    assertEquals(key.key2, hash.getKey2(id));
+                }
+            }
+
+            for (long i = 0; i < hash.size(); i++) {
+                Key key = idToKey.get((int) i);
+                assertEquals(key.key1, hash.getKey1(i));
+                assertEquals(key.key2, hash.getKey2(i));
+            }
+        }
+    }
+
+    public void testClear() {
+        try (LongLongHash hash = randomHash()) {
+            int rounds = between(2, 5);
+            for (int round = 0; round < rounds; round++) {
+                int count = randomIntBetween(1, 10_000);
+                Set<Long> distinct = new HashSet<>();
+                while (distinct.size() < count) {
+                    distinct.add(randomLong());
+                }
+                long[] key1s = distinct.stream().mapToLong(Long::longValue).toArray();
+                long[] key2s = new long[count];
+                for (int i = 0; i < count; i++) {
+                    key2s[i] = randomLong();
+                }
+                for (int i = 0; i < count; i++) {
+                    assertThat(hash.add(key1s[i], key2s[i]), equalTo((long) i));
+                    assertThat(hash.getKey1(i), equalTo(key1s[i]));
+                    assertThat(hash.getKey2(i), equalTo(key2s[i]));
+                }
+                assertThat(hash.size(), equalTo((long) count));
+                hash.clear();
+                assertThat(hash.size(), equalTo(0L));
+                for (int i = 0; i < count; i++) {
+                    assertThat(hash.find(key1s[i], key2s[i]), equalTo(-1L));
+                }
+            }
+        }
+    }
+
+    public void testAllocation() {
+        MockBigArrays.assertFitsIn(ByteSizeValue.ofBytes(256), bigArrays -> new LongLongHash(1, bigArrays));
+    }
+
+    class Key {
+        long key1;
+        long key2;
+
+        Key(long key1, long key2) {
+            this.key1 = key1;
+            this.key2 = key2;
+        }
+    }
+
+}

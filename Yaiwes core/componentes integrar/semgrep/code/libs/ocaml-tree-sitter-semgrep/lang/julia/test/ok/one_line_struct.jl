@@ -1,1 +1,0 @@
-struct ThisThing; end

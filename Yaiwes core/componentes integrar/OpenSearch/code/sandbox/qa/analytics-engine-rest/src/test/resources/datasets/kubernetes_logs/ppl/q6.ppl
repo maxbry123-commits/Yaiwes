@@ -1,1 +1,0 @@
-source=kubernetes_logs | dedup `kubernetes.pod_name` | stats count() as unique_pods by `kubernetes.container_image`

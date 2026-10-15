@@ -1,0 +1,34 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import org.elasticsearch.gradle.VersionProperties
+import org.elasticsearch.gradle.testclusters.StandaloneRestIntegTestTask
+
+apply plugin: 'elasticsearch.internal-java-rest-test'
+apply plugin: 'elasticsearch.bwc-test'
+
+dependencies {
+  javaRestTestImplementation project(':x-pack:qa')
+}
+
+// Only run tests for 7.9+, since the node.roles setting was introduced in 7.9.0
+buildParams.bwcVersions.withWireCompatible(v -> v.onOrAfter("7.9.0") &&
+        v != VersionProperties.getElasticsearchVersion()) { bwcVersion, baseName ->
+  tasks.register(bwcTaskName(bwcVersion), StandaloneRestIntegTestTask) {
+    usesBwcDistribution(bwcVersion)
+    systemProperty("tests.old_cluster_version", bwcVersion.toString().replace('-SNAPSHOT', ''))
+  }
+}
+
+tasks.named("javaRestTest") {
+  enabled = false
+}
+
+// Security is explicitly disabled, do not run tests in FIPS mode
+tasks.withType(Test).configureEach {
+  buildParams.withFipsEnabledOnly(it)
+}

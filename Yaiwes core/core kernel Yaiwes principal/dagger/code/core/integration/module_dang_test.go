@@ -1,0 +1,649 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"dagger.io/dagger"
+	"dagger.io/dagger/core"
+	"github.com/dagger/dagger/internal/testutil"
+	"github.com/dagger/testctx"
+	"github.com/stretchr/testify/require"
+)
+
+type DangSuite struct{}
+
+func TestDang(t *testing.T) {
+	testctx.New(t, Middleware()...).RunTests(DangSuite{})
+}
+
+func (DangSuite) TestSDKClientAttachables(ctx context.Context, t *testctx.T) {
+	const secretValue = "sdk-client-attachable-secret"
+
+	ctr := goGitBase(t, connect(ctx, t)).
+		WithNewFile("/work/dagger.json", `{"name":"test","engineVersion":"latest","sdk":{"source":"dang"}}`).
+		WithNewFile("/work/main.dang", `type Test {
+  envSecret: String! { secret(uri: "env://SDK_CLIENT_SECRET").plaintext }
+  hostFile: String! { secret(uri: "file:///host-secret").plaintext }
+  passedSecret(value: Secret!): String! { value.plaintext }
+  passedDirectory(value: Directory!): String! { value.file("allowed.txt").contents }
+  workspaceFile(ws: Workspace!): String! { ws.file("workspace.txt").contents }
+  engineFile: String! { directory.withNewFile("file.txt", "engine-dir").file("file.txt").contents }
+  engineContainer: String! { container.from("alpine:3.20").withExec(["echo", "engine-container"]).stdout }
+}`).
+		WithNewFile("/host-secret", secretValue).
+		WithNewFile("/allowed/allowed.txt", "passed-dir").
+		WithNewFile("/work/workspace.txt", "passed-workspace").
+		WithEnvVariable("SDK_CLIENT_SECRET", secretValue).
+		WithWorkdir("/work")
+
+	t.Run("rejects main client secrets", func(ctx context.Context, t *testctx.T) {
+		_, err := ctr.With(daggerCall("env-secret")).Sync(ctx)
+		requireErrOut(t, err, "SDK client access to host session attachables is denied")
+	})
+
+	t.Run("rejects main client host files", func(ctx context.Context, t *testctx.T) {
+		_, err := ctr.With(daggerCall("host-file")).Sync(ctx)
+		requireErrOut(t, err, "SDK client access to host session attachables is denied")
+	})
+
+	t.Run("allows explicitly passed values", func(ctx context.Context, t *testctx.T) {
+		out, err := ctr.With(daggerCall("passed-secret", "--value", "env://SDK_CLIENT_SECRET")).Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, secretValue, strings.TrimSpace(out))
+
+		out, err = ctr.With(daggerCall("passed-directory", "--value", "/allowed")).Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "passed-dir", strings.TrimSpace(out))
+
+		out, err = ctr.With(daggerCall("workspace-file")).Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "passed-workspace", strings.TrimSpace(out))
+	})
+
+	t.Run("allows engine graph operations", func(ctx context.Context, t *testctx.T) {
+		out, err := ctr.With(daggerCall("engine-file")).Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "engine-dir", strings.TrimSpace(out))
+
+		out, err = ctr.With(daggerCall("engine-container")).Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "engine-container", strings.TrimSpace(out))
+	})
+
+	// Accessing currentModule.source asks for the generated context from inside
+	// Dang evaluation. That re-enters dependency loading under the inert SDK
+	// client, where another SDK must not require host attachables just to build.
+	t.Run("allows loading a go dependency", func(ctx context.Context, t *testctx.T) {
+		depCtr := goGitBase(t, connect(ctx, t)).
+			WithNewFile("/work/dagger.json", `{
+  "name": "test",
+  "engineVersion": "latest",
+  "sdk": {"source": "dang"},
+  "dependencies": [{"name": "gochild", "source": "gochild"}]
+}`).
+			WithNewFile("/work/main.dang", `type Test {
+  let assets: Directory! = currentModule.source.directory("assets")
+
+  viaGo: String! { gochild.value + assets.file("marker.txt").contents }
+}`).
+			WithNewFile("/work/assets/marker.txt", "-asset").
+			WithNewFile("/work/gochild/dagger.json", `{
+  "name": "gochild",
+  "engineVersion": "latest",
+  "sdk": {"source": "go"},
+  "codegen": {"automaticGitignore": false}
+}`).
+			WithNewFile("/work/gochild/main.go", `package main
+
+type Gochild struct{}
+
+func (m *Gochild) Value() string { return "go" }
+`).
+			WithWorkdir("/work")
+
+		out, err := depCtr.With(daggerCall("via-go")).Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "go-asset", strings.TrimSpace(out))
+	})
+}
+
+func (DangSuite) TestDirectives(_ context.Context, t *testctx.T) {
+	assertEntries := func(t *testctx.T, out string, expected ...string) {
+		t.Helper()
+		require.ElementsMatch(t, expected, strings.Split(strings.TrimSpace(out), "\n"))
+	}
+
+	t.Run("positional defaultPath", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-directives").
+			With(daggerCall("with-positional-default-path")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		assertEntries(t, out, "positional-default.txt")
+	})
+
+	t.Run("named defaultPath", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-directives").
+			With(daggerCall("with-named-default-path")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		assertEntries(t, out, "named-default.txt")
+	})
+
+	t.Run("positional ignorePatterns", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-directives").
+			With(daggerCall("with-positional-ignore")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		assertEntries(t, out, "keep.txt")
+	})
+
+	t.Run("named ignorePatterns", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-directives").
+			With(daggerCall("with-named-ignore")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		assertEntries(t, out, "keep.txt")
+	})
+
+	t.Run("mixed syntax", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-directives").
+			With(daggerCall("with-mixed-syntax")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		assertEntries(t, out, "keep.log", "keep.txt")
+	})
+
+	t.Run("cache directive with enum argument", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-directives").
+			With(daggerCall("with-never-cache")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "never", strings.TrimSpace(out))
+	})
+}
+
+func (DangSuite) TestEnums(_ context.Context, t *testctx.T) {
+	t.Run("get status", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-enum").
+			With(daggerCall("get-status", "--status", "COMPLETED")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Contains(t, out, "COMPLETED")
+	})
+
+	t.Run("is completed true", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-enum").
+			With(daggerCall("is-completed", "--status", "COMPLETED")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "true", strings.TrimSpace(out))
+	})
+
+	t.Run("is completed false", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-enum").
+			With(daggerCall("is-completed", "--status", "PENDING")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "false", strings.TrimSpace(out))
+	})
+
+	t.Run("log level priority", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-enum").
+			With(daggerCall("get-level-priority", "--level", "ERROR")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "3", strings.TrimSpace(out))
+	})
+
+	t.Run("dependency enum member with digits", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "enum-dependency").
+			With(daggerCall("call-foo")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "P256", strings.TrimSpace(out))
+	})
+
+	t.Run("object with an enum field as an argument", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := goGitBase(t, c).
+			WithNewFile("dagger.toml", "[modules.types]\nsource = \".dagger/modules/types\"\n").
+			WithNewFile(".dagger/modules/types/dagger-module.toml", `name = "types"
+engineVersion = "latest"
+source = "."
+
+[runtime]
+source = "dang"
+`).
+			WithNewFile(".dagger/modules/types/main.dang", `enum Mood {
+  HAPPY
+  GRUMPY
+}
+
+type Pair {
+  pub left: String!
+  pub mood: Mood!
+
+  new(left: String!, mood: Mood!) {
+    self.left = left
+    self.mood = mood
+    self
+  }
+}
+
+type Types {
+  pub pair(left: String!, mood: Mood!): Pair! {
+    Pair(left: left, mood: mood)
+  }
+
+  pub join(pair: Pair!): String! {
+    pair.left + ":" + JSON.encode(pair.mood)
+  }
+}
+`).
+			With(daggerShellAt("types", "join $(pair --left a --mood GRUMPY)")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, `a:"GRUMPY"`, strings.TrimSpace(out))
+	})
+}
+
+func (DangSuite) TestMismatch(_ context.Context, t *testctx.T) {
+	t.Run("child parent name", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-mismatch").
+			With(daggerCall("--n", "hello", "child", "parent-name")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "hello", strings.TrimSpace(out))
+	})
+}
+
+func (DangSuite) TestCoreTypeShadowing(_ context.Context, t *testctx.T) {
+	t.Run("object shadows core container", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-shadowing").
+			With(daggerCall("make-container", "value")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "container", strings.TrimSpace(out))
+	})
+
+	t.Run("object shadows core directory", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-shadowing").
+			With(daggerCall("make-directory", "value")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "directory", strings.TrimSpace(out))
+	})
+
+	t.Run("qualified core container", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-shadowing").
+			With(daggerCall("make-core-container", "stdout")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "core", strings.TrimSpace(out))
+	})
+}
+
+func (DangSuite) TestWorkspaceArg(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	out, err := moduleEntrypointFixture(t, c, "workspace-arg", "dang/workspace-arg").
+		WithNewFile("marker.txt", "hello from workspace").
+		With(daggerCall("read")).
+		Stdout(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "hello from workspace", strings.TrimSpace(out))
+}
+
+func (DangSuite) TestPrivateArg(_ context.Context, t *testctx.T) {
+	t.Run("default private value", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-private-arg").
+			With(daggerCall("display")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "84", strings.TrimSpace(out))
+	})
+
+	t.Run("custom private value", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-private-arg").
+			With(daggerCall("--private", "10", "display")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "20", strings.TrimSpace(out))
+	})
+
+	t.Run("ls with default source", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-private-arg").
+			With(daggerCall("ls")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Contains(t, out, "main.dang")
+		require.Contains(t, out, "dagger.json")
+	})
+}
+
+func (DangSuite) TestMapFields(_ context.Context, t *testctx.T) {
+	t.Run("map field survives rehydration", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-map-field").
+			With(daggerCall("env-json")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.JSONEq(t, `{"PATH": "/usr/local/bin:/usr/bin:/bin"}`, out)
+	})
+
+	t.Run("map field mutation across calls", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-map-field").
+			With(daggerCall("with-env", "--name", "HOME", "--value", "/root", "env-json")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.JSONEq(t, `{"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/root"}`, out)
+	})
+
+	t.Run("map nested in anonymous object field", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-map-field").
+			With(daggerCall("nested-json")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.JSONEq(t, `{"FOO": "bar"}`, out)
+	})
+
+	t.Run("exposing a map via GraphQL errors", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		_, err := dangModule(t, c, "test-map-pub").
+			With(daggerCall("env")).
+			Stdout(ctx)
+		requireErrOut(t, err, "cannot be exposed via GraphQL")
+	})
+}
+
+func (DangSuite) TestScalars(_ context.Context, t *testctx.T) {
+	t.Run("timestamp", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-scalar").
+			With(daggerCall("get-timestamp", "--ts", "2024-01-01T00:00:00Z")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Contains(t, out, "2024-01-01")
+	})
+
+	t.Run("url", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-scalar").
+			With(daggerCall("get-url", "--url", "https://example.com")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Contains(t, out, "example.com")
+	})
+}
+
+func (DangSuite) TestInterfaces(_ context.Context, t *testctx.T) {
+	t.Run("define, implement, and consume within a module", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-interface").
+			With(daggerCall("local")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "hey, local", strings.TrimSpace(out))
+	})
+
+	t.Run("implement an interface defined by a dependency", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		// A type that `implements` a dependency's interface must not be
+		// required to provide the synthesized `id: ID!` field that Dagger
+		// adds to every interface definition.
+		out, err := dangModule(t, c, "test-interface").
+			With(daggerCall("run")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "hi, world", strings.TrimSpace(out))
+	})
+
+	t.Run("consume structural interface value across dependencies", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "test-interface/cross-dep").
+			With(daggerCall("run")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "ok", strings.TrimSpace(out))
+	})
+}
+
+// TestVersionedSyntax covers the Dang major version routing: modules pinned
+// to an engineVersion before v0.21.5 are evaluated with Dang v1 (`.{ }` is
+// selection), and modules at v0.21.5+ with Dang v2 (`.{ }` is dot-block
+// application, `.{{ }}` is selection). See core/sdk/dang/README.md.
+func (DangSuite) TestVersionedSyntax(_ context.Context, t *testctx.T) {
+	t.Run("v1 selection for modules pinned before v0.21.5", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "legacy-selection").
+			With(daggerCall("contents")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "old syntax", strings.TrimSpace(out))
+
+		out, err = dangModule(t, c, "legacy-selection").
+			With(daggerCall("size")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "10", strings.TrimSpace(out))
+	})
+
+	t.Run("v2 dot-block and selection for modules at v0.21.5+", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "dot-block").
+			With(daggerCall("double", "--n", "21")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "42", strings.TrimSpace(out))
+
+		out, err = dangModule(t, c, "dot-block").
+			With(daggerCall("contents")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "new syntax", strings.TrimSpace(out))
+
+		out, err = dangModule(t, c, "dot-block").
+			With(daggerCall("size")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "10", strings.TrimSpace(out))
+	})
+}
+
+func (DangSuite) TestNullableSDKInputObjectFields(_ context.Context, t *testctx.T) {
+	for _, call := range []string{
+		"all-null",
+		"string-populated",
+		"file-populated",
+		"secret-populated",
+	} {
+		t.Run(call, func(ctx context.Context, t *testctx.T) {
+			c := connect(ctx, t)
+
+			out, err := dangModule(t, c, "test-nullable-sdk-input").
+				With(daggerCall(call)).
+				Stdout(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "ok", strings.TrimSpace(out))
+		})
+	}
+}
+
+func (DangSuite) TestSelfCallReturningOwnType(_ context.Context, t *testctx.T) {
+	// A self-call that returns the module's own object type surfaces as the
+	// object's GraphQL ID (a string), since the object lives in the module's
+	// runtime schema. The runtime must load that ID back into the object
+	// rather than choke on the raw string. Regression test for tui-qa's
+	// `stop`, which returns `tuiQa`.
+	t.Run("return own type from a self-call and read a field", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "self-calls").
+			With(daggerCall("fresh", "get-message")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "hello from field", strings.TrimSpace(out))
+	})
+
+	t.Run("read a field off a self-returned object", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "self-calls").
+			With(daggerCall("self-message")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "hello from field", strings.TrimSpace(out))
+	})
+
+	// Self-calls are not limited to the module's main type: a field may return
+	// a secondary object type as it lives in the runtime schema (namespaced,
+	// carrying a GraphQL id), annotated Dagger.TestWidget. This exercises the
+	// declaration-phase injection of *every* declared type, not just the main
+	// one. The label is passed in through the API and must round-trip through
+	// the self-call's ID, so it's constructed via the API rather than hardcoded.
+	t.Run("return a secondary type from a self-call", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "self-calls").
+			With(daggerCall("widget", "--label", "constructed via api", "get-label")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "constructed via api", strings.TrimSpace(out))
+	})
+
+	t.Run("read a field off a self-returned secondary object", func(ctx context.Context, t *testctx.T) {
+		c := connect(ctx, t)
+
+		out, err := dangModule(t, c, "self-calls").
+			With(daggerCall("widget-label", "--label", "constructed via api")).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "constructed via api", strings.TrimSpace(out))
+	})
+}
+
+// TestLoadErrorReport locks in where a Dang load failure lands. Dang renders
+// inference and evaluation failures as full reports — multi-line, colored
+// source excerpts. Those reports belong in the function call's stderr, not the
+// span error, which is copied verbatim into tool results and the TUI's error
+// line; the error carries the diagnostic.
+func (DangSuite) TestLoadErrorReport(ctx context.Context, t *testctx.T) {
+	writeModule := func(t *testctx.T, source string) string {
+		t.Helper()
+		modDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(modDir, "dagger.json"),
+			[]byte(`{"name":"broken","engineVersion":"v1.0.0","sdk":"dang"}`), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(modDir, "main.dang"), []byte(source), 0o644))
+		return modDir
+	}
+
+	// requireReported asserts that the report reached the logs but not the
+	// error: only its diagnostic is returned, without source excerpts or ANSI.
+	requireReported := func(t *testctx.T, c *dagger.Client, logs *safeBuffer, err error, diagnostic string) {
+		t.Helper()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), diagnostic)
+		require.NotContains(t, err.Error(), "main.dang:")
+		require.NotContains(t, err.Error(), "\033[")
+		require.NotContains(t, err.Error(), "--> ")
+		require.NoError(t, c.Close()) // close + flush logs
+		require.Contains(t, logs.String(), diagnostic)
+		require.Contains(t, logs.String(), "main.dang:")
+	}
+
+	t.Run("inference error in a function body surfaces at call time", func(ctx context.Context, t *testctx.T) {
+		var logs safeBuffer
+		c := connect(ctx, t, dagger.WithLogOutput(&logs))
+
+		// Body inference is deferred past the declaration-only ModuleTypes
+		// pass, so the module loads and the failure lands on the call.
+		modDir := writeModule(t, `type Broken {
+  hello: String! { intentionallyUndefinedSymbol }
+}
+`)
+		mod, err := core.NewQuery(c).ModuleSource(modDir).AsModule().Sync(ctx)
+		require.NoError(t, err)
+		require.NoError(t, mod.Serve(ctx))
+
+		_, err = testutil.QueryWithClient[struct {
+			Broken struct{ Hello string }
+		}](c, t, `{ broken { hello } }`, nil)
+		requireReported(t, c, &logs, err, "intentionallyUndefinedSymbol")
+	})
+
+	t.Run("declaration error surfaces when loading the module", func(ctx context.Context, t *testctx.T) {
+		var logs safeBuffer
+		c := connect(ctx, t, dagger.WithLogOutput(&logs))
+
+		modDir := writeModule(t, `type Broken {
+  hello: IntentionallyUndefinedType! { "hi" }
+}
+`)
+		_, err := core.NewQuery(c).ModuleSource(modDir).AsModule().Sync(ctx)
+		requireReported(t, c, &logs, err, "unresolved type: IntentionallyUndefinedType")
+	})
+}
+
+func dangModule(t *testctx.T, c *dagger.Client, moduleName string) *core.Container {
+	t.Helper()
+	modSrc, err := filepath.Abs(filepath.Join("./testdata/modules/dang", moduleName))
+	require.NoError(t, err)
+
+	return goGitBase(t, c).
+		WithDirectory("testdata/modules/dang/"+moduleName, core.NewQuery(c).Host().Directory(modSrc)).
+		WithWorkdir("/work/testdata/modules/dang/" + moduleName)
+}

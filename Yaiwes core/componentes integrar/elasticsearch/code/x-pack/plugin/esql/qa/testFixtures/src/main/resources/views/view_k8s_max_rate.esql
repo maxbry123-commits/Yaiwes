@@ -1,3 +1,0 @@
-TS k8s
-| STATS max_rate=max(rate(network.total_bytes_in))
-| EVAL max_rate=ROUND(max_rate, 6)

@@ -1,3 +1,0 @@
-:- include('Driver').
-
-go :- sg(multiup,'Data/cycles').

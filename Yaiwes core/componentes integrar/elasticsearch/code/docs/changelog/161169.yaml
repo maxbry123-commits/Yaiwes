@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161169
-summary: Admit Parquet GET units via async tickets
-type: enhancement

@@ -1,3 +1,0 @@
-FROM employees
-| ENRICH languages ON first_name
-| LIMIT 5 BY emp_no

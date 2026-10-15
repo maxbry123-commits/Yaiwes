@@ -1,0 +1,74 @@
+{
+  "bundle_bytes": 96782991,
+  "bundle_sha256": "581b1338d6d5880c25f8b7b54101d21dd0f9bd1fde8ff1444ddd07a6bda0c3f8",
+  "extracted_tree": {
+    "bytes": 182442227,
+    "files": 16686,
+    "sha256": "8b6e8ed7921b72289cdb605209ea7f778db48ccaafec7fc195961383c0e0634e"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0001",
+      "sha256": "837438815e4822b7c47c8d81239bcf55bb9d1164274cf0ced00f2481472debc2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0002",
+      "sha256": "0c1c723f9e330808d00c5d89bd50f1371872397be4879591b944ac49c0a4e954"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0003",
+      "sha256": "b6afc4fdf9fa46a077995d869d2b6766436659b74f9876bfa504e2f62e92c45a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0004",
+      "sha256": "e4b09fdf7cce6a401fd7ece3c45dbff49fecd6fed20f562565288855a1e430d2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0005",
+      "sha256": "76f1c02a6988af4b88f1c194fd39e54744dc7e536b886e1462c08cbe07c15626"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0006",
+      "sha256": "01e883cd4e5fe20b93894f32897decc9174e8683823350f6e6e291d5bb155480"
+    },
+    {
+      "bytes": 12582912,
+      "name": "dagger.bundle.zip.part-0007",
+      "sha256": "58b9006f469dfa87a1ae010b33fdbe3faa9fb29ed6ae8fc4c4e2eeac7d1f942f"
+    },
+    {
+      "bytes": 8702607,
+      "name": "dagger.bundle.zip.part-0008",
+      "sha256": "462472896ffc020be14355677e71b67ff592cdd915d18a8a268120f92a965a0f"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [
+    ".claude/skills",
+    ".codex/skills",
+    ".github/skills"
+  ],
+  "skipped_special_count": 3,
+  "slug": "dagger",
+  "source_bytes": 182442227,
+  "source_commit": "5d313bf2e326ad8297f4abb1f75cb432944b2c26",
+  "source_files": 16686,
+  "source_ref": "main",
+  "source_repo": "dagger/dagger",
+  "source_tree": {
+    "bytes": 182442227,
+    "files": 16686,
+    "sha256": "8b6e8ed7921b72289cdb605209ea7f778db48ccaafec7fc195961383c0e0634e"
+  }
+}

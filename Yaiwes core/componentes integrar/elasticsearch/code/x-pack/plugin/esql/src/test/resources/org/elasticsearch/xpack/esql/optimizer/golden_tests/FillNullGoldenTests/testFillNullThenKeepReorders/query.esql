@@ -1,3 +1,0 @@
-FROM employees
-| FILLNULL "Unknown" ON gender
-| KEEP first_name, gender, emp_no

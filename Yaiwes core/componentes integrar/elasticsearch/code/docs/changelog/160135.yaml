@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160135
-summary: Fix `NOT IN` dropping rows from a negative-zero partition
-type: bug

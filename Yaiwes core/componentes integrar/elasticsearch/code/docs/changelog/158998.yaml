@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 158998
-summary: "ESQL:DS: Blank CSV/TSV cells read as null unless declared"
-type: bug

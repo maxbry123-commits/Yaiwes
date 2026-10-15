@@ -1,3 +1,0 @@
-FROM employees
-| WHERE emp_no IN (FROM employees | KEEP emp_no)
-   OR salary IN (FROM employees | KEEP salary)

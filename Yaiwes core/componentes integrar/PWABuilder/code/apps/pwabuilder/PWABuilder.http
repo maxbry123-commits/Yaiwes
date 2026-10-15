@@ -1,6 +1,0 @@
-@PWABuilder_HostAddress = http://localhost:5209
-
-GET {{PWABuilder_HostAddress}}/manifest/
-Accept: application/json
-
-###

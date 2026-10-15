@@ -1,3 +1,0 @@
-FROM sample_data METADATA _index
-| WHERE starts_with(_index, "sample")
-| KEEP message

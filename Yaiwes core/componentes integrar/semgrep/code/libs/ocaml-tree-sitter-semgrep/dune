@@ -1,2 +1,0 @@
-; Generated language parsers are standalone projects.
-(dirs core)

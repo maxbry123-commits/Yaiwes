@@ -1,4 +1,0 @@
-[[PackageOverrides]]
-name = "org.apache.logging.log4j:log4j-web"
-ignore = true
-reason = "testing transitive bypass"

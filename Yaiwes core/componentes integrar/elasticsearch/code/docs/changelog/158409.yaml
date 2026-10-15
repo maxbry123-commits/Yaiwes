@@ -1,5 +1,0 @@
-pr: 158409
-summary: Charge the iterator a `for-each` loop allocates
-area: Infra/Scripting
-type: enhancement
-issues: []

@@ -1,1 +1,0 @@
-FROM heavy_a, heavy_b | STATS s = STD_DEV(salary)

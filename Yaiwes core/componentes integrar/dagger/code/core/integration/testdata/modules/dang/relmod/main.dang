@@ -1,5 +1,0 @@
-type Relmod {
-  pub whoami: String! {
-    "loaded from submodule"
-  }
-}

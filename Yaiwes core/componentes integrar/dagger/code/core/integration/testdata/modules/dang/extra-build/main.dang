@@ -1,5 +1,0 @@
-type Extra {
-  pub build: String! {
-    "extra build"
-  }
-}

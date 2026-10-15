@@ -1,5 +1,0 @@
-area: Allocation
-issues: []
-pr: 156898
-summary: Add a per-shard search lane requirement to cluster info
-type: enhancement

@@ -1,3 +1,0 @@
-FROM employees
-| KEEP emp_no, salary, gender
-| FILLNULL DEFAULT ON *

@@ -1,4 +1,0 @@
-nextSnapshotId=128
-snapshot.0.valid=false
-snapshot.0.syncToken=bogus
-snapshot.0.dirName=foo

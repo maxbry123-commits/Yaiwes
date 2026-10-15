@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161517
-summary: Deliver admission grants inline off the I/O pool
-type: bug

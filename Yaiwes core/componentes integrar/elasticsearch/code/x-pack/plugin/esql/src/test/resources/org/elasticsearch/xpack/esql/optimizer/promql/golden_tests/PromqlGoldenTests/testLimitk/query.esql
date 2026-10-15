@@ -1,1 +1,0 @@
-PROMQL index=k8s step=1h result=(limitk(3, network.bytes_in))

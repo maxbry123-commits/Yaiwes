@@ -1,0 +1,178 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.config.server.modelfactory;
+
+import com.google.common.collect.ImmutableSet;
+import com.yahoo.cloud.config.ConfigserverConfig;
+import com.yahoo.component.Version;
+import com.yahoo.config.application.api.ApplicationPackage;
+import com.yahoo.config.model.api.ConfigDefinitionRepo;
+import com.yahoo.config.model.api.EndpointCertificateSecretStore;
+import com.yahoo.config.model.api.Model;
+import com.yahoo.config.model.api.ModelContext;
+import com.yahoo.config.model.api.ModelFactory;
+import com.yahoo.config.model.api.OnnxModelCost;
+import com.yahoo.config.model.api.Provisioned;
+import com.yahoo.config.model.application.provider.MockFileRegistry;
+import com.yahoo.config.provision.ApplicationId;
+import com.yahoo.config.provision.CloudResourceTags;
+import com.yahoo.config.provision.DockerImage;
+import com.yahoo.config.provision.TenantName;
+import com.yahoo.config.provision.Zone;
+import com.yahoo.vespa.config.server.ServerCache;
+import com.yahoo.vespa.config.server.application.Application;
+import com.yahoo.vespa.config.server.application.ApplicationCuratorDatabase;
+import com.yahoo.vespa.config.server.application.ApplicationVersions;
+import com.yahoo.vespa.config.server.deploy.ModelContextImpl;
+import com.yahoo.vespa.config.server.monitoring.MetricUpdater;
+import com.yahoo.vespa.config.server.monitoring.Metrics;
+import com.yahoo.vespa.config.server.provision.HostProvisionerProvider;
+import com.yahoo.vespa.config.server.session.SessionZooKeeperClient;
+import com.yahoo.vespa.config.server.session.SilentDeployLogger;
+import com.yahoo.vespa.config.server.tenant.ContainerEndpointsCache;
+import com.yahoo.vespa.config.server.tenant.EndpointCertificateMetadataStore;
+import com.yahoo.vespa.config.server.tenant.EndpointCertificateRetriever;
+import com.yahoo.vespa.config.server.tenant.TenantRepository;
+import com.yahoo.vespa.curator.Curator;
+import com.yahoo.vespa.flags.FlagSource;
+import com.yahoo.text.Text;
+
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Builds activated versions of the right model versions
+ *
+ * @author bratseth
+ */
+public class ActivatedModelsBuilder extends ModelsBuilder<Application> {
+
+    private static final Logger log = Logger.getLogger(ActivatedModelsBuilder.class.getName());
+
+    private final TenantName tenant;
+    private final long applicationGeneration;
+    private final SessionZooKeeperClient zkClient;
+    private final Optional<ApplicationVersions> activeApplicationVersions;
+    private final ConfigDefinitionRepo configDefinitionRepo;
+    private final Metrics metrics;
+    private final Curator curator;
+    private final FlagSource flagSource;
+    private final ExecutorService executor;
+    private final OnnxModelCost onnxModelCost;
+    private final List<EndpointCertificateSecretStore> endpointCertificateSecretStores;
+    private final Provisioned provisioned = new Provisioned();
+
+    public ActivatedModelsBuilder(TenantName tenant,
+                                  long applicationGeneration,
+                                  SessionZooKeeperClient zkClient,
+                                  Optional<ApplicationVersions> activeApplicationVersions,
+                                  ExecutorService executor,
+                                  Curator curator,
+                                  Metrics metrics,
+                                  FlagSource flagSource,
+                                  HostProvisionerProvider hostProvisionerProvider,
+                                  ConfigserverConfig configserverConfig,
+                                  Zone zone,
+                                  ModelFactoryRegistry modelFactoryRegistry,
+                                  ConfigDefinitionRepo configDefinitionRepo,
+                                  OnnxModelCost onnxModelCost,
+                                  List<EndpointCertificateSecretStore> endpointCertificateSecretStores) {
+        super(modelFactoryRegistry, configserverConfig, zone, hostProvisionerProvider, new SilentDeployLogger());
+        this.tenant = tenant;
+        this.applicationGeneration = applicationGeneration;
+        this.zkClient = zkClient;
+        this.activeApplicationVersions = activeApplicationVersions;
+        this.configDefinitionRepo = configDefinitionRepo;
+        this.metrics = metrics;
+        this.curator = curator;
+        this.flagSource = flagSource;
+        this.executor = executor;
+        this.onnxModelCost = onnxModelCost;
+        this.endpointCertificateSecretStores = endpointCertificateSecretStores;
+    }
+
+    @Override
+    protected Application buildModelVersion(ModelFactory modelFactory,
+                                            ApplicationPackage applicationPackage,
+                                            ApplicationId applicationId,
+                                            Optional<DockerImage> wantedDockerImageRepository,
+                                            Version wantedNodeVespaVersion) {
+        log.log(Level.FINE, () -> Text.format("Loading model version %s for session %s application %s",
+                                                modelFactory.version(), applicationGeneration, applicationId));
+        ModelContext.Properties modelContextProperties = createModelContextProperties(applicationId, modelFactory.version(), applicationPackage);
+        ModelContext modelContext = new ModelContextImpl(
+                applicationPackage,
+                modelOf(modelFactory.version()),
+                new SilentDeployLogger(),
+                configDefinitionRepo,
+                getForVersionOrLatest(applicationPackage.getFileRegistries(), modelFactory.version()).orElse(new MockFileRegistry()),
+                executor,
+                new ApplicationCuratorDatabase(tenant, curator, configserverConfig).readReindexingStatus(applicationId),
+                createStaticProvisioner(applicationPackage, modelContextProperties.applicationId()),
+                provisioned,
+                modelContextProperties,
+                Optional.empty(),
+                onnxModelCost,
+                wantedDockerImageRepository,
+                modelFactory.version(),
+                wantedNodeVespaVersion);
+        MetricUpdater applicationMetricUpdater = metrics.getOrCreateMetricUpdater(Metrics.createDimensions(applicationId));
+        ServerCache serverCache = new ServerCache(configDefinitionRepo, zkClient.getUserConfigDefinitions());
+        return new Application(modelFactory.createModel(modelContext),
+                               serverCache,
+                               applicationGeneration,
+                               modelFactory.version(),
+                               applicationMetricUpdater,
+                               applicationId);
+    }
+
+    /**
+     * All the clusters provisioned by all model versions built by this
+     * (those built first prioritized when multiple build the same).
+     */
+    public Provisioned provisioned() { return provisioned; }
+
+    private Optional<Model> modelOf(Version version) {
+        if (activeApplicationVersions.isEmpty()) return Optional.empty();
+        return activeApplicationVersions.get().get(version).map(Application::getModel);
+    }
+
+    private static <T> Optional<T> getForVersionOrLatest(Map<Version, T> map, Version version) {
+        if (map.isEmpty()) {
+            return Optional.empty();
+        }
+        T value = map.get(version);
+        if (value == null) {
+            value = map.get(map.keySet().stream().max(Comparator.naturalOrder()).get());
+        }
+        return Optional.of(value);
+    }
+
+    private ModelContext.Properties createModelContextProperties(ApplicationId applicationId,
+                                                                 Version modelVersion,
+                                                                 ApplicationPackage applicationPackage) {
+        return new ModelContextImpl.Properties(applicationId,
+                                               modelVersion,
+                                               configserverConfig,
+                                               ImmutableSet.copyOf(new ContainerEndpointsCache(TenantRepository.getTenantPath(tenant), curator).read(applicationId)),
+                                               false, // We may be bootstrapping, but we only know and care during prepare
+                                               false, // Always false, assume no one uses it when activating
+                                               LegacyFlags.from(applicationPackage, flagSource.snapshot()),
+                                               new EndpointCertificateMetadataStore(curator, TenantRepository.getTenantPath(tenant))
+                                                       .readEndpointCertificateMetadata(applicationId)
+                                                       .flatMap(new EndpointCertificateRetriever(endpointCertificateSecretStores)::readEndpointCertificateSecrets),
+                                               zkClient.readAthenzDomain(),
+                                               zkClient.readQuota(),
+                                               zkClient.readTenantVaults(),
+                                               zkClient.readTenantSecretStores(),
+                                               zkClient.readOperatorCertificates(),
+                                               zkClient.readCloudAccount(),
+                                               zkClient.readCloudResourceTags(),
+                                               zkClient.readDataplaneTokens());
+    }
+
+}

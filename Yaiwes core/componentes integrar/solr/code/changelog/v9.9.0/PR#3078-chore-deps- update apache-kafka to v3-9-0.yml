@@ -1,7 +1,0 @@
-title: 'chore(deps): update apache.kafka to v3.9.0'
-type: dependency_update
-authors:
-- name: solrbot
-links:
-- name: PR#3078
-  url: https://github.com/apache/solr/pull/3078

@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: Apache-2.0
+[project]
+name = "memento-s"
+version = "0.4.0"
+description = "A skill-centric runtime for persistent and extensible LLM agents"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [
+    { name = "Memento-Skills contributors" },
+]
+keywords = [
+    "large-language-model-agents",
+    "agent-skills",
+    "procedural-memory",
+    "software-frameworks",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "typer",
+    "rich",
+    "pydantic",
+    "pydantic-settings",
+    "python-dotenv",
+    "watchdog",
+    "anthropic",
+    "openai",
+    "litellm>=1.81.10",
+    "mcp>=1.27.0",
+    "tiktoken>=0.7.0,<0.12.0",
+    "httpx",
+    "beautifulsoup4",
+    "markdownify",
+    "aiohttp",
+    "requests",
+    "certifi>=2023.7.22",
+    "aiofiles",
+    "anyio",
+    "pyyaml",
+    "python-frontmatter>=1.0.0",
+    "google_search_results",
+    "crawl4ai",
+    "camel-ai",
+    "nltk",
+    "jieba>=0.42.1",
+    "rank-bm25",
+    "flet==0.82.0",
+    "platformdirs>=4.0.0",
+    "loguru>=0.7.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.19.0",
+    "sqlite-vec>=0.1.0",
+    "alembic>=1.12.0",
+    "inflection>=0.5.1",
+    "jsonschema>=4.20.0",
+    # IM Platform dependencies
+    "websockets>=12.0",
+    "lark-oapi>=1.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "build>=1.2.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+]
+qwen-router = [
+    "accelerate>=1.0.0",
+    "numpy>=1.24.0",
+    "torch>=2.2.0",
+    "transformers>=4.51.0",
+]
+
+[project.urls]
+Homepage = "https://memento.run/"
+Documentation = "https://github.com/Memento-Teams/Memento-Skills#readme"
+Repository = "https://github.com/Memento-Teams/Memento-Skills"
+Download = "https://memento.run/release"
+Issues = "https://github.com/Memento-Teams/Memento-Skills/issues"
+
+
+[project.scripts]
+memento = "cli.main:memento_entry"
+memento-gui = "gui.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ─── Flet build（原生 Flutter 应用，单进程单图标）──────────────────────────────
+[tool.flet]
+app.module_name     = "gui.app"
+app.name            = "memento-s"
+app.product         = "Memento-S"
+app.org             = "com.yangtzeailab.memento-s"
+app.bundle_id       = "com.yangtzeailab.memento-s.app"
+app.build_version   = "0.4.0"
+app.build_number    = 9
+
+[tool.flet.app.macos]
+# 高分辨率 + 网络/文件权限（Flet 本地服务需要）
+info_plist    = { NSHighResolutionCapable = true }
+entitlements  = { "com.apple.security.network.client" = true, "com.apple.security.network.server" = true, "com.apple.security.files.user-selected.read-write" = true }
+
+# ─── Briefcase packaging ───────────────────────────────────────────────────────
+[tool.briefcase]
+project_name = "Memento-S"
+bundle = "com.memento-s"
+version = "0.4.0"
+
+[tool.briefcase.app.memento-s]
+formal_name = "Memento-S"
+description = "Memento-S Agent"
+# Entry point: briefcase calls gui.app.main()
+main_module = "gui.app"
+# All source packages to copy into the bundle
+sources = [
+    "gui",
+    "core",
+    "middleware",
+    "cli",
+    "utils",
+    "builtin",
+    "daemon",
+    "infra",
+    "tools",
+    "shared",
+    "im",
+    "server",
+    "bootstrap",   # bootstrap/ package (was bootstrap.py)
+]
+requires = [
+    "flet>=0.25.0",
+    "litellm>=1.81.10",
+    "anthropic",
+    "openai",
+    "typer",
+    "rich",
+    "pydantic",
+    "pydantic-settings",
+    "python-dotenv",
+    "watchdog",
+    "mcp>=1.27.0",
+    "tiktoken>=0.7.0,<0.12.0",
+    "httpx",
+    "beautifulsoup4",
+    "markdownify",
+    "aiohttp",
+    "requests",
+    "aiofiles",
+    "anyio",
+    "pyyaml",
+    "platformdirs>=4.0.0",
+    "loguru>=0.7.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.19.0",
+    "sqlite-vec>=0.1.0",
+    "alembic>=1.12.0",
+]
+
+[tool.briefcase.app.memento-s.windows]
+# Windows-specific: GUI app (no console window)
+console_app = false
+
+# ─── Hatch build ───────────────────────────────────────────────────────────────
+[tool.hatch.build.targets.wheel]
+packages = ["cli", "core", "middleware", "gui", "utils", "builtin", "daemon", "infra", "tools", "shared", "im", "server"]
+include = [
+    "bootstrap.py",
+    "version.py",
+    "builtin/skills/**",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"bootstrap.py" = "bootstrap.py"
+"version.py" = "version.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "cli/",
+    "core/",
+    "middleware/",
+    "gui/",
+    "utils/",
+    "builtin/",
+    "daemon/",
+    "infra/",
+    "tools/",
+    "shared/",
+    "im/",
+    "server/",
+    "bootstrap.py",
+    "version.py",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "CITATION.cff",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "howto.md",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+asyncio_mode = "strict"
+python_files = ["test_*.py"]
+norecursedirs = ["scripts"]
+markers = [
+    "smoke: fast checks for core functionality",
+    "slow: tests that invoke an LLM or process substantial data",
+    "integration: end-to-end tests requiring external services or credentials",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["core", "infra", "middleware", "shared", "tools", "utils"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

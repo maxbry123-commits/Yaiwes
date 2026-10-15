@@ -1,3 +1,0 @@
-FROM web_logs
-| GROK uri "/%{WORD:path}/%{WORD:file}"
-| LIMIT 2 BY domain

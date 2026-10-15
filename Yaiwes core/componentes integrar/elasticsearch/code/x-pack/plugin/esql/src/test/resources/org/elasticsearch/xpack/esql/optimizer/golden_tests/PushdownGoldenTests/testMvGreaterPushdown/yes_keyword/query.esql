@@ -1,3 +1,0 @@
-    FROM all_types
-    | KEEP keyword
-    | WHERE mv_greater(keyword, "m")

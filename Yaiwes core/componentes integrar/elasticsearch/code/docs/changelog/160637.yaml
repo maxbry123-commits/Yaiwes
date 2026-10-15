@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160637
-summary: "Cap external data source and dataset description length"
-type: bug

@@ -1,7 +1,0 @@
-title: Change JettySolrRunner's use of GracefulHandler to be opt-in
-type: changed
-authors:
-- name: hossman
-links:
-- name: SOLR-18285
-  url: https://issues.apache.org/jira/browse/SOLR-18285

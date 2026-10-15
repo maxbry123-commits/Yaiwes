@@ -1,7 +1,0 @@
-title: Update mockito to v5.16.1
-type: dependency_update
-authors:
-- name: solrbot
-links:
-- name: PR#3234
-  url: https://github.com/apache/solr/pull/3234

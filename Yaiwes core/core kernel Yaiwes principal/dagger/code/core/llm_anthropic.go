@@ -1,0 +1,654 @@
+package core
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/shared/constant"
+	telemetry "github.com/dagger/otel-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+)
+
+type AnthropicClient struct {
+	client   *anthropic.Client
+	endpoint *LLMEndpoint
+}
+
+// defaultClaudeCodeVersion is the Claude Code release the subscription OAuth
+// client identifies as in its user-agent. Anthropic gates newly released
+// models on a minimum Claude Code version — older clients get a 400 with
+// error_code claude_code_version_too_old — so this has to track the current
+// release. Check it with `npm view @anthropic-ai/claude-code version`; don't
+// read it off a local `claude --version`, since the stable channel lags
+// latest and an installed copy is often below the floor a new model needs.
+// Between Dagger releases, users can override it with
+// ANTHROPIC_CLAUDE_CODE_VERSION (see LLMRouter.LoadConfig).
+const defaultClaudeCodeVersion = "2.1.281"
+
+// claudeCodeVersionPattern is the shape ANTHROPIC_CLAUDE_CODE_VERSION must
+// take: a bare X.Y.Z, exactly as Claude Code itself reports it.
+var claudeCodeVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+
+// claudeCodeUserAgent formats the user-agent Claude Code sends, for the given
+// release or defaultClaudeCodeVersion when empty.
+func claudeCodeUserAgent(version string) string {
+	if version == "" {
+		version = defaultClaudeCodeVersion
+	}
+	return fmt.Sprintf("claude-cli/%s (external, cli)", version)
+}
+
+func newAnthropicClient(endpoint *LLMEndpoint) *AnthropicClient {
+	var opts []option.RequestOption
+	switch {
+	case endpoint.IsOAuth:
+		// Claude Code subscription OAuth: bearer token + Claude Code identity
+		// headers. The endpoint rejects requests that don't look like Claude
+		// Code (see also the Claude Code system-prompt setup in SendQuery). The
+		// token baked in here is only the value observed at construction; when the
+		// endpoint carries a credential source, credentialTransport overwrites
+		// the header with the current token on every request.
+		opts = append(opts,
+			option.WithAuthToken(endpoint.AuthToken),
+			option.WithHeader("anthropic-beta", "claude-code-20250219,oauth-2025-04-20"),
+			option.WithHeader("user-agent", claudeCodeUserAgent(endpoint.ClaudeCodeVersion)),
+			option.WithHeader("x-app", "cli"),
+		)
+	case endpoint.Key != "":
+		opts = append(opts, option.WithAPIKey(endpoint.Key))
+	}
+	if endpoint.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(endpoint.BaseURL))
+	}
+	opts = append(opts, option.WithHTTPClient(endpoint.otelHTTPClient("anthropic")))
+	client := anthropic.NewClient(opts...)
+	return &AnthropicClient{
+		client:   &client,
+		endpoint: endpoint,
+	}
+}
+
+var ephemeral = anthropic.CacheControlEphemeralParam{Type: constant.Ephemeral("").Default()}
+
+var _ LLMClient = (*AnthropicClient)(nil)
+
+var anthropicRetryable = []string{
+	// there's gotta be a better way to do this...
+	string(constant.RateLimitError("").Default()),
+	string(constant.OverloadedError("").Default()),
+	"Internal server error",
+}
+
+// IsRetryable reports whether a failed turn is worth resending. A rejected
+// credential is deliberately absent from the list: it is only retryable once
+// the credential has been re-resolved, so that case is handled centrally (see
+// sendQueryWithRetry).
+func (c *AnthropicClient) IsRetryable(err error) bool {
+	msg := err.Error()
+	for _, retryable := range anthropicRetryable {
+		if strings.Contains(msg, retryable) {
+			return true
+		}
+	}
+	return false
+}
+
+//nolint:gocyclo
+func (c *AnthropicClient) SendQuery(ctx context.Context, history []*LLMMessage, tools []LLMTool, opts *LLMCallOpts) (res *LLMResponse, rerr error) {
+	// Stream this turn's content into per-block display spans (thinking, text
+	// response, tool-call arguments) as it arrives.
+	dp := newDisplayPhases(ctx, opts.CallDigest, tools)
+	defer func() {
+		dp.CloseAll()
+		if rerr != nil {
+			dp.Abort(rerr)
+		}
+	}()
+
+	m := telemetry.Meter(ctx, InstrumentationLibrary)
+	spanCtx := trace.SpanContextFromContext(ctx)
+	attrs := []attribute.KeyValue{
+		attribute.String(telemetry.MetricsTraceIDAttr, spanCtx.TraceID().String()),
+		attribute.String(telemetry.MetricsSpanIDAttr, spanCtx.SpanID().String()),
+		attribute.String("model", c.endpoint.Model),
+		attribute.String("provider", string(c.endpoint.Provider)),
+	}
+
+	inputTokens, err := m.Int64Gauge(telemetry.LLMInputTokens)
+	if err != nil {
+		return nil, err
+	}
+
+	inputTokensCacheReads, err := m.Int64Gauge(telemetry.LLMInputTokensCacheReads)
+	if err != nil {
+		return nil, err
+	}
+
+	inputTokensCacheWrites, err := m.Int64Gauge(telemetry.LLMInputTokensCacheWrites)
+	if err != nil {
+		return nil, err
+	}
+
+	outputTokens, err := m.Int64Gauge(telemetry.LLMOutputTokens)
+	if err != nil {
+		return nil, err
+	}
+
+	// Size the reply and configure reasoning (extended thinking) up front.
+	// Whether thinking ends up enabled for this request also decides whether
+	// prior thinking blocks may be resubmitted: Anthropic rejects a request
+	// that carries thinking blocks when thinking isn't enabled for it
+	// ("thinking blocks without thinking enabled"). If a prior turn produced
+	// thinking but this turn has reasoning off, the stored blocks must be dropped.
+	reasoning := c.reasoningParams(history, tools, opts)
+	reasoningEnabled := reasoning.enabled
+
+	// Convert content-block messages to Anthropic-specific message parameters.
+	var messages []anthropic.MessageParam
+	var systemPrompts []anthropic.TextBlockParam
+	for _, msg := range history {
+		if msg == nil {
+			return nil, fmt.Errorf("anthropic: nil message")
+		}
+		if err := ValidateLLMContent(msg.Content); err != nil {
+			return nil, fmt.Errorf("anthropic: %w", err)
+		}
+		for _, block := range msg.Content {
+			validRole := false
+			switch msg.Role {
+			case LLMMessageRoleSystem:
+				validRole = block.Kind == LLMContentText
+			case LLMMessageRoleUser:
+				validRole = block.Kind == LLMContentText || block.Kind == LLMContentToolResult || block.Kind == LLMContentImage || block.Kind == LLMContentAudio || block.Kind == LLMContentDocument
+			case LLMMessageRoleAssistant:
+				validRole = block.Kind == LLMContentText || block.Kind == LLMContentThinking || block.Kind == LLMContentToolCall
+			}
+			if !validRole {
+				return nil, fmt.Errorf("anthropic: %s content is not supported in %s messages", block.Kind, msg.Role)
+			}
+		}
+		if msg.Role == LLMMessageRoleSystem {
+			text := msg.TextContent()
+			if text != "" {
+				systemPrompts = append(systemPrompts, anthropic.TextBlockParam{Text: text})
+			}
+			continue
+		}
+
+		var blocks []anthropic.ContentBlockParamUnion
+		for _, block := range msg.Content {
+			switch block.Kind {
+			case LLMContentText:
+				// Anthropic's API rejects empty text content blocks:
+				// "messages: text content blocks must be non-empty". Substitute
+				// a space to work around it.
+				text := block.Text
+				if text == "" {
+					text = " "
+				}
+				blocks = append(blocks, anthropic.NewTextBlock(text))
+			case LLMContentToolCall:
+				var args map[string]any
+				if len(block.Arguments) > 0 {
+					if err := json.Unmarshal(block.Arguments.Bytes(), &args); err != nil {
+						return nil, fmt.Errorf("failed to unmarshal tool arguments: %w", err)
+					}
+				}
+				blocks = append(blocks, anthropic.NewToolUseBlock(block.CallID, args, block.ToolName))
+			case LLMContentToolResult:
+				result := &anthropic.ToolResultBlockParam{
+					ToolUseID: block.CallID,
+					IsError:   anthropic.Opt(block.Errored),
+				}
+				if block.Text != "" || len(block.Content) == 0 {
+					text := block.Text
+					if text == "" {
+						text = " "
+					}
+					result.Content = append(result.Content, anthropic.ToolResultBlockParamContentUnion{OfText: &anthropic.TextBlockParam{Text: text}})
+				}
+				for _, child := range block.Content {
+					part, err := anthropicInputBlock(child)
+					if err != nil {
+						return nil, fmt.Errorf("anthropic tool result %q: %w", block.CallID, err)
+					}
+					result.Content = append(result.Content, anthropic.ToolResultBlockParamContentUnion{
+						OfText:     part.OfText,
+						OfImage:    part.OfImage,
+						OfDocument: part.OfDocument,
+					})
+				}
+				blocks = append(blocks, anthropic.ContentBlockParamUnion{OfToolResult: result})
+			case LLMContentImage, LLMContentAudio, LLMContentDocument:
+				part, err := anthropicInputBlock(block)
+				if err != nil {
+					return nil, err
+				}
+				blocks = append(blocks, part)
+			case LLMContentThinking:
+				// Round-trip extended thinking. When thinking is enabled and the
+				// assistant made tool calls, Anthropic requires the original
+				// thinking blocks to be resubmitted unmodified with their signature,
+				// or it rejects the request. A block with no text but a signature
+				// is a redacted thinking block (opaque data stored in Signature).
+				//
+				// Only resubmit thinking (and redacted-thinking) blocks when
+				// reasoning is enabled for this request. If it isn't (effort
+				// cleared, or a model that doesn't support it), Anthropic rejects
+				// a request that carries thinking blocks, so drop them instead.
+				if !reasoningEnabled {
+					continue
+				}
+				switch {
+				case block.Text != "":
+					blocks = append(blocks, anthropic.NewThinkingBlock(block.Signature, block.Text))
+				case block.Signature != "":
+					blocks = append(blocks, anthropic.NewRedactedThinkingBlock(block.Signature))
+				}
+			default:
+				return nil, fmt.Errorf("anthropic: unsupported content kind %q", block.Kind)
+			}
+		}
+
+		switch msg.Role {
+		case LLMMessageRoleUser:
+			messages = appendOrMerge(messages, anthropic.MessageParamRoleUser, blocks)
+		case LLMMessageRoleAssistant:
+			messages = appendOrMerge(messages, anthropic.MessageParamRoleAssistant, blocks)
+		default:
+			return nil, fmt.Errorf("anthropic: unexpected role %s", msg.Role)
+		}
+	}
+
+	// Add cache_control breakpoints. Anthropic allows at most 4 per request.
+	// Place them on the last system prompt block and the last block of the
+	// last user message, so the next turn gets a cache hit on all preceding
+	// content.
+	if len(systemPrompts) > 0 {
+		systemPrompts[len(systemPrompts)-1].CacheControl = ephemeral
+	}
+	if len(messages) > 0 {
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role != anthropic.MessageParamRoleUser {
+				continue
+			}
+			blocks := messages[i].Content
+			if len(blocks) > 0 {
+				lastBlock := &blocks[len(blocks)-1]
+				switch {
+				case lastBlock.OfText != nil:
+					lastBlock.OfText.CacheControl = ephemeral
+				case lastBlock.OfToolUse != nil:
+					lastBlock.OfToolUse.CacheControl = ephemeral
+				case lastBlock.OfToolResult != nil:
+					lastBlock.OfToolResult.CacheControl = ephemeral
+				case lastBlock.OfImage != nil:
+					lastBlock.OfImage.CacheControl = ephemeral
+				case lastBlock.OfDocument != nil:
+					lastBlock.OfDocument.CacheControl = ephemeral
+				}
+			}
+			break
+		}
+	}
+
+	// Convert tools to Anthropic tool format.
+	var toolsConfig []anthropic.ToolUnionParam
+	for _, tool := range tools {
+		// TODO: figure out cache control. do we want a checkpoint at the end?
+		var inputSchema anthropic.ToolInputSchemaParam
+		for k, v := range tool.Schema {
+			switch k {
+			case "properties":
+				inputSchema.Properties = v
+			case "type":
+				if v != "object" {
+					return nil, fmt.Errorf("tool must accept object, got %q", v)
+				}
+				inputSchema.Type = "object"
+			default:
+				if inputSchema.ExtraFields == nil {
+					inputSchema.ExtraFields = make(map[string]any)
+				}
+				inputSchema.ExtraFields[k] = v
+			}
+		}
+		toolsConfig = append(toolsConfig, anthropic.ToolUnionParam{
+			OfTool: &anthropic.ToolParam{
+				Name:        tool.Name,
+				Description: anthropic.Opt(tool.Description),
+				InputSchema: inputSchema,
+				// CacheControl: ephemeral,
+			},
+		})
+	}
+
+	// Claude Code subscription OAuth requires the Claude Code identity system
+	// prompt to be present, or the endpoint rejects the request.
+	if c.endpoint.IsOAuth {
+		claudeCodePrompt := anthropic.TextBlockParam{
+			Text:         "You are Claude Code, Anthropic's official CLI for Claude.",
+			CacheControl: ephemeral,
+		}
+		systemPrompts = append([]anthropic.TextBlockParam{claudeCodePrompt}, systemPrompts...)
+	}
+
+	params := anthropic.MessageNewParams{
+		Model:        c.endpoint.Model,
+		MaxTokens:    reasoning.maxTokens,
+		Messages:     messages,
+		Tools:        toolsConfig,
+		System:       systemPrompts,
+		OutputConfig: reasoning.outputConfig,
+		Thinking:     reasoning.thinking,
+	}
+
+	// Start a streaming request.
+	stream := c.client.Messages.NewStreaming(ctx, params)
+	defer stream.Close()
+
+	if err := stream.Err(); err != nil {
+		return nil, err
+	}
+
+	acc := new(anthropic.Message)
+	for stream.Next() {
+		event := stream.Current()
+		acc.Accumulate(event)
+
+		// Keep track of the token usage
+		if acc.Usage.OutputTokens > 0 {
+			outputTokens.Record(ctx, acc.Usage.OutputTokens, metric.WithAttributes(attrs...))
+		}
+		if acc.Usage.InputTokens > 0 {
+			inputTokens.Record(ctx, acc.Usage.InputTokens, metric.WithAttributes(attrs...))
+		}
+		if acc.Usage.CacheReadInputTokens > 0 {
+			inputTokensCacheReads.Record(ctx, acc.Usage.CacheReadInputTokens, metric.WithAttributes(attrs...))
+		}
+		if acc.Usage.CacheCreationInputTokens > 0 {
+			inputTokensCacheWrites.Record(ctx, acc.Usage.CacheCreationInputTokens, metric.WithAttributes(attrs...))
+		}
+
+		// Route each content block's stream into its own display span: thinking
+		// and tool-call arguments (which main otherwise only shows post-hoc) as
+		// well as the text response.
+		switch ev := event.AsAny().(type) {
+		case anthropic.ContentBlockStartEvent:
+			switch ev.ContentBlock.Type {
+			case "thinking":
+				dp.StartThinking(ev.Index)
+			case "text":
+				dp.StartText(ev.Index)
+			case "tool_use":
+				dp.StartToolCall(ev.Index, ev.ContentBlock.ID, ev.ContentBlock.Name)
+			}
+		case anthropic.ContentBlockDeltaEvent:
+			switch ev.Delta.Type {
+			case "thinking_delta":
+				if p := dp.Phase(ev.Index); p != nil {
+					fmt.Fprint(p.Stdio.Stdout, ev.Delta.Thinking)
+				}
+			case "text_delta":
+				p := dp.Phase(ev.Index)
+				if p == nil {
+					// Text without a start event: lazily open a response phase.
+					p = dp.StartText(ev.Index)
+				}
+				if p.MarkdownW != nil {
+					fmt.Fprint(p.MarkdownW, ev.Delta.Text)
+				}
+			case "input_json_delta":
+				if p := dp.Phase(ev.Index); p != nil {
+					p.writeToolArgs(ev.Delta.PartialJSON)
+				}
+			}
+		case anthropic.ContentBlockStopEvent:
+			dp.Close(ev.Index)
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		return nil, err
+	}
+
+	// A turn cut short — a refusal, a token or context limit — can still have
+	// streamed content before it stopped, so the stop reason has to be checked
+	// on its own rather than only when nothing accumulated. Otherwise a refusal
+	// landing a few thinking tokens in reads as a clean finish, and the caller
+	// idles on a reply carrying no text and no tool calls.
+	if !anthropicStoppedCleanly(acc.StopReason) {
+		return nil, &ModelFinishedError{Reason: string(acc.StopReason)}
+	}
+
+	// Check that we have some accumulated content.
+	if len(acc.Content) == 0 {
+		return nil, &ModelFinishedError{
+			Reason: string(acc.StopReason),
+		}
+	}
+
+	// Process the accumulated content into content blocks.
+	var contentBlocks []*LLMContentBlock
+	for _, block := range acc.Content {
+		switch b := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			contentBlocks = append(contentBlocks, &LLMContentBlock{
+				Kind: LLMContentText,
+				Text: b.Text,
+			})
+		case anthropic.ToolUseBlock:
+			contentBlocks = append(contentBlocks, &LLMContentBlock{
+				Kind:      LLMContentToolCall,
+				CallID:    b.ID,
+				ToolName:  b.Name,
+				Arguments: JSON(b.Input),
+			})
+		case anthropic.ThinkingBlock:
+			contentBlocks = append(contentBlocks, &LLMContentBlock{
+				Kind:      LLMContentThinking,
+				Text:      b.Thinking,
+				Signature: b.Signature,
+			})
+		case anthropic.RedactedThinkingBlock:
+			// Redacted thinking carries no readable text, only opaque data that
+			// must be resubmitted verbatim. Stash it in Signature so the send path
+			// can reconstruct the block.
+			contentBlocks = append(contentBlocks, &LLMContentBlock{
+				Kind:      LLMContentThinking,
+				Signature: b.Data,
+			})
+		}
+	}
+
+	displaySpans, toolCallDisplays := dp.Response()
+	return &LLMResponse{
+		Content: contentBlocks,
+		TokenUsage: LLMTokenUsage{
+			InputTokens:       acc.Usage.InputTokens,
+			OutputTokens:      acc.Usage.OutputTokens,
+			CachedTokenReads:  acc.Usage.CacheReadInputTokens,
+			CachedTokenWrites: acc.Usage.CacheCreationInputTokens,
+			TotalTokens:       acc.Usage.InputTokens + acc.Usage.OutputTokens + acc.Usage.CacheReadInputTokens + acc.Usage.CacheCreationInputTokens,
+		},
+		DisplaySpans:     displaySpans,
+		ToolCallDisplays: toolCallDisplays,
+	}, nil
+}
+
+// anthropicReasoning is a request's output-token cap and reasoning
+// configuration, as worked out by reasoningParams.
+type anthropicReasoning struct {
+	maxTokens    int64
+	outputConfig anthropic.OutputConfigParam
+	thinking     anthropic.ThinkingConfigParamUnion
+	// enabled reports whether thinking is on for the request, and so whether
+	// prior thinking blocks may be resubmitted.
+	enabled bool
+}
+
+// anthropicThinkingBudgets maps reasoning effort levels onto extended-thinking
+// token budgets, for models that take a budget rather than an effort level.
+var anthropicThinkingBudgets = map[string]int64{
+	"minimal": 1024,
+	"low":     4096,
+	"medium":  8192,
+	"high":    16384,
+	"xhigh":   32768,
+	"max":     65536,
+}
+
+const (
+	// anthropicMinThinkingBudget is the smallest budget_tokens the API takes.
+	anthropicMinThinkingBudget = 1024
+	// anthropicDefaultThinkingBudget is used for an effort level without a
+	// known budget mapping.
+	anthropicDefaultThinkingBudget = 8192
+)
+
+// reasoningParams sizes max_tokens and translates the endpoint's reasoning
+// effort into the form the model takes:
+//
+//   - models that take an effort level, and models the catalog doesn't know
+//     (e.g. newer than the embedded catalog), get output_config.effort with
+//     adaptive thinking;
+//   - models that only take a thinking budget (e.g. Claude Haiku 4.5, which
+//     rejects adaptive thinking) get extended thinking with budget_tokens
+//     mapped from the effort level;
+//   - models that can't reason get no reasoning configuration at all.
+func (c *AnthropicClient) reasoningParams(history []*LLMMessage, tools []LLMTool, opts *LLMCallOpts) anthropicReasoning {
+	// The API requires max_tokens; default to the model's own output cap
+	// (from the catwalk catalog) so replies are never artificially truncated,
+	// keeping a conservative fallback for models the catalog doesn't know
+	// (e.g. Anthropic-compatible local endpoints).
+	userSetMaxTokens := opts != nil && opts.MaxTokens > 0
+	maxTokens := c.endpoint.DefaultMaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 8192
+	}
+	if userSetMaxTokens {
+		maxTokens = int64(opts.MaxTokens)
+	}
+
+	effort := c.endpoint.ReasoningEffort
+	if effort == "" || effort == "none" || c.endpoint.ReasoningMode == LLMReasoningUnsupported {
+		// Cap max_tokens to the context window's remaining space; the API
+		// rejects requests whose input tokens + max_tokens exceed it.
+		return anthropicReasoning{
+			maxTokens: clampMaxTokensToContext(maxTokens, c.endpoint.ContextWindow, history, tools),
+		}
+	}
+
+	// When on the conservative fallback default, leave room for reasoning
+	// tokens on top of the reply so the answer isn't truncated. An explicit
+	// maxTokens cap is respected as-is.
+	if !userSetMaxTokens && maxTokens < 16384 {
+		maxTokens = 16384
+	}
+	maxTokens = clampMaxTokensToContext(maxTokens, c.endpoint.ContextWindow, history, tools)
+
+	if c.endpoint.ReasoningMode == LLMReasoningBudget {
+		budget, ok := anthropicThinkingBudgets[effort]
+		if !ok {
+			budget = anthropicDefaultThinkingBudget
+		}
+		// budget_tokens must stay below max_tokens; keep at least half of
+		// the cap for the reply itself. If that leaves less than the
+		// minimum budget, reason not at all rather than fail the request.
+		budget = min(budget, maxTokens/2)
+		if budget < anthropicMinThinkingBudget {
+			return anthropicReasoning{maxTokens: maxTokens}
+		}
+		return anthropicReasoning{
+			maxTokens: maxTokens,
+			thinking:  anthropic.ThinkingConfigParamOfEnabled(budget),
+			enabled:   true,
+		}
+	}
+
+	// Anthropic takes the level straight through as output_config.effort.
+	// Adaptive thinking pairs with effort-based reasoning; request summarized
+	// display so thinking summaries stream back as visible thinking blocks
+	// rather than being omitted.
+	return anthropicReasoning{
+		maxTokens: maxTokens,
+		outputConfig: anthropic.OutputConfigParam{
+			Effort: anthropic.OutputConfigEffort(effort),
+		},
+		thinking: anthropic.ThinkingConfigParamUnion{
+			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
+				Display: anthropic.ThinkingConfigAdaptiveDisplaySummarized,
+			},
+		},
+		enabled: true,
+	}
+}
+
+// anthropicInputBlock translates the content allowed in user input and tool
+// results. Keeping media native here avoids replacing it with a text projection.
+func anthropicInputBlock(block *LLMContentBlock) (anthropic.ContentBlockParamUnion, error) {
+	switch block.Kind {
+	case LLMContentText:
+		text := block.Text
+		if text == "" {
+			text = " "
+		}
+		return anthropic.NewTextBlock(text), nil
+	case LLMContentImage:
+		switch block.MIMEType {
+		case "image/jpeg", "image/png", "image/gif", "image/webp":
+			return anthropic.NewImageBlockBase64(block.MIMEType, base64.StdEncoding.EncodeToString(block.Data)), nil
+		default:
+			return anthropic.ContentBlockParamUnion{}, fmt.Errorf("anthropic: unsupported image MIME type %q", block.MIMEType)
+		}
+	case LLMContentDocument:
+		if block.MIMEType != "application/pdf" {
+			return anthropic.ContentBlockParamUnion{}, fmt.Errorf("anthropic: unsupported document MIME type %q (only application/pdf is supported)", block.MIMEType)
+		}
+		return anthropic.NewDocumentBlock(anthropic.Base64PDFSourceParam{Data: base64.StdEncoding.EncodeToString(block.Data)}), nil
+	case LLMContentAudio:
+		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("anthropic: AUDIO content is not supported")
+	default:
+		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("anthropic: unsupported input content kind %q", block.Kind)
+	}
+}
+
+// anthropicStoppedCleanly reports whether a stop reason means the model
+// finished its turn normally. It rejects only the reasons known to leave the
+// turn unusable, so a reason added to the API later keeps working instead of
+// failing every request.
+func anthropicStoppedCleanly(reason anthropic.StopReason) bool {
+	switch reason {
+	case anthropic.StopReasonRefusal,
+		anthropic.StopReasonMaxTokens,
+		// Absent from the non-beta enum, but the API still sends it.
+		"model_context_window_exceeded":
+		return false
+	default:
+		return true
+	}
+}
+
+// appendOrMerge appends content blocks to the messages slice. If the last
+// message has the same role, the blocks are merged into it rather than
+// creating a new message. This is required by the Anthropic API, which
+// mandates alternating user/assistant roles — consecutive tool_result blocks
+// from parallel tool calls must be in a single user message.
+func appendOrMerge(messages []anthropic.MessageParam, role anthropic.MessageParamRole, blocks []anthropic.ContentBlockParamUnion) []anthropic.MessageParam {
+	if len(messages) > 0 && messages[len(messages)-1].Role == role {
+		messages[len(messages)-1].Content = append(messages[len(messages)-1].Content, blocks...)
+		return messages
+	}
+	return append(messages, anthropic.MessageParam{
+		Role:    role,
+		Content: blocks,
+	})
+}

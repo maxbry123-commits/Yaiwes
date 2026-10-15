@@ -1,3 +1,0 @@
-FROM employees
-| WHERE emp_no IN (FROM emps_view) OR salary > 50000
-| KEEP emp_no

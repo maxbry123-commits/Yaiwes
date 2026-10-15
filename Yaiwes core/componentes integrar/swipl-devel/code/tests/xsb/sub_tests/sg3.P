@@ -1,3 +1,0 @@
-:- include('Driver').
-
-go :- sg('X8','Data/chain').

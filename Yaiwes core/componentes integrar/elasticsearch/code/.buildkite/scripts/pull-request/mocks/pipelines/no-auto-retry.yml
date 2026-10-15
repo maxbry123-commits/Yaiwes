@@ -1,5 +1,0 @@
-config:
-  auto-retry: false
-steps:
-  - label: no-auto-retry
-    command: echo 'no retries'

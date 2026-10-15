@@ -1,1 +1,0 @@
-source=test_data | rename value as amount, total as count_val | fields category, amount, count_val | head 5

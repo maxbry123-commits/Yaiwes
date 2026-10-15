@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 160554
-summary: Refund cancelled S3 read buffers
-type: bug

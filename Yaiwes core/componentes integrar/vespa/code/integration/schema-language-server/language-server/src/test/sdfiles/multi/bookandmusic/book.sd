@@ -1,6 +1,0 @@
-schema book {
-  document book {
-    field soundtrack type music {}
-  }
-}
-

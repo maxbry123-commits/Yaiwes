@@ -1,9 +1,0 @@
-name = "tui-qa"
-engineVersion = "v1.0.0-0"
-
-[runtime]
-  source = "dang"
-
-[[dependencies]]
-  name = "cli-dev"
-  source = "../cli-dev"

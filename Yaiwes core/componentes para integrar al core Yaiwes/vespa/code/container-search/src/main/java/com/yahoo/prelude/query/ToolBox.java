@@ -1,0 +1,54 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.prelude.query;
+
+import com.yahoo.api.annotations.Beta;
+import com.yahoo.search.Query;
+
+/**
+ * Query tree helper methods and factories.
+ *
+ * @author Steinar Knutsen
+ */
+@Beta
+public final class ToolBox {
+
+    public static abstract class QueryVisitor {
+
+        /**
+         * Called for each item in the query tree given to
+         * {@link ToolBox#visit(QueryVisitor, Item)}. Return true to visit the
+         * sub-items of the given item, return false to ignore the sub-items.
+         *
+         * @param item each item in the query tree
+         * @return whether to visit the sub-items of the argument item
+         *         (and then invoke the {@link #onExit(Item)} method)
+         */
+        public abstract boolean visit(Item item);
+
+        /**
+         * Invoked when all sub-items have been visited, or immediately after
+         * visit() if there are no sub-items or visit() returned false.
+         * This default implementation does nothing.
+         */
+        public void onExit(Item item) {}
+
+    }
+
+    public static void visit(Query query, QueryVisitor visitor) {
+        visit(visitor, query.getModel().getQueryTree().getRoot());
+    }
+
+    public static void visit(QueryVisitor visitor, Item item) {
+        if (item instanceof CompositeItem composite) {
+            if (visitor.visit(item)) {
+                for (int i = 0; i < composite.getItemCount(); ++i) {
+                    visit(visitor, composite.getItem(i));
+                }
+            }
+        } else {
+            visitor.visit(item);
+        }
+        visitor.onExit(item);
+    }
+
+}

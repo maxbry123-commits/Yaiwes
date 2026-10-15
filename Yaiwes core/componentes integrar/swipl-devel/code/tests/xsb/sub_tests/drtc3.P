@@ -1,3 +1,0 @@
-:- include('Driver').
-
-go :- drtc('X8','Data/chain').

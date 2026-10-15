@@ -1,3 +1,0 @@
-:- include('Driver').
-
-go :- lrtc(multidown,'Data/cycles').

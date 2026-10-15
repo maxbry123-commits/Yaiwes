@@ -1,2 +1,0 @@
-TS k8s
-| STATS version = 2, cnt = COUNT(COUNT_OVER_TIME(network.cost)) BY cluster

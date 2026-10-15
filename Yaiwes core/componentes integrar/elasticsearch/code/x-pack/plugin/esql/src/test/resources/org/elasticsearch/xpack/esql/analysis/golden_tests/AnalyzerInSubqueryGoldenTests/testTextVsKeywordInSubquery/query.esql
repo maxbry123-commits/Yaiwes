@@ -1,2 +1,0 @@
-FROM all_types
-| WHERE text IN (FROM all_types | KEEP keyword)

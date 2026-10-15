@@ -1,0 +1,40 @@
+{
+  "bundle_bytes": 13418440,
+  "bundle_sha256": "54b01602d7a3c1239d0a7a14365413f75c589653a3301d7f73de2aae50f2e67f",
+  "extracted_tree": {
+    "bytes": 22925222,
+    "files": 388,
+    "sha256": "b4c8387bf08cb616958683ff4ada6cf8fae90265f2c22a4145d80ff014e4e968"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "SoarGroup.github.io.bundle.zip.part-0001",
+      "sha256": "7a530f342c35f0646f70f1887b8aed1830221b89a86a075f854c8067cfad5b34"
+    },
+    {
+      "bytes": 835528,
+      "name": "SoarGroup.github.io.bundle.zip.part-0002",
+      "sha256": "70f18a01cbb0194fce85df5953e2b20a596449c1d51b4b46b0415334b383c97e"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "SoarGroup.github.io",
+  "source_bytes": 22925222,
+  "source_commit": "a7d656460054cfa0001275ff88873b1944601b21",
+  "source_files": 388,
+  "source_ref": "main",
+  "source_repo": "SoarGroup/SoarGroup.github.io",
+  "source_tree": {
+    "bytes": 22925222,
+    "files": 388,
+    "sha256": "b4c8387bf08cb616958683ff4ada6cf8fae90265f2c22a4145d80ff014e4e968"
+  }
+}

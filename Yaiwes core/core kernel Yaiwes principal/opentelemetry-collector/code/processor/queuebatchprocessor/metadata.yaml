@@ -1,0 +1,17 @@
+display_name: Queue Batch Processor
+type: queue_batch
+github_project: open-telemetry/opentelemetry-collector
+
+status:
+  disable_codecov_badge: true
+  class: processor
+  stability:
+    development: [traces, metrics, logs, profiles]
+  distributions: []
+  codeowners:
+    active: [jmacd, iblancasa]
+
+tests:
+  # The queue batch processor buffers data and flushes it on a detached context, so
+  # it cannot propagate the incoming context to the next consumer.
+  skip_context_propagation: true

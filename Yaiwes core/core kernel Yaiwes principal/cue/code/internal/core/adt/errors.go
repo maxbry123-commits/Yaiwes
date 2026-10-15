@@ -1,0 +1,580 @@
+// Copyright 2020 CUE Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package adt
+
+// This file contains error encodings.
+//
+//
+// *Bottom:
+//    - an adt.Value
+//    - always belongs to a single vertex.
+//    - does NOT implement error
+//    - marks error code used for control flow
+//
+// errors.Error
+//    - CUE default error
+//    - implements error
+//    - tracks error locations
+//    - has error message details
+//    - supports multiple errors
+//
+
+import (
+	"slices"
+
+	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/errors"
+	cueformat "cuelang.org/go/cue/format"
+	"cuelang.org/go/cue/token"
+	"cuelang.org/go/internal/iterutil"
+)
+
+// ErrorCode indicates the type of error. The type of error may influence
+// control flow. No other aspects of an error may influence control flow.
+type ErrorCode int8
+
+// See the stringer directive in doc.go for the generated String method.
+
+const (
+	// An EvalError is a fatal evaluation error.
+	EvalError ErrorCode = iota // eval
+
+	// A UserError is a fatal error originating from the user using the error
+	// builtin.
+	UserError // user
+
+	// A LegacyUserError is a fatal error originating from the user using the
+	// _|_ token, which we intend to phase out.
+	LegacyUserError // user
+
+	// StructuralCycleError means a structural cycle was found. Structural
+	// cycles are permanent errors, but they are not passed up recursively,
+	// as a unification of a value with a structural cycle with one that
+	// doesn't may still give a useful result.
+	StructuralCycleError // structural_cycle
+
+	// IncompleteError means an evaluation could not complete because of
+	// insufficient information that may still be added later.
+	IncompleteError // incomplete
+
+	// A CycleError indicates a reference error. It is considered to be
+	// an incomplete error, as reference errors may be broken by providing
+	// a concrete value.
+	CycleError // cycle
+)
+
+// Bottom represents an error or bottom symbol.
+//
+// Although a Bottom node holds control data, it should not be created until the
+// control information already resulted in an error.
+type Bottom struct {
+	Src ast.Node
+	Err errors.Error
+
+	Code         ErrorCode
+	HasRecursive bool
+	ChildError   bool // Err is the error of the child
+	NotExists    bool // This error originated from a failed lookup.
+	CloseCheck   bool // This error resulted from a close check.
+	// Value holds the computed value so far in case
+	Value Value
+
+	// Node marks the node at which an error occurred. This is used to
+	// determine the package to which an error belongs.
+	// TODO: use a more precise mechanism for tracking the package.
+	Node *Vertex
+}
+
+func (x *Bottom) Source() ast.Node { return x.Src }
+func (x *Bottom) Kind() Kind       { return BottomKind }
+
+func (b *Bottom) IsIncomplete() bool {
+	if b == nil {
+		return false
+	}
+	return b.Code == IncompleteError || b.Code == CycleError
+}
+
+// isLiteralBottom reports whether x is an error originating from a user.
+func isLiteralBottom(x Expr) bool {
+	b, ok := x.(*Bottom)
+	return ok && b.Code == LegacyUserError
+}
+
+// isError reports whether v is an error or nil.
+func isError(v Value) bool {
+	if v == nil {
+		return true
+	}
+	_, ok := v.(*Bottom)
+	return ok
+}
+
+// isIncomplete reports whether v is associated with an incomplete error.
+func isIncomplete(v *Vertex) bool {
+	if v == nil {
+		return true
+	}
+	if b := v.Bottom(); b != nil {
+		return b.IsIncomplete()
+	}
+	return false
+}
+
+// AddChildError updates x to record an error that occurred in one of
+// its descendent arcs. The resulting error will record the worst error code of
+// the current error or recursive error.
+//
+// If x is not already an error, the value is recorded in the error for
+// reference.
+func (n *nodeContext) AddChildError(recursive *Bottom) {
+	v := n.node
+	v.ChildErrors = CombineErrors(nil, v.ChildErrors, recursive)
+	if recursive.IsIncomplete() {
+		return
+	}
+	x := v.BaseValue
+	err, _ := x.(*Bottom)
+	if err == nil || err.CloseCheck {
+		n.setBaseValue(&Bottom{
+			Code:         recursive.Code,
+			Value:        v,
+			HasRecursive: true,
+			ChildError:   true,
+			CloseCheck:   recursive.CloseCheck,
+			Err:          recursive.Err,
+			Node:         n.node,
+		})
+		return
+	}
+
+	err.HasRecursive = true
+	if err.Code > recursive.Code {
+		err.Code = recursive.Code
+	}
+
+	n.setBaseValue(err)
+}
+
+// CombineErrors combines two errors that originate at the same Vertex.
+func CombineErrors(src ast.Node, x, y Value) *Bottom {
+	a, _ := Unwrap(x).(*Bottom)
+	b, _ := Unwrap(y).(*Bottom)
+
+	switch {
+	case a == nil && b == nil:
+		return nil
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case a == b && isCyclePlaceholder(a):
+		return a
+	case a == b:
+		// Don't return a (or b) because they may have other non-nil fields.
+		return &Bottom{
+			Src:  src,
+			Err:  a.Err,
+			Code: a.Code,
+		}
+	}
+
+	if a.Code != b.Code {
+		if a.Code > b.Code {
+			a, b = b, a
+		}
+
+		if b.Code >= IncompleteError {
+			return a
+		}
+	}
+
+	return &Bottom{
+		Src:        src,
+		Err:        errors.Append(a.Err, b.Err),
+		Code:       a.Code,
+		CloseCheck: a.CloseCheck || b.CloseCheck,
+	}
+}
+
+func addPositions(ctx *OpContext, err *ValueError, c Conjunct) {
+	switch x := c.x.(type) {
+	case *Field:
+		// if x.ArcType == ArcRequired {
+		err.AddPosition(c.x)
+		// }
+	case *ConjunctGroup:
+		for _, c := range *x {
+			addPositions(ctx, err, c)
+		}
+	}
+	err.AddPos(c.CloseInfo.Location(ctx))
+}
+
+// NewIncompleteValueError returns the error for a non-concrete value where a
+// concrete one is required, positioned at each of its conjuncts.
+func NewIncompleteValueError(ctx *OpContext, v *Vertex, morePositions ...Node) *Bottom {
+	err := ctx.Newf("incomplete value %v", v.Value())
+	for c := range v.LeafConjuncts() {
+		err.AddPosition(c.Elem())
+	}
+	for _, p := range morePositions {
+		err.AddPosition(p)
+	}
+	return &Bottom{Code: IncompleteError, Err: err}
+}
+
+// NewRequiredNotPresentError reports that the required field v is missing.
+// Besides the required field itself, the error points at the structs unified
+// into v's parent which do not declare it, such as a data file validated
+// against a schema. Structs from definitions are left out, as they are schemas.
+//
+// TODO: consider making the first such struct the primary position, so that
+// tools such as the language server report the error at the data.
+func NewRequiredNotPresentError(ctx *OpContext, v *Vertex, morePositions ...Node) *Bottom {
+	saved := ctx.PushArc(v)
+	err := ctx.Newf("field is required but not present")
+	for _, p := range morePositions {
+		err.AddPosition(p)
+	}
+	// The structs of a vertex within a definition belong to a schema even when
+	// they were not added through a reference to one, as with structure sharing.
+	if p := v.Parent; p != nil && enclosingDef(p) == nil {
+		for _, s := range p.Structs {
+			if !s.fromDef && !declaresField(s.StructLit, v.Label) {
+				err.AddPosition(s.StructLit)
+			}
+		}
+	}
+	for c := range v.LeafConjuncts() {
+		if f, ok := c.x.(*Field); ok && f.ArcType == ArcRequired {
+			err.AddPosition(c.x)
+		}
+		err.AddPos(c.CloseInfo.Location(ctx))
+	}
+
+	b := &Bottom{
+		Code: IncompleteError,
+		Err:  err,
+		Node: v,
+	}
+	ctx.PopArc(saved)
+	return b
+}
+
+// declaresField reports whether s declares a field with label f,
+// including within embedded struct literals and comprehension bodies.
+//
+// TODO: embedded references such as {common, name: "n"} are not resolved,
+// so a struct which declares f through one is reported as lacking it.
+func declaresField(s *StructLit, f Feature) bool {
+	return slices.ContainsFunc(s.Decls, func(d Decl) bool {
+		switch d := d.(type) {
+		case *Field:
+			return d.Label == f
+		case *StructLit:
+			return declaresField(d, f)
+		case *Comprehension:
+			return declaresField(d.Value, f)
+		}
+		return false
+	})
+}
+
+func newRequiredFieldInComprehensionError(ctx *OpContext, x *ForClause, v *Vertex) *Bottom {
+	err := ctx.Newf("missing required field in for comprehension: %v", v.Label)
+	err.AddPosition(x.Src)
+	for c := range v.LeafConjuncts() {
+		addPositions(ctx, err, c)
+	}
+	return &Bottom{
+		Code: IncompleteError,
+		Err:  err,
+	}
+}
+
+func (v *Vertex) reportFieldIndexError(c *OpContext, pos token.Pos, f Feature) {
+	// An integer index into a value that can never be a list is a permanent
+	// error. BottomKind falls through so reportFieldError adopts its code.
+	if k := v.Kind(); f.IsInt() && k != BottomKind && k&ListKind == 0 {
+		c.AddBottom(&Bottom{
+			Code: EvalError,
+			Err:  c.NewPosf(pos, "invalid index %d (found %v, want list)", f.Index(), k),
+			Node: v,
+		})
+		return
+	}
+	v.reportFieldError(c, pos, f,
+		"index out of range [%d] with length %d",
+		"undefined field: %s")
+}
+
+func (v *Vertex) reportFieldCycleError(c *OpContext, pos token.Pos, f Feature) *Bottom {
+	const msg = "cyclic reference to field %[1]v"
+	b := v.reportFieldError(c, pos, f, msg, msg)
+	return b
+}
+
+// addVertexPositions adds the positions of the expressions that v is composed
+// of to err. Errors about a field of v not being usable otherwise only carry
+// the position of the failing selector, which says nothing about where the
+// value that was searched is declared.
+//
+// Unlike [addPositions], this keeps conjuncts that are not fields, as an
+// inline struct or list is just as much a declaration site as a field is.
+func addVertexPositions(err *ValueError, v *Vertex) {
+	for c := range v.LeafConjuncts() {
+		err.AddPosition(c.x)
+	}
+}
+
+func (v *Vertex) reportFieldError(c *OpContext, pos token.Pos, f Feature, intMsg, stringMsg string) *Bottom {
+	code := IncompleteError
+	// If v is an error, we need to adopt the worst error.
+	if b := v.Bottom(); b != nil && !isCyclePlaceholder(b) {
+		code = b.Code
+	} else if s := v.state; s != nil && s.errs != nil && s.errs.Code == CycleError {
+		// Also check cycle errors in the state (e.g. from failed
+		// comprehension tasks) that have not yet been promoted to BaseValue.
+		// This ensures that when a comp fails due to a mutual cycle, lookups
+		// of fields on the same vertex report CycleError instead of
+		// IncompleteError, allowing validate to propagate the cycle.
+		code = s.errs.Code
+	} else if !v.Accept(c, f) {
+		code = EvalError
+	}
+
+	label := f.SelectorString(c.Runtime)
+
+	var err *ValueError
+	if f.IsInt() {
+		err = c.NewPosf(pos, intMsg, f.Index(), iterutil.Count(v.Elems()))
+	} else {
+		err = c.NewPosf(pos, stringMsg, label)
+	}
+	addVertexPositions(err, v)
+	b := &Bottom{
+		Code: code,
+		Err:  err,
+		Node: v,
+	}
+	// TODO: yield failure
+	c.AddBottom(b) // TODO: unify error mechanism.
+	return b
+}
+
+// baseError contains common fields and methods for error types.
+type baseError struct {
+	r      Runtime
+	format func(Runtime, Node) string
+	v      *Vertex
+	pos    token.Pos
+	auxpos []token.Pos
+
+	altPath []string
+
+	// auxposBootstrap lets auxpos avoid extra allocations for few positions,
+	// which is a very common scenario.
+	auxposBootstrap [4]token.Pos
+}
+
+func (e *baseError) AddPos(p token.Pos) {
+	if !p.IsValid() {
+		return
+	}
+	if slices.Contains(e.auxpos, p) {
+		return
+	}
+	e.auxpos = append(e.auxpos, p)
+}
+
+func (e *baseError) AddClosedPositions(ctx *OpContext, p posInfo) {
+	for n := range p.AncestorPositions(ctx) {
+		e.AddPos(n)
+	}
+}
+
+func (e *baseError) Position() token.Pos {
+	return e.pos
+}
+
+func (e *baseError) InputPositions() []token.Pos {
+	return e.auxpos
+}
+
+func (e *baseError) Path() (a []string) {
+	if len(e.altPath) > 0 {
+		return e.altPath
+	}
+	if e.v == nil {
+		return nil
+	}
+	for _, f := range appendPath(nil, e.v) {
+		a = append(a, f.SelectorString(e.r))
+	}
+	return a
+}
+
+// A ValueError is returned as a result of evaluating a value.
+type ValueError struct {
+	baseError
+	errors.Message
+}
+
+func (v *ValueError) AddPosition(n Node) {
+	v.AddPos(Pos(n))
+}
+
+func (c *OpContext) errNode() *Vertex {
+	return c.vertex
+}
+
+// markPositions marks the current position stack.
+func (c *OpContext) markPositions() int {
+	return len(c.positions)
+}
+
+// releasePositions sets the position state to one from a call to markPositions.
+func (c *OpContext) releasePositions(p int) {
+	c.positions = c.positions[:p]
+}
+
+func (c *OpContext) AddPosition(n Node) {
+	if n != nil {
+		c.positions = append(c.positions, n)
+	}
+}
+
+func (c *OpContext) Newf(format string, args ...interface{}) *ValueError {
+	return c.NewPosf(c.pos(), format, args...)
+}
+
+func appendNodePositions(a []token.Pos, n Node) []token.Pos {
+	if p := Pos(n); p.IsValid() {
+		a = append(a, p)
+	}
+	if v, ok := n.(*Vertex); ok {
+		for c := range v.LeafConjuncts() {
+			a = appendNodePositions(a, c.Elem())
+		}
+	}
+	return a
+}
+
+func (c *OpContext) NewPosf(p token.Pos, format string, args ...interface{}) *ValueError {
+	err := &ValueError{
+		baseError: baseError{
+			r:       c.Runtime,
+			format:  c.format,
+			v:       c.errNode(),
+			pos:     p,
+			altPath: c.makeAltPath(),
+		},
+	}
+	err.auxpos = err.auxposBootstrap[:0]
+
+	if len(c.positions) > 0 {
+		for _, n := range c.positions {
+			err.auxpos = appendNodePositions(err.auxpos, n)
+		}
+	}
+	for i, arg := range args {
+		switch x := arg.(type) {
+		case Node:
+			err.auxpos = appendNodePositions(err.auxpos, x)
+			// A Vertex will set an error as its BaseValue via a Bottom node,
+			// which might be this error we are creating.
+			// Using the Vertex directly could then lead to endless recursion.
+			// Make a shallow copy to avoid that.
+			if v, ok := x.(*Vertex); ok {
+				vcopy := *v
+				vcopy.arcMap = nil
+				x = &vcopy
+			}
+			// Keep the Node in args; ValueError.Msg wraps it in a
+			// Formatter lazily, avoiding an interface-boxing allocation
+			// for the common case where the error is never rendered.
+			args[i] = x
+		case ast.Node:
+			// TODO: ideally the core evaluator should not depend on higher
+			// level packages. This will allow the debug packages to be used
+			// more widely.
+			b, _ := cueformat.Node(x)
+			if p := x.Pos(); p.IsValid() {
+				err.auxpos = append(err.auxpos, p)
+			}
+			args[i] = string(b)
+		case Feature:
+			args[i] = x.SelectorString(c.Runtime)
+		}
+	}
+
+	err.Message = errors.NewMessagef(format, args...)
+	return err
+}
+
+func (c *OpContext) makeAltPath() (a []string) {
+	if len(c.altPath) == 0 {
+		return nil
+	}
+
+	for _, f := range appendPath(nil, c.altPath[0]) {
+		a = append(a, f.SelectorString(c))
+	}
+	for _, v := range c.altPath[1:] {
+		if f := v.Label; f != 0 {
+			a = append(a, f.SelectorString(c))
+		}
+	}
+	return a
+}
+
+// Msg wraps any Node args with [Formatter] lazily, so the boxing allocation
+// only happens when the error is actually rendered (the minority case).
+func (e *ValueError) Msg() (format string, args []interface{}) {
+	format, args = e.Message.Msg()
+	for i, a := range args {
+		if x, ok := a.(Node); ok {
+			args[i] = Formatter{X: x, F: e.format, R: e.r}
+		}
+	}
+	return format, args
+}
+
+func (e *ValueError) Error() string {
+	return errors.String(e)
+}
+
+// ConflictError defers formatting of conflict messages until the error is
+// actually needed, avoiding expensive string conversions and allocations.
+type ConflictError struct {
+	baseError
+	v1, v2 Node
+	k1, k2 Kind
+}
+
+func (e *ConflictError) Error() string {
+	return errors.String(e)
+}
+
+func (e *ConflictError) Msg() (format string, args []interface{}) {
+	v1Str := Formatter{X: e.v1, F: e.format, R: e.r}
+	v2Str := Formatter{X: e.v2, F: e.format, R: e.r}
+	if e.k1 == e.k2 {
+		return "conflicting values %s and %s", []interface{}{v1Str, v2Str}
+	}
+	return "conflicting values %s and %s (mismatched types %s and %s)",
+		[]interface{}{v1Str, v2Str, e.k1, e.k2}
+}

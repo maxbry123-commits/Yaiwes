@@ -1,9 +1,0 @@
-bin/
-dist/
-share/
-!build/
-!target/
-mytestapp/
-mytestapp-cache/
-mytmp/
-!Makefile

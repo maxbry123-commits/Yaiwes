@@ -1,2 +1,0 @@
-    FROM employees
-    | WHERE mv_in_range(salary, 25000, 30000, {"include_lower": false, "include_upper": false})

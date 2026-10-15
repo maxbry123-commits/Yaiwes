@@ -1,8 +1,0 @@
-CHANGELOG.md
-
-/.nx/workspace-data
-
-# Generated build output (not source; Prettier does not read .gitignore)
-dist/
-.next/
-build/

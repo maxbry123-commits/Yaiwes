@@ -1,3 +1,0 @@
-FROM employees
-| EVAL x = salary * 2
-| LIMIT 5 BY x

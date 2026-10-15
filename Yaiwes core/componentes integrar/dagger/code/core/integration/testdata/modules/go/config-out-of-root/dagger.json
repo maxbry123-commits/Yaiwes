@@ -1,8 +1,0 @@
-{
-  "name": "outside-root",
-  "engineVersion": "latest",
-  "sdk": {
-    "source": "go"
-  },
-  "source": "."
-}

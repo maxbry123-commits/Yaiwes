@@ -1,2 +1,0 @@
-FROM employees
-| STATS l = SUM(LENGTH(last_name)) + AVG(LENGTH(last_name))

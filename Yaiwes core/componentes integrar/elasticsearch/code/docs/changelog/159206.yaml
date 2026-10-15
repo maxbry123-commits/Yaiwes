@@ -1,5 +1,0 @@
-area: Inference
-issues: []
-pr: 159206
-summary: "[Inference API] Add `document_extraction` task type"
-type: feature

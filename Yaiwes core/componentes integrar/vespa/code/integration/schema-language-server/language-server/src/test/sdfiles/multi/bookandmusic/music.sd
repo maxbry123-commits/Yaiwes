@@ -1,5 +1,0 @@
-document music {
-  field intfield type int {}
-  field stringfield type string {}
-  field longfield type long {}
-}

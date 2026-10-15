@@ -1,0 +1,123 @@
+package core
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/dagger/dagger/dagql"
+	telemetry "github.com/dagger/otel-go"
+	"github.com/vektah/gqlparser/v2/ast"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+type checkNameKey struct{}
+
+// WithCheckName marks a check already covered by an artifact evaluation span.
+// It does not change the check's execution identity.
+func WithCheckName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, checkNameKey{}, name)
+}
+
+// CheckNameFromContext returns the check's dag:// address when the current
+// evaluation already named it (see WithCheckName), or "" otherwise. Check
+// constructors use it to record the address on the Check itself so later runs
+// name their span correctly even when reached through a path that does not set
+// the context value.
+func CheckNameFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(checkNameKey{}).(string)
+	return name
+}
+
+// Check is a deferred assertion and its outcome.
+type Check struct {
+	Assertion       dagql.Nullable[dagql.String]                   `field:"true" doc:"The assertion that is false when this check fails."`
+	Report          dagql.Nullable[dagql.ObjectResult[*Directory]] `field:"true" doc:"An optional report produced by the check."`
+	RemoteArtifact  *Artifact
+	RemoteArguments JSON
+	Receiver        dagql.ObjectResult[*ModuleObject]
+	Workspace       dagql.ObjectResult[*Workspace]
+	Function        string
+	Address         string
+	Inputs          []CallInput
+	Generator       dagql.ObjectResult[*Generator]
+	CacheTTL        int64
+	Failure         string
+	Completed       bool
+	Passed          bool
+	Error           dagql.Nullable[dagql.ObjectResult[*Error]]
+}
+
+func (*Check) Type() *ast.Type { return &ast.Type{NamedType: "Check", NonNull: true} }
+func (*Check) TypeDescription() string {
+	return "One deferred check. Reading pass, error, or sync runs it."
+}
+
+func (c *Check) Clone() *Check {
+	copy := *c
+	if c.RemoteArtifact != nil {
+		copy.RemoteArtifact = c.RemoteArtifact.Clone()
+	}
+	return &copy
+}
+
+func (c *Check) Run(ctx context.Context) (_ *Check, rerr error) {
+	c = c.Clone()
+	if c.Completed {
+		return c, nil
+	}
+	var failure error
+	name := CheckNameFromContext(ctx)
+	if c.RemoteArtifact == nil && name == "" {
+		name = c.Address
+		if name == "" {
+			name = c.Function
+		}
+		if name == "" {
+			name = "generator stale"
+		}
+		var span trace.Span
+		ctx, span = Tracer(ctx).Start(ctx, name, trace.WithAttributes(
+			attribute.Bool(telemetry.UIRollUpLogsAttr, true),
+			attribute.Bool(telemetry.UIRollUpSpansAttr, true),
+			attribute.String(telemetry.CheckNameAttr, name),
+		))
+		defer func() {
+			span.SetAttributes(attribute.Bool(telemetry.CheckPassedAttr, failure == nil))
+			telemetry.EndWithCause(span, &failure)
+		}()
+	}
+	switch {
+	case c.RemoteArtifact != nil:
+		failure = c.runRemote(ctx)
+	case c.Failure != "":
+		failure = fmt.Errorf("%s", c.Failure)
+	case c.Receiver.Self() != nil:
+		failure = c.runFunction(ctx)
+	case c.Generator.Self() != nil:
+		var changes dagql.ObjectResult[*Changeset]
+		var srv *dagql.Server
+		srv, failure = CurrentDagqlServer(ctx)
+		if failure == nil {
+			failure = srv.Select(ctx, c.Generator, &changes, dagql.Selector{Field: "changeset"})
+		}
+		if failure == nil {
+			var empty bool
+			empty, failure = changes.Self().IsEmpty(ctx)
+			if failure == nil && !empty {
+				failure = fmt.Errorf("generated files are not up to date")
+			}
+		}
+	default:
+		failure = fmt.Errorf("check has no assertion")
+	}
+	c.Completed, c.Passed = true, failure == nil
+	if failure != nil {
+		errObj, err := NewErrorFromErr(ctx, failure)
+		if err != nil {
+			return nil, err
+		}
+		c.Error = dagql.NonNull(errObj)
+	}
+	return c, nil
+}

@@ -1,1 +1,0 @@
-source=transactions | eventstats sum(amount) as totalspent by userid | fields userid, orderid, amount, totalspent | sort userid | head 15

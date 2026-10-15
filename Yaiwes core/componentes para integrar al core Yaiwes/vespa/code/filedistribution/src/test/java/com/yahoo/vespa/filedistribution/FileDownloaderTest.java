@@ -1,0 +1,636 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.filedistribution;
+
+import com.yahoo.config.FileReference;
+import com.yahoo.io.IOUtils;
+import com.yahoo.jrt.Int32Value;
+import com.yahoo.jrt.Request;
+import com.yahoo.jrt.RequestWaiter;
+import com.yahoo.jrt.Spec;
+import com.yahoo.jrt.StringValue;
+import com.yahoo.jrt.Supervisor;
+import com.yahoo.jrt.Transport;
+import com.yahoo.text.Utf8;
+import com.yahoo.vespa.config.Connection;
+import com.yahoo.vespa.config.ConnectionPool;
+import net.jpountz.xxhash.XXHash64;
+import net.jpountz.xxhash.XXHashFactory;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import static com.yahoo.jrt.ErrorCode.CONNECTION;
+import static com.yahoo.jrt.ErrorCode.TIMEOUT;
+import static com.yahoo.vespa.filedistribution.FileReferenceData.CompressionType.zstd;
+import static com.yahoo.vespa.filedistribution.FileReferenceData.Type;
+import static com.yahoo.vespa.filedistribution.FileReferenceData.Type.compressed;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+public class FileDownloaderTest {
+    private static final Duration sleepBetweenRetries = Duration.ofMillis(10);
+
+    private MockConnection connection;
+    private FileDownloader fileDownloader;
+    private File downloadDir;
+    private Supervisor supervisor;
+
+    @Before
+    public void setup() {
+        try {
+            downloadDir = Files.createTempDirectory("filedistribution").toFile();
+            connection = new MockConnection();
+            supervisor = new Supervisor(new Transport()).setDropEmptyBuffers(true);
+            fileDownloader = createDownloader(connection, Duration.ofMillis(500));
+        } catch (IOException e) {
+            fail(e.getMessage());
+        }
+    }
+
+    @After
+    public void teardown() {
+        fileDownloader.close();
+        supervisor.transport().shutdown().join();
+    }
+
+    @Test
+    public void getFile() throws IOException {
+        File downloadDir = fileDownloader.downloadDirectory();
+
+        {
+            // fileReference already exists on disk, does not have to be downloaded
+
+            String fileReferenceString = "foo";
+            String filename = "foo.jar";
+            FileReference fileReference = new FileReference(fileReferenceString);
+            File fileReferenceFullPath = fileReferenceFullPath(downloadDir, fileReference);
+            writeFileReference(downloadDir, fileReferenceString, filename);
+            fileDownloader.downloads().completedDownloading(fileReference, fileReferenceFullPath);
+
+            // Check that we get correct path and content when asking for file reference
+            Optional<File> pathToFile = getFile(fileReference);
+            assertTrue(pathToFile.isPresent());
+            String downloadedFile = new File(fileReferenceFullPath, filename).getAbsolutePath();
+            assertEquals(new File(fileReferenceFullPath, filename).getAbsolutePath(), downloadedFile);
+            assertEquals("content", IOUtils.readFile(pathToFile.get()));
+
+            // Verify download status when downloaded
+            assertDownloadStatus(fileReference, 1.0);
+        }
+
+        {
+            // fileReference does not exist on disk, needs to be downloaded, but fails when asking upstream for file)
+
+            connection.setResponseHandler(new MockConnection.UnknownFileReferenceResponseHandler());
+
+            FileReference fileReference = new FileReference("bar");
+            File fileReferenceFullPath = fileReferenceFullPath(downloadDir, fileReference);
+            assertFalse(fileReferenceFullPath.getAbsolutePath(), getFile(fileReference).isPresent());
+
+            // Verify download status when unable to download
+            assertDownloadStatus(fileReference, 0.0);
+        }
+
+        {
+            // fileReference does not exist on disk, needs to be downloaded)
+
+            FileReference fileReference = new FileReference("baz");
+            File fileReferenceFullPath = fileReferenceFullPath(downloadDir, fileReference);
+            assertFalse(fileReferenceFullPath.getAbsolutePath(), getFile(fileReference).isPresent());
+
+            // Verify download status
+            assertDownloadStatus(fileReference, 0.0);
+
+            // Receives fileReference, should return and make it available to caller
+            String filename = "abc.jar";
+            receiveFile(fileReference, filename, FileReferenceData.Type.file, "some other content");
+            Optional<File> downloadedFile = getFile(fileReference);
+
+            assertTrue(downloadedFile.isPresent());
+            File downloadedFileFullPath = new File(fileReferenceFullPath, filename);
+            assertEquals(downloadedFileFullPath.getAbsolutePath(), downloadedFile.get().getAbsolutePath());
+            assertEquals("some other content", IOUtils.readFile(downloadedFile.get()));
+
+            // Verify download status when downloaded
+            System.out.println(fileDownloader.downloads().downloadStatuses());
+            assertDownloadStatus(fileReference, 1.0);
+        }
+
+        {
+            // fileReference does not exist on disk, needs to be downloaded, is compressed data
+
+            FileReference fileReference = new FileReference("fileReferenceToDirWithManyFiles");
+            File fileReferenceFullPath = fileReferenceFullPath(downloadDir, fileReference);
+            assertFalse(fileReferenceFullPath.getAbsolutePath(), getFile(fileReference).isPresent());
+
+            // Verify download status
+            assertDownloadStatus(fileReference, 0.0);
+
+            // Receives fileReference, should return and make it available to caller
+            String filename = "abc.tar.gz";
+            Path tempPath = Files.createTempDirectory("dir");
+            File subdir = new File(tempPath.toFile(), "subdir");
+            File fooFile = new File(subdir, "foo");
+            IOUtils.writeFile(fooFile, "foo", false);
+            // Check that long file names work. (need to do TarArchiveOutPutStream.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)) for it to work);
+            File barFile = new File(subdir, "really-long-filename-over-100-bytes-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            IOUtils.writeFile(barFile, "bar", false);
+
+            File tarFile = new FileReferenceCompressor(compressed, zstd).compress(tempPath.toFile(), List.of(fooFile, barFile), new File(tempPath.toFile(), filename));
+            byte[] tarredContent = IOUtils.readFileBytes(tarFile);
+            receiveFile(fileReference, filename, compressed, tarredContent);
+            Optional<File> downloadedFile = getFile(fileReference);
+
+            assertTrue(downloadedFile.isPresent());
+            File downloadedFoo = new File(fileReferenceFullPath, tempPath.relativize(fooFile.toPath()).toString());
+            File downloadedBar = new File(fileReferenceFullPath, tempPath.relativize(barFile.toPath()).toString());
+            assertEquals("foo", IOUtils.readFile(downloadedFoo));
+            assertEquals("bar", IOUtils.readFile(downloadedBar));
+
+            // Verify download status when downloaded
+            assertDownloadStatus(fileReference, 1.0);
+        }
+    }
+
+    @Test
+    public void getFileWhenConnectionError() throws IOException {
+        fileDownloader = createDownloader(connection, Duration.ofSeconds(2));
+        File downloadDir = fileDownloader.downloadDirectory();
+
+        int timesToFail = 2;
+        MockConnection.ConnectionErrorResponseHandler responseHandler = new MockConnection.ConnectionErrorResponseHandler(timesToFail);
+        connection.setResponseHandler(responseHandler);
+
+        FileReference fileReference = new FileReference("fileReference");
+        File fileReferenceFullPath = fileReferenceFullPath(downloadDir, fileReference);
+        assertFalse(fileReferenceFullPath.getAbsolutePath(), getFile(fileReference).isPresent());
+
+        // Getting file failed, verify download status and since there was an error is not downloading ATM
+        assertDownloadStatus(fileReference, 0.0);
+        assertFalse(fileDownloader.isDownloading(fileReference));
+
+        // Receives fileReference, should return and make it available to caller
+        String filename = "abc.jar";
+        receiveFile(fileReference, filename, FileReferenceData.Type.file, "some other content");
+        Optional<File> downloadedFile = getFile(fileReference);
+        assertTrue(downloadedFile.isPresent());
+        File downloadedFileFullPath = new File(fileReferenceFullPath, filename);
+        assertEquals(downloadedFileFullPath.getAbsolutePath(), downloadedFile.get().getAbsolutePath());
+        assertEquals("some other content", IOUtils.readFile(downloadedFile.get()));
+
+        // Verify download status when downloaded
+        assertDownloadStatus(fileReference, 1.0);
+
+        assertEquals(timesToFail, responseHandler.failedTimes);
+    }
+
+    @Test
+    public void getFileWhenPermissionDenied() {
+        // Zero grace period: a denial must be treated as permanent on the very first RPC round trip,
+        // not retried at all.
+        fileDownloader = new FileDownloader(connection, supervisor, downloadDir,
+                                            Duration.ofSeconds(30), sleepBetweenRetries, 0, Duration.ZERO);
+
+        MockConnection.PermissionDeniedResponseHandler responseHandler = new MockConnection.PermissionDeniedResponseHandler();
+        connection.setResponseHandler(responseHandler);
+
+        FileReference fileReference = new FileReference("deniedFileReference");
+        FileReferenceDownloadPermissionDeniedException exception = assertThrows(
+                FileReferenceDownloadPermissionDeniedException.class,
+                () -> getFile(fileReference));
+        assertTrue(exception.getMessage(), exception.getMessage().contains("Peer is not allowed to access file reference"));
+
+        // With no grace period, denial must exit the retry loop on the very first RPC round trip, not after
+        // retrying for the full download timeout.
+        assertEquals(1, responseHandler.requestCount);
+        assertFalse(fileDownloader.isDownloading(fileReference));
+    }
+
+    @Test
+    public void getFileWhenPermissionDeniedOutlastsGracePeriod() {
+        // Short grace period so the test runs fast, but long enough to observe more than one retry.
+        fileDownloader = new FileDownloader(connection, supervisor, downloadDir,
+                                            Duration.ofSeconds(30), sleepBetweenRetries, 0, Duration.ofMillis(100));
+
+        MockConnection.PermissionDeniedResponseHandler responseHandler = new MockConnection.PermissionDeniedResponseHandler();
+        connection.setResponseHandler(responseHandler);
+
+        FileReference fileReference = new FileReference("deniedFileReference");
+        FileReferenceDownloadPermissionDeniedException exception = assertThrows(
+                FileReferenceDownloadPermissionDeniedException.class,
+                () -> getFile(fileReference));
+        assertTrue(exception.getMessage(), exception.getMessage().contains("Peer is not allowed to access file reference"));
+
+        // A denial that persists for the whole grace period must still end up permanent, but only after
+        // being retried rather than failing on the very first attempt.
+        assertTrue("Expected more than one request, got " + responseHandler.requestCount, responseHandler.requestCount > 1);
+        assertFalse(fileDownloader.isDownloading(fileReference));
+    }
+
+    @Test
+    public void getFileWhenPermissionDeniedIsTransient() throws IOException {
+        // A denial that clears up before the grace period elapses must not fail the download -
+        // this is the eventual-consistency race the grace period exists to ride out.
+        fileDownloader = new FileDownloader(connection, supervisor, downloadDir,
+                                            Duration.ofSeconds(2), sleepBetweenRetries, 0, Duration.ofSeconds(1));
+
+        int timesToDeny = 3;
+        MockConnection.PermissionDeniedThenFoundResponseHandler responseHandler =
+                new MockConnection.PermissionDeniedThenFoundResponseHandler(timesToDeny);
+        connection.setResponseHandler(responseHandler);
+
+        FileReference fileReference = new FileReference("temporarilyDeniedFileReference");
+        // The RPC retries past the transient denials and the download "starts", but since no file content
+        // has been pushed yet, getFile() still times out waiting for it - it must NOT throw
+        // FileReferenceDownloadPermissionDeniedException, which is what the grace period prevents.
+        assertFalse(getFile(fileReference).isPresent());
+        assertTrue("Expected more than one request, got " + responseHandler.requestCount,
+                   responseHandler.requestCount > timesToDeny);
+
+        // Receives fileReference, should return and make it available to caller - proving the earlier
+        // denials did not permanently fail the download.
+        String filename = "abc.jar";
+        receiveFile(fileReference, filename, FileReferenceData.Type.file, "some content");
+        Optional<File> downloadedFile = getFile(fileReference);
+        assertTrue(downloadedFile.isPresent());
+    }
+
+    @Test
+    public void getFileWhenDownloadInProgress() throws IOException, ExecutionException, InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        String filename = "abc.jar";
+        fileDownloader = createDownloader(connection, Duration.ofSeconds(3));
+        File downloadDir = fileDownloader.downloadDirectory();
+
+        // Delay response so that we can make a second request while downloading the file from the first request
+        connection.setResponseHandler(new MockConnection.WaitResponseHandler(Duration.ofSeconds(1)));
+
+        FileReference fileReference = new FileReference("fileReference123");
+        File fileReferenceFullPath = fileReferenceFullPath(downloadDir, fileReference);
+        FileReferenceDownload fileReferenceDownload = new FileReferenceDownload(fileReference, "test");
+
+        Future<Future<Optional<File>>> future1 = executor.submit(() -> fileDownloader.getFutureFile(fileReferenceDownload));
+        do {
+            Thread.sleep(10);
+        } while (! fileDownloader.isDownloading(fileReference));
+        assertTrue(fileDownloader.isDownloading(fileReference));
+
+        // Request file while download is in progress
+        Future<Future<Optional<File>>> future2 = executor.submit(() -> fileDownloader.getFutureFile(fileReferenceDownload));
+
+        // Receive file, will complete downloading and futures
+        receiveFile(fileReference, filename, FileReferenceData.Type.file, "some other content");
+
+        // Check that we got file correctly with first request
+        Optional<File> downloadedFile = future1.get().get();
+        assertTrue(downloadedFile.isPresent());
+        File downloadedFileFullPath = new File(fileReferenceFullPath, filename);
+        assertEquals(downloadedFileFullPath.getAbsolutePath(), downloadedFile.get().getAbsolutePath());
+        assertEquals("some other content", IOUtils.readFile(downloadedFile.get()));
+
+        // Check that request done while downloading works
+        downloadedFile = future2.get().get();
+        assertTrue(downloadedFile.isPresent());
+        executor.shutdownNow();
+    }
+
+    @Test
+    public void setFilesToDownload() {
+        Duration timeout = Duration.ofMillis(200);
+        MockConnection connectionPool = new MockConnection();
+        connectionPool.setResponseHandler(new MockConnection.WaitResponseHandler(timeout.plus(Duration.ofMillis(1000))));
+        FileDownloader fileDownloader = createDownloader(connectionPool, timeout);
+        FileReference xyzzy = new FileReference("xyzzy");
+        // Should download since we do not have the file on disk
+        Spec spec = new Spec("localhost", 1234);
+        assertTrue(fileDownloader.downloadFromSource(new FileReferenceDownload(xyzzy, "test"), spec));
+        assertFalse(getFile(xyzzy).isPresent());
+        // Receive files to simulate download
+        receiveFile(xyzzy, "xyzzy.jar", FileReferenceData.Type.file, "content");
+        // Should not download, since file has already been downloaded
+        assertFalse(fileDownloader.downloadFromSource(new FileReferenceDownload(xyzzy, "test"), spec));
+        // and file should be available
+        assertTrue(getFile(xyzzy).isPresent());
+    }
+
+    @Test
+    public void receiveFile() throws IOException {
+        FileReference foobar = new FileReference("foobar");
+        String filename = "foo.jar";
+        receiveFile(foobar, filename, FileReferenceData.Type.file, "content");
+        File downloadedFile = new File(fileReferenceFullPath(downloadDir, foobar), filename);
+        assertEquals("content", IOUtils.readFile(downloadedFile));
+    }
+
+    @Test
+    public void testConnectionCloseOnTimeout() {
+        int timesToTimeout = 2;
+        MockConnection mockConnection = new MockConnection();
+        MockConnection.TimeoutResponseHandler responseHandler =
+                new MockConnection.TimeoutResponseHandler(timesToTimeout);
+        mockConnection.setResponseHandler(responseHandler);
+
+        FileDownloader downloader = new FileDownloader(mockConnection, supervisor, downloadDir,
+                                                       Duration.ofSeconds(4), sleepBetweenRetries,
+                                                       1);
+        FileReference fileReference = new FileReference("timeoutTest");
+        // File won't be found, download will fail after retries and timeout
+        assertFalse(downloader.getFile(new FileReferenceDownload(fileReference, "test")).isPresent());
+        assertEquals("Expected closeConnection called for each timeout, got " + mockConnection.getCloseConnectionCount(),
+                     timesToTimeout, mockConnection.getCloseConnectionCount());
+        downloader.close();
+    }
+
+    @Test
+    public void testConnectionCloseAfterNTimeouts() {
+        int timesToTimeout = 6;
+        int retriesOnTimeoutBeforeClose = 2;
+        MockConnection mockConnection = new MockConnection();
+        MockConnection.TimeoutResponseHandler responseHandler =
+                new MockConnection.TimeoutResponseHandler(timesToTimeout);
+        mockConnection.setResponseHandler(responseHandler);
+
+        FileDownloader downloader = new FileDownloader(mockConnection, supervisor, downloadDir,
+                                                       Duration.ofSeconds(4), sleepBetweenRetries,
+                                                       retriesOnTimeoutBeforeClose);
+        FileReference fileReference = new FileReference("timeoutNTest");
+        // File won't be found, download will fail after retries and timeout
+        assertFalse(downloader.getFile(new FileReferenceDownload(fileReference, "test")).isPresent());
+        // With retriesOnTimeoutBeforeClose=2, close happens after the 2nd timeout (count 1,2 -> close),
+        // then counter resets, so 6 timeouts / 2 = 3 closes
+        assertEquals("Expected 3 closeConnection calls for 6 timeouts with threshold 2, got " + mockConnection.getCloseConnectionCount(),
+                     3, mockConnection.getCloseConnectionCount());
+        downloader.close();
+    }
+
+    @Test
+    public void testNoConnectionCloseOnTimeoutByDefault() {
+        int timesToTimeout = 2;
+        MockConnection mockConnection = new MockConnection();
+        MockConnection.TimeoutResponseHandler responseHandler =
+                new MockConnection.TimeoutResponseHandler(timesToTimeout);
+        mockConnection.setResponseHandler(responseHandler);
+
+        // maxTimeoutsBeforeClose=0 means timeout-based close feature is disabled
+        FileDownloader downloader = new FileDownloader(mockConnection, supervisor, downloadDir,
+                                                       Duration.ofSeconds(4), sleepBetweenRetries,
+                                                       0);
+        FileReference fileReference = new FileReference("timeoutDefaultTest");
+        assertFalse(downloader.getFile(new FileReferenceDownload(fileReference, "test")).isPresent());
+        assertEquals("Expected no closeConnection calls when feature is disabled, got " + mockConnection.getCloseConnectionCount(),
+                     0, mockConnection.getCloseConnectionCount());
+        downloader.close();
+    }
+
+    private void writeFileReference(File dir, String fileReferenceString, String fileName) throws IOException {
+        File fileReferenceDir = new File(dir, fileReferenceString);
+        fileReferenceDir.mkdir();
+        File file = new File(fileReferenceDir, fileName);
+        IOUtils.writeFile(file, "content", false);
+    }
+
+    private File fileReferenceFullPath(File dir, FileReference fileReference) {
+        return new File(dir, fileReference.value());
+    }
+
+    private void assertDownloadStatus(FileReference fileReference, double expectedDownloadStatus) {
+        Downloads downloads = fileDownloader.downloads();
+        double downloadStatus = downloads.downloadStatus(fileReference);
+        assertEquals("Download statuses: " + downloads.downloadStatuses().toString(),
+                     expectedDownloadStatus,
+                     downloadStatus,
+                     0.0001);
+    }
+
+    private void receiveFile(FileReference fileReference, String filename, Type type, String content) {
+        receiveFile(fileReference, filename, type, Utf8.toBytes(content));
+    }
+
+    private void receiveFile(FileReference fileReference, String filename, Type type, byte[] content) {
+        XXHash64 hasher = XXHashFactory.fastestInstance().hash64();
+        var session = new FileReceiver.Session(downloadDir, 1, fileReference, type, zstd, filename, content.length);
+        session.addPart(0, content);
+        File file = session.close(hasher.hash(ByteBuffer.wrap(content), 0));
+        fileDownloader.downloads().completedDownloading(fileReference, file);
+    }
+
+    private Optional<File> getFile(FileReference fileReference) {
+        return fileDownloader.getFile(new FileReferenceDownload(fileReference, "test"));
+    }
+
+    private FileDownloader createDownloader(MockConnection connection, Duration timeout) {
+        return new FileDownloader(connection, supervisor, downloadDir, timeout, sleepBetweenRetries);
+    }
+
+    private static class MockConnection implements ConnectionPool, com.yahoo.vespa.config.Connection {
+
+        private ResponseHandler responseHandler;
+        private int closeConnectionCount = 0;
+
+        MockConnection() {
+            this(new FileReferenceFoundResponseHandler());
+        }
+
+        MockConnection(ResponseHandler responseHandler) {
+            this.responseHandler = responseHandler;
+        }
+
+        @Override
+        public void invokeAsync(Request request, Duration jrtTimeout, RequestWaiter requestWaiter) {
+            responseHandler.request(request);
+        }
+
+        @Override
+        public void invokeSync(Request request, Duration jrtTimeout) {
+            responseHandler.request(request);
+        }
+
+        @Override
+        public String getAddress() {
+            return "localhost";
+        }
+
+        @Override
+        public void closeConnection() {
+            closeConnectionCount++;
+        }
+
+        int getCloseConnectionCount() {
+            return closeConnectionCount;
+        }
+
+        @Override
+        public void close() {
+        }
+
+        @Override
+        public Connection getCurrent() {
+            return this;
+        }
+
+        @Override
+        public Connection switchConnection(Connection connection) {
+            return this;
+        }
+
+        @Override
+        public int getSize() {
+            return 1;
+        }
+
+        @Override
+        public List<Connection> connections() { return List.of();}
+
+        void setResponseHandler(ResponseHandler responseHandler) {
+            this.responseHandler = responseHandler;
+        }
+
+        public interface ResponseHandler {
+            void request(Request request);
+        }
+
+        static class FileReferenceFoundResponseHandler implements MockConnection.ResponseHandler {
+
+            @Override
+            public void request(Request request) {
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    request.returnValues().add(new Int32Value(0));
+                    request.returnValues().add(new StringValue("OK"));
+                }
+            }
+        }
+
+        static class UnknownFileReferenceResponseHandler implements MockConnection.ResponseHandler {
+
+            @Override
+            public void request(Request request) {
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    request.returnValues().add(new Int32Value(1));
+                    request.returnValues().add(new StringValue("Internal error"));
+                }
+            }
+        }
+
+        static class WaitResponseHandler implements MockConnection.ResponseHandler {
+
+            private final Duration waitUntilAnswering;
+
+            WaitResponseHandler(Duration waitUntilAnswering) {
+                super();
+                this.waitUntilAnswering = waitUntilAnswering;
+            }
+
+            @Override
+            public void request(Request request) {
+                try { Thread.sleep(waitUntilAnswering.toMillis());} catch (InterruptedException e) { /* do nothing */ }
+
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    request.returnValues().add(new Int32Value(0));
+                    request.returnValues().add(new StringValue("OK"));
+                }
+            }
+        }
+
+        static class TimeoutResponseHandler implements MockConnection.ResponseHandler {
+
+            private final int timesToTimeout;
+            private int timedOutTimes = 0;
+
+            TimeoutResponseHandler(int timesToTimeout) {
+                super();
+                this.timesToTimeout = timesToTimeout;
+            }
+
+            @Override
+            public void request(Request request) {
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    if (timedOutTimes < timesToTimeout) {
+                        request.setError(TIMEOUT, "Request timed out");
+                        timedOutTimes++;
+                    } else {
+                        request.returnValues().add(new Int32Value(0));
+                        request.returnValues().add(new StringValue("OK"));
+                    }
+                }
+            }
+        }
+
+        private static class PermissionDeniedResponseHandler implements MockConnection.ResponseHandler {
+
+            int requestCount = 0;
+
+            @Override
+            public void request(Request request) {
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    requestCount++;
+                    request.setError(FileReferenceDownloader.jrtErrorUnauthorized,
+                                      "Peer is not allowed to access file reference " + request.parameters().get(0).asString());
+                }
+            }
+        }
+
+        private static class PermissionDeniedThenFoundResponseHandler implements MockConnection.ResponseHandler {
+
+            private final int timesToDeny;
+            int requestCount = 0;
+
+            PermissionDeniedThenFoundResponseHandler(int timesToDeny) {
+                this.timesToDeny = timesToDeny;
+            }
+
+            @Override
+            public void request(Request request) {
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    requestCount++;
+                    if (requestCount <= timesToDeny) {
+                        request.setError(FileReferenceDownloader.jrtErrorUnauthorized,
+                                          "Peer is not allowed to access file reference " + request.parameters().get(0).asString());
+                    } else {
+                        request.returnValues().add(new Int32Value(0));
+                        request.returnValues().add(new StringValue("OK"));
+                    }
+                }
+            }
+        }
+
+        static class ConnectionErrorResponseHandler implements MockConnection.ResponseHandler {
+
+            private final int timesToFail;
+            private int failedTimes = 0;
+
+            ConnectionErrorResponseHandler(int timesToFail) {
+                super();
+                this.timesToFail = timesToFail;
+            }
+
+            @Override
+            public void request(Request request) {
+                if (request.methodName().equals("filedistribution.serveFile")) {
+                    if (failedTimes < timesToFail) {
+                        request.setError(CONNECTION, "Connection error");
+                        failedTimes++;
+                    } else {
+                        request.returnValues().add(new Int32Value(0));
+                        request.returnValues().add(new StringValue("OK"));
+                    }
+                }
+            }
+        }
+    }
+
+}

@@ -1,9 +1,0 @@
-spec:
-  files:
-    - "updatecli-compose.yaml"
-
-labels:
-  - ":Delivery/Tooling"
-  - "auto-merge-without-approval"
-  - "dependencies"
-  - ">non-issue"

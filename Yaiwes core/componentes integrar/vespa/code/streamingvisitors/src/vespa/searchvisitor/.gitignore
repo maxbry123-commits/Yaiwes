@@ -1,9 +1,0 @@
-*.So
-*.lo
-.*.swp
-.depend
-.depend.NEW
-.deps
-.libs
-Makefile
-/libsearchvisitor.so.5.1

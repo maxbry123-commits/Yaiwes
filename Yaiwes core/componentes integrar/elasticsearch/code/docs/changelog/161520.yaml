@@ -1,5 +1,0 @@
-area: ES|QL
-issues: []
-pr: 161520
-summary: "ES|QL|DS: Split external-source query telemetry by client, storage, format"
-type: enhancement

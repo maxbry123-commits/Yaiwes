@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 400811,
+  "bundle_sha256": "31b37baaa1661594c2e04a0c784339c534d7b3a78c1f10fbc2494b662df2eacb",
+  "extracted_tree": {
+    "bytes": 1000280,
+    "files": 98,
+    "sha256": "2666b40b6e272ed79bb645df1b89d91e9fe8cc580fbc6d558cee6a8f691963c0"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 400811,
+      "name": "localForage.bundle.zip.part-0001",
+      "sha256": "31b37baaa1661594c2e04a0c784339c534d7b3a78c1f10fbc2494b662df2eacb"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "localForage",
+  "source_bytes": 1000280,
+  "source_commit": "fb78c77ee583fb727a558c439b5174aca38c5924",
+  "source_files": 98,
+  "source_ref": "master",
+  "source_repo": "localForage/localForage",
+  "source_tree": {
+    "bytes": 1000280,
+    "files": 98,
+    "sha256": "2666b40b6e272ed79bb645df1b89d91e9fe8cc580fbc6d558cee6a8f691963c0"
+  }
+}

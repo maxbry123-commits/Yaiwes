@@ -1,0 +1,444 @@
+// Copyright Vespa.ai. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
+package com.yahoo.vespa.config.server.application;
+
+import com.yahoo.cloud.config.ConfigserverConfig;
+import com.yahoo.component.Version;
+import com.yahoo.component.VersionCompatibility;
+import com.yahoo.concurrent.StripedExecutor;
+import com.yahoo.config.FileReference;
+import com.yahoo.config.provision.ApplicationId;
+import com.yahoo.config.provision.TenantName;
+import com.yahoo.path.Path;
+import com.yahoo.text.Text;
+import com.yahoo.transaction.Transaction;
+import com.yahoo.vespa.config.ConfigKey;
+import com.yahoo.vespa.config.GetConfigRequest;
+import com.yahoo.vespa.config.protocol.ConfigResponse;
+import com.yahoo.vespa.config.server.ConfigActivationListener;
+import com.yahoo.vespa.config.server.NotFoundException;
+import com.yahoo.vespa.config.server.RequestHandler;
+import com.yahoo.vespa.config.server.deploy.TenantFileSystemDirs;
+import com.yahoo.vespa.config.server.host.HostRegistry;
+import com.yahoo.vespa.config.server.host.HostValidator;
+import com.yahoo.vespa.config.server.monitoring.MetricUpdater;
+import com.yahoo.vespa.config.server.monitoring.Metrics;
+import com.yahoo.vespa.config.server.rpc.ConfigResponseFactory;
+import com.yahoo.vespa.config.server.tenant.TenantRepository;
+import com.yahoo.vespa.curator.Curator;
+import com.yahoo.vespa.curator.Lock;
+import com.yahoo.vespa.curator.transaction.CuratorTransaction;
+import com.yahoo.vespa.flags.FlagSource;
+import com.yahoo.vespa.flags.ListFlag;
+import com.yahoo.vespa.flags.PermanentFlags;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.recipes.cache.PathChildrenCacheEvent;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static com.yahoo.vespa.curator.Curator.CompletionWaiter;
+import static com.yahoo.vespa.flags.Dimension.INSTANCE_ID;
+import static java.util.stream.Collectors.toSet;
+
+/**
+ * The applications of a tenant.
+ *
+ * @author Ulf Lilleengen
+ * @author jonmv
+ */
+public class TenantApplications implements RequestHandler, HostValidator {
+
+    private static final Logger log = Logger.getLogger(TenantApplications.class.getName());
+    /* Time to wait for all config servers to get event when an application is removed */
+    private static final Duration waitForAll = Duration.ofSeconds(5);
+
+    private final Curator curator;
+    private final ApplicationCuratorDatabase database;
+    private final Curator.DirectoryCache directoryCache;
+    private final Executor zkWatcherExecutor;
+    private final Metrics metrics;
+    private final TenantName tenant;
+    private final ConfigActivationListener configActivationListener;
+    private final ConfigResponseFactory responseFactory;
+    private final HostRegistry hostRegistry; // global host registry, hosts for all apps for all tenants
+    private final ApplicationMapper applicationMapper = new ApplicationMapper();
+    private final MetricUpdater tenantMetricUpdater;
+    private final Clock clock;
+    private final TenantFileSystemDirs tenantFileSystemDirs;
+    private final String serverId;
+    private final ListFlag<String> incompatibleVersions;
+
+    public TenantApplications(TenantName tenant, Curator curator, StripedExecutor<TenantName> zkWatcherExecutor,
+                              ExecutorService zkCacheExecutor, Metrics metrics, ConfigActivationListener configActivationListener,
+                              ConfigserverConfig configserverConfig, HostRegistry hostRegistry,
+                              TenantFileSystemDirs tenantFileSystemDirs, Clock clock, FlagSource flagSource) {
+        this.curator = curator;
+        this.database = new ApplicationCuratorDatabase(tenant, curator, configserverConfig);
+        this.tenant = tenant;
+        this.zkWatcherExecutor = command -> zkWatcherExecutor.execute(tenant, command);
+        this.directoryCache = database.createApplicationsPathCache(zkCacheExecutor);
+        this.directoryCache.addListener(this::childEvent);
+        this.directoryCache.start();
+        this.metrics = metrics;
+        this.configActivationListener = configActivationListener;
+        this.responseFactory = ConfigResponseFactory.create(configserverConfig);
+        this.tenantMetricUpdater = metrics.getOrCreateMetricUpdater(Metrics.createDimensions(tenant));
+        this.hostRegistry = hostRegistry;
+        this.tenantFileSystemDirs = tenantFileSystemDirs;
+        this.clock = clock;
+        this.serverId = configserverConfig.serverId();
+        this.incompatibleVersions = PermanentFlags.INCOMPATIBLE_VERSIONS.bindTo(flagSource);
+    }
+
+    /** The curator backed ZK storage of this. */
+    public ApplicationCuratorDatabase database() { return database; }
+
+    /**
+     * List the active applications of a tenant in this config server.
+     *
+     * @return a list of {@link ApplicationId}s that are active.
+     */
+    public List<ApplicationId> activeApplications() {
+        return database().activeApplications();
+    }
+
+    public boolean exists(ApplicationId id) {
+        return database().exists(id);
+    }
+
+    /**
+     * Returns the active session id for the given application.
+     * Returns Optional.empty if application not found or no active session exists.
+     */
+    public Optional<Long> activeSessionOf(ApplicationId id) {
+        return database().activeSessionOf(id);
+    }
+
+    /**
+     * Returns application data for the given application.
+     * Returns Optional.empty if application not found or no application data exists.
+     */
+    public Optional<ApplicationData> applicationData(ApplicationId id) {
+        return database().applicationData(id);
+    }
+
+    public boolean sessionExistsInFileSystem(long sessionId) {
+        return Files.exists(Paths.get(tenantFileSystemDirs.sessionsPath().getAbsolutePath(), String.valueOf(sessionId)));
+    }
+
+    /**
+     * Append transaction operations for activation of session: update the "last deployed" session of the application,
+     * and set which session is active for the application.
+     */
+    public Transaction appendActivateOperations(Lock applicationLock,
+                                                ApplicationId applicationId,
+                                                long sessionId,
+                                                Transaction transaction) {
+        return database().appendDeployOperations(applicationLock, applicationId, sessionId, OptionalLong.of(sessionId), transaction);
+    }
+
+    /** Application session is being prepared: Update the "last deployed" session of the application. */
+    public void prepare(ApplicationId applicationId, long sessionId) {
+        try (var applicationLock = lock(applicationId);
+             var transaction = new CuratorTransaction(curator)) {
+            OptionalLong activeSessionId = database().activeSessionOf(applicationId).map(OptionalLong::of).orElseGet(OptionalLong::empty);
+            database().appendDeployOperations(applicationLock,
+                                              applicationId,
+                                              sessionId,
+                                              activeSessionId,
+                                              transaction)
+                      .commit();
+        }
+    }
+
+    /**
+     * Creates a node for the given application, marking its existence.
+     */
+    public void createApplication(ApplicationId id) {
+        database().createApplication(id);
+    }
+
+    /**
+     * Return the active session id for a given application.
+     *
+     * @param  applicationId an {@link ApplicationId}
+     * @return session id of given application id.
+     * @throws IllegalArgumentException if the application does not exist
+     */
+    public long requireActiveSessionOf(ApplicationId applicationId) {
+        return activeSessionOf(applicationId)
+                .orElseThrow(() -> new IllegalArgumentException("Application '" + applicationId + "' has no active session."));
+    }
+
+    /**
+     * Returns a transaction which deletes this application.
+     */
+    public CuratorTransaction createDeleteTransaction(Lock applicationLock, ApplicationId applicationId) {
+        return database().createDeleteTransaction(applicationLock, applicationId);
+    }
+
+    /**
+     * Removes all applications not known to this from the config server state.
+     */
+    public void removeUnusedApplications() {
+        removeApplicationsExcept(Set.copyOf(activeApplications()));
+    }
+
+    /**
+     * Closes the application repo. Once a repo has been closed, it should not be used again.
+     */
+    public void close() {
+        directoryCache.close();
+    }
+
+    /** Returns the lock for changing the session status of the given application. */
+    public Lock lock(ApplicationId id) {
+        return database().lock(id);
+    }
+
+    /** Returns the lock for changing the session status of the given application. */
+    public Lock lock(ApplicationId id, Duration lockTimeout) {
+        return database().lock(id, lockTimeout);
+    }
+
+    private void childEvent(CuratorFramework ignored, PathChildrenCacheEvent event) {
+        zkWatcherExecutor.execute(() -> {
+            // Note: event.getData() might return null on types not handled here (CONNECTION_*, INITIALIZED, see javadoc)
+            switch (event.getType()) {
+                case CHILD_ADDED:
+                    /* A new application is added when a session is added, @see
+                    {@link com.yahoo.vespa.config.server.session.SessionRepository#childEvent(CuratorFramework, PathChildrenCacheEvent)} */
+                    ApplicationId applicationId = ApplicationId.fromSerializedForm(Path.fromString(event.getData().getPath()).getName());
+                    log.log(Level.FINE, () -> TenantRepository.logPre(applicationId) + "Application added: " + applicationId);
+                    break;
+                // Event CHILD_REMOVED will be triggered on all config servers if deleteApplication() above is called on one of them
+                case CHILD_REMOVED:
+                    removeApplication(ApplicationId.fromSerializedForm(Path.fromString(event.getData().getPath()).getName()));
+                    break;
+                case CHILD_UPDATED:
+                    // do nothing, application just got redeployed
+                    break;
+                default:
+                    break;
+            }
+        });
+    }
+
+    /**
+     * Gets a config for the given app, or null if not found
+     */
+    @Override
+    public ConfigResponse resolveConfig(ApplicationId appId, GetConfigRequest req, Optional<Version> vespaVersion) {
+        Application application = getApplication(appId, vespaVersion);
+        log.log(Level.FINE, () -> TenantRepository.logPre(appId) + "Resolving config");
+        return application.resolveConfig(req, responseFactory);
+    }
+
+    /**
+     * Activates the config of the given app. Notifies listeners
+     *
+     * @param applicationVersions the {@link ApplicationVersions} to be activated
+     */
+    public void activateApplication(ApplicationVersions applicationVersions, long activeSessionId) {
+        ApplicationId id = applicationVersions.getId();
+        try (@SuppressWarnings("unused") Lock lock = lock(id)) {
+            if ( ! exists(id))
+                return; // Application was deleted before activation.
+            if (applicationVersions.applicationGeneration() != activeSessionId)
+                return; // Application activated a new session before we got here.
+
+            setActiveApp(applicationVersions);
+        }
+    }
+
+    // Note: Assumes that caller already holds the application lock
+    // (when getting event from zookeeper to remove application,
+    // the lock should be held by the thread that causes the event to happen)
+    public void removeApplication(ApplicationId applicationId) {
+        log.log(Level.FINE, () -> "Removing application " + applicationId);
+        if (exists(applicationId)) {
+            log.log(Level.INFO, "Tried removing application " + applicationId + ", but it seems to have been deployed again");
+            return;
+        }
+
+        if (hasApplication(applicationId)) {
+            applicationMapper.remove(applicationId);
+            configActivationListenersOnRemove(applicationId);
+            tenantMetricUpdater.setApplications(applicationMapper.numApplications());
+            metrics.removeMetricUpdater(Metrics.createDimensions(applicationId));
+            getRemoveApplicationWaiter(applicationId).notifyCompletion();
+            log.log(Level.INFO, "Application removed: " + applicationId);
+        }
+    }
+
+    public boolean hasApplication(ApplicationId applicationId) {
+        return applicationMapper.hasApplication(applicationId, clock.instant());
+    }
+
+    public void removeApplicationsExcept(Set<ApplicationId> applications) {
+        for (ApplicationId activeApplication : applicationMapper.listApplicationIds()) {
+            if ( ! applications.contains(activeApplication)) {
+                try (@SuppressWarnings("unused") var applicationLock = lock(activeApplication)){
+                    removeApplication(activeApplication);
+                }
+            }
+        }
+    }
+
+    private void configActivationListenersOnRemove(ApplicationId applicationId) {
+        hostRegistry.removeHosts(applicationId);
+        configActivationListener.applicationRemoved(applicationId);
+    }
+
+    private void setActiveApp(ApplicationVersions applicationVersions) {
+        ApplicationId applicationId = applicationVersions.getId();
+        Collection<String> hostsForApp = applicationVersions.allHosts();
+        hostRegistry.update(applicationId, hostsForApp);
+        applicationVersions.updateHostMetrics();
+        tenantMetricUpdater.setApplications(applicationMapper.numApplications());
+        applicationMapper.register(applicationId, applicationVersions);
+        configActivationListener.configActivated(applicationVersions);
+    }
+
+    @Override
+    public Set<ConfigKey<?>> listNamedConfigs(ApplicationId appId, Optional<Version> vespaVersion, ConfigKey<?> keyToMatch, boolean recursive) {
+        Application application = getApplication(appId, vespaVersion);
+        return listConfigs(application, keyToMatch, recursive);
+    }
+
+    private Set<ConfigKey<?>> listConfigs(Application application, ConfigKey<?> keyToMatch, boolean recursive) {
+        Set<ConfigKey<?>> ret = new LinkedHashSet<>();
+        for (ConfigKey<?> key : application.allConfigsProduced()) {
+            String configId = key.getConfigId();
+            if (recursive) {
+                key = new ConfigKey<>(key.getName(), configId, key.getNamespace());
+            } else {
+                // Include first part of id as id
+                key = new ConfigKey<>(key.getName(), configId.split("/")[0], key.getNamespace());
+            }
+            if (keyToMatch != null) {
+                String n = key.getName(); // Never null
+                String ns = key.getNamespace(); // Never null
+                if (n.equals(keyToMatch.getName()) &&
+                    ns.equals(keyToMatch.getNamespace()) &&
+                    configId.startsWith(keyToMatch.getConfigId()) &&
+                    !(configId.equals(keyToMatch.getConfigId()))) {
+
+                    if (!recursive) {
+                        // For non-recursive, include the id segment we were searching for, and first part of the rest
+                        key = new ConfigKey<>(key.getName(), appendOneLevelOfId(keyToMatch.getConfigId(), configId), key.getNamespace());
+                    }
+                    ret.add(key);
+                }
+            } else {
+                ret.add(key);
+            }
+        }
+        return ret;
+    }
+
+    @Override
+    public Set<ConfigKey<?>> listConfigs(ApplicationId appId, Optional<Version> vespaVersion, boolean recursive) {
+        Application application = getApplication(appId, vespaVersion);
+        return listConfigs(application, null, recursive);
+    }
+
+    /**
+     * Given baseIdSegment search/ and id search/container/default.0, return search/container
+     * @return id segment with one extra level from the id appended
+     */
+    String appendOneLevelOfId(String baseIdSegment, String id) {
+        if ("".equals(baseIdSegment)) return id.split("/")[0];
+        String theRest = id.substring(baseIdSegment.length());
+        if ("".equals(theRest)) return id;
+        theRest = theRest.replaceFirst("/", "");
+        String theRestFirstSeg = theRest.split("/")[0];
+        return baseIdSegment+"/"+theRestFirstSeg;
+    }
+
+    @Override
+    public Set<ConfigKey<?>> allConfigsProduced(ApplicationId appId, Optional<Version> vespaVersion) {
+        Application application = getApplication(appId, vespaVersion);
+        return application.allConfigsProduced();
+    }
+
+    private Application getApplication(ApplicationId appId, Optional<Version> vespaVersion) {
+        try {
+            return applicationMapper.getForVersion(appId, vespaVersion, clock.instant());
+        } catch (VersionDoesNotExistException ex) {
+            throw new NotFoundException(Text.format("%sNo such application (id %s): %s", TenantRepository.logPre(tenant), appId, ex.getMessage()));
+        }
+    }
+
+    @Override
+    public Set<String> allConfigIds(ApplicationId appId, Optional<Version> vespaVersion) {
+        Application application = getApplication(appId, vespaVersion);
+        return application.allConfigIds();
+    }
+
+    @Override
+    public boolean hasApplication(ApplicationId appId, Optional<Version> vespaVersion) {
+        return hasHandler(appId, vespaVersion);
+    }
+
+    private boolean hasHandler(ApplicationId appId, Optional<Version> vespaVersion) {
+        return applicationMapper.hasApplicationForVersion(appId, vespaVersion, clock.instant());
+    }
+
+    @Override
+    public ApplicationId resolveApplicationId(String hostName) {
+        return hostRegistry.getApplicationId(hostName);
+    }
+
+    @Override
+    public Set<FileReference> listFileReferences(ApplicationId applicationId) {
+        return applicationMapper.listApplications(applicationId).stream()
+                .flatMap(app -> app.getModel().fileReferences().stream())
+                .collect(toSet());
+    }
+
+    @Override
+    public boolean compatibleWith(Optional<Version> vespaVersion, ApplicationId application) {
+        if (vespaVersion.isEmpty()) return true;
+        Version wantedVersion = applicationMapper.getForVersion(application, Optional.empty(), clock.instant())
+                                                 .getModel().wantedNodeVersion();
+        return VersionCompatibility.fromVersionList(incompatibleVersions.with(INSTANCE_ID, application.serializedForm()).value())
+                                   .accept(vespaVersion.get(), wantedVersion);
+    }
+
+    @Override
+    public void verifyHosts(ApplicationId applicationId, Collection<String> newHosts) {
+        hostRegistry.verifyHosts(applicationId, newHosts);
+    }
+
+    public HostRegistry hostRegistry() { return hostRegistry; }
+
+    public TenantFileSystemDirs getTenantFileSystemDirs() { return tenantFileSystemDirs; }
+
+    public CompletionWaiter createRemoveApplicationWaiter(ApplicationId applicationId) {
+        return curator.createCompletionWaiter(barrierPath(applicationId), serverId, waitForAll);
+    }
+
+    public CompletionWaiter getRemoveApplicationWaiter(ApplicationId applicationId) {
+        return curator.getCompletionWaiter(barrierPath(applicationId), serverId, waitForAll);
+    }
+
+    private static Path barrierPath(ApplicationId applicationId) {
+        return TenantRepository.getBarriersPath().append(applicationId.tenant().value())
+                .append("delete-application")
+                .append(applicationId.serializedForm());
+    }
+
+}

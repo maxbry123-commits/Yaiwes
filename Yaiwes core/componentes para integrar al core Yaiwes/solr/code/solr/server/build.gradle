@@ -1,0 +1,136 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+apply plugin: 'java-library'
+
+description = 'Solr Server'
+
+// No java classes from this module
+jar.enabled(false)
+javadoc.enabled(false)
+compileJava.enabled(false)
+
+configurations {
+  libExt
+  serverLib
+  solrCore
+  runtimeClasspath {
+    extendsFrom serverLib, libExt, solrCore
+  }
+  startJar
+  webapp
+  packaging
+}
+
+dependencies {
+  serverLib platform(project(":platform"))
+  serverLib(libs.eclipse.jetty.deploy, {
+    exclude group: "org.awaitility", module: "awaitility"
+  })
+  serverLib libs.eclipse.jetty.http
+  serverLib libs.eclipse.jetty.io
+  serverLib libs.eclipse.jetty.jmx
+  serverLib libs.eclipse.jetty.rewrite
+  serverLib libs.eclipse.jetty.security
+  serverLib libs.eclipse.jetty.server
+  serverLib libs.eclipse.jetty.ee10.servlet
+  serverLib libs.eclipse.jetty.ee10.servlets
+  serverLib libs.eclipse.jetty.util
+  serverLib libs.eclipse.jetty.ee10.webapp
+  serverLib libs.eclipse.jetty.xml
+  serverLib libs.eclipse.jetty.alpnserver
+  serverLib(libs.eclipse.jetty.alpnjavaserver, {
+    exclude group: "org.eclipse.jetty.alpn", module: "alpn-api"
+  })
+
+  serverLib libs.eclipse.jetty.http2.server
+  serverLib libs.eclipse.jetty.http2.common
+  serverLib libs.eclipse.jetty.http2.hpack
+  serverLib libs.jakarta.servlet.api
+
+  libExt libs.lmax.disruptor
+  libExt libs.slf4j.jcloverslf4j
+  libExt libs.slf4j.jultoslf4j
+  libExt libs.slf4j.api
+  libExt libs.apache.log4j1.api
+  libExt libs.apache.log4j.api
+  libExt libs.apache.log4j.core
+  libExt libs.apache.log4j.layout.templatejson
+  libExt libs.apache.log4j.slf4j2impl
+  libExt libs.apache.log4j.web
+
+  webapp project(path: ":solr:webapp", configuration: "war")
+
+  startJar(variantOf(libs.eclipse.jetty.start) {classifier 'shaded'}, {
+    transitive false
+  })
+
+  solrCore project(":solr:core")
+}
+
+// Add the following non-standard configurations to JAR validation.
+afterEvaluate {
+  configurations {
+    jarValidation.extendsFrom startJar
+    distJarValidation.extendsFrom startJar // start.jar ships in the distribution
+  }
+}
+
+ext {
+  packagingDir = file("${buildDir}/packaging")
+}
+
+task assemblePackaging(type: Sync) {
+  from(projectDir, {
+    include "contexts/**"
+    include "etc/**"
+    include "modules/**"
+    include "resources/**"
+    include "scripts/**"
+    include "solr/**"
+    include "README.md"
+  })
+
+  // Add in the intersection of serverLib and solrCore
+  from(configurations.libExt +
+      (configurations.serverLib - (configurations.serverLib - configurations.solrCore)), {
+    into "lib/ext"
+  })
+
+  from(configurations.serverLib - configurations.libExt - configurations.solrCore, {
+    into "lib/"
+  })
+
+  from {project.configurations.startJar.singleFile} {
+    rename {file -> 'start.jar'}
+  }
+
+  dependsOn configurations.webapp
+  from({zipTree(configurations.webapp.asPath)}, {
+    into "solr-webapp/webapp"
+  })
+
+  into packagingDir
+}
+
+artifacts {
+  packaging packagingDir, {
+    builtBy assemblePackaging
+  }
+}
+
+assemble.dependsOn assemblePackaging

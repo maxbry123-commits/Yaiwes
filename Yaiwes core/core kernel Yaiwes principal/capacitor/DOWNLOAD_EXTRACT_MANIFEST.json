@@ -1,0 +1,35 @@
+{
+  "bundle_bytes": 1215183,
+  "bundle_sha256": "34690a3102c4fc6af474520bb0763bb004815240f6186b0ee5ac3bd81fd748a2",
+  "extracted_tree": {
+    "bytes": 3101603,
+    "files": 510,
+    "sha256": "3368321abb6d49d50fa468aeead7cd16c55da4c41d49ead7e2e9688f8f56d22e"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1215183,
+      "name": "capacitor.bundle.zip.part-0001",
+      "sha256": "34690a3102c4fc6af474520bb0763bb004815240f6186b0ee5ac3bd81fd748a2"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.hf.download-extract.v1",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "capacitor",
+  "source_bytes": 3101603,
+  "source_commit": "9dc5aebd0335e0553827d81b4ce0f79e8a1c51aa",
+  "source_files": 510,
+  "source_ref": "main",
+  "source_repo": "ionic-team/capacitor",
+  "source_tree": {
+    "bytes": 3101603,
+    "files": 510,
+    "sha256": "3368321abb6d49d50fa468aeead7cd16c55da4c41d49ead7e2e9688f8f56d22e"
+  }
+}
