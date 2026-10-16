@@ -52,7 +52,7 @@ Commits: lote 1/2 `738a9cc84d393fcb2ed687aa326998206a09e230` (core + 35 componen
 | phoenix | `phoenix` | 7251 | 78 |
 | playwright | `playwright` | 3081 | 74 |
 | playwright-mcp | `➡️📂 Shack imput/📂 Componentes para integración sharck imput/search/playwright-mcp` | 37 | 1 |
-| prefect | `prefect` | 5357 | 99 |
+| prefect | → movido a core kernel (duplicado borrado t131u): https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/prefect | — | — |
 | pydantic | `pydantic` | 824 | 13 |
 | python-sdk | `python-sdk` | 1660 | 19 |
 | ragas | `➡️📂 sharck imput/📂 input sharck code principal/📂 componentes open source/B04-context-engineering/ragas` | 699 | 91 |

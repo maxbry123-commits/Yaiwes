@@ -40,7 +40,7 @@ Reanudar/auditar: ver reglas de motores y concurrencia en [README-INDICE.md](./R
   - [phoenix](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/phoenix)
   - [playwright-mcp](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/playwright-mcp)
   - [playwright](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/playwright)
-  - [prefect](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/prefect)
+  - prefect → duplicado borrado (t131u); copia verificada vs upstream en core kernel: https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal/prefect
   - [pydantic](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/pydantic)
   - [python-sdk](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/python-sdk)
   - [ragas](https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput/componentes%20por%20integrar/ragas)
@@ -76,3 +76,20 @@ Reanudar/auditar: ver reglas de motores y concurrencia en [README-INDICE.md](./R
 
 ### Desviación histórica registrada
 - Commits anteriores al cierre t130u (lotes 1–9 de recuperación, 7724e1ecd y las 4 importaciones ya revertidas) escribieron en el índice git directamente (contenido verificado, pero no colocado con motor_3). El contenido actual es idéntico al upstream; esos commits quedan en el historial (sin force push no se pueden reescribir).
+
+
+---
+## Mini raíces (t132u)
+- **Yaiwes core/core kernel Yaiwes principal** — https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/core%20kernel%20Yaiwes%20principal — Núcleo Yaiwes: 115 repos (listas t126u y t130u) verificados contra upstream, con README principal en formato de 4 líneas.
+- **Yaiwes core/componentes para integrar al core Yaiwes** — https://github.com/maxbry123-commits/Yaiwes/tree/main/Yaiwes%20core/componentes%20para%20integrar%20al%20core%20Yaiwes — 49 repos de la lista de 115 pendientes de integrar al core, verificados contra upstream.
+- **shark imput** — https://github.com/maxbry123-commits/Yaiwes/tree/main/shark%20imput — Entrada, búsqueda y clasificación de información: core de imput shark + 39 componentes por integrar.
+- **memoria** — https://github.com/maxbry123-commits/Yaiwes/tree/main/memoria — Memoria y almacenamiento del orquestador: core de memoria + 13 componentes por integrar.
+- **readme arquitectura índice** — https://github.com/maxbry123-commits/Yaiwes/tree/main/readme%20arquitectura%20%C3%ADndice — Índice maestro con índice y handoff cableados por cada destino y las auditorías.
+- **claude-notas** — https://github.com/maxbry123-commits/Yaiwes/tree/main/claude-notas — Notas de trabajo de Claude.
+- **➡️📂motores de descarga extracción copiado movimiento archivos router-universal-router-inteligente-** — https://github.com/maxbry123-commits/Yaiwes/tree/main/%E2%9E%A1%EF%B8%8F%F0%9F%93%82motores%20de%20descarga%20extracci%C3%B3n%20copiado%20movimiento%20archivos%20router-universal-router-inteligente- — Copia de los motores canónicos (motor_1–4, motor_2 + engine) usada para los traspasos.
+
+## Auditoría t131u (3 pasadas) y limpieza de orígenes
+- Pasada 1 (listas): 115 → 107 en Yaiwes core + 8 en shark imput; lista t126u → 104 core + 7 shark; lista 2 → 14/14 (12 nuevos + 2 ya en core); shark imput 40/40 y memoria 13/13 según clasificación v3.
+- Pasada 2 (contenido): forense blob a blob de 164 repos de Yaiwes core contra el upstream: idénticos (elasticsearch verificado con árbol completo).
+- Pasada 3 (higiene): 0 punteros LFS, 0 filter=lfs, 0 `_archives`, 0 sueltos; duplicado `shark imput/.../prefect` borrado (queda en core kernel, verificado).
+- Orígenes borrados tras verificar árbol idéntico por hash: osquestador-auditor (36 carpetas, 2a412c58d), agentes (16, e37a91f91), Agentes-motores-Wordflow-YAIWES (5, 6c58a7378).
