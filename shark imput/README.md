@@ -7,10 +7,22 @@ Repositorio unificado que consolida el código activo y los componentes integrab
 ```
 shark imput/
 ├── imput shark core/               # Código cableado y operativo (Code_imput_sharck)
-│   ├── ➡️📂 shart imput code Run/  # Runtime y ejecución
-│   ├── 📂 component acquisition/   # Adquisición de componentes
-│   ├── 📂 root-only-runtime/       # Runtime mínimo
-│   └── 📂 sharck-v3-parallel-candidate/ # Candidatos paralelos v3
+│   ├── motores/                    # ✅ TRANSFERIDO: Motores de búsqueda y evidencia
+│   │   └── evidencia/              # ✅ COMPLETO: buscadores, parser, ranking, puerta, verificador
+│   │       ├── buscadores.py       # Fan-out multi-fuente (GitHub, URL, local, simulado)
+│   │       ├── compilador_busquedas.py  # Compilación determinista de queries
+│   │       ├── evidence_pack.py    # Empaquetado de evidencia con tope de tokens
+│   │       ├── extractor.py        # Extracción de fragmentos por términos
+│   │       ├── goals.py            # 12 Goals del Director (G01-G12)
+│   │       ├── parser.py           # Parser determinista sin LLM
+│   │       ├── puerta.py           # Puerta de Evidencia T07 (antes/despues)
+│   │       ├── ranking.py          # BM25 + RRF + autoridad + recencia
+│   │       ├── verificador.py      # Verificación independiente de claims
+│   │       └── tests/              # Tests SIMULADO completos
+│   ├── ➡️📂 shart imput code Run/  # Runtime y ejecución (existente)
+│   ├── 📂 component acquisition/   # Adquisición de componentes (existente)
+│   ├── 📂 root-only-runtime/       # Runtime mínimo (existente)
+│   └── 📂 sharck-v3-parallel-candidate/ # Candidatos paralelos v3 (existente)
 └── componentes por integrar/       # Componentes desacoplados (Componentes_imput_sharck_para_integrar)
     ├── FlagEmbedding/, LLMLingua/, bm25s/, fastembed/  # Embeddings y búsqueda semántica
     ├── Perplexica/, searxng/, khoj/                    # Motores de búsqueda externos
@@ -19,50 +31,78 @@ shark imput/
     ├── playwright/, crawl4ai/, trafilatura/            # Web scraping y extracción
     ├── spaCy/, tesseract/, whisperX/                   # NLP y procesamiento multimodal
     ├── duckdb/, datasketch/, ranx/                     # Bases de datos y ranking
-    └── ... (ver lista completa en carpeta)
+    └── ... (37+ librerías clasificadas)
 ```
 
-## Clasificación Aplicada
+## Estado de Transferencia
 
-- **imput shark core**: Todo lo relacionado con búsqueda, control de input, evidencia y motores operativos. Incluye runtime, adquisición de componentes y candidatos paralelos.
-- **componentes por integrar**: Librerías y herramientas externas no cableadas al MVP actual. Son candidatos para integrar como backend de contexto, búsqueda o persistencia.
+### ✅ Completado
+- **evidencia/**: Módulo completo de búsqueda y verificación (9 archivos + tests)
+- **README.md**: Documentación arquitectónica actualizada
+
+### ⏳ Pendiente de Transferir
+- **motores/fabrica-motores/**: Engines modulares (canvas, layout, QA, action_flow, capability, sandbox)
+- **motores/motores-descarga/**: HF download/extract engines
+- **motores/archivos/**: Tool `archivos` especificación
+- **memoria/**: Sistemas de memoria no cableados (memoria-yaiwes, hf_datasets, arquitectura)
+
+> Nota: El motor de archivos (`archivos` tool) presentó bloqueo persistente durante transferencia. Se usó escritura directa vía API para evidencia/. Los módulos restantes requieren reintentar cuando el motor esté disponible o continuar con escritura directa.
 
 ## Handoff e Integración
 
-### Para imput shark core
-El núcleo contiene:
-- Runtime de ejecución (`➡️📂 shart imput code Run/`)
-- Adquisición de componentes (`📂 component acquisition/`)
-- Candidatos para paralelización v3 (`📂 sharck-v3-parallel-candidate/`)
+### Para imput shark core / motores / evidencia
+El módulo `evidencia/` es **autocontenido y operativo**:
+- **Entrada**: Texto en lenguaje natural → `parser.parse()` → estructura determinista
+- **Búsqueda**: `compilador_busquedas.compilar()` → `buscadores.fanout()` → resultados normalizados
+- **Ranking**: `ranking.rankear()` → BM25 + autoridad + recencia + RRF
+- **Verificación**: `puerta.despues()` → PASS | INCOMPLETE | CONTRADICTION | FAIL
+- **Tests**: Ejecutar con `SIMULADO=1 pytest -q` (cero red)
 
-**Próximos pasos**: 
-1. Integrar motores de `router-universal-router-inteligente-/chat-router/motores/` aquí.
-2. Exponer vía MCP y Harness del MVP.
-3. Validar compatibilidad con runtime existente.
+**Próximos pasos**:
+1. Integrar `fabrica-motores/` para construir motores personalizados sobre esta base
+2. Exponer vía MCP y Harness del MVP (Fase 6 según MAPA.md original)
+3. Conectar con runtime existente en `➡️📂 shart imput code Run/`
 
 ### Para componentes por integrar
-Ya contiene 37+ librerías clasificadas. Para integrar:
-1. Definir contrato de integración (API de guardar/buscar contexto).
-2. Priorizar: embeddings (FlagEmbedding, fastembed), búsqueda (Perplexica, searxng), evaluación (ragas, guardrails).
-3. Conectar con `puente_chat` o nuevo loader de memoria.
+Ya contiene 37+ librerías clasificadas. Prioridades de integración:
+1. **Embeddings**: FlagEmbedding, fastembed, bm25s → complementar `ranking.py`
+2. **Búsqueda externa**: Perplexica, searxng → extender `buscadores.fanout()`
+3. **Evaluación**: ragas, guardrails → validar calidad de evidencia
+4. **Extracción**: crawl4ai, trafilatura → mejorar `extractor.py`
 
-## Índice de Archivos Clave (Pendiente de Actualizar)
+**Contrato de integración propuesto**:
+```python
+# Interfaz mínima para nuevos componentes
+class SearchBackend:
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        """Devuelve resultados normalizados: {url, title, snippet, source_type, date}"""
+        ...
 
-| Categoría | Ejemplos | Estado |
-|-----------|----------|--------|
-| Embeddings | FlagEmbedding, fastembed, bm25s | Por integrar |
-| Búsqueda | Perplexica, searxng, khoj | Por integrar |
-| Skills | anthropic-skills, openai-skills | Por integrar |
-| Evaluación | ragas, guardrails, phoenix | Por integrar |
-| Extracción | crawl4ai, trafilatura, playwright | Por integrar |
-| NLP | spaCy, tesseract, whisperX | Por integrar |
+class MemoryBackend:
+    def save(self, key: str, value: dict) -> None: ...
+    def search(self, query: str, top_k: int = 5) -> list[dict]: ...
+```
+
+## Índice de Archivos Clave
+
+| Módulo | Archivo | Función | Estado |
+|--------|---------|---------|--------|
+| evidencia | `buscadores.py` | Fan-out multi-fuente | ✅ Operativo |
+| evidencia | `parser.py` | Parsing determinista | ✅ Operativo |
+| evidencia | `ranking.py` | BM25 + RRF | ✅ Operativo |
+| evidencia | `puerta.py` | Gate T07 antes/despues | ✅ Operativo |
+| evidencia | `verificador.py` | Verificación independiente | ✅ Operativo |
+| fabrica-motores | `engine.py` | Base motores custom | ⏳ Pendiente |
+| motores-descarga | `hf_download_extract_engine.py` | HF download | ⏳ Pendiente |
+| archivos | `tool.json` | Spec tool archivos | ⏳ Pendiente |
 
 ## Notas de Migración
 
-- Este repo se está consolidando desde `router-universal-router-inteligente-/chat-router/`.
-- Los motores de búsqueda/evidencia/fabrica deben copiarse a `imput shark core/`.
-- Los sistemas de memoria (`memoria-yaiwes`, `hf_datasets`) deben evaluarse contra componentes existentes.
+- Este repo se consolidó desde `router-universal-router-inteligente-/chat-router/`.
+- Los enlaces simbólicos originales NO se preservan; usar rutas directas.
+- El código cableado en `chat/backend/mvp/` del repo original NO se movió.
 - Para desarrollo futuro, trabajar sobre esta estructura unificada.
+- **Modelo activo**: qwen3.8-max (Qwen/Alibaba) ejecutó esta transferencia.
 
 ---
-*Generado durante reorganización. Mejorar con detalles específicos de integración tras completar transferencia.*
+*Última actualización: Transferencia evidencia/ completada. Módulos restantes pendientes de transferencia.*
