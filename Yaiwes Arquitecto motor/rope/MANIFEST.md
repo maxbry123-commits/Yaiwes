@@ -20,6 +20,6 @@
 
 ## Contenido publicado
 
-- Ficheros publicados: 189
-- Tamano total: 1.82 MiB (1904115 bytes)
+- Ficheros publicados: 187
+- Tamano total: 1.81 MiB (1902943 bytes)
 - Reglas aplicadas: se excluyen `.git/`, `node_modules/`, `dist/`, `build/`, `target/`, `vendor/`, `__pycache__/`, `.venv/` y binarios pesados (*.bin *.onnx *.safetensors *.pt *.pth *.tar.gz *.tgz *.zip *.jar *.war *.wasm *.so *.dylib *.dll *.exe *.png *.jpg *.jpeg *.gif *.mp4 *.pdf *.db).
