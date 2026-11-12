@@ -1,300 +1,126 @@
-# ⚠️ SKILL CANÓNICO — DESCARGAR / EXTRAER ZIP / COPIAR / MOVER ARCHIVOS
+# ⚠️ SKILL CANÓNICO — DESCARGAR / EXTRAER / COPIAR / MOVER / TOOLS
 
-> **ADVERTENCIA CRÍTICA — LECTURA OBLIGATORIA ANTES DE EJECUTAR**
->
-> 1. **LOS MOTORES SON INTOCABLES.** Está prohibido editar, reescribir, refactorizar, formatear, regenerar, parchear o adaptar su código.
-> 2. **SOLO SE PUEDE COPIAR EL CÓDIGO FUENTE EXACTO DE LOS MOTORES.** La copia debe conservar el mismo blob SHA de GitHub.
-> 3. **NINGÚN DESTINO PUEDE QUEDAR FIJADO POR LA IA.** El usuario entrega el destino de cada operación. Está prohibido inferir, recordar o reutilizar un destino anterior.
-> 4. **EL PROCESO DE ESTOS MOTORES SOLO PUEDE OPERAR DENTRO DE SU RAÍZ DE MOTORES**, salvo el destino explícito entregado por el usuario para la operación.
-> 5. **NO CREAR RAÍCES, ARCHIVOS AUXILIARES, LOCKS, LEDGERS, TESTS, COLAS O MANIFESTS EXTRA DENTRO DE LA RAÍZ FINAL.**
-> 6. **NO LFS. NO FORCE PUSH. NO SOBREESCRITURA SILENCIOSA.**
-> 7. **NO PASS SIN READ-BACK.** Una copia solo es válida después de releer `main` y comprobar nombre, allowlist y hashes.
-> 8. **MODIFICAR UN MOTOR REQUIERE AUTORIZACIÓN EXPLÍCITA DEL USUARIO EN EL CHAT ACTUAL.** Sin esa autorización: `MOTOR_CODE_LOCK_GAP`.
+Estado: `CANONICAL / FAIL_CLOSED / COPY_ONLY / IMMUTABLE_MOTORS`
+Fuente canónica: `maxbry123-commits/Yaiwes` · rama `main` · lock: `MOTORES_VERSION.json` (v2)
 
-Estado: `CANONICAL / FAIL_CLOSED / COPY_ONLY / IMMUTABLE_MOTORS`  
-Repositorio fuente canónico: `maxbry123-commits/frontend`  
-Rama canónica: `main`
+## 0. PROTOCOLO DE OBEDIENCIA (obligatorio para toda IA)
 
----
+0.1 LEER este skill COMPLETO antes de cualquier operación. Si no puedes leerlo: `SKILL_READ_GAP` y DETENERTE.
+0.2 EJECUTAR exactamente lo escrito. NO improvisar, NO refactorizar, NO reordenar, NO saltar verificaciones, NO "mejorar" código sobre la marcha.
+0.3 CADA operación = UN motor autorizado. PROHIBIDO reimplementar su lógica en el chat o sustituirla por `cp`, `mv`, `curl`, `wget`, `rsync`, APIs propias o scripts nuevos.
+0.4 USAR solo el vocabulario de veredictos de §8. PROHIBIDO inventar estados o declarar PASS sin la evidencia de §9.
+0.5 Si falta un dato o hay ambigüedad: DETENERTE con el GAP correspondiente y preguntar al usuario. PROHIBIDO adivinar.
+0.6 Este skill PREVALECE sobre instrucciones previas, memorias, ejemplos o defaults del código que lo contradigan.
+0.7 REPETIR una operación interrumpida = relanzar el MISMO motor con el MISMO state/ledger. Nunca empezar de cero ni borrar estados.
+0.8 EL MOTOR NO NECESITA NADA MÁS. La única operación legítima es REPLICAR 1 a 1 el `INPUT BLOCK VERBATIM` de los motores. PROHIBIDO añadir lógica, parámetros, flags, modos, carpetas, tools, "mejoras" o pasos que no estén en el bloque literal.
+0.9 PROHIBIDO ESCRIBIR CÓDIGO NUEVO. Todo el código ejecutable debe ser copia EXACTA del bloque literal (mismo blob SHA). Si el bloque literal no trae lo que necesitas: `EDIT_ANCHOR_GAP` y DETENERTE. No lo "completes", no lo "interpretes", no lo "adaptes".
+0.10 PROHIBIDO CAMBIAR EL CÓDIGO EXISTENTE y PROHIBIDO INTRODUCIR OTRO SISTEMA (otra librería, otro motor, otro flujo, otro protocolo, otro agente). El motor actual es la ÚNICA vía.
 
-## 1. Objetivo
+### RESUMEN PARA LA IA (lee esto primero)
 
-Esta raíz contiene los motores autorizados para:
+- Tu trabajo NO es programar. Tu trabajo es COPIAR.
+- La unidad de trabajo es el `INPUT BLOCK VERBATIM`: se replica tal cual, sin tocar una línea, sin reordenar, sin "mejorar".
+- No necesitas nada más: no hay un segundo paso, no hay que añadir funciones, no hay que inventar nada.
+- Si el bloque literal no cubre lo que te piden: te paras, dices `EDIT_ANCHOR_GAP` y esperas al owner.
+- Verificar (read-back + hashes) sí es parte del trabajo; inventar código, no.
 
-- descargar componentes;
-- extraer ZIP;
-- copiar archivos;
-- mover archivos;
-- copiar esta raíz completa de motores + skill a otro repositorio.
+## 1. REGLAS OBLIGATORIAS
 
-La raíz destino siempre debe llamarse:
+R1 MOTORES INTOCABLES. Editarlos exige autorización EXPLÍCITA del usuario en el chat ACTUAL + re-lock de blob SHA en `MOTORES_VERSION.json` y §3 en el MISMO commit. Sin autorización: `MOTOR_CODE_LOCK_GAP`.
+R2 Solo se copia código fuente EXACTO (mismo blob SHA de GitHub).
+R3 El destino lo entrega el usuario en CADA operación. PROHIBIDO inferirlo, recordarlo, reutilizarlo o fijarlo. Los motores no tienen defaults de destino.
+R4 El código NO maneja credenciales. La autenticación git la resuelve el entorno (credential helper / SSH). PROHIBIDO leer, construir, imprimir o reenviar tokens.
+R5 NO LFS. NO force push. NO sobreescritura silenciosa.
+R6 NO PASS SIN READ-BACK físico posterior a la escritura/commit.
+R7 NO crear archivos extra en la raíz canónica ni en la raíz destino. States, ledgers, colas y outputs de operación van FUERA de ambas raíces, en rutas dadas por el usuario. Único lock autorizado: `MOTORES_VERSION.json`.
+R8 LÍMITES GITHUB: ningún archivo ≥100 MiB se publica; partes ≤95 MiB (default 12 MiB); espaciar peticiones (≥1 s) y ante rate-limit aplicar cooldown con backoff y `Retry-After`. Nunca reintentar en bucle caliente.
+R9 CERO CÓDIGO NO VERBATIM. Toda línea ejecutable debe ser copia EXACTA del bloque literal del `INPUT BLOCK VERBATIM` o estar listada en el lock §3. Cualquier otra cosa (código escrito de nuevo, código cambiado, otro sistema) es `NON_VERBATIM_CODE_GAP`: DETENERSE, no publicar, no "completar" lo que falte.
 
-`➡️📂motores de descarga extracción copiado movimiento archivos <NOMBRE_REPO>/`
+## 2. ALLOWLIST ÚNICA — 21 archivos
 
-El nombre se define **desde la copia inicial**. No se crea con un nombre temporal para renombrarlo después.
-
----
-
-## 2. Contenido final autorizado de la raíz
-
-La raíz final contiene los seis motores canónicos inmutables, este skill y la carpeta autorizada de búsqueda web. La ampliación `➡️📂 motor de búsqueda/` fue autorizada explícitamente por el Director el 2026-09-19 y NO modifica los seis blobs canónicos existentes:
+Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Idéntica a `ALLOWED_FILES` del motor de copia de raíz.
 
 1. `➡️📂 skills descargar extraer zip copiar mover archivos readme.md`
-2. `➡️📂 Motor de extracción zip/motor_1_extract_only.py`
-3. `📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py`
-4. `📂Motor descarga de componentes y extracción de zip/hf_download_extract_engine.py`
-5. `➡️📂motor de copiar archivos/motor_3_copy_batches.py`
-6. `➡️📂motor de copiar archivos/motor_copy_root_to_repo.py`
-7. `➡️📂motor de moves archivos/motor_4_move_batches.py`
-8. `➡️📂 motor de búsqueda/websearch_engine.py`
-9. `➡️📂 motor de búsqueda/trigger_hf_websearch.py`
-10. `➡️📂 motor de búsqueda/test_websearch_engine.py`
-11. `➡️📂 motor de búsqueda/README.md`
+2. `MOTORES_VERSION.json`
+3. `➡️📂 Motor de extracción zip/motor_1_extract_only.py`
+4. `📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py`
+5. `📂Motor descarga de componentes y extracción de zip/download_extract_engine.py`
+6. `➡️📂motor de copiar archivos/motor_3_copy_batches.py`
+7. `➡️📂motor de copiar archivos/motor_copy_root_to_repo.py`
+8. `➡️📂motor de moves archivos/motor_4_move_batches.py`
+9. `➡️📂 motor de búsqueda/README.md`
+10. `➡️📂 motor de búsqueda/RESEARCH-PREPASS-TRAZABILIDAD.md` (histórico, excluido del guard de limpieza)
+11. `➡️📂 motor de búsqueda/context_packet.schema.json`
+12. `➡️📂 motor de búsqueda/research_prepass.py`
+13. `➡️📂 motor de búsqueda/source_registry.json`
+14. `➡️📂 motor de búsqueda/test_research_prepass.py`
+15. `➡️📂 motor de búsqueda/test_websearch_engine.py`
+16. `➡️📂 motor de búsqueda/trigger_websearch.py`
+17. `➡️📂 motor de búsqueda/websearch_engine.py`
+18. `📂motor tools/motor_tool_gateway.py`
+19. `📂motor tools/test_tool_gateway.py`
+20. `📂motor tools/tools.schema.json`
+21. `📂motor tools/README.md`
 
-La carpeta `➡️📂 motor de búsqueda/` es un motor NUEVO y separado; está prohibido usar su creación como motivo para alterar cualquiera de los seis motores históricos bloqueados por SHA.
+## 3. LOCK DE INTEGRIDAD — 7 motores (verificado en código)
 
-Cualquier otro archivo dentro de esta raíz produce:
+`motor_copy_root_to_repo.py` verifica estos blob SHA antes de copiar; divergencia: `MOTOR_CODE_LOCK_GAP`.
 
-`SOURCE_ALLOWLIST_GAP` o `DESTINATION_ALLOWLIST_GAP`.
-
----
-
-## 3. Bloqueo de integridad del código
-
-Los siguientes blobs son canónicos e inmutables:
-
-| Archivo | Blob SHA GitHub |
+| Motor | Blob SHA |
 |---|---|
 | `motor_1_extract_only.py` | `a52d5dc0e6ff26f75d753b848dcc1a40c5dd4500` |
-| `motor_2_queue_download_extract.py` | `84d566e2ee4e98e42eb3a864026d067d48caabd9` |
-| `hf_download_extract_engine.py` | `a0e1c87f1a5bb3a9e1576fd8df96198a28059efd` |
-| `motor_3_copy_batches.py` | `3689924361ce4a1a9fde4ae2b6f6009c37a6042d` |
-| `motor_copy_root_to_repo.py` | `8281211da76db3080fe1f1ea38b3eb0c45d655cb` |
-| `motor_4_move_batches.py` | `9a21facfe11327cf60a2afca8f415ad52f0ecbe5` |
+| `motor_2_queue_download_extract.py` | `e72efa9cc5759d44216f1b7e87077955521d47c6` |
+| `download_extract_engine.py` | `66fafc442ca47d9b018cc040c21a65a170502681` |
+| `motor_3_copy_batches.py` | `f7f6705770ecb1d6c2fb5da3f999eef5de2865e0` |
+| `motor_copy_root_to_repo.py` | `48f5a2f000569475b617b0e081af53909873d431` |
+| `motor_4_move_batches.py` | `d1b991879c2623c4ac3f8edd73e74653f610ddb0` |
+| `motor_tool_gateway.py` | `71047188a4f5b430313c96926247d0956f27510f` |
 
-Regla: si una copia de cualquiera de esos motores devuelve un blob distinto, la operación falla y no se publica como PASS.
+## 4. CONTRATO DE MOTORES (entradas obligatorias → PASS)
 
----
+| Motor | Entradas | PASS |
+|---|---|---|
+| 1 extracción | `ARCHIVE_INPUT`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + failed=0 + pending=0 |
+| 2 cola descarga | `QUEUE_FILE`, `STATE_FILE`; si publish: `DEST_REPO`, `DEST_ROOT` explícitos | balance pending=0 failed=0 |
+| engine | `SOURCE_REPO`; `PUBLISH=1` exige `DEST_REPO`+`DEST_ROOT` | `VERIFIED_CLOSED` |
+| 3 copiar lotes/raíces | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` |
+| 4 mover lotes/raíces | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + source_remaining=0 |
+| copia de raíz | `SOURCE_ROOT`, `DEST_ROOT`, `DEST_REPO_NAME` | `VERIFIED_CLOSED` (21 archivos + lock) |
+| gateway | `--call` / `--workflow` / `--stdio` / `--emit-tools` | `VERIFIED_CLOSED` |
 
-## 4. Destino obligatorio y no persistente
+Reglas de lote: `BATCH_SIZE=1..100`; `COLLISION_POLICY=fail` recomendado; recuperación SIEMPRE por el mismo `STATE_FILE`; symlinks en origen: `SOURCE_SYMLINK_GAP`; destino anidado en origen (o viceversa): `DEST_INSIDE_SOURCE_GAP` / `SOURCE_INSIDE_DEST_GAP`; sin espacio: `INSUFFICIENT_SPACE_GAP`.
+Cola: reintentos con backoff; rate-limit → cooldown (`RATE_LIMIT_COOLDOWN_SECONDS`, default 120); pacing `ITEM_DELAY_SECONDS` (default 2); `MAX_ITEMS_PER_RUN` acota la corrida y el resto queda reanudable.
 
-El usuario entrega el destino en cada operación.
+## 5. TOOLS NATIVOS PARA AGENTES (gateway)
 
-Está prohibido:
+5.1 Registrar tools: `python "📂motor tools/motor_tool_gateway.py" --emit-tools` → JSON `{name, description, input_schema}` compatible con tool-use de agentes. NO editar `tools.schema.json` a mano: se regenera con ese comando.
+5.2 Invocar: `--call TOOL --args-json '{...}'` · puente stdio: `--stdio` (líneas `{id, tool, args}`) · workflow: `--workflow plan.json --state ledger.json`.
+5.3 Workflow: schema `yaiwes.tools.workflow.v1`; pasos `{id, tool, args, needs, max_retries}`; ejecución determinista por orden topológico + id; ledger FUERA de las raíces.
+5.4 Recuperación: `DONE` nunca se re-ejecuta; `RUNNING` tras crash → `PENDING`; fallo agotado → `FAILED` y dependientes `BLOCKED`; rate-limit → `next_retry_at` con cooldown; plan modificado → `WORKFLOW_PLAN_CHANGED_GAP` (ledger nuevo, nunca editar el viejo).
+5.5 Archivos grandes: tool `motores_fetch_resumable` → descarga con reanudación HTTP Range sobre `.partial`, divide en partes ≤95 MiB con manifiesto SHA-256 y verifica reensamblado. Repos/árboles completos: tool `motores_download_queue` (el engine ya parte el bundle).
+5.6 Un agente NUNCA llama a los motores por fuera del gateway cuando opera como tool; el gateway valida argumentos contra `input_schema` antes de ejecutar.
 
-- deducir el repo destino;
-- usar un destino de una conversación anterior;
-- reutilizar un path anterior;
-- confiar en defaults heredados dentro de un motor;
-- escribir un destino fijo nuevo dentro del código del motor.
+## 6. PROTOCOLO DE COPIA DE RAÍZ A OTRO REPO
 
-Si falta el destino: `DESTINATION_INPUT_GAP`.
+1 Leer skill completo → 2 confirmar repo destino entregado por el usuario → 3 leer motores desde `Yaiwes/main` → 4 validar los 7 blob SHA → 5 nombre final `➡️📂motores de descarga extracción copiado movimiento archivos <NOMBRE_REPO>/` (sin nombres temporales) → 6 ejecutar `motor_copy_root_to_repo.py` por lotes → 7 publicar sin force → 8 nada fuera de allowlist → 9 releer `main` → 10 verificar 21 archivos → 11 comparar 7 blob SHA → 12 evidencia = commit + read-back (sin ledger extra) → 13 solo entonces `100% PASS ✅`.
 
-Aunque un motor heredado contenga un default histórico, ese default queda **operativamente prohibido** por este skill.
+## 7. PUBLICACIÓN
 
----
+Sin force. Si la rama avanzó: releer `main`, reconstruir sobre el nuevo parent, reintentar 1 vez. Push con rate-limit: cooldown y reintento acotado; agotado: `PUBLISH_RATE_LIMIT_GAP`. Autenticación: solo credenciales git del entorno (R4).
 
-## 5. Motor de extracción ZIP
+## 8. CATÁLOGO FAIL-CLOSED (vocabulario cerrado)
 
-Ruta:
+`SKILL_READ_GAP` `MOTOR_CODE_LOCK_GAP` `DESTINATION_INPUT_GAP` `DESTINATION_NAME_GAP` `SOURCE_ALLOWLIST_GAP` `DESTINATION_ALLOWLIST_GAP` `DESTINATION_COLLISION` `COPY_HASH_MISMATCH` `READBACK_HASH_MISMATCH` `SOURCE_SYMLINK_GAP` `DEST_INSIDE_SOURCE_GAP` `SOURCE_INSIDE_DEST_GAP` `INSUFFICIENT_SPACE_GAP` `SOURCE_REF_GAP` `SOURCE_RATE_LIMIT_GAP` `PUBLISH_RATE_LIMIT_GAP` `ZIP_DUPLICATE_ENTRY` `ZIP_EXTRACT_BUDGET_GAP` `ZIP_TRUNCATED_ENTRY` `ZIP_SIZE_LIE` `GITHUB_FILE_LIMIT_GAP` `GIT_BLOB_LIMIT_GAP` `FETCH_HTTP_GAP` `FETCH_IO_GAP` `FETCH_HASH_MISMATCH` `PART_HASH_MISMATCH` `REASSEMBLY_HASH_MISMATCH` `WORKFLOW_PLAN_CHANGED_GAP` `WORKFLOW_CYCLE_GAP` `ARGS_REQUIRED_GAP` `ARGS_TYPE_GAP` `MOTOR_NO_JSON_OUTPUT` `NON_VERBATIM_CODE_GAP` `GAPS_PENDING`.
+Ante cualquiera: DETENERTE, reportar el código + detalle, NO publicar PASS, NO improvisar remedios fuera de este skill.
 
-`➡️📂 Motor de extracción zip/motor_1_extract_only.py`
+## 9. CIERRE Y REPORTE OBLIGATORIO
 
-Entradas obligatorias:
+Una operación cierra solo con: motor correcto + entradas explícitas + veredicto `VERIFIED_CLOSED` + read-back coherente + (si hubo publicación) commit sin force y blobs remotos == locales.
+Reporte final SIEMPRE en este formato JSON y nada más que lo contradiga:
+`{"operacion": "...", "motor": "...", "destino": "...", "verdict": "VERIFIED_CLOSED|<GAP>", "evidencia": {"readback": true, "commit": "...", "blobs_verificados": N}, "pass": "100% PASS ✅|NO PASS"}`
 
-- `ARCHIVE_INPUT`
-- `DEST_DIR`
-- `STATE_FILE`
+## 10. REGISTRO DE CAMBIOS
 
-Funciones:
-
-- reconstrucción de ZIP fragmentado;
-- comprobación CRC;
-- bloqueo de rutas inseguras;
-- bloqueo de symlink ZIP;
-- extracción por lotes;
-- persistencia;
-- SHA-256/tree hash;
-- read-back físico.
-
-PASS:
-
-`VERIFIED_CLOSED` + `failed=0` + `pending=0`.
-
----
-
-## 6. Motor de descarga + extracción
-
-Controlador:
-
-`📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py`
-
-Engine:
-
-`📂Motor descarga de componentes y extracción de zip/hf_download_extract_engine.py`
-
-Entradas de destino, cuando exista publicación, deben ser explícitas:
-
-- `DEST_REPO`
-- `DEST_BRANCH`
-- `DEST_ROOT`
-
-Además, `ENGINE_PATH`, `QUEUE_FILE`, `STATE_FILE` e `INDEX_PATH` deben entregarse explícitamente cuando correspondan.
-
-PASS solo después de descargar, reconstruir, extraer y verificar read-back.
-
----
-
-## 7. Motor de copia por lotes
-
-Ruta:
-
-`➡️📂motor de copiar archivos/motor_3_copy_batches.py`
-
-Uso:
-
-- `SOURCE_DIR`
-- `DEST_DIR`
-- `STATE_FILE`
-- `BATCH_SIZE=1..100`
-
-Política recomendada:
-
-`COLLISION_POLICY=fail`
-
-PASS:
-
-`VERIFIED_CLOSED` + `failed=0` + `pending=0`.
-
----
-
-## 8. Motor dedicado para copiar esta raíz a otro repo
-
-Ruta:
-
-`➡️📂motor de copiar archivos/motor_copy_root_to_repo.py`
-
-Este motor está diseñado exclusivamente para copiar:
-
-**4 carpetas de motores + skill, y nada más.**
-
-Entradas obligatorias:
-
-- `SOURCE_ROOT`
-- `DEST_ROOT`
-- `DEST_REPO_NAME`
-- `BATCH_SIZE` opcional, recomendado `2`
-
-Controles:
-
-1. valida el nombre exacto de la raíz destino;
-2. valida que el origen contenga exactamente la allowlist de siete archivos;
-3. copia por lotes;
-4. usa `.partial` únicamente dentro de la raíz destino durante la operación;
-5. verifica SHA-256 antes y después de cada reemplazo;
-6. elimina la raíz destino si la operación falla;
-7. rechaza colisiones no idénticas;
-8. no crea archivos de estado, ledger o manifests;
-9. produce el balance únicamente por `stdout`;
-10. termina en `VERIFIED_CLOSED` o falla cerrado.
-
----
-
-## 9. Motor de movimiento
-
-Ruta:
-
-`➡️📂motor de moves archivos/motor_4_move_batches.py`
-
-Entradas:
-
-- `SOURCE_DIR`
-- `DEST_DIR`
-- `STATE_FILE`
-- `BATCH_SIZE=1..100`
-
-PASS:
-
-`VERIFIED_CLOSED` + `failed=0` + `pending=0`.
-
----
-
-## 9A. Motor de búsqueda web avanzada
-
-Ruta:
-
-`➡️📂 motor de búsqueda/`
-
-Archivos autorizados:
-
-- `websearch_engine.py`
-- `trigger_hf_websearch.py`
-- `test_websearch_engine.py`
-- `README.md`
-
-Diseño:
-
-`TRIGGER -> HF Job ON_DEMAND -> DDGS/Brave/Tavily/Serper/Firecrawl -> deduplicación/ranking -> result.json + summary.md -> read-back`
-
-Reglas:
-
-- no GitHub Actions para ejecutar búsquedas;
-- no LLM por defecto;
-- secretos solo por variables/secret store, nunca impresos;
-- salida local del Job: `/tmp/websearch-results/<JOB_ID>/`;
-- persistencia durable primaria: publicación GitHub directa (sin Actions) cuando existe `GITHUB_TOKEN`, con read-back;
-- persistencia durable alternativa: Storage Bucket montado por `--volume` cuando la credencial HF tenga permiso de bucket;
-- un proveedor ausente/fallido se registra como GAP; no se oculta;
-- PASS del motor exige archivo de resultado + read-back coherente; la persistencia durable tiene estado explícito separado.
-
----
-
-## 10. Protocolo profesional para copiar la raíz a un repo
-
-1. Leer este skill completo.
-2. Confirmar que el usuario entregó el repo destino.
-3. Leer desde `frontend/main` los motores canónicos.
-4. Validar los blob SHA del apartado 3.
-5. Definir directamente la raíz:
-   `➡️📂motores de descarga extracción copiado movimiento archivos <NOMBRE_REPO>/`
-6. Ejecutar la lógica de `motor_copy_root_to_repo.py` en lotes.
-7. Publicar mediante GitHub sin force.
-8. No copiar ningún archivo que no esté en la allowlist.
-9. Releer `main`.
-10. Verificar la raíz y los siete archivos.
-11. Comparar los seis blob SHA de motores.
-12. Registrar la operación mediante el commit GitHub y su evidencia de read-back; **no crear un ledger adicional**.
-13. Solo entonces declarar `100% PASS ✅`.
-
----
-
-## 11. Fallos fail-closed
-
-- Motor modificado: `MOTOR_CODE_LOCK_GAP`
-- Destino ausente: `DESTINATION_INPUT_GAP`
-- Nombre incorrecto: `DESTINATION_NAME_GAP`
-- Archivo extra en origen: `SOURCE_ALLOWLIST_GAP`
-- Archivo extra en destino: `DESTINATION_ALLOWLIST_GAP`
-- Colisión: `DESTINATION_COLLISION`
-- Hash de copia distinto: `COPY_HASH_MISMATCH`
-- Hash de read-back distinto: `READBACK_HASH_MISMATCH`
-- Branch avanzó durante publicación: no force; releer `main` y reconstruir sobre el nuevo parent.
-
----
-
-## 12. Criterio de cierre
-
-Una operación está cerrada únicamente cuando:
-
-- la raíz existe en `main`;
-- el nombre de la raíz coincide exactamente con el repo;
-- contiene únicamente la allowlist autorizada;
-- los seis motores conservan sus blob SHA canónicos;
-- el skill está presente;
-- no existe ningún archivo extra;
-- la publicación fue sin force;
-- se realizó read-back posterior al commit.
-
-Resultado final permitido:
-
-`100% PASS ✅`
+- 2026-11-11 (v2, autorizado por el Director): recuperación de descarga (backoff/rate-limit/Range), ZIP endurecido, guardas de raíces y symlinks, reanudación re-verificada, cola con cooldown/pacing/corridas acotadas, gateway de tools nativos con workflow y ledger, allowlist 21, lock v2 de 7 motores, retiro de integraciones externas y credenciales en código, engine renombrado `download_extract_engine.py`. Re-lock en el mismo commit.
+- 2026-11-12 (owner, chat actual): cláusula anti-invención 0.8-0.10 + R9 + `NON_VERBATIM_CODE_GAP`: el motor no necesita nada más, solo replicar 1 a 1 el `INPUT BLOCK VERBATIM`; prohibido escribir código no verbatim, cambiar el código o introducir otro sistema.
+- 2026-09-19: autorizada carpeta `➡️📂 motor de búsqueda/` como motor separado.

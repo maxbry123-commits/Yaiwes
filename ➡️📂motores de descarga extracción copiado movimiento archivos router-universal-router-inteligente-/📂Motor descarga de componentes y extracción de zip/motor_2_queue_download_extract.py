@@ -13,6 +13,9 @@ LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "0"))
 ITEM_DELAY_SECONDS = float(os.getenv("ITEM_DELAY_SECONDS", "2"))
 RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "0"))
+ITEM_DELAY_SECONDS = float(os.getenv("ITEM_DELAY_SECONDS", "2"))
+RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120"))
+MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "0"))
 
 
 def load_queue():
@@ -103,6 +106,7 @@ def main():
             row = state["items"].setdefault(item_id, {"status": "PENDING", "attempts": 0, "slug": item["slug"], "source_repo": item["source_repo"]})
             if row.get("status") == "VERIFIED_CLOSED" or row.get("attempts", 0) >= MAX_RETRIES: continue
             if row.get("cooldown_until", 0) > time.time(): continue
+            if row.get("cooldown_until", 0) > time.time(): continue
             progress = True; row["attempts"] = row.get("attempts", 0) + 1; row["status"] = "RUNNING"; save_state(state)
             try:
                 result = run_item(item); row["result"] = result; row["status"] = "VERIFIED_CLOSED"; row.pop("error", None)
@@ -120,6 +124,6 @@ def main():
             time.sleep(ITEM_DELAY_SECONDS + LOOP_SLEEP_SECONDS)
     b = balance(state); write_index(state)
     verdict = "VERIFIED_CLOSED" if b["pending"] == 0 and b["failed"] == 0 else "GAPS_PENDING"
-    print(json.dumps({"schema": SCHEMA, "balance": b, "state_file": str(STATE_FILE), "index_path": str(INDEX_PATH) if INDEX_PATH else "", "verdict": verdict}, ensure_ascii=False, sort_keys=True))
+    print(json.dumps({"schema": SCHEMA, "balance": b, "state_file": str(STATE_FILE), "index_path": str(INDEX_PATH) if INDEX_PATH else "" if INDEX_PATH else "", "verdict": verdict}, ensure_ascii=False, sort_keys=True))
 
 if __name__ == "__main__": main()
