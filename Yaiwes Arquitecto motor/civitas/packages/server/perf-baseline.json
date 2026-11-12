@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "city": "2x2",
+  "ticks": 900,
+  "date": "2026-10-27",
+  "node": "v20.2.0",
+  "arch": "x64",
+  "calibMs": 20.59,
+  "tick": {
+    "avg": 2.79,
+    "p95": 5.02,
+    "max": 26
+  },
+  "rel": {
+    "avg": 0.14,
+    "p95": 0.24
+  },
+  "phases": {
+    "plan": {
+      "avg": 0.09,
+      "share": 3.37
+    },
+    "gateways": {
+      "avg": 0,
+      "share": 0.01
+    },
+    "traffic0": {
+      "avg": 0.04,
+      "share": 1.6
+    },
+    "citizens": {
+      "avg": 1.24,
+      "share": 44.57
+    },
+    "vehicles": {
+      "avg": 0.71,
+      "share": 25.48
+    },
+    "transit": {
+      "avg": 0.01,
+      "share": 0.24
+    },
+    "mobile": {
+      "avg": 0.11,
+      "share": 4
+    },
+    "dispatch": {
+      "avg": 0.1,
+      "share": 3.55
+    },
+    "traffic1": {
+      "avg": 0.03,
+      "share": 0.92
+    },
+    "systems": {
+      "avg": 0.09,
+      "share": 3.22
+    },
+    "flush": {
+      "avg": 0.36,
+      "share": 12.84
+    },
+    "history": {
+      "avg": 0,
+      "share": 0.03
+    }
+  },
+  "work": {
+    "routes": 9590,
+    "nodes": 204496,
+    "msgs": 0,
+    "bytes": 0,
+    "pop": 4967,
+    "hash": "7123d5fb"
+  },
+  "load": [
+    9.49,
+    9.75,
+    12.39
+  ]
+}

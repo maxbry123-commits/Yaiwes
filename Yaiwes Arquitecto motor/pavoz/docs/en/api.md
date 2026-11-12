@@ -1,0 +1,872 @@
+# API reference
+
+🇨🇳 [简体中文](../cn/api.md)
+
+The public surface is `__all__` in `pavoz/__init__.py`. The core has zero third-party dependencies.
+
+## Contents
+
+- [DAG](#dag)
+- [Runtime](#runtime)
+- [Ctx (stage argument)](#ctx-stage-argument)
+- [State](#state)
+- [Checkpoint](#checkpoint)
+- [`StorageBackend` (Protocol, business-injected)](#storagebackend-protocol-business-injected)
+- [Storage loader](#storage-loader)
+- [`TestPipe`](#testpipe)
+- [DAG viz export (v0.5.4)](#dag-viz-export-v054)
+- [`EnginePolicy` (v0.5.3)](#enginepolicy-v053)
+- [`CancelRegistry` (v0.5.3)](#cancelregistry-v053)
+- [EventRecorder (v0.5.3)](#eventrecorder-v053)
+- [CLI](#cli)
+- [Param overrides (library equivalents of `fork-run`)](#param-overrides-library-equivalents-of-fork-run)
+- [Related documents](#related-documents)
+- [Conditional edges (v0.5.5)](#conditional-edges-v055)
+
+## DAG
+
+```python
+dag = DAG(name: str)
+```
+
+- `dag.stage(*, depends_on: list[str] | None = None, retries: int = 0,
+  timeout: float | None = None)` — decorator to register a stage function
+  - `depends_on`: list of prerequisite stage names
+  - `retries`: retry budget for `RetryableError` / timeout (exponential backoff `2^n`, capped at 30s)
+  - `timeout`: hard timeout for this stage (seconds); effective timeout = `min(stage.timeout, remaining run deadline)`
+- `dag.validate()` — static validation (unknown deps + cycle detection); auto-called before run, freezes on success
+- `dag.topo_order() -> list[str]` — Kahn topological order
+- `dag.reachable(upstream, downstream) -> bool` — transitive dependency check (used by chained overwrite)
+
+Exceptions: `UnknownDepError` / `CycleError`
+
+## Runtime
+
+```python
+rt = Runtime(
+    checkpoint_store: CheckpointStore | None = None,
+    caller: Callable[[str, str, dict, CallMeta], Awaitable[dict]] | None = None,
+    default_timeout: float | None = None,   # absolute deadline for the whole run (seconds)
+    on_event: Callable[[str, dict], None] | None = None,   # lifecycle event sink
+    cancel_check: Callable[[str], bool] | None = None,     # task_id → cancelled?
+)
+
+result: RunResult = await rt.run(
+    dag, task_id: str | None = None,
+    *,
+    initial_state: dict | None = None,
+    resume: bool = False,
+)
+```
+
+- `task_id` is optional. If omitted, pavoz auto-generates a UUID4 (36 chars).
+  If supplied, it is validated at entry: non-empty, ≤ 128 chars, charset
+  `[A-Za-z0-9_.-]` only (`/` rejected — the task_id is embedded in the storage
+  key path). Stable across retries/resumes — the idempotency key. Resume needs
+  an explicit task_id (an auto-generated one has no checkpoint to find).
+- `run_id` is auto-generated (UUID4) per `run()` invocation and returned in
+  `RunResult.run_id`. Resume **reuses** the checkpoint's original run_id
+  (Temporal Continue-As-New pattern) — one task can have multiple runs without
+  overwriting each other.
+- `resume` (default `False`): `True` → load this task's latest checkpoint and
+  continue from where it stopped (skipping completed stages, restoring state).
+  Raises `RuntimeError` if there is no checkpoint, and raises if the run already
+  completed (done guard — no silent no-op; start over with `resume=False`, which
+  begins a new run_id).
+- On `resume`, a `workflow_hash` mismatch (DAG structure changed) →
+  `CheckpointMismatchError`.
+- The run-level absolute deadline comes from `Runtime(default_timeout=...)`,
+  falling back to `EnginePolicy(default_timeout=...)`; there is no per-`run()`
+  deadline parameter. Per-stage `timeout` is capped by the remaining run
+  deadline. **The same deadline covers all three entry points** (`run`,
+  single-stage `run_stage` replay, and `fork_run`): a ceiling set on the policy
+  bounds replays too — the policy fallback used to be missing here, leaving
+  replays entirely unbounded and silent about it.
+- On completion the checkpoint is kept (not deleted) — it is the task's latest
+  run and the target of future resumes/`load_latest`.
+- `on_event`: lifecycle event sink (`fn(event: str, data: dict)`) — observe only, it
+  never changes execution semantics. Events: `run_start` / `run_end` (`task_id` /
+  `run_id` / `status`), `stage_start` / `stage_end` (`stage` / `attempt` / `status` /
+  `duration`), `stage_retry` (+ `error`), and `stage_progress` (emitted by
+  `ctx.set_progress()` inside a stage — best-effort transient signal, **never
+  checkpointed**). Beyond `done`/`failed`/`cancelled`, a `stage_end` `status` can also
+  be **`"skipped"`** — `skip_unchanged` hit, replaying a historical result.
+  `RunResult.stage_statuses` still records `"done"` there (the stage's output *is* in
+  state), so **the event stream is the only place that distinguishes "actually ran"
+  from "reused an old result"** — look there when a prompt change appears to do
+  nothing, not at the statuses. Observer exceptions are isolated (logged and
+  ignored) and never affect the run. This is the **main extension seam** — instrumentation, alerting
+  and metrics all hang off it (see [Architecture · extension surface](architecture.md#extension-surface-a-stage-function-is-the-extension-point))
+- `cancel_check`: cooperative cancellation (`task_id → cancelled?`). The runtime
+  intercepts at stage and retry boundaries (status="cancelled"; stages already
+  completed stay checkpointed, so resume continues); long-running stage bodies poll
+  `ctx.cancelled()` and exit on their own. A checker that raises → treated as
+  "not cancelled" (fail-open)
+
+### `Runtime.run_stage` (single-stage replay, v0.5.1)
+
+```python
+result: RunResult = await rt.run_stage(dag, task_id: str, stage_name: str)
+```
+
+Debug helper: rebuild the stage's pre-run state from the task's latest
+checkpoint and run **only that stage** — tune a prompt/parameters and see the
+effect in seconds without re-running upstream stages.
+
+- Pre-state rebuild: completed stages → `cp.rebuild_state_before(stage_name)`;
+  a stage that never completed (failed/interrupted original run) whose deps are
+  all done → `cp.rebuild_state()`; deps incomplete → `RuntimeError`
+- Does **not** write a checkpoint and does **not** move the `latest` pointer
+  (replay output is a dev artifact — it must not become the resume target);
+  `ctx.run_id` is a throwaway UUID4 for the call
+- Emits **no lifecycle events** — a replay is not a run, so nothing reaches
+  `on_event` (no `run_start`/`run_end`, no `stage_start`/`stage_end`, no
+  `stage_alive`). Metrics and alerts hung on those events therefore do not see
+  replays at all; that is deliberate, not a dropped event
+- Still honours the run-level policy: `default_timeout` (explicit or from
+  `EnginePolicy`) and `max_concurrent_runs` both bound a replay, since it calls
+  the same stages and the same downstream
+- Errors: no checkpoint → `RuntimeError`; DAG hash mismatch →
+  `CheckpointMismatchError`; pre-M2 (v0.5.0) checkpoint without
+  `stage_deltas` → `RuntimeError` (re-run once to produce a fresh checkpoint);
+  unknown stage → `KeyError`
+
+### `Runtime.fork_run` (branch a past run, v0.6)
+
+```python
+result: RunResult = await rt.fork_run(
+    dag, task_id, *, from_stage: str, overrides: dict | None = None,
+    run_id: str | None = None,
+)
+```
+
+Upstream stages are reused (never re-run); `from_stage` and everything after it
+re-run against the injected `overrides` — "change one input, re-run only what
+depends on it". The original run's checkpoint is untouched; the fork gets a new
+run_id and becomes the task's latest.
+
+
+> ⚠️ **With `skip_unchanged=True`, `from_stage` is a "starting hint", not a forced
+> re-run point.** The engine walks the topo order comparing `stage_input_hash` (fn
+> source + full pre-execution state) and **keeps skipping until the first miss**;
+> everything from there on re-runs — so `from_stage` itself is skipped when its own
+> hash matches. Measured (`from_stage="s_a"` + `skip_unchanged=True` + **no
+> override**): all three stages skipped, not a single fn called, yet
+> `status=done`.
+> Injected `overrides` change the input hash, so a fork that *did* change something
+> always re-runs. Replaying instead of re-running is equivalent for pure functions;
+> but if your change lives somewhere the hash cannot see (module-level constant,
+> env var, file, clock — see `stage_input_hash`'s coverage boundary), that fork
+> becomes a **silent no-op**.
+> To check whether anything was skipped: `RunResult.skipped_stages` /
+> `pavos trace`'s `skipped_stages` (since v0.5.8) — `stage_statuses` records those
+> as `"done"` and cannot tell them apart.
+- `overrides`: top-level state-key overrides injected into `from_stage`'s pre-run
+  state (deep merge — sibling keys survive). The CLI `--set` / `--set-file` flags
+  go through this same entry (see [replay-params.md](../replay-params.md))
+- Overrides are **injected input, not the final value**: `from_stage` re-runs and
+  may overwrite them (the stage's own output wins). Checkpoint rebuild
+  (`cp.state`) reproduces that same order, so the persisted state and the live
+  result are always identical — the rebuild used to merge overrides **last**,
+  the opposite of the runtime order, which made `runtime` report `a='A'` while
+  the checkpoint said `a='A9'`
+- `run_id`: fork onto a specific run_id (defaults to a fresh UUID4)
+
+##### Chained forks don't inherit ancestor `overrides`
+
+Forking on top of an earlier fork, the new checkpoint's `fork_overrides` holds
+**only what you passed this time** — values injected by the ancestor fork are not
+carried over. That is deliberate, not an oversight:
+
+    r1 = await rt.fork_run(dag, "T", from_stage="s_a", overrides={"a": "A9"})
+    #   s_a re-runs and overwrites a back to 'A' — overrides are injected input,
+    #   not final values
+    r2 = await rt.fork_run(dag, "T", from_stage="s_c", overrides={"extra": "X"})
+    #   r2.state["a"] == r1.state["a"] == 'A'  (s_a sits in the kept prefix)
+
+An ancestor's override is *injected input* that `from_stage`'s re-run already
+consumed, while the new checkpoint's kept prefix **does not re-run** — those
+stages' outputs are final. Carrying the ancestor's override forward would inject
+something that never happened in this run and overwrite a real output from the
+kept prefix: in the example above `a` would turn from `'A'` into `'A9'`.
+
+Note this is *not* a checkpoint-vs-live divergence: measuring a build that
+actually merges them, the runtime and the rebuild share the same override dict
+and both end up at `'A9'` — the consistency invariant still holds. What breaks is
+**reproducibility**: the same `(dag, from_stage, overrides)` would yield different
+results depending on what forks preceded it.
+
+To change a few values *on top of* an ancestor's configuration, pass that
+ancestor's `overrides` to the new `fork_run` as well.
+
+#### Source-drift notice (unreleased, see CHANGELOG [Unreleased])
+
+The checkpoint carries `stage_fn_sources` (a fingerprint of each stage function's
+source as of its last real execution; replays don't overwrite it). When
+`fork_run` / `run_stage` reuse past results, the current source is compared
+against it and a single WARNING is logged on mismatch. Function bodies are
+deliberately excluded from `workflow_hash` (so editing a prompt doesn't force a
+full-chain re-run); this makes "did my edit actually take effect" visible instead
+of silent. It never blocks or refuses to continue — it only tells you.
+
+> Caveat: this only covers reuse of past results. Editing the wrong file outright
+> (say, a copy nothing reads) in a fresh run is invisible at runtime — that class
+> of mistake needs call-site guards on the business side.
+- `from_stage` absent from the task's checkpoint record → explicit error, never a
+  silent fresh start
+
+### `RunResult`
+
+- `task_id`: caller-supplied or auto-generated UUID4
+- `run_id`: this run's UUID4 (or the reused original on resume)
+- `status`: `"running" | "done" | "failed" | "cancelled"` (terminal: `done` / `failed` / `cancelled`)
+- `state`: final state
+- `stage_statuses`: each stage's `done`, `failed`, or `cancelled`
+- `error`: failure or cancellation reason (exception converted to string)
+- `error_class`: the original exception's class name on failure (e.g. `ValueError`
+  or a business `PipelineError`) — for triage: business failure → re-run with
+  tweaked parameters, code bug → find the owner. `None` when done/cancelled. Class
+  names may change across refactors; not a cross-version contract
+- `error_category`: business category of the failure (v0.5.4) — passed through from
+  `raise StageError(..., category="LLM_TIMEOUT")`; 9 suggested values: LLM_TIMEOUT /
+  SEARCH_NO_RESULT / CODE_BUG / NETWORK / AUTH / INFRA / CHECKPOINT_LOAD_FAIL /
+  STATE_VALIDATION / PROTOCOL_BREACH (free-form string, not an enforced enum);
+  `None` when not passed / done / cancelled
+
+  ⚠️ **Only the first 6 of those are values a caller can raise. The last 3 describe
+  engine-side failures, and the engine never assigns them** (guessing a business
+  category for you would be wrong) — so they **can never reach this field**
+  (measured 2026-10-17; the matrix is pinned in `tests/test_error_category.py`):
+
+  | engine-side failure | what you actually get |
+  |---|---|
+  | `STATE_VALIDATION` (stage returns a non-finite value, etc.) | `status=failed`, `error_class="ValueError"`, `error_category=None` |
+  | `PROTOCOL_BREACH` (router returns an undeclared key) | `status=failed`, `error_class="UnmappedRouteError"`, `error_category=None` |
+  | `CHECKPOINT_LOAD_FAIL` (resume with a changed DAG) | **raises `CheckpointMismatchError`** — there is no `RunResult` at all |
+
+  So dispatch needs **both** legs: caller-raised categories via `error_category`,
+  engine-side failures via `error_class` (or by catching the exception). Dispatching
+  on `error_category` alone sends every engine-originated failure into the `None`
+  branch — which is exactly the class that most needs triage.
+- **`error_category` is independent of the exception type (unreleased, see CHANGELOG
+  [Unreleased])**: any exception carrying a `.category` attribute passes it through —
+  **subclassing `StageError` is not required**. Custom exceptions work the same way:
+
+  ```python
+  class MyErr(Exception):
+      def __init__(self, msg, category=None):
+          super().__init__(msg)
+          self.category = category      # → RunResult.error_category
+
+  @dag.stage()
+  async def s_x(ctx):
+      raise MyErr("empty result", category="CAT_TRUNCATION")
+  ```
+
+  Exceptions that are not `StageError` / `FatalError` / `RetryableError` /
+  `TimeoutError` are handled with **FatalError semantics** (fail, no retry, terminal),
+  and `error_class` is their class name. **Carrying a category does not change that** —
+  category is triage metadata, not a "retryable" signal. Route on the category rather
+  than matching the error message text: text matching drifts silently whenever the
+  wording changes.
+- `stage_timings`: `{stage: wall-clock seconds}` (includes retry backoff sleeps;
+  executed stages only)
+
+### Failure semantics (no exception raised; returns `failed`)
+
+| Exception | Meaning | Behavior |
+|---|---|---|
+| `StageError` | Business failure | Fail, no retry |
+| `RetryableError` | Network / rate-limit / timeout | Backoff retry, fail when budget exhausted |
+| `FatalError` / unknown exception | Code bug | Fail immediately, does not consume retries |
+
+All three derive from `PavozError`, as do the conditional-edge errors
+`UnmappedRouteError` / `MaxVisitsExceeded` / `OrphanStagesError` — every
+exception the library itself raises shares that one base, so wrapping pavoz in
+an SDK or mapping errors onto your own codes needs a single `except PavozError`.
+`CheckpointMismatchError` (a checkpoint whose structure no longer matches the DAG
+— caller misuse) is deliberately outside that tree.
+
+Note that "no exception raised" above describes `run()`: engine-decided failures
+come back as `RunResult(status="failed", error_class=...)`. Unified catching
+matters for the entry points outside `run()` (CLI, TestPipe, …).
+
+## Ctx (stage argument)
+
+```python
+ctx.task_id: str
+ctx.run_id: str          # UUID4 of the current run (reused on resume)
+ctx.attempt: int         # 1-based; current attempt for this stage (+1 per retry)
+ctx.stage_name: str
+ctx.state: ReadOnlyStateView   # read-only deep copy; any write raises
+ctx.deadline: float | None     # absolute deadline for this stage
+
+await ctx.call(kind: str, op: str, params: dict | None = None) -> dict
+ctx.set_progress(fraction: float, note: str | None = None) -> None  # long-stage heartbeat
+ctx.cancelled() -> bool                                            # cooperative-cancel poll
+ctx.on_event: Callable[[str, dict], None] | None                   # this run's event sink
+```
+
+- `ctx.call` is the **only** entry point for external calls inside a stage. The `kind`/`op`/return-value shape is defined by the business caller — the framework just passes them through. The default caller is a no-op echo (`CallResult(kind=..., op=..., params=...)`)
+- The injected caller receives a 4th argument: `meta: CallMeta` (`task_id` /
+  `run_id` / `stage` / `attempt`) — callers that record traces/`llm_calls` can
+  correlate the execution context without extra plumbing. `CallMeta` lives in
+  `pavoz.runtime`. Stage functions are unaffected (`async def fn(ctx) -> dict`).
+- `ctx.logger`: `logging.Logger` (with the stage name already injected)
+- `ctx.set_progress(fraction, note=None)`: optional heartbeat for long stages —
+  answers "working or stuck?" during minute-long LLM calls. Best-effort: it only
+  emits a `stage_progress` event on `on_event`, is never checkpointed, and does not
+  affect deadline/retry/cancellation semantics; identical fractions are debounced,
+  and it is a no-op when no `on_event` is configured
+- `ctx.cancelled()`: cooperative-cancellation poll (the loop decides how to exit);
+  a raising `cancel_check` counts as "not cancelled"
+- `ctx.on_event`: the same sink as `Runtime(on_event=...)` — decorator-style
+  extensions (a quality gate, say) emit their own events onto the same stream
+
+## State
+
+- **Returning `None` is the same as returning `{}`** (`_run_stage` normalises it to
+  `{}`): a purely side-effecting stage (webhook / DB write / metric) need not return
+  anything. Mind the converse — a **forgotten `return` has the same result**: the run
+  still reports `done` and writes no state, so when a downstream stage can't see some
+  upstream stage's output, check that the upstream one didn't forget its `return`
+- Allowed types: `str`/`int`/`float`/`bool`/`None`/`list`/`dict` (json-serializable).
+  Anything else (`set`/`datetime`/`Path`/`bytes`/...) → `TypeError`
+- A `float` must also be **finite**: `NaN` / `±Inf` pass the type check but
+  serialize to the literals `NaN`/`Infinity`, which are not valid RFC 8259 JSON —
+  strict parsers (other languages, jq, PostgreSQL JSONB) reject the whole file,
+  while Python's own json is lenient so it never shows up in-process → `ValueError`.
+  The check lives at the single `deep_validate_state` chokepoint, so stage
+  return values and `--set-file` / `--overrides` all go through it
+- ⚠️ This section used to name a `StateValidationError` that **does not exist in
+  the code** (the two builtins above are what actually get raised). `except
+  StateValidationError` against the old docs is an ImportError
+- Write path: stage `return dict` → **shallow merge**; a nested dict is
+  **replaced wholesale, not deep-merged**: if s_a writes
+  `{"cfg": {"model": "m1", "temp": 0.1}}` and the next stage returns
+  `{"cfg": {"temp": 0.9}}`, then `cfg` becomes `{"temp": 0.9}` and **`model` is
+  gone** (measured: the downstream `cfg["model"]` raises `KeyError` and the run
+  fails). To change one leaf, return the **whole** `cfg`, or lift the leaf to a
+  top-level key
+- ⚠️ This differs from override semantics: `--set` / `--set-file` / `--overrides` /
+  `fork_run(overrides=)` go through `apply_overrides` → **deep merge** (only the
+  patched leaf is replaced, siblings survive). Stage returns are shallow, injected
+  overrides are deep — don't carry reasoning from one path to the other
+- ⚠️ **`skipped_stages`**: stage names whose function was **not called** — their
+  results were replayed from the checkpoint. Empty means every completed stage
+  really ran.
+- ⚠️ A **dot-path that does not exist is silently created**, no error. Typing
+  `llm.modle` instead of `llm.model` leaves a dead key nobody reads, the real
+  `llm.model` keeps its old value, and the run still reports `done` — the config
+  looks set but never took effect. This is **deliberate**: adding a new config key
+  (`llm.temp`) to an existing structure, and first-time injection into empty state,
+  are both legitimate, so erroring would reject them too (pvos must not guess your
+  state schema). Discoverability comes from tiered logging: overwriting a
+  **non-dict intermediate** = WARNING (that loses data, almost always a mistake);
+  intermediate creation and **leaf-key creation** = DEBUG (a mistyped leaf and a
+  genuinely new key are indistinguishable). So when an override "didn't take",
+  turn on DEBUG logging, or read `overrides_applied` in the `fork-run` output /
+  the `--compare-with` diff
+- Conflict: a delta key already exists in state and its producer is **not** a transitive upstream of the current stage → `StateConflictError` (parallel-producer conflict)
+- Chained overwrite: the producer is a transitive upstream → allowed (v0.1.1)
+
+## Checkpoint
+
+```python
+store = CheckpointStore(storage: StorageBackend)
+store.save(cp)                                  # write checkpoint + latest pointer
+cp: Checkpoint | None = store.load(task_id, run_id)       # a specific run
+cp: Checkpoint | None = store.load_latest(task_id)        # via the latest pointer
+run_ids: list[str] = store.list_runs(task_id)             # what runs exist? (debug/cleanup)
+store.delete(task_id, run_id)                             # pointer is NOT updated on delete
+cp: Checkpoint | None = store.load_compatible(task_id, run_id, dag)
+# hash-checked load; run_id="" → load the task's latest run (load_latest sentinel)
+removed: dict = store.prune(task_id, keep_last=5, dry_run=False)   # trim old runs
+```
+
+- Storage layout: each run is saved at `runs/{task_id}/{run_id}/checkpoint`;
+  every `save()` also updates a pointer file `runs/{task_id}/latest`
+  (`{"run_id": ...}`). Multiple runs of the same task never overwrite each
+  other, and "latest" does not rely on lexicographic ordering (UUID4 lex order
+  ≠ chronological). Deleting the run the pointer names → `load_latest` returns
+  `None` (clear "no checkpoint" signal — acceptable edge).
+- `Checkpoint` fields: `task_id / run_id / dag_name / workflow_hash /
+  stage_statuses / state / done_stages / producers` + v0.5.1:
+  `initial_state` (the run's starting state) and `stage_deltas` (each
+  completed stage's raw return dict, in completion order). Together they can
+  rebuild the state as it was before any recorded stage (`cp.state` is the
+  final merged state — you cannot derive per-stage inputs from it).
+  `run_id` is required — pre-v0.5 checkpoints (no `run_id`, old key
+  `runs/{task_id}/checkpoint`) are orphaned (hard cut, no legacy loader);
+  within the current format, missing optional fields load via defaults
+  (forward-compatible schema — v0.5.0 checkpoints without the new fields
+  load and resume fine).
+- `cp.stage_attempts` (0.5.9+): one record per **attempt** of every stage,
+  in execution order. Each record is
+  `{visit, attempt, status, ts, duration_ms, error}` — `status` is
+  `done | failed | retry | cancelled`; `error` is a summary of the exception
+  message (truncated to 500 chars; the full message stays in
+  `RunResult.error`) and `None` on success; `ts` is the attempt's **start**
+  time (epoch seconds) and `duration_ms` excludes retry backoff sleeps.
+  Loop rounds are distinguished by `(visit, attempt)`; on resume the attempt
+  counter restarts at 1 for the same visit, and `ts` orders records across
+  resume episodes. `pavoz trace` prints this field.
+  **This is pure audit data**: it affects neither execution decisions nor
+  state rebuilding; checkpoints without it load as `{}`. It answers "which
+  stage was slow / why did it fail last time" after a run ends or resumes —
+  the event stream is not persisted and `RunResult.stage_timings` lives only
+  in memory.
+- `cp.rebuild_state() -> dict` — reconstruct the merged state after all
+  completed stages (`initial_state` + done deltas in completion order;
+  chain overwrites resolve by order). This is the input state for replaying
+  a stage that never completed (its deps are done).
+- `cp.rebuild_state_before(stage_name) -> dict` — reconstruct the state as it
+  was just before `stage_name` ran (`initial_state` + deltas of stages
+  completed before it). `KeyError` if the stage is not in this run's record.
+  Used by `run_stage` so a stage's own earlier output can never pollute its
+  replay input.
+- `store.prune(task_id, *, keep_last, dry_run=False)`: trim a task's old checkpoints —
+  keeps the newest `keep_last` runs by last activity (`max(stage_ts)`), deletes the
+  rest at key granularity and returns an approximate freed-byte count. **The run the
+  `latest` pointer names is always kept** and the pointer file itself is untouched
+  (the pointer can never dangle). `dry_run=True` reports without deleting.
+  CLI: `pavoz prune`
+- `workflow_hash(dag)`: sha256 over the **DAG name** + stage names + dependencies +
+  retries + timeout (+ conditional edges); function-body changes don't affect the
+  hash. Counting the name is deliberate: two pipelines with identical structure used
+  to hash identically, so a task_id collision let `resume` pick up the wrong
+  checkpoint with no warning at all — measured, `RunResult.dag_name` reported the
+  new DAG while every value in `state` came from the old one. **Cost**: renaming a
+  DAG changes its fingerprint, so old checkpoints stop resuming (rename it back, or
+  use a fresh task_id)
+- `CheckpointMismatchError`: resume found a different fingerprint (structure
+  changed, **or the DAG name changed**) → refuse to resume (rerun with
+  `resume=False`, or delete the run's checkpoint). When the names differ, the
+  message names both DAGs
+
+## `StorageBackend` (Protocol, business-injected)
+
+```python
+class StorageBackend:
+    def put(self, key: str, data: dict) -> None: ...
+    def get(self, key: str) -> dict | None: ...
+    def list_keys(self, prefix: str) -> list[str]: ...
+    def delete(self, key: str) -> None: ...
+```
+
+Built-in: `FileStorage(dir)` — local filesystem implementation (tests / single-host).
+
+`FileStorage` writes records **atomically** (temp file in the same directory +
+`os.replace`): if the process dies or the machine loses power mid-write, what
+remains on disk is the previous **complete** record, not a half-written file.
+
+### `CorruptRecordError`
+
+Raised when a record on disk is **not valid JSON** (most commonly a half-written
+file left by a crash / power loss). The message carries the file path, the
+underlying error and what to do about it; the CLI catches it and exits 1 — so
+`trace` / `state` / `export-input` / `replay` / `fork-run` / `run --resume` all
+print **one readable sentence** instead of a traceback pointing into
+`json/decoder.py`.
+
+**It never degrades to `None`.** `get` returning `None` means "no such record";
+treating corruption as absence would make `run --resume` start over — the user
+sees `done` while the task's accumulated progress is **silently dropped** (the
+old data is still on disk, merely unreadable).
+
+## Storage loader
+
+pavoz core ships **only** the `StorageBackend` Protocol + `FileStorage`. Drivers
+(psycopg / redis / boto3 / etc.) are the user's responsibility — install what you
+need, write (or vendor) an adapter that implements the Protocol, then load it by
+config string.
+
+```python
+from pavoz import load_storage
+
+storage = load_storage("pavoz.storage.FileStorage", root_dir="/data/cp")
+# or:
+storage = load_storage(
+    "backend.integration.sf_storage.MinioStorage",
+    task_id="run-2026-09-05-001",
+)
+cp_store = CheckpointStore(storage)
+```
+
+### `load_storage(spec: str, **kwargs) -> StorageBackend`
+
+- `spec` — adapter locator. Two equivalent forms:
+  - `"pkg.module:ClassName"` (canonical, explicit separator)
+  - `"pkg.module.path.ClassName"` (dotted, last segment = class name)
+- `**kwargs` — forwarded to `ClassName.__init__`
+- Raises `PavozStorageError` (subclass of `ImportError`) with friendly messages
+  for 5 failure modes: format error / module not installed / wrong class name /
+  wrong kwargs / non-`StorageBackend` instance.
+
+Full reference + storage interop contract + adapter recipe: [docs/storage.md](../storage.md).
+
+## `TestPipe`
+
+```python
+pipe = TestPipe(dag, initial_state={...})                  # caller=None default
+pipe.mock("s_search", lambda state: {"sources": [...]})   # replace stage output on demand
+result: RunResult = await pipe.run()
+
+# v0.5.1: replay a real run's checkpoint as a regression fixture
+pipe2 = TestPipe.replay_from(cp, dag)  # completed stages fed with their saved deltas
+result2 = await pipe2.run()
+assert result2.state == cp.state       # same stage outputs in → same graph behavior out
+```
+
+- Unmocked stages run normally (you can mock only the heavy external-call segments and let the rest execute for real)
+- `pipe.calls()` returns one record per **mocked** stage call, shaped
+  `{stage, mock, state_keys}` — `state_keys` is the set of top-level state keys the
+  stage could see when it ran (insertion order), which is what you assert on to
+  check "the downstream stage really received the upstream output"
+- `pipe.run(resume=True)` is **not supported** (TestPipe persists nothing, so there
+  is no checkpoint to resume from) — passing it raises `ValueError` naming the two
+  alternatives (`replay_from`, or a real `Runtime`). For genuine resume use
+  `Runtime(checkpoint_store=...).run(..., resume=True)`
+- Regression scenario: drive the full graph with fixed mock outputs and assert the final state
+- `replay_from(cp, dag)`: every completed stage in `cp.done_stages` is mocked
+  with its saved `stage_deltas` output; stages that never completed run for
+  real. Requires the checkpoint's `workflow_hash` to match the DAG (structure
+  unchanged) → mismatch raises `CheckpointMismatchError`; a pre-M2 (v0.5.0)
+  checkpoint without `stage_deltas` raises `RuntimeError` (re-run once).
+  Hand-written mocks for real runs can be replaced by replaying the checkpoint.
+- ⚠️ On **looping graphs** (conditional-edge cycles) it only guarantees the final
+  state is self-consistent, not that the path matches: `stage_deltas` is a
+  last-write view, so every iteration of a looped stage is fed that stage's
+  **final** delta and a real 3-round loop collapses to 1 round. The final state
+  usually still equals `cp.state` (the last value is the endpoint anyway), but
+  iteration-sensitive stages (counters, accumulators) will compute the wrong
+  number — assert those through a real `Runtime` run instead
+
+## DAG viz export (v0.5.4)
+
+```python
+from pavoz import to_mermaid, to_graph_json
+
+# embed in README / Feishu
+print(to_mermaid(dag))
+# → graph LR
+#     s_a["s_a"]
+#     s_b["s_b"]
+#     s_a --> s_b
+
+# frontend Vue / dagre / cytoscape rendering
+import json
+graph = to_graph_json(dag)
+# {"dag_name": ..., "nodes": [{id, name, depends_on, retries, timeout}, ...],
+#  "edges": [{from, to}, ...], "topo_order": [...]}
+```
+
+- **Data only** — caller renders (pavez shipping UI / drag-drop / server would violate the `独立性` principle)
+- `to_mermaid(direction="LR"|"TD")` second arg picks the layout direction
+- `to_graph_json()` is fully JSON-serializable — feed wire protocols / UI without an intermediate layer
+- Zero deps; pavoz core is untouched
+
+## `EnginePolicy` (v0.5.3)
+
+### `stage_input_hash(fn, before_state) -> str`
+
+Fingerprint of a stage's execution inputs (first 16 hex of sha256) =
+**fn source + the full pre-execution state** — those two things and nothing else.
+Recorded automatically into the checkpoint's `stage_input_hashes` before each stage
+runs; `fork_run(skip_unchanged=True)` uses it to skip downstream stages whose inputs
+are unchanged (side-effecting stages opt out with `Stage.skip_unchanged=False`).
+
+> ⚠️ **Coverage boundary: the prompt has to live inside the fn body.** The fingerprint
+> does **not** cover closure variables, module-level config, env vars, files, or the
+> clock — changing those leaves the hash identical, so `skip_unchanged` **silently
+> replays the old result**. Measured: with a module-level `PROMPT = "v1"` bumped to
+> `"v2"`, neither the fn source nor the pre-execution state changed, so the fork kept
+> returning the v1 output with `status=done`. Put what you want to change inside the
+> stage function body (editing the body edits the hash), or mark that stage
+> `skip_unchanged=False`. Non-pure external dependencies (an LLM whose output drifts
+> with its version, say) need the same `skip_unchanged=False` opt-out.
+
+```python
+from pavoz import EnginePolicy, Runtime
+
+policy = EnginePolicy(
+    default_timeout=600,        # whole-run deadline; explicit Runtime.default_timeout wins
+    max_steps=50,               # total stage attempts (incl. retries); exceeded → failed
+    backoff_max=30.0,           # RetryableError backoff cap in seconds
+    max_concurrent_runs=4,      # in-process concurrent run cap per Runtime
+    skip_unchanged=False,       # default for fork_run when not passed explicitly
+    stage_alive_interval=30.0,  # heartbeat: emit stage_alive every interval once a stage runs that long; None disables
+)
+rt = Runtime(policy=policy)     # additive: no policy == pre-policy behaviour exactly
+```
+
+**Field values are validated at construction** (`EnginePolicy.__post_init__`): any
+negative value raises `ValueError`, and so does `0` for `max_steps` /
+`max_concurrent_runs` — every call site tests `if policy.x`, so `0` is a falsy value
+read as "not set": "limit of 0" reads like "no concurrency allowed" while actually
+meaning *unlimited*, and `max_steps=0` fuses the very first stage. Pass `None`
+- Reaching `max_concurrent_runs` **queues**, it does not reject. Measured (cap = 1,
+  two concurrent runs, one 0.4 s stage each): the second waits for the first to finish,
+  ~0.8 s overall, both `done`.
+- ⚠️ **The queue itself has no timeout.** A hung run (only reachable with the run-level
+  deadline and `default_timeout` both disabled) blocks every later run **forever** —
+  measured: first run sleeping 30 s ⇒ the second still hadn't started after 2 s. There is
+  no second safety net inside the library: what bounds the wait is the run's own
+  deadline / `default_timeout`. To bound **the wait itself**, wrap the call:
+  `await asyncio.wait_for(rt.run(dag, task_id), timeout=X)` — measured to raise
+  `TimeoutError` rather than being swallowed into a fake `RunResult` (registry hard-kill
+  and external cancellation are tracked separately).
+explicitly to mean "unlimited / off".
+
+### `stage_alive_interval` events (unreleased, see CHANGELOG [Unreleased])
+
+Once a stage has run longer than this interval, the runtime emits
+`stage_alive {task_id, run_id, stage, visit, attempt, elapsed}` via `on_event` —
+a liveness signal for long stages that never call `Ctx.set_progress` (LLM calls,
+large-model inference). Fast stages emit nothing; without a policy the engine
+default is 30.0s; `None` disables it. The heartbeat stops as soon as the stage ends.
+
+## `CancelRegistry` (v0.5.3)
+
+```python
+reg = CancelRegistry()
+rt = Runtime(cancel_registry=reg)
+task = asyncio.create_task(rt.run(dag, "t1"))
+reg.cancel("t1")                  # graceful: boundary interception (same as v0.9 cancel_check)
+reg.cancel("t1", mode="hard")     # hard kill: interrupt the running stage now (stages must be idempotent)
+# current stage marked @dag.stage(killable=False) → hard raises NotKillable
+await task   # → RunResult(status="cancelled", failed_stage=..., retryable=None)
+```
+
+- graceful uses the stage/retry checkpoints; hard injects CancelledError into
+  the running stage — the run saves its checkpoint and returns a cancelled
+  result (callers must guarantee stage idempotency)
+- Cancellation from **outside** the registry (`asyncio.wait_for` timeout, the
+  caller's own `t.cancel()`, loop shutdown) still propagates as an exception.
+  Previously the runtime only asked "is there a cancel flag?" and converted
+  that into `RunResult(status="cancelled")`, so `wait_for(rt.run(...), t)`
+  **did not raise `TimeoutError`** — the caller's timeout protection silently
+  stopped working
+- **At most one active run per task_id**: a second `run()` raises
+  `TaskIdInUse`. ⚠️ **This only holds when a `cancel_registry` is configured** —
+  `Runtime()` defaults `cancel_registry` to `None`, and the in-use registration
+  (`_register`) happens on that path. A `Runtime` without a registry has no
+  `cancel()` at all, so two runs may share a task_id and both finish
+  **without any error**; the consequence is that the checkpoint `latest`
+  pointer becomes "whichever finished last", and `resume` / `trace` follow it
+  (each run's own file is separate, so nothing is corrupted). For the
+  protection, give every `Runtime` that may run the same task_id **the same**
+  `CancelRegistry` instance — two separate registries are the same as none.
+  The registry addresses runs by task_id, so `cancel(task_id)`
+  has no well-defined target when two runs share one (and checkpoints are keyed
+  by task_id too — they'd fight over the latest pointer). This used to collide
+  silently: whichever run finished first unregistered the *other* one's handle,
+  so the hard kill **never fired** yet reported success, the target stage's
+  `killable=False` guard was bypassed, and the flag still got set — mis-killing
+  a run that was never actually killed
+- After a run is cancelled the **flag persists** (it expresses what the caller
+  asked for): call `reg.reset(task_id)` before resuming or reusing that
+  task_id — a new run without a reset is cancelled again immediately. A run
+  that ends **normally** (done/failed) has its leftover race-condition flag
+  cleared by `Runtime` itself. Both cancellation log lines (graceful and hard)
+  name `registry.reset(task_id)`
+
+### `diff_runs(cp_a, cp_b) -> dict` / `CheckpointStore.diff_runs(task, run_a, run_b="")`
+
+Stage-level structured diff of two runs (R4). Output is fully
+JSON-serializable, no AI summarization: `workflow_hash_changed` / `dag_names [a, b]` /
+`stages` (per-stage `status [a, b]`, `input_hash_changed`, `visits [a, b]`,
+path-level `output_diff`) / `state_diff` (final merged state, path-level).
+The store wrapper's `run_b=""` resolves the latest pointer (same convention as
+load_compatible); a missing checkpoint raises RuntimeError. Consumers (AI agents)
+read it to decide "what changed, which stages were affected, what to rerun".
+
+- **`visits` is how many times each stage ran in each of the two runs.** On
+  looping graphs (R1) that is the number that matters, and neither `output_diff`
+  nor `state_diff` can express it: measured, two runs whose **final states were
+  byte-identical** (3 rounds vs 5) produced an empty `state_diff`, while
+  `output_diff` only reported how the *last* visit's delta differed — the signal
+  is inverted, since "this run did 67% more work" goes unreported and a
+  meaningless last-round detail becomes the only clue
+- **`dag_names` makes a pure rename identifiable on its own.** Since 0.5.7 the dag
+  name is part of `workflow_hash`, so *renaming* flips `workflow_hash_changed` to
+  `true` — and a rename is exactly the change that should be judged "not a real
+  difference": measured, when the only difference between two runs was the dag
+  name, every entry under `stages` reported "no difference", while the old
+  single `dag_name` field only named run *a*, leaving **run b's name invisible**,
+  so a consumer could only conclude "the structure changed but nothing else did"
+  — the wrong conclusion
+- ⚠️ `output_diff` reads `stage_deltas`, the **last-write view** (one delta per
+  stage: its final execution). On looping graphs that drops the intermediate
+  rounds. The full per-round history is `cp.stage_deltas_visits`
+- ⚠️ `workflow_hash_changed: true` does **not** say *what* differs. The fingerprint
+  is one opaque string and can't be broken down into "which stage, which
+  attribute". That boundary is deliberate: the field exists to tell a consumer
+  "don't compare these two", not to explain them — the one exception being a
+  rename, which `dag_names` covers on its own
+
+## EventRecorder (v0.5.3)
+
+```python
+rec = EventRecorder()                  # collects (event, data) pairs
+rec = EventRecorder(sink_path="ev.jsonl")  # appends one JSONL line per event
+rt = Runtime(on_event=rec)             # matches the on_event signature
+rec.events   # [(event, data), ...]
+rec.names()  # ["run_start", "stage_start", ...]
+```
+
+- Lifecycle events: `run_start` / `stage_start` / `stage_end` / `stage_retry` /
+  `stage_progress` / `run_end` (same stream as `on_event`)
+- A ready-made observer for callers who don't want a hand-written lambda;
+  the JSONL sink keeps an audit trail for post-mortems
+- **Every sink line is valid RFC 8259 JSON**: non-finite floats (`NaN` / `±Inf`)
+  in a payload are stringified to `"nan"` / `"inf"` / `"-inf"` on the way to disk
+  rather than written as invalid literals — this file exists to be read by
+  jq / Splunk / Loki, and one unreadable line is one lost record. Only the
+  **serialization** is normalized; `recorder.events` still holds the original
+  float. (Non-finite values in *state* are already rejected by
+  `deep_validate_state`, but event payloads are caller/stage-reported data and
+  never pass through that chokepoint.)
+
+## CLI
+
+```bash
+python -m pavoz run <dag.py> [--task-id X] [--input '{"k": "v"}'] [--resume]
+python -m pavoz trace --task-id X
+python -m pavoz state --task-id X [--key K]
+python -m pavoz replay <dag.py> --task-id X --stage Y [--patch P.py]   # v0.5.1
+```
+
+- `run`: runs a DAG file. **Selection** — *any* `DAG` instance in module scope counts
+  (the variable need not be called `dag`; instances of `class MyDAG(DAG)` subclasses are
+  recognized too, while a same-named `DAG` from some other library is *not* picked up).
+  With more than one DAG in the file, name the one to run with `DEFAULT_DAG = "<name>"`:
+
+      ```python
+      from pavoz import DAG
+      alpha = DAG("alpha");  beta = DAG("beta")
+      DEFAULT_DAG = "beta"          # ← runs beta
+      ```
+
+  The name must match `DAG(...)`'s name **exactly** (no prefix or fuzzy matching), and a
+  mismatch is a **hard error that lists the names actually present** — it never silently
+  falls back to the first one. Ignoring an explicit declaration means running a different
+  pipeline with no signal at all, which is worse than failing (you would debug beta
+  against alpha's results). With several DAGs and no `DEFAULT_DAG`, the first is used and
+  a note is printed to stderr. `PAVOZ_STORAGE` environment variable
+  `PAVOZ_STORAGE` env var points at the `FileStorage` directory — every
+  run persists per-stage checkpoints there (single runs included, v0.5.1 R5
+  fix), so `--resume` / replay / trace / state work on CLI runs
+- `trace`/`state`: read checkpoints from `FileStorage`. `state --key K` **names
+  the offending key, lists the available ones and exits 1** when K is absent —
+  strictly distinguishable from "K exists but its value is null" (exit 0), so a
+  caller piping the output cannot have to guess
+- `replay`: replays one stage on its checkpoint-rebuilt input (see
+  `Runtime.run_stage`); optional `--patch P.py` loads a module exposing
+  `patch(dag) -> None` to swap implementations in before replaying (must be
+  sync — async patch is rejected). Output is the result JSON; nothing is
+  persisted (no checkpoint written, `latest` pointer untouched)
+
+## Param overrides (library equivalents of `fork-run`)
+
+```python
+parse_set_args(["a.b=1", "c=true"]) -> dict    # --set dotted-path parsing (types inferred)
+parse_set_file("overrides.yaml") -> dict        # --set-file (JSON/YAML, safe_load, 1 MB cap)
+merge_overrides(base: dict, patch: dict) -> dict   # deep merge (sibling keys survive)
+apply_overrides(state: dict, overrides: dict) -> dict
+```
+
+The CLI `pavoz fork-run --set / --set-file` flags go through this same chain, and
+`Runtime.fork_run(overrides=...)` deep-merges identically. Full guide:
+[replay-params.md](../replay-params.md).
+
+`pavoz.__version__`: the current version string (kept in sync with
+`pyproject.toml` / the release tag).
+
+## Related documents
+
+- [quickstart.md](quickstart.md) — 5-minute walkthrough
+- [architecture.md](architecture.md) — architecture and design decisions
+- [use-cases/](use-cases/) — reference business integrations
+
+## Conditional edges (v0.5.5)
+
+The orchestrator owns all edges (including conditional ones); nodes are pure
+data processing — a stage only writes state and never decides what runs next.
+Routing logic lives on the edge, declared once, as a sync pure function over state.
+
+### `DAG.add_conditional_edges(from_node, route_fn, mapping, *, max_visits=None)`
+
+```python
+dag.add_conditional_edges(
+    "s_review",
+    lambda s: "ship" if s["verdict"] == "pass" else "fix",  # sync pure function
+    {"ship": "s_save", "fix": "s_revision"},                # key → target (closed set)
+    max_visits=5,
+)
+```
+
+- `route_fn(state) -> key`: sync pure function; same state → same key
+  **Shapes**: a plain `def`, a bound method, or a **callable object** with a
+  lookup table all work (an object's fingerprint comes from its `__call__`).
+  Anything async is rejected at declaration — including a callable object
+  whose `__call__` is async (`inspect.iscoroutinefunction(instance)` is
+  False, so checking only functions misses it)
+  (replay/resume determinism). **Enforced at declaration**: an `async def`
+  raises `TypeError` there and now. Left unchecked it only fails at run time —
+  the edge receives a coroutine object, misses the mapping, and reports "returned
+  an undeclared key <coroutine ...>", which points the reader the wrong way (the
+  route was never called). For LLM-based judgment use a judge stage that
+  writes state (e.g. `state["route"]`) and read it on the edge — the same
+  pattern converged on by LangGraph / Temporal / Step Functions / BPMN.
+- `mapping`: closed set of key → target stage; an undeclared key at runtime
+  raises `UnmappedRouteError`. Exceptions raised by route_fn itself propagate
+  unchanged (error_class preserved, failed_stage = the router).
+- Loop with a static chain (R2): if a loop-edge target's cycle has no member with
+  a *cycle-external* static parent, the first-declared cycle member is exempted as
+  the loop entry (round 1 starts there). A router jumping back to an executed
+  stage is an explicit re-entry: the target's static-downstream closure re-executes
+  (each rerun records a fresh visit); `max_visits` fusing still applies; router-chain
+  loops (body reached via route jumps) are unchanged. Mid-loop failures resume from
+  the breakpoint.
+- Termination validity (fail-loud): at normal termination, any declared stage
+  that never executed and is not covered by an *unexpired* executed router's
+  mapping raises `OrphanStagesError` — the run fails listing every orphan.
+  A router is "unexpired" only if nothing outside its chosen target's reachable
+  set executed after its decision (an off-branch stage running after the
+  decision means the loop never closed and nobody re-judged); such a router's
+  mapping no longer exempts its unexecuted targets. A branch simply not taken
+  this run (judge says pass) is a legitimate exemption.
+- `max_visits`: max executions of the router per run; exceeding it raises
+  `MaxVisitsExceeded`. validate() requires it when conditional edges form a
+  loop (anti-runaway guard); branch-only graphs may omit it.
+- ⚠️ **`resume` is useless once `max_visits` is exhausted — use `resume=False`
+  to re-run.** The count is **carried across resumes** (recovered from the
+  checkpoint's completion order), so resuming after the budget is spent raises
+  `MaxVisitsExceeded` again **without running a single stage**; and raising
+  `max_visits` changes `workflow_hash`, so both `resume` and `fork_run` then
+  refuse with `CheckpointMismatchError`. The way out is `resume=False` (a fresh
+  run_id that ignores the old checkpoint) — fix the exit condition and run once
+  more. Measured: after an exhausted budget caused by an exit condition that
+  never fires, correcting it plus `resume=False` completes normally. This is
+  not a dead end, but without it written down every user who hits it has to
+  rediscover it by retrying `resume`.
+- validate() structural rules: a conditional target must not statically depend
+  on a router; a router's static dependents must be mapping targets; a loop-edge
+  target with a static parent joins topo (loop head), otherwise it is route-only
+  (branch / loop body).
+- `workflow_hash` includes route_fn source + mapping + max_visits — changing
+  routing = structural change; resume/fork refuse stale checkpoints.
+- Single-point isolated debugging on conditional graphs (R2): `run_stage(dag,
+  task_id, stage)` replays one stage (input = per-visit fold up to the stage's
+  first execution; no checkpoint write, latest pointer untouched);
+  `fork_run(dag, task_id, from_stage=..., overrides=...)` truncates at
+  from_stage's first completion + overrides + route-driven continuation (same
+  execution model as resume; from_stage must have executed). Editing a stage
+  body (e.g. an LLM prompt) does not change workflow_hash — no full-chain
+  rerun needed. The `<fork>` pseudo-producer may be overwritten by the
+  continuation (rewriting injected inputs is the point of fork).
+- Events: `route` `{from, key, to}`; `stage_start/stage_end` gain a `visit`
+  number (loop iteration, distinct from attempt = retry). Viz: `to_mermaid`
+  renders conditional edges as labeled dotted arrows; `to_graph_json` edges
+  carry `kind`/`key`/`max_visits`.

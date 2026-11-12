@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pavoz"
+version = "0.5.9"
+description = "Micro/in-process Python DAG workflow engine — stdlib only, zero runtime deps, in your process"
+authors = [{ name = "liyong-labs" }]
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+    "dag", "workflow", "orchestration", "pipeline", "llm",
+    "checkpoint", "resume", "durable-execution", "pavoz",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/liyong-labs/pavoz"
+Repository = "https://github.com/liyong-labs/pavoz"
+Changelog = "https://github.com/liyong-labs/pavoz/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "pyflakes>=3.0",
+    "pyyaml>=6.0",
+    "pyright>=1.1.400",
+    "hatchling>=1.18",
+]
+
+[project.scripts]
+pavoz = "pavoz.cli:main"
+
+# ⚠️ sdist 必须**显式**排除消费方业务路径 —— 不写的话, hatchling 默认打包**全部
+# git 跟踪的文件**。2026-10-17 实测: PyPI 上的 0.5.8 sdist (512KB) 里逐字含有
+# research/llm_router.py 的 "用户原话 (2026-09-07)" + 四个厂商模型 + 硬编码的
+# 厂商 API 端点 + **真实 token 消耗反推的人民币成本** (total_yuan: 0.474), 以及
+# dags/research_dag.py。
+#
+# 这两个路径已于 2026-10-23 从仓里删除 (user 拍板), exclude **留着不撤**:
+# hatchling 只打包 git 跟踪的文件, 但若有人从历史里把文件捞回来 add, sdist 会再次
+# 带上它们 —— 这两条 exclude 是防再引入的最后一道闸。`tools/check_business_leak.py`
+# 的 MUST_NOT_SHIP 判据盯着这里: exclude 必须覆盖同样的路径, 两边一旦漂移就报红。
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/research",
+    # 只排**消费方那个**文件, 不是整个 dags/ —— `dags/demo.py` 是通用 mock demo,
+    # 而 README.cn 首页与 CLI --help 的 epilog 都拿它当示例命令。2026-10-17 实测:
+    # 上一版排除 "/dags" 时把 demo.py 一起排掉了, 于是那两条命令对从 sdist 装的
+    # 人都变成 "dag 文件不存在"。见 tests/test_sdist_keeps_referenced_examples.py。
+    "/dags/research_dag.py",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pavoz"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"

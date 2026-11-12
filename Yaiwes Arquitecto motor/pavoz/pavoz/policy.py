@@ -1,0 +1,102 @@
+"""EnginePolicy: run 级策略外置 (W3, 0.5.3, additive 非 BREAKING).
+
+zeroflow 同款思路: 策略对象化. Runtime 旧参数 (default_timeout 等) 全部
+保留 — policy 只在显式参数缺省时生效, caller 0 迁移.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+__all__ = ["EnginePolicy"]
+
+
+@dataclass(frozen=True)
+class EnginePolicy:
+    """run 级引擎策略. 全部字段可选, None/False = 引擎默认行为.
+
+    何时传: 要给 run 加护栏 (超时/熔断/并发闸) 或开 fork 重放优化时;
+    不传 = 引擎默认行为, 与 0.5.2 完全一致. Runtime 同名显式参数永远优先.
+
+    default_timeout: 整 run absolute deadline (秒). 默认 None = 不限时.
+        何时覆写: run 挂死会白占资源时 (LLM 长任务常见 300~3600);
+        Runtime(default_timeout=...) 显式给值时优先生效 (后者省略才看这里).
+    max_steps: 单 run stage attempt 总数上限 (含重试), 防死循环熔断.
+        默认 None = 不熔断. 何时覆写: 推荐 ≥ stage 数 × (1 + retries),
+        如 8 stage × retry 2 取 50 量级; 超限时当前 stage 记 failed
+        (error_class=MaxStepsExceeded).
+    backoff_max: RetryableError 重试退避上限 (秒). 默认 30.0 (替代旧硬编码 30).
+        何时覆写: 重试密集想快速失败 → 调低 (如 5.0); 极少调高.
+    max_concurrent_runs: 同一 Runtime 实例进程内并发 run 上限. 默认 None = 不限.
+        何时覆写: 下游 (LLM API / DB) 有并发配额时取配额值; 排队等闸
+        (asyncio.Semaphore), deadline 在获得闸门后才起算.
+    skip_unchanged: R2 — fork_run 未显式传 skip_unchanged 时用它. 默认 False.
+        何时覆写: prompt 迭代期频繁 fork_run 重放 → True 省重跑;
+        副作用 stage 必须标 Stage.skip_unchanged=False 拒跳.
+    stage_alive_interval: R2 — stage 存活心跳间隔 (秒). stage 执行超过该间隔后,
+        runtime 经 on_event 每 interval 发一条
+        stage_alive {task_id, run_id, stage, visit, attempt, elapsed} —
+        长 stage 无 fraction 汇报 (Ctx.set_progress 不调用) 也能观测, 免得
+        caller 靠 ps 判活. 默认 30.0; None 关闭; 快 stage (执行 < interval)
+        零事件; stage 结束心跳即停; 单 stage 重放 (run_stage) 不发.
+    """
+
+    default_timeout: float | None = None
+    max_steps: int | None = None
+    backoff_max: float = 30.0
+    max_concurrent_runs: int | None = None
+    skip_unchanged: bool = False
+    stage_alive_interval: float | None = 30.0
+
+    def __post_init__(self) -> None:
+        """字段取值校验: 构造时就拒, 不让 nonsense 变成运行期的怪现象.
+
+        实测过的两类失败 (2026-10-16):
+        - **负数 → 忙循环**: `stage_alive_interval=-0.001` 时 `asyncio.sleep(负数)`
+          立即返回, 心跳变成无节流的死循环 —— 0.2s 的 stage 喷出 **58099** 条
+          `stage_alive` 事件 (CPU 空转 + 事件流/日志/内存三重放大), 而 run 照样
+          `status=done`。全程无任何提示。
+        - **限值类传 0 → 上限悄悄消失**: 调用点一律写 `if policy.x`, 于是 0 被当成
+          "没设"。`max_concurrent_runs=0` 读起来像"不许并发" (实际 = 不限),
+          `max_steps=0` 会让第一个 stage 立刻熔断 —— 两个都不是任何人想要的语义。
+
+        规则: 负数一律拒; 限值类 (`max_steps` / `max_concurrent_runs`) 的 0 也拒 ——
+        "不限" 请显式写 `None`。`backoff_max=0` (不退避)、`stage_alive_interval=None`
+        (关心跳)、`default_timeout=None` (不限时) 都是合法用法, 保留。
+        """
+        for name, value in (
+            ("default_timeout", self.default_timeout),
+            ("backoff_max", self.backoff_max),
+            ("stage_alive_interval", self.stage_alive_interval),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(
+                    f"EnginePolicy.{name} 不能为负 (got {value!r}); "
+                    f"不限/关闭请显式传 None"
+                )
+        for name, value in (
+            ("max_steps", self.max_steps),
+            ("max_concurrent_runs", self.max_concurrent_runs),
+        ):
+            if value is not None and value < 1:
+                raise ValueError(
+                    f"EnginePolicy.{name} 必须 >= 1 (got {value!r}); "
+                    f"不限请显式传 None"
+                )
+        # default_timeout 只拒 **0**, 不并进上面那组 —— 亚秒超时是完全合法的
+        # 需求 (`default_timeout=0.2` 本仓测试就在用), 拿 "< 1" 去卡它会误伤。
+        #
+        # 为什么单独拒 0 (2026-10-16): 调用点是 `if _to` 真值判断
+        # (`run_deadline = time.time() + _to if _to else None`), 0 被当成"没设"
+        # ⇒ **run 级超时护栏静默消失**。实测 default_timeout=0 时一个跑 0.3s 的
+        # stage 跑满 0.30s 报 done, 而 0.1 报 TimeoutError。而 default_timeout
+        # 的**全部意义**就是给 LLM 调用封顶, "0 = 完全不管" 是最坏的一种失效:
+        # 用户以为护栏在, 实际 LLM 可以无限烧。
+        # 旁证: 同语义的 `@dag.stage(timeout=0)` 是**正确的** (那边用
+        # `is not None` 判断 ⇒ 0 是真值设置, 超时生效) —— 同一件事两个入口两种行为。
+        # 那边的 0 不是"立即", `_with_timeout` 有 0.1s 下限, 至少给 0.1s。
+        if self.default_timeout is not None and self.default_timeout == 0:
+            raise ValueError(
+                "EnginePolicy.default_timeout 不能为 0 (got 0): 调用点按真值判断, "
+                "0 会被当成'没设' ⇒ 超时护栏静默消失。不限请显式传 None"
+            )

@@ -1,0 +1,544 @@
+"""State 契约: json-serializable 限定 + read-only 视图 + shallow merge + 冲突检测.
+
+stage 只能:
+- 读: 通过 ctx.state (ReadOnlyStateView, 改会 raise)
+- 写: 通过 return dict (runtime 做 shallow merge)
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import logging
+from typing import Any
+
+_logger = logging.getLogger("pavoz")
+
+__all__ = [
+    "ReadOnlyStateView",
+    "StateConflictError",
+    "apply_overrides",
+    "merge_overrides",
+    # "merge_state" 曾在这里: 它是 runtime 内部用来折叠 delta 的实现细节, 既没进
+    # 顶层也没进文档 —— 公开面与实际可用面不一致 (2026-10-16 新门禁逮到)。用户要
+    # 折叠/合并自己的 state 用 apply_overrides / merge_overrides。
+    "parse_set_args",
+    "parse_set_file",
+]
+
+# json.dumps 能处理的类型白名单 (naobao 调研: set/datetime/Path/bytes 全要 raise)
+_JSON_TYPES = (str, int, float, bool, type(None), list, dict)
+
+
+class StateConflictError(Exception):
+    """两个 stage 试图写同一 state key. 修: stage 用不同 key (语义 key)."""
+
+
+class ReadOnlyStateView:
+    """read-only defensive copy. 写操作 raise.
+
+    ctx.state 就是这个对象 — stage 内改它 = 改了个寂寞 (zeroflow ANTI_PATTERN).
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """读一个 key; 缺失返回 default (与 `dict.get` 同)."""
+        return self._data.get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def keys(self):
+        """顶层 key 的只读视图 (与 `dict.keys` 同)."""
+        return self._data.keys()
+
+    def values(self):
+        """顶层 value 的只读视图 (与 `dict.values` 同)."""
+        return self._data.values()
+
+    def items(self):
+        """顶层 `(key, value)` 的只读视图 (与 `dict.items` 同)."""
+        return self._data.items()
+
+    def _readonly_raise(self, *a, **kw):
+        """ctx.state 的只读守卫 — 挂到 __setitem__ / __delitem__ / setdefault /
+        update / pop / clear 上, 任何原地写都抛带指引的 TypeError。
+
+        `*a, **kw` 是刻意的: 吞掉任意位置参数与关键字参数, 让调用方拿到
+        "read-only" 这条有用信息, 而不是 "takes 1 positional argument but 2
+        were given" 这种把人引向错误方向的签名报错。
+        (vulture 会把 `kw` 报成未使用变量 —— 它看不到下面 6 处方法名赋值。)
+        """
+        raise TypeError("ctx.state 是 read-only — stage 通过 return dict 写 state, 不要原地改")
+
+    __setitem__ = _readonly_raise
+    __delitem__ = _readonly_raise
+    setdefault = _readonly_raise
+    update = _readonly_raise
+    pop = _readonly_raise
+    clear = _readonly_raise
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return f"<ReadOnlyState {self._data!r}>"
+
+
+def _validate_value(key: str, value: Any, path: str = "") -> None:
+    """递归校验单值类型 + 有限性 (给更精确的报错)."""
+    # 有限性必须单独查: float 在 _JSON_TYPES 里, 类型检查挡不住 NaN/±Inf ——
+    # 它们会照常被 json.dump 写成字面量 NaN/Infinity, 而那不是 RFC 8259 的合法
+    # JSON: Python 自己 lenient 所以本仓内不显形, 任何严格解析器 (其他语言 /
+    # jq / PostgreSQL JSONB) 拒收整个文件。2026-10-16 实测: stage 直接返回
+    # float("nan") → run 报 done, checkpoint.json 含 NaN, 严格解析器拒收。
+    # 故非有限值抛 **ValueError** (值的问题而非类型的问题 —— 报"类型 float 不可
+    # 序列化"会指错方向); 调用方按 FatalError 语义处理 = 不重试直接失败。
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(
+            f"state key '{key}' 是非有限数值 {value!r} (path={path or key}) — "
+            f"无法持久化为合法 JSON"
+        )
+    if value is None or isinstance(value, _JSON_TYPES):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _validate_value(str(k), v, f"{path}.{k}")
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                _validate_value(str(i), v, f"{path}[{i}]")
+        return
+    raise TypeError(
+        f"state key '{key}' 值类型 {type(value).__name__} 不可 json 序列化 (path={path or key}). "
+        f"允许: str/int/float/bool/None/list/dict"
+    )
+
+
+def deep_validate_state(state: dict) -> None:
+    """递归校验所有值类型 + 有限性. run 开始时 + 每 stage return 后调.
+
+    顶层 key 直接作为 path 的起点 —— 否则递归里 f"{path}.{k}" 会从 ".llm"
+    起拼, 报错给出的是 ".llm.nested.deep" 这种前导点路径 (既有 TypeError 报错
+    一直是这个毛病: 在嵌套 key 上指错位置, 而那正是排查时最需要它说对的场景)。
+    """
+    for k, v in state.items():
+        _validate_value(str(k), v, str(k))
+
+
+def merge_state(
+    prev: dict, delta: dict, stage_name: str, overwrite_keys: set[str] | None = None
+) -> dict:
+    """shallow merge + 冲突检测: stage 不能覆盖已存在的 key.
+
+    返回新 dict (不 mutate prev). prev key 与 delta key 重叠 → StateConflictError.
+    默认语义 (v1): 每个 state key 只有一个 producer.
+    v0.1.1 链式演进: overwrite_keys 内的 key 允许覆盖 — runtime 已确认其 producer
+    是当前 stage 的传递上游 (数据流水线: search→filter→compress 逐级更新同一产物).
+    平行 producer (无依赖链) 覆盖仍 raise.
+    """
+    _ow = overwrite_keys or set()
+    conflicts = [k for k in delta if k in prev and k not in _ow]
+    if conflicts:
+        raise StateConflictError(
+            f"stage '{stage_name}' 试图写已存在的 state key: {conflicts}. "
+            f"DAG 里每个 key 只允许一个 producer — 改用不同 key (语义 key)."
+        )
+    merged = dict(prev)
+    merged.update(delta)
+    return merged
+
+
+def snapshot(state: dict) -> dict:
+    """deep copy (defensive). 每 stage 前给 ctx.state 用的快照."""
+    return copy.deepcopy(state)
+
+
+# ── v0.9: apply_overrides utilities (CLI + Library API) ─────────────
+
+import json as _json
+
+_DUNDER_BLOCKLIST = frozenset({
+    "__proto__", "__class__", "__init__", "__dict__", "__getattribute__",
+    "__setattr__", "__delattr__", "__bases__", "__mro__", "__subclasses__",
+    "__getstate__", "__setstate__", "__reduce__", "__reduce_ex__",
+})
+
+_MAX_PATH_DEPTH = 5
+_MAX_INLINE_JSON_LEN = 500
+
+
+def _validate_path(path: str) -> None:
+    """Validate a dot-separated path is safe to use.
+
+    Raises ValueError on:
+    - empty path
+    - depth > 5
+    - empty segment
+    - dunder key (Python object injection defense)
+    - non-identifier characters
+    """
+    if not path:
+        raise ValueError(f"path {path!r} 为空")
+    parts = path.split(".")
+    if len(parts) > _MAX_PATH_DEPTH:
+        raise ValueError(
+            f"path {path!r} 深度 {len(parts)} > {_MAX_PATH_DEPTH} 限制"
+        )
+    for p in parts:
+        if not p:
+            raise ValueError(f"path {path!r} 含空 segment")
+        if p in _DUNDER_BLOCKLIST:
+            raise ValueError(
+                f"path {path!r} 含禁词 {p!r} (防 Python object injection)"
+            )
+        if not all(c.isalnum() or c == "_" for c in p):
+            raise ValueError(
+                f"path {path!r} 含非标识符字符 (只允许 [a-zA-Z0-9_])"
+            )
+
+
+def _infer_type(raw: str, *, infer_types: bool = True) -> Any:
+    """Auto-infer type from string. Default conservative (infer_types=True).
+
+    When infer_types=False, never infer — always return raw str. Use this
+    when type drift between v0.8 and v0.9 is unacceptable.
+
+    **下面三个 `except ...: pass` 不是吞错, 是类型试探阶梯**: 按
+    int → float → JSON → 原样字符串 的顺序试, 每个 pass 的含义是
+    "这个解释不适用, 试下一种", 兜底是末尾的 `return raw`。
+    记日志/raise 都是错的 —— 每个字符串值都会刷一条噪声。
+    (静默吞错扫描器会报这 3 行, 是已知误报。)
+    """
+    if not infer_types:
+        return raw
+    s = raw.strip()
+    if not s:
+        return s
+    if s in ("null", "None"):
+        return None
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    if len(s) <= _MAX_INLINE_JSON_LEN and s.startswith(("[", "{")):
+        try:
+            return _json.loads(s)
+        except _json.JSONDecodeError:
+            pass
+    return raw
+
+
+def _deep_set(d: dict, path: str, value: Any) -> None:
+    """Set d[path.split('.')[0]][...][last] = value. Mutates d.
+
+    Creates intermediate dicts as needed; **overwrites non-dict intermediate
+    values** (caller is responsible for understanding the schema).
+
+    ⚠️ 那两种情况原先是**完全静默**的 (docstring 自称 "warning implicit in
+    behavior", 即没有 warning)。实测用户从 CLI 写路径时踩得到, 且两种后果都很坏:
+
+    - **key 拼错** (`--set llm.modle=x`, 真的 key 是 `model`) → 静默新建一个
+      `modle`, 真 `model` 保持旧值 ⇒ **配置看起来设了, 实际没生效**, 无任何提示
+    - **中间不是 dict** (`{"cfg": "a-string-value"}` 上写 `cfg.model=x`) → 那个
+      **原值被静默丢弃**, 变成 `{"model": "x"}` —— 这是数据丢失
+
+    行为**不改** (pavoz 是通用编排库, 不该猜用户的 state schema —— 首次注入一个
+    全新路径本就是合法用法), 只把"隐式"变成"可见": 覆盖非 dict 是 WARNING
+    (几乎总是写错且丢数据), 新建路径是 DEBUG (首次注入的常态, 不该刷屏)。
+    """
+    parts = path.split(".")
+    cur = d
+    for i, p in enumerate(parts[:-1]):
+        if p in cur and not isinstance(cur[p], dict):
+            _logger.warning(
+                "state 路径 '%s': %s 处的现有值是 %s 而不是 dict, 已覆盖为 {} "
+                "(原值丢失) —— 多半是路径写错, 或该 key 本就不是嵌套结构",
+                path, ".".join(parts[: i + 1]), type(cur[p]).__name__,
+            )
+            cur[p] = {}
+        elif p not in cur:
+            _logger.debug(
+                "state 路径 '%s': 中间层 %s 不存在, 已创建", path,
+                ".".join(parts[: i + 1]),
+            )
+            cur[p] = {}
+        cur = cur[p]
+    leaf = parts[-1]
+    if leaf not in cur:
+        # 叶子新建: 往**已有**结构里加新配置项是合法常态 (`llm.temp` 首次加上),
+        # 首次注入也合法 ⇒ 只能是 DEBUG。但它是最常见的用户错误所在 ——
+        # `--set llm.modle=x` 而真 key 是 `model` 时, 只有开 DEBUG 才看得见。
+        # 上一版漏了这一层: 中间层新建有日志, 叶子新建没有, 而用户拼错的正是叶子。
+        _logger.debug(
+            "state 路径 '%s': 叶子 key '%s' 不在 %s 里, 已创建 (若这是改已有配置, "
+            "多半是 key 拼错了 —— 真 key 仍在, 本次设置不生效)",
+            path, leaf, ".".join(parts[:-1]) or "<顶层>",
+        )
+    cur[leaf] = value
+
+
+def _deep_merge(into: dict, src: dict) -> None:
+    """Recursively merge src into into (mutates into)."""
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(into.get(k), dict):
+            _deep_merge(into[k], v)
+        else:
+            into[k] = v
+
+
+def parse_set_args(items: list[str]) -> dict:
+    """Parse --set KEY=VALUE list into a nested dict.
+
+    Example:
+        >>> parse_set_args(["llm.model=x", "config.x=5"])
+        {'llm': {'model': 'x'}, 'config': {'x': 5}}
+
+    Raises:
+        ValueError: any item missing '=' or path unsafe.
+    """
+    result: dict = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(
+                f"--set {item!r} 缺 '=' 分隔符. 格式: --set path.to.key=value"
+            )
+        path, raw = item.split("=", 1)
+        _validate_path(path)
+        value = _infer_type(raw)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(
+                f"--set {item!r} 值为非有限数值 (nan/inf) — JSON 无法持久化"
+            )
+        _deep_set(result, path, value)
+    return result
+
+
+_MAX_FILE_SIZE = 1_000_000  # 1MB
+
+
+def parse_set_file(path: str) -> dict:
+    """Parse --set-file PATH. JSON or YAML. 1MB limit, yaml.safe_load only.
+
+    Raises:
+        ValueError: file missing / too large / parse error / not dict / unsafe keys.
+    """
+    from pathlib import Path  # local import — Path not in state module yet
+
+    p = Path(path)
+    if not p.exists():
+        raise ValueError(f"--set-file {path} 不存在")
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        raise ValueError(f"--set-file {path} 读取失败: {e}")
+    if size > _MAX_FILE_SIZE:
+        raise ValueError(
+            f"--set-file {path} 大小 {size}B > {_MAX_FILE_SIZE}B (1MB) 限制"
+        )
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"--set-file {path} 读取失败: {e}")
+    if path.endswith((".yaml", ".yml")):
+        try:
+            import yaml  # lazy import (stdlib-only 保持)
+        except ImportError:
+            raise ValueError(
+                f"--set-file {path} 是 YAML 但 PyYAML 未安装. "
+                "用 JSON 替代 OR pip install pyyaml."
+            )
+        try:
+            data = yaml.safe_load(text)  # 强制 safe_load (防任意代码)
+        except yaml.YAMLError as e:
+            raise ValueError(f"--set-file {path} YAML 解析失败: {e}")
+    else:
+        def _reject_nonfinite(lit):
+            raise ValueError(f"--set-file {path} 含非有限数值 {lit!r} — JSON 无法持久化")
+
+        try:
+            data = _json.loads(text, parse_constant=_reject_nonfinite)
+        except _json.JSONDecodeError as e:
+            raise ValueError(f"--set-file {path} JSON 解析失败: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"--set-file {path} 顶层必须是 dict (实际 {type(data).__name__})"
+        )
+    _validate_dict_keys(data, path="")
+    # 值层校验 (类型 + 有限性) 也在这里做: 文件是用户直接给的数据, 错误该在
+    # 解析现场报, 而不是等 merge 进 state 后由 deep_validate_state 在更远处抛。
+    # 复用同一个 chokepoint (不平行实现一份 walker —— 平行实现必然漂)。
+    # JSON 分支的 parse_constant 只挡 NaN 这一类, 这层还挡 datetime 之类"能
+    # 解析但存不下来"的类型, 且对 YAML 分支同样生效 (YAML 此前两样都没有)。
+    deep_validate_state(data)
+    return data
+
+
+def _validate_dict_keys(d: dict, path: str = "", *, top: bool = True) -> None:
+    """递归校验 override 源结构里的**所有** key (file / library 调用来源不可信).
+
+    两类规则分清 (2026-10-16 —— 原实现两处都与这句 docstring 对不上, 方向相反):
+
+    **任何层级都拒** —— key 必须是非空 str; 含 '.' 时每个 segment 非空且非
+    dunder。这两条与"该 key 最终当路径还是当字面 key"无关: 空 segment 是畸形,
+    dunder 是 Python object injection 的入口 (`__proto__` / `__class__` …)。
+
+    **只有顶层才按路径判** —— 深度上限 (`_MAX_PATH_DEPTH`) 与"只允许标识符
+    字符"。依据是 `apply_overrides` 的实际分支: 顶层 `if "." in k` 才走
+    `_deep_set` 展开成嵌套路径; 嵌套 dict 走 `_deep_merge`, 该 key **原样保留**
+    成字面 key。所以 `{"cfg": {"a.b.c.d.e.f": 1}}` 是一个本会干净落盘的字面
+    key, 不该被 "深度 6 > 5" 拒掉 —— 而它此前就是被拒的 (过度拒绝合法输入)。
+    注: 这也纠正了原注释里的 "含 '.' 的 key 走 _validate_path (dot-path 语义,
+    apply_overrides 会展开)" —— **只有顶层会被展开**。
+
+    列表 / 元组也要走: 此前只递归 dict 值, 于是 `{"x": [{"__proto__": 1}]}`
+    把校验全绕过去 —— 同一个坏 key, 挂 dict 上拒、挂 list 里放行。
+
+    不变量: 本函数是 override key 校验的唯一入口 — parse_set_file /
+    merge_overrides / fork_run 共用; 新增校验路径时复用本函数, 不要平行实现.
+    """
+    for k, v in d.items():
+        if not isinstance(k, str) or not k:
+            raise ValueError(
+                f"override key {k!r} 必须是非空字符串 (在 {path or '<root>'})"
+            )
+        if k in _DUNDER_BLOCKLIST:
+            raise ValueError(
+                f"override key {k!r} 含禁词 (在 {path or '<root>'})"
+            )
+        if "." in k:
+            if top:
+                _validate_path(k)
+            else:
+                _validate_key_segments(k, f"{path}.{k}" if path else k)
+        _validate_child_keys(v, f"{path}.{k}" if path else k)
+
+
+def _validate_key_segments(key: str, where: str) -> None:
+    """含 '.' 但**不会被展开**的 key: 只查畸形 segment, 不查路径深度/标识符.
+
+    与 `_validate_path` 的差别就是那两条"路径语义"规则 —— 因为这个 key 最终是
+    字面 key, 用路径标准去卡它就是误拒合法输入。
+    """
+    for seg in key.split("."):
+        if not seg:
+            raise ValueError(f"override key {key!r} 含空 segment (在 {where})")
+        if seg in _DUNDER_BLOCKLIST:
+            raise ValueError(
+                f"override key {key!r} 含禁词 {seg!r} (在 {where}; 防 Python object injection)"
+            )
+
+
+def _validate_child_keys(v: object, where: str) -> None:
+    """递归进 dict / list / tuple —— 任何容器里的 key 都要过校验."""
+    if isinstance(v, dict):
+        _validate_dict_keys(v, where, top=False)
+    elif isinstance(v, (list, tuple)):
+        for i, item in enumerate(v):
+            _validate_child_keys(item, f"{where}[{i}]")
+
+
+# merge_overrides 的 key 校验复用 _validate_dict_keys (唯一入口) —
+# 拒 非字符串/空 key/dunder; '-' 等 dict key 合法; 含 '.' 的 key **只有顶层**
+# 走 _validate_path (只有顶层会被 apply_overrides 展开), 嵌套层只查 segment
+# 畸形. 不要在此平行实现校验 (重复 def 会静默覆盖).
+
+
+def merge_overrides(*sources: dict | None) -> dict:
+    """Merge multiple override dicts by priority. Later sources win.
+
+    注意: 结果 dict 的嵌套对象与输入 src 按引用共享 (不做 deepcopy) —
+    merge 后不要再 mutate 输入源.
+
+    Example:
+        >>> merge_overrides({"a": 1}, {"a": 2, "b": 3})
+        {'a': 2, 'b': 3}
+
+    None sources are skipped.
+    """
+    merged: dict = {}
+    for src in sources:
+        if src:
+            _validate_dict_keys(src, "")
+            _deep_merge(merged, src)
+    return merged
+
+
+def apply_overrides(base: dict, *patch_dicts: dict) -> dict:
+    """Library API: apply one or more patch dicts to base.
+
+    Each patch dict accepts BOTH formats:
+    - Nested dict (current pavoz convention): {"llm": {"model": "x"}}
+    - Dot-path dict (new): {"llm.model": "x"}
+
+    Returns: new dict (does not mutate base).
+    base 的嵌套对象与结果完全独立 (deepcopy). 结果的嵌套对象可能与 patch
+    的嵌套对象共享引用 — 调用方 apply 后不要再 mutate patch.
+
+    Example:
+        >>> apply_overrides({"a": 1}, {"b.c": 2})
+        {'a': 1, 'b': {'c': 2}}
+    """
+    merged = copy.deepcopy(base)
+    for patch in patch_dicts:
+        if not patch:
+            continue
+        for k, v in patch.items():
+            if "." in k:
+                # dot-path: validate + set
+                _validate_path(k)
+                _deep_set(merged, k, v)
+            else:
+                # nested dict: merge
+                if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                    _deep_merge(merged[k], v)
+                else:
+                    merged[k] = v
+    return merged
+
+
+_DIFF_STR_MAX = 200
+_DIFF_LIST_MAX = 50
+
+
+def _truncate_for_diff(v: Any) -> Any:
+    """Truncate long strings / lists for readable diff output."""
+    if isinstance(v, str) and len(v) > _DIFF_STR_MAX:
+        return v[:_DIFF_STR_MAX] + f"...(truncated, total {len(v)} chars)"
+    if isinstance(v, list) and len(v) > _DIFF_LIST_MAX:
+        return v[:_DIFF_LIST_MAX] + ["...(truncated)"]
+    return v
+
+
+def _state_diff(a: dict, b: dict, path: str = "") -> dict[str, list]:
+    """Recursively find leaf differences between two state dicts.
+
+    Returns: {full.path: [before, after]} dict. Skips nested diffs
+    when both sides are dicts (recurses instead).
+    """
+    diffs: dict[str, list] = {}
+    keys = set(a.keys()) | set(b.keys())
+    for k in keys:
+        full = f"{path}.{k}" if path else k
+        va, vb = a.get(k), b.get(k)
+        if isinstance(va, dict) and isinstance(vb, dict):
+            diffs.update(_state_diff(va, vb, full))
+        elif va != vb:
+            diffs[full] = [_truncate_for_diff(va), _truncate_for_diff(vb)]
+    return diffs

@@ -1,0 +1,56 @@
+name: test
+
+# ⚠️ `workflow_call` 不是可有可无的装饰 —— publish.yml **复用这个定义**再发版。
+# 此前 test.yml 只在 `push: main` 与 PR 上跑, 而发版由 `push: tags: v*` 触发,
+# 于是**推 tag 这条路上一个门禁都不跑**: 破包直接进 PyPI, 而发出去的版本撤不回
+# (能 yank, 但版本号已经烧掉)。发版是不可逆的那一步, 恰恰是最该有门禁的一步。
+# 复用而不是抄第二份: 抄一份就多一处会悄悄过期的副本 (本会话已经吃过"注释说的
+# 和代码做的不一致"的亏)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ⚠️ 必须 fetch-depth: 0 —— 默认的 depth=1 **不拉 tag**, 而
+          # tools/check_changelog.py 靠 `git show v<x.y.z>:CHANGELOG.md` 判断
+          # 已发布段有没有被改动过。拿不到 tag 时它会**显式判失败** (而不是静默
+          # 通过: 那等于一个恒绿的门禁)。所以这一行不是可有可无的优化。
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+      - name: Lint (pyflakes)
+        run: |
+          python -m pyflakes pavoz tests examples tools
+      - name: Type check (pyright basic)
+        run: |
+          python -m pyright
+      - name: Doc links + style
+        run: |
+          python tools/check_doc_links.py
+          python tools/check_doc_style.py
+      - name: CHANGELOG released sections frozen
+        run: |
+          python tools/check_changelog.py
+      - name: Text integrity (no U+FFFD)
+        run: |
+          python tools/check_text_integrity.py
+      - name: No business values (vendor models / consumer keys)
+        run: |
+          python tools/check_business_leak.py
+      - name: Test (coverage gate 80%)
+        run: |
+          python -m pytest tests/ -q --cov=pavoz --cov-fail-under=80

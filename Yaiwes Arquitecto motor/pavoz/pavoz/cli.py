@@ -1,0 +1,511 @@
+"""CLI: run / trace / state / replay / export-input / fork-run (v0.6).
+
+用法:
+    python -m pavoz run dags/demo.py --task-id abc [--input '{"name": "x"}']
+    python -m pavoz trace --task-id abc
+    python -m pavoz state --task-id abc [--key k]
+    (存储目录: PAVOZ_STORAGE env, 默认 ~/.pavoz/data)
+    python -m pavoz replay dags/demo.py --task-id abc --stage s_b [--patch patch.py]
+
+replay (--stage 单 stage 重放 + --patch 改 fn): v0.5.1 已 ship (2026-09-05).
+export-input / fork-run (v0.6, 2026-09-06): 任意过去节点取输入 → 改 → 装回续跑
+(LangGraph fork 范式, 见 docs/design/node-input-edit-fork.md).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib.util
+import inspect
+import json
+import os
+import sys
+from pathlib import Path
+
+from .checkpoint import CheckpointMismatchError, CheckpointStore
+from .dag import DAG
+from .runtime import Runtime
+from .storage import CorruptRecordError, FileStorage
+
+# ⚠️ 这行 expanduser 只覆盖**默认值**那一支: env 命中时 os.environ.get 原样返回,
+# 于是 `PAVOZ_STORAGE=~/x` 里的 `~` 没人展开 —— 实测会在 cwd 里造出字面量 `~`
+# 目录树并把数据静默写进去。展开统一由 FileStorage.__init__ 负责 (唯一汇合点),
+# 这里保留 expanduser 纯属无害, 但**别**把它当成"展开已经处理了"的依据。
+DEFAULT_STORAGE = os.environ.get("PAVOZ_STORAGE", os.path.expanduser("~/.pavoz/data"))
+
+
+def _load_dag(path: str):
+    """import 一个 dag 文件, 返回其中要跑的那个 DAG 实例.
+
+    挑选规则 (2026-10-17 修过三个缺陷, 每条都有判据钉住 —— 见
+    tests/test_cli_dag_selection.py):
+
+      · **按 isinstance 认, 不按类名字符串**。原实现写的是
+        `type(v).__name__ == "DAG"`, 于是 ① `class MyDAG(DAG)` 的子类实例**不被认**
+        (报"里没有 DAG 实例" —— 而它明明有, 报错还把人指向错误的方向);
+        ② 作用域里恰好有别的库的同名 `DAG` 实例时会被**收进来**, 选中后用户看到的是
+        `AttributeError: 'DAG' object has no attribute 'validate'` —— 一条完全看不出
+        "你的 dag 文件里有重名东西"的裸栈。
+      · `DEFAULT_DAG = "<DAG 名>"` 指定跑哪个; **写错就报错, 不猜**。
+      · 多个 DAG 且没声明 DEFAULT_DAG → 取第一个, 并在 stderr 上说一声。
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        raise SystemExit(f"dag 文件不存在: {p}")
+    spec = importlib.util.spec_from_file_location("_pavoz_dag", p)
+    assert spec is not None and spec.loader is not None, f"无法加载 dag 文件: {p}"
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_pavoz_dag"] = mod
+    spec.loader.exec_module(mod)
+    # 按 **isinstance** 认, 不按类名字符串 —— 且按 id 去重 (同一个实例被绑到两个名字
+    # 不算"多个 DAG", 否则会误报提示, 甚至让 DEFAULT_DAG 的匹配被绕过)。
+    dags: list[DAG] = []
+    seen: set[int] = set()
+    for v in vars(mod).values():
+        if isinstance(v, DAG) and id(v) not in seen:
+            seen.add(id(v))
+            dags.append(v)
+    if not dags:
+        raise SystemExit(f"{p} 里没有 DAG 实例")
+    if len(dags) > 1:
+        want = getattr(mod, "DEFAULT_DAG", None)
+        if want is not None:
+            for d in dags:
+                if d.name == want:
+                    return d
+            # 声明了却匹配不上 → **报错, 不猜** (2026-10-17 修)。
+            # 原实现匹配不上就掉到 `return dags[0]`, 于是打错一个字会静默跑起另一个
+            # pipeline 且全程无提示 —— 实测: 声明 DEFAULT_DAG="beta_typo", 实际跑的
+            # 是 alpha, state 里 ran=ALPHA, rc=0, stderr 一个字都没有。用户**明确**
+            # 指定了却被忽略, 比根本没写更糟: 他以为跑的是自己声明的那个。
+            raise SystemExit(
+                f"{p} 里声明了 DEFAULT_DAG = {want!r}, 但该文件里没有名为 "
+                f"{want!r} 的 DAG。实际有的: {[d.name for d in dags]} —— "
+                f"名字要完全一致 (不做前缀/模糊匹配)。"
+            )
+        print(f"提示: {p.name} 里有多个 DAG {[d.name for d in dags]}, 但没声明 "
+              f"DEFAULT_DAG —— 取第一个 {dags[0].name!r}。要指定就在该文件里写 "
+              f"DEFAULT_DAG = '<DAG 名>'。", file=sys.stderr)
+    return dags[0]
+
+
+def _storage(task_id: str | None = None):
+    """storage 解析: PAVOZ_STORAGE_SPEC (任意 StorageBackend) > PAVOZ_STORAGE
+    (FileStorage 目录, 向后兼容) > 默认 ~/.pavoz/data.
+
+    PAVOZ_STORAGE_KWARGS: JSON dict, 传给 spec 类的 kwargs;
+    字符串值中的 {task_id} 替换为当前命令的 task_id (per-task adapter 用).
+    """
+    spec = os.environ.get("PAVOZ_STORAGE_SPEC")
+    if not spec:
+        # FileStorage 会就"这个根目录看起来是 storage spec 而不是目录"抛 ValueError
+        # (它紧跟着 os.makedirs, 否则错误提示晚于副作用 —— 目录已经建出来了)。
+        # 这里转成 SystemExit 与本文件其余的参数错一致: CLI 的用法就是**一句说清怎么办**,
+        # 而不是一段指向 storage.py 的 traceback (2026-10-17 实测)。
+        try:
+            return FileStorage(DEFAULT_STORAGE)
+        except ValueError as e:
+            raise SystemExit(f"PAVOZ_STORAGE 无效: {e}")
+    from .storage_loader import load_storage
+
+    kwargs = {}
+    raw = os.environ.get("PAVOZ_STORAGE_KWARGS")
+    if raw:
+        try:
+            kwargs = json.loads(raw)
+        except ValueError as e:
+            raise SystemExit(f"PAVOZ_STORAGE_KWARGS 不是合法 JSON: {e}")
+    if task_id:
+        kwargs = {
+            k: v.replace("{task_id}", task_id) if isinstance(v, str) else v
+            for k, v in kwargs.items()
+        }
+    return load_storage(spec, **kwargs)
+
+
+async def _cmd_run(args) -> int:
+    dag = _load_dag(args.dag)
+    task_id = args.task_id or f"run-{os.getpid()}"
+    initial = {}
+    if args.input:
+        # 参数错在解析期, 不在下面那个 try 里 —— 打错一个括号就炸出 15 行
+        # json/decoder.py 内部栈, 真因埋在最后一行。口径对齐 fork-run 的
+        # parse 路径 (那边三个来源都裹了 try/except ValueError → "参数错误: ...")。
+        try:
+            initial = json.loads(args.input)
+        except ValueError as e:
+            print(f"参数错误: --input 不是合法 JSON: {e}")
+            return 1
+    # v0.5.1 (R5 fix): 恒 attach store → CLI run 落盘, replay/trace/state 可用
+    runtime = Runtime(checkpoint_store=CheckpointStore(_storage(task_id)))
+    try:
+        result = await runtime.run(
+            dag, task_id, initial_state=initial, resume=args.resume
+        )
+    except (CheckpointMismatchError, RuntimeError, ValueError) as e:
+        # v0.5: resume/校验错误 (无 cp / 已全部完成 / DAG hash 变了 / task_id 非法)
+        # → 友好消息, 不炸 traceback
+        print(f"run 失败: {e}")
+        return 1
+    print(json.dumps({
+        "task_id": result.task_id,
+        "run_id": result.run_id,
+        "dag": result.dag_name,
+        "status": result.status,
+        "stage_statuses": result.stage_statuses,
+        "error": result.error,
+        "state": result.state,
+    }, ensure_ascii=False, indent=2))
+    return 0 if result.status == "done" else 1
+
+
+async def _cmd_trace(args) -> int:
+    """列 task 的最新 run checkpoint + stage 记录 (per-run, 看 load_latest)."""
+    store = CheckpointStore(_storage(args.task_id))
+    cp = store.load_latest(args.task_id)
+    if cp is None:
+        print(f"task {args.task_id} 无 checkpoint (没跑过)")
+        return 1
+    # ⚠️ 输出里原先**没有任何迹象**表明这是个多 run 的 task —— `trace` 只显示
+    # latest, 而一个跑过 5 次的 task 看起来和只跑过 1 次的完全一样。用户据此以为
+    # "这就是全部", 而 `diff_runs` 需要两个 run_id, CLI 层又没有任何命令能列出它们
+    # (`prune --dry-run` 能, 但那是另一回事)。纯增两个字段, JSON 消费方不受影响。
+    # 同样的道理: 输出里也没说这是 latest —— 而 checkpoint 是会变的 (fork 会让
+    # latest 指向新 run)。
+    try:
+        total_runs = len(store.list_runs(args.task_id))
+    except Exception:                      # 存储后端不支持枚举时不该让整条命令挂掉
+        total_runs = None
+    print(json.dumps({
+        "task_id": cp.task_id,
+        "run_id": cp.run_id,
+        "is_latest": True,
+        "total_runs": total_runs,
+        "dag": cp.dag_name,
+        "workflow_hash": cp.workflow_hash,
+        "stage_statuses": cp.stage_statuses,
+        # ⚠️ 这两个必须一起读: `stage_statuses` 对被 skip_unchanged 跳过的 stage 记的是
+        # "done" (结果从 cp 重放, 但状态层面确实完成了), 所以**光看它无法分辨"跑过"
+        # 与"重放过"** —— 而"我改的那一段到底跑没跑"恰恰是唯一该问的问题。不给这个
+        # 字段, trace 就会理直气壮地报告"都跑了", 而它们一个都没跑。
+        "skipped_stages": cp.stage_skipped,
+        "done_stages": cp.done_stages,
+        "state_keys": sorted(cp.state.keys()),
+        # 0.5.9: 每次 attempt 的耗时/错误摘要 — 回答"哪个 stage 慢, 上次为什么
+        # 失败"的唯一落盘证据 (事件流不持久化; RunResult.stage_timings 只在内存).
+        # 纯增量字段, 旧 cp 为 {}.
+        "stage_attempts": cp.stage_attempts,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def _cmd_state(args) -> int:
+    store = CheckpointStore(_storage(args.task_id))
+    cp = store.load_latest(args.task_id)
+    if cp is None:
+        print(f"task {args.task_id} 无 checkpoint")
+        return 1
+    if args.stats:
+        print(json.dumps(cp.state_stats(), ensure_ascii=False, indent=2))
+        return 0
+    if args.key:
+        # 缺失与"值就是 null"必须能分辨: `state.get(key, None)` 让两者输出逐字节相同
+        # 且 rc 都是 0, 接管道的调用方拿不到任何信号。查单字段正是这个命令的全部意义,
+        # 打错字是最自然的失误 → 点名报错 + 列可用 key, 退出码 1。
+        if args.key not in cp.state:
+            print(f"state 无此 key: {args.key!r}")
+            print(f"  可用 key: {', '.join(sorted(cp.state)) or '(空)'}")
+            return 1
+        print(json.dumps(cp.state[args.key], ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(cp.state, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def _cmd_replay(args) -> int:
+    """重放单 stage: pavoz replay <dag.py> --task-id X --stage Y [--patch P.py].
+
+    patch 文件约定: 模块顶层暴露 patch(dag) -> None (import 后调用, 可改 stage fn).
+    """
+    dag = _load_dag(args.dag)
+    if args.patch:
+        patch_path = Path(args.patch).resolve()
+        if not patch_path.exists():
+            print(f"patch 文件不存在: {patch_path}")
+            return 1
+        spec = importlib.util.spec_from_file_location("_pavoz_patch", patch_path)
+        assert spec is not None and spec.loader is not None, f"无法加载 patch 文件: {patch_path}"
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_pavoz_patch"] = mod
+        spec.loader.exec_module(mod)
+        patcher = getattr(mod, "patch", None)
+        if patcher is None:
+            print(f"patch 文件 {patch_path} 需暴露 patch(dag) -> None")
+            return 1
+        if inspect.iscoroutinefunction(patcher):
+            print(f"patch 文件 {patch_path} 的 patch 不能是 async — 用同步 def patch(dag)")
+            return 1
+        try:
+            patcher(dag)
+        except Exception as e:
+            # patch 文件是**用户提供的数据** (与 --input 的 JSON 同类), 而 CLI 对
+            # 这类输入的既有口径是"友好一行 + 退出码 1"。此前这里没有 try, patch
+            # 函数体里任何异常都从 cli.py 甩出一整段 runpy/asyncio 栈 ——
+            # 2026-10-17 实测: 用户按最自然的写法用 `@dag.stage()` 重定义一个已存在
+            # 的 stage, 撞 `duplicate stage name`, 而栈指向引擎内部, 真因在 patch
+            # 文件第 3 行。用户拿到的是"引擎炸了"的错觉。
+            #
+            # 消息带 patch 文件路径: 用户往往同时有好几个 patch 文件, 只说
+            # "patch 失败"他不知道是哪个; 同时保留原始异常消息 —— 那是他自己写的,
+            # 真正的原因在里面。类型名放前面是因为前面的分支已各自点名具体问题。
+            print(f"patch 执行失败 ({type(e).__name__}): {e} — 文件 {patch_path}")
+            return 1
+    runtime = Runtime(checkpoint_store=CheckpointStore(_storage(args.task_id)))
+    try:
+        result = await runtime.run_stage(dag, task_id=args.task_id, stage_name=args.stage)
+    except (CheckpointMismatchError, RuntimeError, ValueError, KeyError) as e:
+        print(f"replay 失败: {e}")
+        return 1
+    print(json.dumps({
+        "task_id": result.task_id,
+        "run_id": result.run_id,
+        "dag": result.dag_name,
+        "stage": args.stage,
+        "status": result.status,
+        "error": result.error,
+        "state": result.state,
+    }, ensure_ascii=False, indent=2))
+    return 0 if result.status == "done" else 1
+
+
+async def _cmd_export_input(args) -> int:
+    """export-input: 打印 stage 执行前 state (rebuild_state_before) — 人编辑的基座."""
+    store = CheckpointStore(_storage(args.task_id))
+    cp = store.load_latest(args.task_id)
+    if cp is None:
+        print(f"task {args.task_id} 无 checkpoint")
+        return 1
+    try:
+        before = cp.rebuild_state_before(args.stage)
+    except KeyError as e:
+        print(f"export-input 失败: {e} (stage 须已执行过)")
+        return 1
+    print(json.dumps(before, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def _cmd_prune(args) -> int:
+    """修剪 task 的旧 run checkpoint (R1). 格式归引擎 — 消费者自删会踩 latest 指针."""
+    store = CheckpointStore(_storage(args.task_id))
+    try:
+        rep = store.prune(args.task_id, keep_last=args.keep_last, dry_run=args.dry_run)
+    except ValueError as e:
+        # keep_last < 0 由 store.prune 判定 (那是删数据的命令, 参数校验必须响)
+        print(f"参数错误: {e}")
+        return 1
+    print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def _cmd_fork_run(args) -> int:
+    """fork-run: 装回 state → 从 stage 分支续跑.
+
+    v0.9 新增: --set / --set-file / --compare-with / --dry-run.
+    优先级 (后写覆盖前写): --set > --set-file > --overrides > --input
+    (--overrides > --input 是 v0.8 组合使用时的既有胜者, 保持不变).
+    """
+    from pavoz.state import _state_diff, merge_overrides, parse_set_args, parse_set_file
+
+    dag = _load_dag(args.dag)
+
+    try:
+        overrides = merge_overrides(
+            json.loads(Path(args.input).read_text(encoding="utf-8")) if args.input else None,
+            json.loads(args.overrides) if args.overrides else None,
+            parse_set_file(args.set_file) if args.set_file else None,
+            parse_set_args(args.set) if args.set else None,
+        )
+    except (ValueError, TypeError) as e:
+        # TypeError 也要接: parse_set_file 的值层校验对 "YAML 里放了 date 这类
+        # 能解析但存不下来的类型" 抛 TypeError, 此前它从参数层逃出去变成整段栈。
+        # 这个 try 里只有 json.loads / Path.read_text / parse_set_file /
+        # parse_set_args / merge_overrides —— 全是参数解析, 其中的 TypeError
+        # 就是参数问题, 不存在"吞掉深层代码 bug"的风险 (stage 内部异常由
+        # Runtime 自己转成 failed 状态, 根本不经过这里)。
+        print(f"参数错误: {e}")
+        return 1
+
+    if args.dry_run:
+        from pavoz.state import apply_overrides
+
+        out = {
+            "dry_run": True,
+            "task_id": args.task_id,
+            "stage": args.stage,
+            "overrides": overrides,
+        }
+        # 预演: 对 latest run 的执行前 state 应用 overrides, 看 leaf 级效果 (不执行)
+        cp = CheckpointStore(_storage(args.task_id)).load_latest(args.task_id)
+        if cp is None:
+            out["preview"] = None
+            out["preview_note"] = "task 无 checkpoint — 首跑无预演基线"
+        elif args.stage not in cp.done_stages:
+            out["preview"] = None
+            out["preview_note"] = f"stage {args.stage} 未在 latest run 完成 — 无执行前 state 基线"
+        else:
+            before = cp.rebuild_state_before(args.stage)
+            after = apply_overrides(before, overrides)
+            diff = _state_diff(before, after)
+            stages = list(dag.stages)
+            out["preview"] = {
+                "diff_keys_count": len(diff),
+                "diff_sample": dict(list(diff.items())[:10]),
+                "would_rerun": stages[stages.index(args.stage):],
+            }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+
+    # --compare-with 的目标必须在**跑之前**确认存在。此前这一查落在
+    # `runtime.fork_run(...)` 之后, 于是拼错一个 run_id 的代价是: fork **已经跑完**、
+    # 盘上多出一个 run 与它的 checkpoint, 然后才打印 "compare-with: run X 不存在"
+    # + rc=1。那句报错读起来像"参数错, 什么都没发生", 用户会以为环境干净。
+    #
+    # 它是 CLI 里唯一"先跑后验"的参数: --input 的 JSON 先 parse 再跑; 四个
+    # override 来源先 merge 再跑 (错 → "参数错误", 什么都没发生); prune 的
+    # keep_last 先校验再删。这个例外没有理由。
+    orig_cp = None
+    if args.compare_with:
+        orig_cp = CheckpointStore(_storage(args.task_id)).load(args.task_id, args.compare_with)
+        if orig_cp is None:
+            print(f"compare-with: run {args.compare_with} 不存在")
+            return 1
+
+    runtime = Runtime(checkpoint_store=CheckpointStore(_storage(args.task_id)))
+    try:
+        result = await runtime.fork_run(
+            dag, task_id=args.task_id,
+            from_stage=args.stage,
+            overrides=overrides,
+        )
+    except (CheckpointMismatchError, RuntimeError, ValueError, KeyError, TimeoutError) as e:
+        print(f"fork-run 失败: {e}")
+        return 1
+
+    output = {
+        "task_id": result.task_id,
+        "run_id": result.run_id,
+        "dag": result.dag_name,
+        "stage": args.stage,
+        "status": result.status,
+        "error": result.error,
+        "overrides_applied": overrides,
+    }
+
+    if args.compare_with:
+        # orig_cp 是**跑之前**就取到的 (见上); 这里只做 diff, 不再查一次 ——
+        # 那次重查正是这个检查曾经晚于 fork_run 的原因。
+        # assert 只为给类型检查器收窄 (pyright: OptionalMemberAccess), 不是运行时
+        # 防线 —— 上面的早查已经保证了它非 None。
+        assert orig_cp is not None, "compare_with 有值时 orig_cp 必已取到"
+        diff = _state_diff(orig_cp.state, result.state)
+        output["compare_with"] = args.compare_with
+        output["diff_keys_count"] = len(diff)
+        output["diff_sample"] = dict(list(diff.items())[:10])
+
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0 if result.status == "done" else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI 入口: 解析 argv (默认 sys.argv) → 派发子命令 → 返回退出码.
+
+    退出码约定: 0 = 成功; 1 = 业务/参数错误 (打一句人话, 不打栈); 其余留给未预期异常
+    (真 bug 的 traceback 里有文件和行号, 顶层刻意**不**写 catch-all —— 只有
+    CorruptRecordError 是例外, 它是预期内的, 单独兜住)。
+    """
+    parser = argparse.ArgumentParser(prog="pavoz", description="LLM/SE/Extract 流程编排")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="跑 DAG")
+    p_run.add_argument("dag", help="dag 文件路径 (含 DAG 实例)")
+    p_run.add_argument("--task-id", default=None)
+    p_run.add_argument("--input", default=None, help='JSON 初始 state, e.g. \'{"name": "x"}\'')
+    p_run.add_argument("--resume", action="store_true", help="从 checkpoint 续跑 (若存在)")
+    p_run.set_defaults(fn=_cmd_run)
+
+    p_trace = sub.add_parser("trace", help="列 task checkpoint / stage 记录")
+    p_trace.add_argument("--task-id", required=True)
+    p_trace.set_defaults(fn=_cmd_trace)
+
+    p_state = sub.add_parser("state", help="看 task state snapshot")
+    p_state.add_argument("--task-id", required=True)
+    p_state.add_argument("--key", default=None)
+    p_state.add_argument("--stats", action="store_true", help="state 体积统计 (key top N + 构成)")
+    p_state.set_defaults(fn=_cmd_state)
+
+    p_replay = sub.add_parser("replay", help="重放单 stage (调试: 改 prompt/参数秒级看效果)")
+    p_replay.add_argument("dag", help="dag 文件路径")
+    p_replay.add_argument("--task-id", required=True)
+    p_replay.add_argument("--stage", required=True, help="要重放的 stage 名")
+    p_replay.add_argument(
+        "--patch", default=None,
+        help="patch 文件 (暴露 patch(dag) -> None, 改 stage fn). "
+             "写法: def patch(dag): async def v2(ctx): ...; dag.stages[NAME].fn = v2 "
+             "(不要用 @dag.stage() 重定义 — 已存在的 stage 会撞 duplicate stage name)")
+    p_replay.set_defaults(fn=_cmd_replay)
+
+    p_export = sub.add_parser("export-input", help="导出某 stage 的执行前输入 (state JSON, 可编辑)")
+    p_export.add_argument("--task-id", required=True)
+    p_export.add_argument("--stage", required=True, help="要导出的 stage 名 (须已执行过)")
+    p_export.set_defaults(fn=_cmd_export_input)
+
+    p_fork = sub.add_parser("fork-run", help="从历史 stage 分支: 前序复用, 该 stage 起用改后输入重跑")
+    p_fork.add_argument("dag", help="dag 文件路径")
+    p_fork.add_argument("--task-id", required=True)
+    p_fork.add_argument(
+        "--stage", required=True,
+        help="分支点 stage (重跑起点)。⚠️ 若开了 skip_unchanged (库 API / EnginePolicy; CLI 未暴露该 flag), 它只是\"起点提示\": 输入 hash 命中就跳到首个未命中处, 自身也可能被跳过 —— 查 pavos trace 的 skipped_stages")
+    p_fork.add_argument("--overrides", default=None,
+                        help='JSON 顶层覆盖, e.g. \'{"topic": "chickens"}\'')
+    p_fork.add_argument("--input", default=None,
+                        help="编辑过的输入 JSON 文件 (export-input 产物, 全量 state 覆盖)")
+    # v0.9 NEW — 4 flags
+    p_fork.add_argument("--set", action="append", default=[],
+                        help="点分路径 KEY=VALUE (可重复). 例: --set llm.model=my-model. "
+                             "值按 int→float→JSON→str 自动推断, 所以 1.10→1.1、007→7 "
+                             "(静默, 无开关); 要字符串写 --set-file 的 JSON (引号即字符串)")
+    p_fork.add_argument("--set-file", default=None,
+                        help="JSON/YAML 文件批量覆盖. 1MB 上限, YAML 用 safe_load.")
+    p_fork.add_argument("--compare-with", default=None,
+                        help="跑完后输出 state leaf diff vs RUN_ID")
+    p_fork.add_argument("--dry-run", action="store_true", default=False,
+                        help="仅解析 + 显示 overrides, 不执行 stage")
+    p_fork.set_defaults(fn=_cmd_fork_run)
+
+    p_prune = sub.add_parser(
+        "prune", help="按保留数修剪 task 的旧 run checkpoint (保护 latest 指针指向的 run)")
+    p_prune.add_argument("--task-id", required=True)
+    p_prune.add_argument("--keep-last", type=int, default=3,
+                         help="保留最近 N 个 run (按 stage 最后活动时间排序; latest 指针的 run 无条件保留)")
+    p_prune.add_argument("--dry-run", action="store_true", default=False,
+                         help="只列出将删 run 与近似可释放字节, 不删除")
+    p_prune.set_defaults(fn=_cmd_prune)
+
+    args = parser.parse_args(argv)
+    try:
+        return asyncio.run(args.fn(args))
+    except CorruptRecordError as e:
+        # 顶层只兜**这一种**: 它是预期内、且用户有办法处置的错误 (文件坏了, 消息里
+        # 带着路径与处置建议)。实测 (修复前): 崩溃留下的半截 checkpoint 上跑
+        # `pavos trace`, 用户看到的是一整段指向 json/decoder.py 的 traceback ——
+        # 既没说哪个文件坏了, 也没说能怎么办, 而那恰恰是"崩溃后回来查"的时刻。
+        #
+        # **不写 catch-all**: 真 bug 的 traceback 是有用的 (栈里有文件和行号), 把
+        # 它吞成一句 "内部错误" 只会让人少一条线索。要收敛的只是这一类已知形状。
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
