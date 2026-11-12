@@ -1,0 +1,120 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.chaquopy)
+}
+
+val pocketIdeAbi = providers.gradleProperty("pocketide.abi").orNull
+val supportedPocketIdeAbis = setOf("arm64-v8a", "x86_64")
+require(pocketIdeAbi == null || pocketIdeAbi in supportedPocketIdeAbis) {
+    "pocketide.abi must be one of: ${supportedPocketIdeAbis.joinToString()}"
+}
+
+android {
+    namespace = "com.pocketide"
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
+
+    defaultConfig {
+        applicationId = "com.pocketide"
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 2
+        versionName = "1.0.1"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            // ExecuTorch AAR ships arm64-v8a and x86_64. Hackathon target is
+            // Arm-only, but keep x86_64 in the default build for emulator tests.
+            // Use --project-prop pocketide.abi=arm64-v8a for the smaller phone artifact.
+            abiFilters += pocketIdeAbi?.let(::listOf) ?: supportedPocketIdeAbis
+        }
+    }
+
+    buildTypes {
+        release {
+            optimization {
+                enable = false
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+        isCoreLibraryDesugaringEnabled = true
+    }
+    buildFeatures {
+        compose = true
+    }
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.11"
+    }
+}
+
+dependencies {
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.navigation.compose)
+    implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+
+    // Sora Editor
+    implementation(platform(libs.sora.editor.bom))
+    implementation(libs.sora.editor)
+    implementation(libs.sora.language.textmate)
+    implementation(libs.sora.language.treesitter)
+    implementation(libs.sora.language.java)
+
+    // Core library desugaring for TextMate on API < 33
+    coreLibraryDesugaring(libs.desugar.jdk.libs)
+
+    // JavaScript execution engine
+    implementation(libs.rhino)
+
+    // Lua execution engine
+    implementation(libs.luaj.jse)
+
+    // Java execution engine (BeanShell interpreter)
+    implementation(libs.beanshell)
+
+    // On-device LLM inference - ExecuTorch (.pte models)
+    // Acceleration depends on the backend embedded in the PTE export and the
+    // backend libraries in the runtime AAR. This dependency alone is not proof
+    // of Qualcomm QNN/NPU execution.
+    implementation(libs.executorch.android)
+
+    // On-device LLM inference - pinned source fork of KotlinLlamaCpp 0.4.0.
+    // The local binding exposes actual context/cache evidence and Q8 KV cache controls.
+    implementation(project(":third_party:kotlinllamacpp"))
+
+    // Embedded HTTP server for localhost web testing
+    implementation(libs.nanohttpd)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.androidx.junit)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+}

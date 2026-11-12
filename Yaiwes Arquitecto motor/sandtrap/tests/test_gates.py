@@ -1,0 +1,576 @@
+"""Tests for attribute access gates (Phase 2)."""
+
+import pytest
+
+from sandtrap import Policy, Sandbox, VirtualFS
+
+
+@pytest.fixture
+def sandbox():
+    return Sandbox(Policy())
+
+
+def _make_gates_sandbox():
+    """A sandbox with a VirtualFS, for workspace-module reads."""
+    fs = VirtualFS({})
+    return Sandbox(Policy(), filesystem=fs), fs
+
+
+def test_attr_read(sandbox):
+    """obj.attr in Load context goes through __st_getattr__."""
+    result = sandbox.exec("""\
+class Obj:
+    x = 42
+o = Obj()
+result = o.x
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 42
+
+
+def test_attr_write(sandbox):
+    """obj.attr = value goes through __st_setattr__."""
+    result = sandbox.exec("""\
+class Obj:
+    pass
+o = Obj()
+o.x = 99
+result = o.x
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 99
+
+
+def test_attr_delete(sandbox):
+    """del obj.attr goes through __st_delattr__."""
+    result = sandbox.exec("""\
+class Obj:
+    pass
+o = Obj()
+o.x = 1
+del o.x
+result = hasattr(o, 'x')
+""")
+    assert result.error is None
+    assert result.namespace["result"] is False
+
+
+def test_chained_attr_read(sandbox):
+    """a.b.c chains through multiple __st_getattr__ calls."""
+    result = sandbox.exec("""\
+class Inner:
+    val = 10
+class Outer:
+    pass
+o = Outer()
+o.inner = Inner()
+result = o.inner.val
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 10
+
+
+def test_method_call(sandbox):
+    """obj.method() works — getattr returns the bound method, then called."""
+    result = sandbox.exec("""\
+class Calc:
+    def add(self, a, b):
+        return a + b
+c = Calc()
+result = c.add(3, 4)
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 7
+
+
+def test_augmented_assign_attr(sandbox):
+    """obj.x += 1 decomposes into get + op + set."""
+    result = sandbox.exec("""\
+class Counter:
+    def __init__(self):
+        self.n = 0
+c = Counter()
+c.n += 5
+c.n += 3
+result = c.n
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 8
+
+
+def test_augmented_assign_evaluates_obj_once(sandbox):
+    """obj.x += 1 evaluates obj only once (important for side effects)."""
+    result = sandbox.exec("""\
+call_count = 0
+class Box:
+    val = 0
+
+box = Box()
+
+def get_box():
+    global call_count
+    call_count += 1
+    return box
+
+get_box().val += 10
+result_val = box.val
+result_calls = call_count
+""")
+    assert result.error is None
+    assert result.namespace["result_val"] == 10
+    assert result.namespace["result_calls"] == 1
+
+
+def test_blocked_private_attr(sandbox):
+    """Accessing _private attrs is blocked by default policy."""
+    result = sandbox.exec("""\
+class Obj:
+    _secret = 42
+o = Obj()
+x = o._secret
+""")
+    assert result.error is not None
+    assert isinstance(result.error, AttributeError)
+
+
+def test_blocked_unsafe_dunder(sandbox):
+    """Accessing __code__ is blocked by default policy."""
+    result = sandbox.exec("""\
+def f(): pass
+x = f.__code__
+""")
+    assert result.error is not None
+    assert isinstance(result.error, AttributeError)
+
+
+def test_allowed_dunders(sandbox):
+    """Allowed dunders like __len__, __str__ work."""
+    result = sandbox.exec("""\
+class MyList:
+    def __init__(self):
+        self.items = [1, 2, 3]
+    def __len__(self):
+        return len(self.items)
+    def __str__(self):
+        return str(self.items)
+
+ml = MyList()
+length = ml.__len__()
+s = ml.__str__()
+""")
+    assert result.error is None
+    assert result.namespace["length"] == 3
+    assert result.namespace["s"] == "[1, 2, 3]"
+
+
+def test_introspection_dunders_on_sandbox_definitions(sandbox):
+    """__name__, __qualname__, __module__ and __doc__ read as strings."""
+    result = sandbox.exec("""\
+class Boom(Exception):
+    \"\"\"boom doc\"\"\"
+
+def helper():
+    pass
+
+try:
+    raise Boom("x")
+except Exception as e:
+    exc_name = type(e).__name__
+
+qualname = Boom.__qualname__
+module = helper.__module__
+doc = Boom.__doc__
+instance_doc = Boom("y").__doc__
+""")
+    assert result.error is None
+    assert result.namespace["exc_name"] == "Boom"
+    assert result.namespace["qualname"] == "Boom"
+    assert isinstance(result.namespace["module"], str)
+    assert result.namespace["doc"] == "boom doc"
+    assert result.namespace["instance_doc"] == "boom doc"
+
+
+def test_introspection_dunders_on_builtin_exception(sandbox):
+    """type(e).__name__ names a builtin exception class."""
+    result = sandbox.exec("""\
+try:
+    1 / 0
+except Exception as e:
+    name = type(e).__name__
+    qualname = type(e).__qualname__
+    doc_is_str = isinstance(type(e).__doc__, str)
+""")
+    assert result.error is None
+    assert result.namespace["name"] == "ZeroDivisionError"
+    assert result.namespace["qualname"] == "ZeroDivisionError"
+    assert result.namespace["doc_is_str"] is True
+
+
+def test_introspection_dunders_on_registered_class():
+    """A registration's member filters don't hide the names describing it."""
+
+    class Widget:
+        """widget doc"""
+
+        def ping(self):
+            return "pong"
+
+    policy = Policy()
+    policy.cls(Widget, include=("ping",))
+    sandbox = Sandbox(policy)
+    result = sandbox.exec(
+        """\
+name = Widget.__name__
+doc = Widget.__doc__
+module = Widget.__module__
+instance_name = type(obj).__name__
+""",
+        namespace={"obj": Widget()},
+    )
+    assert result.error is None
+    assert result.namespace["name"] == "Widget"
+    assert result.namespace["doc"] == "widget doc"
+    assert isinstance(result.namespace["module"], str)
+    assert result.namespace["instance_name"] == "Widget"
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "fn.__class__",
+        "fn.__globals__",
+        "Thing.__dict__",
+        "Thing.__class__",
+        "int.__subclasses__",
+        "fn.__code__",
+        "Thing.__bases__",
+        "Thing.__mro__",
+    ],
+)
+def test_object_graph_dunders_stay_blocked(sandbox, expr):
+    """The traversal dunders raise AttributeError."""
+    result = sandbox.exec(f"""\
+class Thing:
+    pass
+
+def fn():
+    pass
+
+x = {expr}
+""")
+    assert isinstance(result.error, AttributeError)
+    assert "is not accessible" in str(result.error)
+
+
+def test_introspection_dunder_refuses_non_string_value():
+    """A name bound to an object rather than a string is not a name read."""
+
+    class Sneaky:
+        __doc__ = object()
+        __module__ = object()
+
+    policy = Policy()
+    policy.cls(Sneaky)
+    sandbox = Sandbox(policy)
+    for attr in ("__doc__", "__module__"):
+        result = sandbox.exec(f"x = Sneaky.{attr}")
+        assert isinstance(result.error, AttributeError), attr
+        assert f"Attribute '{attr}' is not accessible" in str(result.error)
+
+
+def test_introspection_dunder_does_not_run_a_metaclass_property():
+    """A name a host class computes is refused, and the code never runs."""
+    fired = []
+
+    class Meta(type):
+        @property
+        def __name__(cls):
+            fired.append("__name__")
+            return "Spoofed"
+
+    class Widget(metaclass=Meta):
+        """widget doc"""
+
+    policy = Policy()
+    policy.cls(Widget, name="Widget")
+    sandbox = Sandbox(policy)
+    sandbox.exec("x = 1")  # build the namespace before watching for the call
+    fired.clear()
+
+    result = sandbox.exec("x = Widget.__name__")
+    assert isinstance(result.error, AttributeError)
+    assert "'__name__' is not accessible" in str(result.error)
+    assert fired == []
+
+    # The names that class does not compute still read.
+    result = sandbox.exec("doc = Widget.__doc__\nqualname = Widget.__qualname__")
+    assert result.error is None
+    assert result.namespace["doc"] == "widget doc"
+    assert result.namespace["qualname"].endswith("Widget")
+    assert fired == []
+
+
+def test_introspection_dunder_does_not_run_a_module_getattr():
+    """A module's PEP 562 __getattr__ is not a source of these names."""
+    sandbox, fs = _make_gates_sandbox()
+    fs.write(
+        "/helpers.py",
+        b'def __getattr__(name):\n    raise RuntimeError("module __getattr__ ran")\n',
+    )
+
+    result = sandbox.exec("import helpers\nx = helpers.__qualname__")
+    assert isinstance(result.error, AttributeError)
+    assert "'__qualname__' is not accessible" in str(result.error)
+
+    # __name__ and __doc__ live in the module's own dict, so they read.
+    result = sandbox.exec(
+        "import helpers\nname = helpers.__name__\ndoc = helpers.__doc__"
+    )
+    assert result.error is None
+    assert result.namespace["name"] == "helpers"
+    assert result.namespace["doc"] is None
+
+
+def test_introspection_dunder_does_not_run_getattribute():
+    """__getattribute__ does not get to answer for these names either."""
+    fired = []
+
+    class Sneaky:
+        def __getattribute__(self, name):
+            if name in ("__name__", "__qualname__", "__module__", "__doc__"):
+                fired.append(name)
+                return "leaked"
+            return object.__getattribute__(self, name)
+
+    policy = Policy()
+    policy.cls(Sneaky)
+    sandbox = Sandbox(policy)
+    result = sandbox.exec(
+        "doc = obj.__doc__\nmodule = obj.__module__",
+        namespace={"obj": Sneaky()},
+    )
+    assert result.error is None
+    assert result.namespace["doc"] is None
+    assert result.namespace["module"] == __name__
+    assert fired == []
+
+
+def test_exec_module_dunder_is_the_embedders_mapping():
+    """A per-exec module's surface is the mapping, gate rules included."""
+    sandbox = Sandbox(Policy())
+    result = sandbox.exec(
+        "import host\nname = host.__name__",
+        modules={"host": {"__name__": "shipped"}},
+    )
+    assert result.error is None
+    assert result.namespace["name"] == "shipped"
+
+    result = sandbox.exec(
+        "import host\nname = host.__name__", modules={"host": {"db": 1}}
+    )
+    assert isinstance(result.error, AttributeError)
+    assert "has no attribute '__name__'" in str(result.error)
+
+
+def test_only_doc_may_answer_none():
+    """A name, a qualified name, and a module are strings or they raise."""
+
+    class Quiet:
+        __module__ = None
+
+    policy = Policy()
+    policy.cls(Quiet, name="Quiet")
+    sandbox = Sandbox(policy)
+
+    result = sandbox.exec("x = Quiet.__module__")
+    assert isinstance(result.error, AttributeError)
+    assert "'__module__' is not accessible" in str(result.error)
+
+    # The same None is the ordinary answer for a class with no docstring.
+    result = sandbox.exec("doc = Quiet.__doc__\nname = Quiet.__name__")
+    assert result.error is None
+    assert result.namespace["doc"] is None
+    assert result.namespace["name"] == "Quiet"
+
+
+@pytest.mark.parametrize("stmt", ["fn.__doc__ = 'x'", "del fn.__doc__"])
+def test_introspection_dunders_are_read_only(sandbox, stmt):
+    """Reading a name is granted; renaming or re-documenting is not."""
+    result = sandbox.exec(f"""\
+def fn():
+    pass
+
+{stmt}
+""")
+    assert isinstance(result.error, AttributeError)
+
+
+def test_fstring_with_attr(sandbox):
+    """f-string accessing obj.attr goes through gate."""
+    result = sandbox.exec("""\
+class Person:
+    name = 'Alice'
+p = Person()
+result = f'Hello, {p.name}!'
+""")
+    assert result.error is None
+    assert result.namespace["result"] == "Hello, Alice!"
+
+
+def test_multi_target_assign_with_attr(sandbox):
+    """x = obj.attr = value stores value in both."""
+    result = sandbox.exec("""\
+class Obj:
+    pass
+o = Obj()
+x = o.val = 42
+result_x = x
+result_o = o.val
+""")
+    assert result.error is None
+    assert result.namespace["result_x"] == 42
+    assert result.namespace["result_o"] == 42
+
+
+def test_tuple_unpack_with_attr(sandbox):
+    """a, obj.x = (1, 2) decomposes correctly."""
+    result = sandbox.exec("""\
+class Obj:
+    pass
+o = Obj()
+a, o.x = 10, 20
+result_a = a
+result_x = o.x
+""")
+    assert result.error is None
+    assert result.namespace["result_a"] == 10
+    assert result.namespace["result_x"] == 20
+
+
+def test_class_with_self_attrs(sandbox):
+    """Full class with self.attr patterns works end to end."""
+    result = sandbox.exec("""\
+class Stack:
+    def __init__(self):
+        self.items = []
+    def push(self, item):
+        self.items.append(item)
+    def pop(self):
+        return self.items.pop()
+    def size(self):
+        return len(self.items)
+
+s = Stack()
+s.push(1)
+s.push(2)
+s.push(3)
+popped = s.pop()
+size = s.size()
+""")
+    assert result.error is None
+    assert result.namespace["popped"] == 3
+    assert result.namespace["size"] == 2
+
+
+def test_gate_names_not_in_namespace(sandbox):
+    """Gate function names (__st_*) are cleaned from result namespace."""
+    result = sandbox.exec("x = 1")
+    assert result.error is None
+    for key in result.namespace:
+        assert not key.startswith("__st_"), f"Gate name leaked: {key}"
+
+
+def test_attr_on_builtin_types(sandbox):
+    """Attribute access on builtin types works (e.g., str.upper)."""
+    result = sandbox.exec("""\
+s = 'hello'
+result = s.upper()
+""")
+    assert result.error is None
+    assert result.namespace["result"] == "HELLO"
+
+
+def test_list_method_calls(sandbox):
+    """List methods work through attribute gate."""
+    result = sandbox.exec("""\
+items = [3, 1, 2]
+items.sort()
+items.append(4)
+result = items
+""")
+    assert result.error is None
+    assert result.namespace["result"] == [1, 2, 3, 4]
+
+
+def test_dict_method_calls(sandbox):
+    """Dict methods work through attribute gate."""
+    result = sandbox.exec("""\
+d = {'a': 1, 'b': 2}
+keys = list(d.keys())
+vals = list(d.values())
+""")
+    assert result.error is None
+    assert sorted(result.namespace["keys"]) == ["a", "b"]
+    assert sorted(result.namespace["vals"]) == [1, 2]
+
+
+def test_format_string_attr_blocked(sandbox):
+    """str.format() with attribute traversal is blocked."""
+    result = sandbox.exec("x = '{0.__class__}'.format(42)")
+    assert result.error is not None
+    assert "format string" in str(result.error).lower()
+
+
+def test_format_string_item_blocked(sandbox):
+    """str.format() with item traversal is blocked."""
+    result = sandbox.exec("x = '{0[secret]}'.format({'secret': 'leaked'})")
+    assert result.error is not None
+    assert "format string" in str(result.error).lower()
+
+
+def test_format_map_attr_blocked(sandbox):
+    """str.format_map() with attribute traversal is blocked."""
+    result = sandbox.exec("x = '{obj.__class__}'.format_map({'obj': 42})")
+    assert result.error is not None
+    assert "format string" in str(result.error).lower()
+
+
+def test_format_string_simple_fields_allowed(sandbox):
+    """str.format() with simple positional/keyword fields works."""
+    result = sandbox.exec("""\
+a = '{0} + {1} = {2}'.format(1, 2, 3)
+b = '{name} is {age}'.format(name='Alice', age=30)
+""")
+    assert result.error is None
+    assert result.namespace["a"] == "1 + 2 = 3"
+    assert result.namespace["b"] == "Alice is 30"
+
+
+def test_getattr_enforces_policy(sandbox):
+    """Builtin getattr() routes through the attr whitelist."""
+    result = sandbox.exec("""\
+class Obj:
+    _secret = 42
+    public = 99
+o = Obj()
+a = getattr(o, 'public')
+b = getattr(o, '_secret', 'blocked')
+""")
+    assert result.error is None
+    assert result.namespace["a"] == 99
+    assert result.namespace["b"] == "blocked"
+
+
+def test_hasattr_enforces_policy(sandbox):
+    """Builtin hasattr() routes through the attr whitelist."""
+    result = sandbox.exec("""\
+class Obj:
+    _secret = 42
+    public = 99
+o = Obj()
+a = hasattr(o, 'public')
+b = hasattr(o, '_secret')
+""")
+    assert result.error is None
+    assert result.namespace["a"] is True
+    assert result.namespace["b"] is False

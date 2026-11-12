@@ -1,0 +1,1194 @@
+"""Tests for VFS module imports."""
+
+import pickle
+import types
+from contextlib import contextmanager
+
+import pytest
+
+from sandtrap import IsolationUnavailable, Policy, Sandbox, VirtualFS, sandbox
+from sandtrap.sandbox import ModuleRef
+
+
+def _make_sandbox(**kwargs):
+    """Create a sandbox with a VirtualFS."""
+    fs = kwargs.pop("fs", None) or VirtualFS({})
+    policy = kwargs.pop("policy", None) or Policy()
+    return Sandbox(policy, filesystem=fs, **kwargs), fs
+
+
+def test_import_vfs_module():
+    """Basic VFS module import."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"def double(x): return x * 2")
+
+    result = sandbox.exec("""\
+import helpers
+result = helpers.double(5)
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 10
+
+
+def test_from_import_vfs_module():
+    """from-import from a VFS module."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"PI = 3.14159\ndef area(r): return PI * r * r")
+
+    result = sandbox.exec("""\
+from helpers import area, PI
+result = area(2)
+""")
+    assert result.error is None
+    assert abs(result.namespace["result"] - 12.56636) < 0.001
+    assert abs(result.namespace["PI"] - 3.14159) < 0.001
+
+
+def test_from_import_missing_name():
+    """from-import of a name that doesn't exist in the VFS module."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"x = 1")
+
+    result = sandbox.exec("from helpers import missing")
+    assert result.error is not None
+    assert isinstance(result.error, ImportError)
+    assert "missing" in str(result.error)
+
+
+def test_vfs_module_not_found():
+    """Import of a non-existent VFS module raises ImportError."""
+    sandbox, fs = _make_sandbox()
+
+    result = sandbox.exec("import nonexistent")
+    assert result.error is not None
+    assert isinstance(result.error, ImportError)
+
+
+def test_vfs_module_cached():
+    """Importing the same VFS module twice returns the cached version."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/counter.py", b"n = 0")
+
+    result = sandbox.exec("""\
+import counter
+counter.n = 42
+import counter as counter2
+result = counter2.n
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 42  # Same module object
+
+
+def test_vfs_module_sandboxed():
+    """VFS module code goes through the sandbox gates."""
+    sandbox, fs = _make_sandbox()
+    # Module code that tries to access a private attribute should fail
+    fs.write(
+        "/bad.py",
+        b"""\
+class Foo:
+    _secret = 42
+
+f = Foo()
+val = f._secret
+""",
+    )
+    result = sandbox.exec("import bad")
+    assert result.error is not None
+    assert isinstance(result.error, AttributeError)
+
+
+def test_vfs_module_uses_checkpoints():
+    """VFS module code respects timeouts via checkpoints."""
+    policy = Policy()
+    policy.timeout = 0.1
+    sandbox, fs = _make_sandbox(policy=policy)
+    fs.write("/slow.py", b"while True: pass")
+
+    from sandtrap.errors import StTimeout
+
+    result = sandbox.exec("import slow")
+    assert result.error is not None
+    assert isinstance(result.error, StTimeout)
+
+
+def test_policy_modules_shadow_vfs():
+    """Policy-registered modules take precedence over VFS files."""
+    import math
+
+    policy = Policy()
+    policy.module(math)
+    sandbox, fs = _make_sandbox(policy=policy)
+    # Even though math.py exists in VFS, the registered math module wins
+    fs.write("/math.py", b"sqrt = lambda x: 'fake'")
+
+    result = sandbox.exec("""\
+import math
+result = math.sqrt(4)
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 2.0  # Real math, not VFS fake
+
+
+def test_vfs_module_can_import_registered():
+    """VFS modules can import policy-registered modules."""
+    import math
+
+    policy = Policy()
+    policy.module(math)
+    sandbox, fs = _make_sandbox(policy=policy)
+    fs.write(
+        "/geometry.py",
+        b"""\
+import math
+def circle_area(r):
+    return math.pi * r * r
+""",
+    )
+
+    result = sandbox.exec("""\
+from geometry import circle_area
+result = circle_area(1)
+""")
+    assert result.error is None
+    assert abs(result.namespace["result"] - 3.14159265) < 0.001
+
+
+def test_vfs_module_can_import_vfs_module():
+    """VFS modules can import other VFS modules."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/base.py", b"FACTOR = 10")
+    fs.write(
+        "/derived.py",
+        b"""\
+import base
+def scaled(x):
+    return x * base.FACTOR
+""",
+    )
+
+    result = sandbox.exec("""\
+from derived import scaled
+result = scaled(5)
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 50
+
+
+def test_vfs_module_classes():
+    """VFS modules can define and export classes."""
+    sandbox, fs = _make_sandbox()
+    fs.write(
+        "/models.py",
+        b"""\
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    def magnitude(self):
+        return (self.x ** 2 + self.y ** 2) ** 0.5
+""",
+    )
+
+    result = sandbox.exec("""\
+from models import Point
+p = Point(3, 4)
+result = p.magnitude()
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 5.0
+
+
+def test_vfs_module_no_filesystem():
+    """Without a filesystem, VFS imports are not attempted."""
+    policy = Policy()
+    sandbox = Sandbox(policy)  # No filesystem
+
+    result = sandbox.exec("import helpers")
+    assert result.error is not None
+    assert isinstance(result.error, ImportError)
+
+
+def test_vfs_circular_import():
+    """Circular imports don't crash (partial module returned)."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/a.py", b"import b\nX = 1")
+    fs.write("/b.py", b"import a\nY = 2")
+
+    result = sandbox.exec("""\
+import a
+import b
+result = a.X + b.Y
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 3
+
+
+def test_vfs_module_syntax_error_not_cached():
+    """A VFS module with a syntax error is evicted from cache and can be retried."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/broken.py", b"def oops(:")
+
+    # First import fails
+    result = sandbox.exec("import broken")
+    assert result.error is not None
+    assert isinstance(result.error, SyntaxError)
+
+    # Fix the module
+    fs.write("/broken.py", b"X = 42")
+
+    # Second import should succeed (not return the cached broken module)
+    result = sandbox.exec("""\
+import broken
+result = broken.X
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 42
+
+
+def test_vfs_module_runtime_error_not_cached():
+    """A VFS module that raises at import time is evicted from cache."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/bad.py", b"raise RuntimeError('init failed')")
+
+    result = sandbox.exec("import bad")
+    assert result.error is not None
+    assert isinstance(result.error, RuntimeError)
+
+    # Fix the module
+    fs.write("/bad.py", b"Y = 99")
+
+    result = sandbox.exec("""\
+import bad
+result = bad.Y
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 99
+
+
+# ------------------------------------------------------------------
+# Relative imports
+# ------------------------------------------------------------------
+
+
+def test_relative_import_same_package():
+    """from .sibling import name works within a VFS package."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/utils.py", b"FACTOR = 7")
+    fs.write(
+        "/pkg/main.py",
+        b"""\
+from .utils import FACTOR
+result = FACTOR * 3
+""",
+    )
+
+    result = sandbox.exec("""\
+from pkg import main
+result = main.result
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 21
+
+
+def test_relative_import_dot_only():
+    """from . import sibling works to import a sibling module."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/helpers.py", b"X = 42")
+    fs.write(
+        "/pkg/main.py",
+        b"""\
+from . import helpers
+result = helpers.X
+""",
+    )
+
+    result = sandbox.exec("""\
+from pkg import main
+result = main.result
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 42
+
+
+def test_relative_import_parent_level():
+    """from ..sibling import name goes up one level."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/shared.py", b"VAL = 100")
+    fs.write(
+        "/pkg/sub/inner.py",
+        b"""\
+from ..shared import VAL
+doubled = VAL * 2
+""",
+    )
+
+    result = sandbox.exec("""\
+from pkg.sub import inner
+result = inner.doubled
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 200
+
+
+def test_relative_import_no_vfs_fails():
+    """Relative imports without a VFS filesystem raise ImportError."""
+    sandbox = Sandbox(Policy())
+    result = sandbox.exec("from .foo import bar")
+    assert result.error is not None
+    assert isinstance(result.error, ImportError)
+
+
+def test_relative_import_from_toplevel():
+    """Relative import from top-level sandbox code resolves against VFS root."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/utils.py", b"X = 99")
+
+    # Top-level sandbox code has no __file__, so base_dir becomes ""
+    # and ".utils" resolves to "utils" at VFS root
+    result = sandbox.exec("""\
+from .utils import X
+result = X
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 99
+
+
+def test_relative_import_dot_only_from_toplevel():
+    """from . import mod from top-level resolves to VFS root module."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"Y = 7")
+
+    result = sandbox.exec("""\
+from . import helpers
+result = helpers.Y
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 7
+
+
+def test_relative_import_chained():
+    """Relative imports work across multiple levels of VFS modules."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/a/b/c.py", b"VAL = 1")
+    fs.write(
+        "/a/b/d.py",
+        b"""\
+from .c import VAL
+DOUBLED = VAL * 2
+""",
+    )
+    fs.write(
+        "/a/entry.py",
+        b"""\
+from .b.d import DOUBLED
+RESULT = DOUBLED + 10
+""",
+    )
+
+    result = sandbox.exec("""\
+from a import entry
+result = entry.RESULT
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 12
+
+
+def test_relative_import_nonexistent_module():
+    """Relative import of a nonexistent sibling raises ImportError."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/main.py", b"from .missing import X")
+
+    result = sandbox.exec("from pkg import main")
+    assert result.error is not None
+    assert isinstance(result.error, ImportError)
+
+
+def test_relative_import_nonexistent_name():
+    """Relative import of a nonexistent name from an existing module."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/utils.py", b"X = 1")
+    fs.write("/pkg/main.py", b"from .utils import MISSING")
+
+    result = sandbox.exec("from pkg import main")
+    assert result.error is not None
+    assert isinstance(result.error, ImportError)
+    assert "MISSING" in str(result.error)
+
+
+# ------------------------------------------------------------------
+# VFS module definitions
+# ------------------------------------------------------------------
+
+
+def test_vfs_function_is_a_plain_function():
+    """A function imported from a VFS module is an ordinary function."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"def double(x): return x * 2")
+
+    result = sandbox.exec("""\
+from helpers import double
+result = double(5)
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 10
+    assert type(result.namespace["double"]) is types.FunctionType
+
+
+def test_vfs_class_is_a_plain_class():
+    """A class imported from a VFS module is an ordinary class."""
+    sandbox, fs = _make_sandbox()
+    fs.write(
+        "/models.py",
+        b"""\
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+""",
+    )
+
+    result = sandbox.exec("""\
+from models import Point
+p = Point(3, 4)
+result = p.x + p.y
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 7
+    assert isinstance(result.namespace["Point"], type)
+
+
+def test_vfs_module_getattr_gated():
+    """getattr() and hasattr() inside VFS modules go through the attribute policy."""
+
+    class Secret:
+        _hidden = 42
+        public = 99
+
+    policy = Policy(tick_limit=10_000)
+    policy.cls(Secret)
+    sandbox, fs = _make_sandbox(policy=policy)
+    fs.write(
+        "/probe.py",
+        b"""\
+def read_private(obj):
+    return getattr(obj, '_hidden', 'blocked')
+
+def read_public(obj):
+    return getattr(obj, 'public', 'missing')
+
+def has_private(obj):
+    return hasattr(obj, '_hidden')
+
+def has_public(obj):
+    return hasattr(obj, 'public')
+""",
+    )
+
+    result = sandbox.exec("""\
+from probe import read_private, read_public, has_private, has_public
+obj = Secret()
+pub = read_public(obj)
+priv = read_private(obj)
+h_pub = has_public(obj)
+h_priv = has_private(obj)
+""")
+    assert result.error is None
+    assert result.namespace["pub"] == 99
+    assert result.namespace["priv"] == "blocked"
+    assert result.namespace["h_pub"] is True
+    assert result.namespace["h_priv"] is False
+
+
+# ------------------------------------------------------------------
+# ModuleRef reactivation
+# ------------------------------------------------------------------
+
+
+def test_moduleref_bare_dotted_import_reactivation():
+    """ModuleRef for a bare dotted import (import pkg.mod) restores the package chain."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/__init__.py", b"")
+    fs.write("/pkg/mod.py", b"X = 42")
+
+    # Simulate what happens after deserializing a namespace that had
+    # ``import pkg.mod`` — the key is "pkg" and the ModuleRef stores "pkg.mod"
+    ns = {"pkg": ModuleRef("pkg.mod")}
+    result = sandbox.exec("result = pkg.mod.X", namespace=ns)
+    assert result.error is None
+    assert result.namespace["result"] == 42
+
+
+def test_moduleref_aliased_dotted_import_reactivation():
+    """ModuleRef for an aliased dotted import (import pkg.mod as m) returns the leaf."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/__init__.py", b"")
+    fs.write("/pkg/mod.py", b"Y = 99")
+
+    # Simulate ``import pkg.mod as m`` — key is "m", ModuleRef stores "pkg.mod"
+    ns = {"m": ModuleRef("pkg.mod")}
+    result = sandbox.exec("result = m.Y", namespace=ns)
+    assert result.error is None
+    assert result.namespace["result"] == 99
+
+
+def test_moduleref_simple_import_reactivation():
+    """ModuleRef for a simple import (import helpers) resolves correctly."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"Z = 7")
+
+    ns = {"helpers": ModuleRef("helpers")}
+    result = sandbox.exec("result = helpers.Z", namespace=ns)
+    assert result.error is None
+    assert result.namespace["result"] == 7
+
+
+# ------------------------------------------------------------------
+# VFS package __init__.py execution
+# ------------------------------------------------------------------
+
+
+def test_vfs_package_init_executes():
+    """__init__.py in a VFS package is executed during dotted import."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/__init__.py", b"PKG_LOADED = True")
+    fs.write("/pkg/mod.py", b"VAL = 1")
+
+    result = sandbox.exec("""\
+import pkg.mod
+result = pkg.PKG_LOADED
+""")
+    assert result.error is None
+    assert result.namespace["result"] is True
+
+
+# -- did-you-mean on unresolved imports ---------------------------------------
+# VFS imports resolve from '/', and "Import of 'X' is not allowed" reads
+# as a policy ban when the real problem is an unqualified path. When the
+# file exists elsewhere on the VFS, the error says where and shows the fix.
+
+
+def test_bare_import_of_nested_module_suggests_qualified_form():
+    sandbox, fs = _make_sandbox()
+    fs.makedirs("/helpers", exist_ok=True)
+    fs.write("/helpers/evdata.py", b"VALUE = 41")
+
+    result = sandbox.exec("import evdata")
+    assert isinstance(result.error, ImportError)
+    msg = str(result.error)
+    assert "Found /helpers/evdata.py" in msg
+    assert "from helpers import evdata" in msg
+    assert "not allowed" not in msg
+
+
+def test_from_import_of_nested_module_suggests_qualified_form():
+    sandbox, fs = _make_sandbox()
+    fs.makedirs("/lib/util", exist_ok=True)
+    fs.write("/lib/util/evdata.py", b"VALUE = 41")
+
+    result = sandbox.exec("from evdata import VALUE")
+    assert isinstance(result.error, ImportError)
+    msg = str(result.error)
+    assert "Found /lib/util/evdata.py" in msg
+    assert "from lib.util import evdata" in msg
+
+
+def test_truly_missing_module_keeps_the_policy_message():
+    sandbox, fs = _make_sandbox()
+    fs.write("/other.py", b"x = 1")
+
+    result = sandbox.exec("import nowhere")
+    assert isinstance(result.error, ImportError)
+    assert "Import of 'nowhere' is not allowed" in str(result.error)
+
+
+def test_suggestion_search_is_bounded():
+    """A wide tree doesn't stall the error path (bounded BFS)."""
+    sandbox, fs = _make_sandbox()
+    for i in range(300):
+        fs.makedirs(f"/d{i:03d}", exist_ok=True)
+        fs.write(f"/d{i:03d}/x.py", b"pass")
+    fs.makedirs("/zzz", exist_ok=True)
+    fs.write("/zzz/deep.py", b"pass")
+
+    result = sandbox.exec("import deep")
+    assert isinstance(
+        result.error, ImportError
+    )  # may or may not find it; must not hang
+
+
+def test_suggestion_skips_unimportable_directories():
+    """A hit inside a hidden / dunder / non-identifier directory can't
+    ride a dotted import — no suggestion beats a non-actionable one
+    (and skipping saves per-entry RPCs under RemoteFS)."""
+    sandbox, fs = _make_sandbox()
+    for d in ("/.hidden", "/__pycache__", "/my-stuff"):
+        fs.makedirs(d, exist_ok=True)
+        fs.write(f"{d}/evdata.py", b"VALUE = 1")
+
+    result = sandbox.exec("import evdata")
+    assert isinstance(result.error, ImportError)
+    msg = str(result.error)
+    assert "Found" not in msg
+    assert "Import of 'evdata' is not allowed" in msg
+
+    # ...but a legitimate location still wins
+    fs.makedirs("/helpers", exist_ok=True)
+    fs.write("/helpers/evdata.py", b"VALUE = 41")
+    result = sandbox.exec("import evdata")
+    assert "from helpers import evdata" in str(result.error)
+
+
+def test_dotted_import_with_wrong_root_suggests_qualified_form():
+    """The gemma case: `import api._helpers` for /app/api/_helpers.py —
+    the top segment is a DIRECTORY, so the file search must fall back
+    to the leaf name to find the fix."""
+    sandbox, fs = _make_sandbox()
+    fs.makedirs("/app/api", exist_ok=True)
+    fs.write("/app/api/_helpers.py", b"VALUE = 41")
+
+    result = sandbox.exec("import api._helpers")
+    assert isinstance(result.error, ImportError)
+    msg = str(result.error)
+    assert "Found /app/api/_helpers.py" in msg
+    assert "from app.api import _helpers" in msg
+
+    result = sandbox.exec("from api._helpers import VALUE")
+    assert "from app.api import _helpers" in str(result.error)
+
+
+def test_module_root_resolves_imports_from_prefix():
+    """Policy.module_root moves the import base: hosts that present the
+    workspace under a prefix (nontainer's /workspace) need `import mod`
+    to find <root>/mod.py, matching what sandboxed open() sees."""
+    sandbox, fs = _make_sandbox(policy=Policy(module_root="/workspace"))
+    fs.makedirs("/workspace/helpers", exist_ok=True)
+    fs.write("/workspace/util.py", b"def triple(x): return x * 3")
+    fs.write("/workspace/helpers/__init__.py", b"")
+    fs.write("/workspace/helpers/data.py", b"VALUE = 42")
+
+    result = sandbox.exec("""\
+import util
+from helpers import data
+result = util.triple(3)
+value = data.VALUE
+""")
+    assert result.error is None
+    assert result.namespace["result"] == 9
+    assert result.namespace["value"] == 42
+
+
+def test_module_root_error_message_names_the_root():
+    """A miss under a module root explains where imports resolve from,
+    and the did-you-mean derives its dotted path RELATIVE to the root
+    (never `workspace.helpers.data`)."""
+    sandbox, fs = _make_sandbox(policy=Policy(module_root="/workspace"))
+    fs.makedirs("/workspace/helpers", exist_ok=True)
+    fs.write("/workspace/helpers/data.py", b"VALUE = 42")
+
+    result = sandbox.exec("import data")
+    assert isinstance(result.error, ImportError)
+    msg = str(result.error)
+    assert "resolve from '/workspace'" in msg
+    assert "from helpers import data" in msg
+    assert "workspace.helpers" not in msg
+
+
+def test_module_root_hit_outside_root_is_named_not_suggested():
+    """A file that exists only OUTSIDE the module root can't be
+    imported at all — the message must say so instead of suggesting a
+    dotted path that would also fail."""
+    sandbox, fs = _make_sandbox(policy=Policy(module_root="/workspace"))
+    fs.makedirs("/workspace", exist_ok=True)
+    fs.makedirs("/stray", exist_ok=True)
+    fs.write("/stray/data.py", b"VALUE = 42")
+
+    result = sandbox.exec("import data")
+    assert isinstance(result.error, ImportError)
+    msg = str(result.error)
+    assert "Found /stray/data.py" in msg
+    assert "OUTSIDE the module root" in msg
+
+
+def _make_rooted_pkg():
+    """Sandbox with module_root=/workspace and a helpers package."""
+    sandbox, fs = _make_sandbox(policy=Policy(module_root="/workspace"))
+    fs.makedirs("/workspace/helpers", exist_ok=True)
+    fs.write("/workspace/helpers/__init__.py", b"")
+    fs.write("/workspace/helpers/foo.py", b"VALUE = 42")
+    return sandbox, fs
+
+
+def test_module_root_relative_import():
+    """Relative imports resolve root-relative. The caller's __file__ is
+    root-ABSOLUTE (/workspace/helpers/bar.py) because that's the path
+    sandboxed open() sees, but dotted names start at the root — so the
+    root prefix must be stripped before dotting, or resolution would
+    prepend it a second time (/workspace/workspace/helpers/foo.py)."""
+    sandbox, fs = _make_rooted_pkg()
+    fs.write("/workspace/helpers/bar.py", b"from .foo import VALUE\nresult = VALUE * 3")
+
+    result = sandbox.exec("from helpers import bar\nresult = bar.result")
+    assert result.error is None
+    assert result.namespace["result"] == 126
+
+
+def test_module_root_relative_import_bare_dot():
+    """`from . import foo` takes the same root-relative path as
+    `from .foo import X` — both derive a dotted name from __file__."""
+    sandbox, fs = _make_rooted_pkg()
+    fs.write("/workspace/helpers/bar.py", b"from . import foo\nresult = foo.VALUE")
+
+    result = sandbox.exec("from helpers import bar\nresult = bar.result")
+    assert result.error is None
+    assert result.namespace["result"] == 42
+
+
+def test_module_root_segment_is_not_importable():
+    """The root's own name is not a package — imports start AT the
+    root, so `workspace.helpers` must stay unresolvable even though
+    /workspace/helpers exists on the VFS."""
+    sandbox, _ = _make_rooted_pkg()
+
+    result = sandbox.exec("from workspace.helpers import foo")
+    assert isinstance(result.error, ImportError)
+
+
+def test_module_root_relative_import_cannot_escape_root():
+    """Over-dotting clamps at the fs root and then re-roots, so a
+    relative import can never address anything above the module root."""
+    sandbox, fs = _make_rooted_pkg()
+    fs.write("/secret.py", b"KEY = 'pwned'")
+    fs.write("/workspace/helpers/esc.py", b"from ...secret import KEY")
+
+    result = sandbox.exec("from helpers import esc")
+    assert isinstance(result.error, ImportError)
+    assert "pwned" not in str(result.namespace)
+
+
+def test_dynamic_import_of_vfs_module():
+    """__import__ resolves VFS modules, like the statement form."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/helpers.py", b"def double(x): return x * 2")
+
+    result = sandbox.exec("h = __import__('helpers')\nresult = h.double(5)")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == 10
+
+
+def test_dynamic_import_inside_a_vfs_module():
+    """VFS modules are rewritten too, so __import__ is gated there as well."""
+    import math
+
+    policy = Policy()
+    policy.module(math)
+    sandbox, fs = _make_sandbox(policy=policy)
+    fs.write(
+        "/geom.py",
+        b"m = __import__('math')\ndef area(r): return m.pi * r * r",
+    )
+
+    result = sandbox.exec("import geom\nresult = round(geom.area(2), 4)")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == 12.5664
+
+    # the gate itself must not be copied onto the module object
+    leaked = sandbox.exec(
+        "import geom\nresult = [k for k in dir(geom) if 'import' in k]"
+    )
+    assert leaked.error is None, f"unexpected error: {leaked.error}"
+    assert leaked.namespace["result"] == []
+
+
+def test_dynamic_import_in_vfs_module_respects_policy():
+    """An ungranted module stays refused from inside a VFS module."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/sneaky.py", b"os = __import__('os')")
+
+    result = sandbox.exec("import sneaky")
+    assert isinstance(result.error, ImportError)
+
+
+def test_dynamic_import_fromlist_resolves_a_vfs_package_directory():
+    """`__import__('pkg', fromlist=['sub'])` must reach as far as
+    `from pkg import sub`.
+
+    VFS package directories are built by ensure_package_chain, not found as
+    `<name>.py`, so the aliased resolution used for the fromlist form misses
+    them without an explicit fallback.
+    """
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/__init__.py", b"MARK = 1")
+    fs.write("/pkg/sub.py", b"VALUE = 42")
+
+    statement = sandbox.exec("from pkg import sub\nresult = sub.VALUE")
+    assert statement.error is None, f"unexpected error: {statement.error}"
+
+    dynamic = sandbox.exec(
+        "m = __import__('pkg', fromlist=['sub'])\nresult = m.sub.VALUE"
+    )
+    assert dynamic.error is None, f"unexpected error: {dynamic.error}"
+    assert dynamic.namespace["result"] == statement.namespace["result"] == 42
+
+
+def test_dynamic_import_fromlist_runs_the_package_init():
+    """The fallback must return the real package, __init__ side effects and all."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/__init__.py", b"MARK = 'loaded'")
+    fs.write("/pkg/sub.py", b"VALUE = 42")
+
+    result = sandbox.exec("m = __import__('pkg', fromlist=['sub'])\nresult = m.MARK")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == "loaded"
+
+
+def test_dynamic_import_fromlist_dotted_vfs_package():
+    """The fallback walks back down to the package the caller asked for."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/a/__init__.py", b"")
+    fs.write("/a/b/__init__.py", b"")
+    fs.write("/a/b/c.py", b"V = 9")
+
+    result = sandbox.exec("m = __import__('a.b', fromlist=['c'])\nresult = m.c.V")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == 9
+
+
+def test_dynamic_import_fromlist_propagates_a_vfs_submodule_failure():
+    """A submodule that exists but blows up must not read as 'absent'."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/pkg/__init__.py", b"")
+    fs.write("/pkg/broken.py", b"import totally_not_granted\n")
+
+    result = sandbox.exec("m = __import__('pkg', fromlist=['broken'])")
+    assert isinstance(result.error, ImportError)
+    assert "totally_not_granted" in str(result.error)
+
+
+# ------------------------------------------------------------------
+# A module's execution namespace IS its __dict__
+# ------------------------------------------------------------------
+
+
+@contextmanager
+def _vfs_sandbox(isolation, files, policy=None):
+    """A sandbox at *isolation* over a VirtualFS holding *files*."""
+    fs = VirtualFS({})
+    for path, source in files.items():
+        fs.write(path, source.encode())
+    try:
+        sb = sandbox(policy or Policy(timeout=30.0), isolation=isolation, filesystem=fs)
+    except IsolationUnavailable as e:
+        pytest.skip(f"kernel isolation unavailable: {e}")
+    with sb as active:
+        yield active
+
+
+ISOLATIONS = ("none", "process", "kernel")
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_module_attribute_set_by_caller_is_what_the_module_reads(isolation):
+    """Setting a module attribute changes what the module's own code sees."""
+    files = {"/h.py": "LIMIT = 10\n\ndef get():\n    return LIMIT\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("""\
+import h
+h.LIMIT = 99
+read_back = h.LIMIT
+from_inside = h.get()
+""")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["read_back"] == 99
+    assert result.namespace["from_inside"] == 99
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_patch_object_on_a_module_is_what_the_module_calls(isolation):
+    """``patch.object`` on a module function reaches the module's own calls."""
+    import unittest.mock
+
+    policy = Policy(timeout=30.0)
+    policy.module(unittest.mock)
+    files = {
+        "/h.py": "def fetch():\n    return 'real'\n\ndef call_fetch():\n    return fetch()\n"
+    }
+    with _vfs_sandbox(isolation, files, policy=policy) as sb:
+        result = sb.exec("""\
+from unittest.mock import patch
+import h
+
+def fake():
+    return 'fake'
+
+with patch.object(h, 'fetch', fake):
+    patched = h.call_fetch()
+restored = h.call_fetch()
+""")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["patched"] == "fake"
+    assert result.namespace["restored"] == "real"
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_a_module_whose_body_raises_leaves_no_half_module(isolation):
+    """A failed module body is not cached, so the next import fails the same way."""
+    files = {"/broken.py": "OK = 1\nraise ValueError('boom')\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("""\
+first = 'clean'
+second = 'clean'
+try:
+    import broken
+except ValueError:
+    first = 'raised'
+try:
+    import broken
+except ValueError:
+    second = 'raised'
+""")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["first"] == "raised"
+    assert result.namespace["second"] == "raised"
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_a_module_imported_twice_is_one_object(isolation):
+    """Two imports of one module name bind the same module object."""
+    files = {"/h.py": "STATE = 0\n\ndef get():\n    return STATE\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("""\
+import h
+import h as also_h
+h.STATE = 7
+same = also_h.STATE
+from_inside = also_h.get()
+""")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["same"] == 7
+    assert result.namespace["from_inside"] == 7
+
+
+# ------------------------------------------------------------------
+# A module exports what its body defined, and nothing else
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_from_import_of_getattribute_is_refused(isolation):
+    """``__getattribute__`` walks the type, and its first stop is the
+    module dict the sandbox's own gates and builtins live in."""
+    files = {"/h.py": "VALUE = 1\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("""\
+from h import __getattribute__ as get
+leaked = get('__builtins__')['__import__']('os').getcwd()
+""")
+    assert isinstance(result.error, ImportError), f"leaked: {result.error!r}"
+    assert "__getattribute__" in str(result.error)
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_from_import_of_dunder_dict_is_refused(isolation):
+    """The module dict is the execution namespace, gates included."""
+    files = {"/h.py": "VALUE = 1\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("from h import __dict__ as d")
+    assert isinstance(result.error, ImportError), f"leaked: {result.error!r}"
+    assert "__dict__" in str(result.error)
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_from_import_of_a_body_assigned_dunder_is_refused(isolation):
+    """A module body cannot re-export a name under a dunder spelling --
+    beyond the module metadata (`__version__`, `__author__`, `__all__`),
+    which is read as data (see test_module_metadata.py)."""
+    files = {"/h.py": "__version__ = '1.2'\n__getattr__ = 'not a hook'\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        version = sb.exec("from h import __version__ as v")
+        hook = sb.exec("from h import __getattr__ as g")
+    assert version.error is None and version.namespace["v"] == "1.2"
+    assert isinstance(hook.error, ImportError), f"leaked: {hook.error!r}"
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_from_import_of_a_defined_name_still_works(isolation):
+    """The refusal is about dunders, not about from-imports."""
+    files = {"/h.py": "VALUE = 7\n\ndef get():\n    return VALUE\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("from h import VALUE, get\nboth = (VALUE, get())")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["both"] == (7, 7)
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_relative_from_import_of_getattribute_is_refused(isolation):
+    """The relative-import path resolves names the same way."""
+    files = {
+        "/pkg/helper.py": "VALUE = 1\n",
+        "/pkg/entry.py": "from .helper import __getattribute__ as get\n",
+    }
+    with _vfs_sandbox(isolation, files) as sb:
+        result = sb.exec("import pkg.entry")
+    assert isinstance(result.error, ImportError), f"leaked: {result.error!r}"
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_from_main_import_of_getattribute_is_refused(isolation):
+    """The `main` proxy resolves from the exec namespace, same rule."""
+    with _vfs_sandbox(isolation, {}) as sb:
+        result = sb.exec("from main import __getattribute__ as get")
+    assert isinstance(result.error, ImportError), f"leaked: {result.error!r}"
+
+
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_module_type_machinery_is_not_readable_as_an_attribute(isolation):
+    """The attribute gate refuses what the import gate refuses."""
+    files = {"/h.py": "VALUE = 1\n"}
+    with _vfs_sandbox(isolation, files) as sb:
+        for expr in (
+            "h.__dict__",
+            "h.__getattribute__",
+            "h.__class__",
+            "getattr(h, '__dict__')",
+            "getattr(h, '__getattribute__')",
+        ):
+            result = sb.exec(f"import h\nx = {expr}")
+            assert isinstance(result.error, AttributeError), (
+                f"{expr} leaked: {result.error!r}"
+            )
+
+
+def test_a_module_ref_pickled_under_the_old_path_still_loads():
+    """A namespace persisted by an earlier release names the class as
+    ``sandtrap.wrappers.ModuleRef``. Protocol 0 spells the module path
+    as text with no length prefix, so the old path can be substituted
+    into a fresh pickle to stand in for one written back then."""
+    fresh = pickle.dumps(ModuleRef("helpers", file="/helpers.py"), protocol=0)
+    assert b"sandtrap.sandbox" in fresh
+    old = fresh.replace(b"sandtrap.sandbox", b"sandtrap.wrappers")
+
+    ref = pickle.loads(old)
+
+    assert type(ref) is ModuleRef
+    assert ref.name == "helpers"
+    assert ref.file == "/helpers.py"
+
+
+def test_the_old_path_holds_nothing_but_module_ref():
+    """Wrapped mode did not survive under the alias."""
+    import sandtrap.wrappers as old_path
+
+    assert old_path.__all__ == ["ModuleRef"]
+    for gone in ("StFunction", "StClass", "StInstance", "activate_value"):
+        assert not hasattr(old_path, gone)
+
+
+# ------------------------------------------------------------------
+# A package is importable by its own name, and runs before its modules
+# ------------------------------------------------------------------
+
+TERN = {
+    "/tern/__init__.py": "VERSION = '0.1.0'\n",
+    "/tern/cli.py": ("from tern import VERSION\n\ndef main():\n    return VERSION\n"),
+}
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import tern\nresult = tern.VERSION",
+        "from tern import VERSION as result",
+        "from tern.cli import main\nresult = main()",
+        "import tern.cli\nresult = tern.cli.main()",
+        "import tern.cli as cli\nresult = cli.main()",
+        "result = __import__('tern', fromlist=['cli']).cli.main()",
+    ],
+)
+@pytest.mark.parametrize("isolation", ISOLATIONS)
+def test_a_package_is_importable_by_its_own_name(isolation, code):
+    """Only `<name>.py` was looked for, so a package directory read as
+    "Import of 'tern' is not allowed" -- and so did a submodule importing
+    from its own package."""
+    with _vfs_sandbox(isolation, TERN) as sb:
+        result = sb.exec(code)
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == "0.1.0"
+
+
+def test_a_package_runs_before_its_submodules():
+    """CPython runs `p/__init__.py` before `p/m.py`; the submodule ran first."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/p/__init__.py", b"print('init')")
+    fs.write("/p/q/__init__.py", b"print('q')")
+    fs.write("/p/q/m.py", b"print('m')")
+    result = sandbox.exec("import p.q.m\nimport p.q.m")
+    assert result.error is None
+    assert result.stdout.split() == ["init", "q", "m"]
+
+
+def test_a_package_and_its_module_may_import_each_other():
+    """`__init__` re-exports from a submodule that imports from the
+    package, as packages commonly do: the module sees what the package
+    had bound when it was imported."""
+    sandbox, fs = _make_sandbox()
+    fs.write(
+        "/pkg/__init__.py",
+        b"NAME = 'pkg'\nfrom .core import shout\n",
+    )
+    fs.write(
+        "/pkg/core.py",
+        b"from pkg import NAME\n\ndef shout():\n    return NAME.upper()\n",
+    )
+    result = sandbox.exec("from pkg import shout\nresult = shout()")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == "PKG"
+
+
+def test_a_package_whose_init_fails_stays_unimported():
+    """A failed `__init__` must not leave a half-built package behind for
+    the next import to find."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/bad/__init__.py", b"raise ValueError('boom')")
+    fs.write("/bad/m.py", b"X = 1")
+    first = sandbox.exec("import bad")
+    second = sandbox.exec("import bad.m")
+    assert "boom" in str(first.error)
+    assert "boom" in str(second.error)
+
+
+def test_a_directory_without_init_still_carries_its_modules():
+    sandbox, fs = _make_sandbox()
+    fs.write("/plain/m.py", b"X = 7")
+    result = sandbox.exec("import plain.m\nresult = plain.m.X")
+    assert result.error is None
+    assert result.namespace["result"] == 7
+
+
+def test_a_package_wins_over_a_module_of_the_same_name():
+    """CPython takes `foo/__init__.py` over `foo.py`."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/foo.py", b"WHICH = 'module'")
+    fs.write("/foo/__init__.py", b"WHICH = 'package'")
+    fs.write("/foo/bar.py", b"X = 1")
+    result = sandbox.exec("import foo.bar\nresult = (foo.WHICH, foo.bar.X)")
+    assert result.error is None, f"unexpected error: {result.error}"
+    assert result.namespace["result"] == ("package", 1)
+
+
+def test_a_failed_package_takes_the_children_it_imported_with_it():
+    """A child the package's `__init__` imported before raising is not
+    importable past the package that never finished: each later import
+    runs the `__init__` again and fails as it did."""
+    sandbox, fs = _make_sandbox()
+    fs.write("/bad/__init__.py", b"import bad.child\nraise ValueError('boom')")
+    fs.write("/bad/child.py", b"X = 1")
+    attempt = "try:\n    import bad\nexcept ValueError:\n    pass\n"
+    for code in (
+        "from bad.child import X",
+        "import bad.child",
+        "import bad.child as c",
+    ):
+        result = sandbox.exec(attempt + code)
+        assert isinstance(result.error, ValueError), f"{code}: {result.error!r}"
+        assert "boom" in str(result.error)

@@ -1,0 +1,1198 @@
+"""Gate functions injected into sandboxed code at compile time."""
+
+import ast
+import builtins as _builtins
+import functools
+import importlib.util
+import inspect
+import posixpath
+import string as _string_mod
+import sys
+import time
+import types
+from collections.abc import Mapping
+from contextlib import ExitStack
+from typing import Any
+
+from .builtins import _FrozenBuiltins, make_safe_builtins
+from .clock import HostClock, current_clock, host_time, wrap_host_time
+from .errors import StCancelled, StTickLimit, StTimeout
+from .fs import current_fs, suspend
+from .net.context import allow_network, network_allowed
+from .policy import (
+    INTROSPECTION_DUNDERS,
+    MODULE_METADATA_DUNDERS,
+    NO_METADATA,
+    Policy,
+    module_metadata,
+)
+from .resource_limits import get_rss_bytes
+from .rewriter import Rewriter, take_future
+
+
+class _SafeFormatter(_string_mod.Formatter):
+    """Formatter that blocks attribute and item traversal in field names.
+
+    Standard ``str.format`` allows ``"{0.__class__}".format(obj)`` which
+    performs attribute access outside the AST rewriter's reach.  This
+    subclass overrides ``get_field`` to reject any such traversal.
+    """
+
+    def get_field(self, field_name: str, args: Any, kwargs: Any) -> tuple[Any, str]:
+        if "." in field_name or "[" in field_name:
+            raise AttributeError(
+                "Attribute/item access in format strings is not allowed"
+            )
+        return super().get_field(field_name, args, kwargs)
+
+
+_safe_formatter = _SafeFormatter()
+
+# Distinguishes "the module has no such export" from "its value is None".
+_MISSING = object()
+
+# Returned when an introspection dunder cannot be resolved without running
+# host code. It is neither a str nor None, so it fails the gate's value
+# check like any other unacceptable answer.
+_REFUSED = object()
+
+# Types whose C-level slots answer an introspection dunder out of the
+# object's header rather than out of a method the host wrote. `method` is
+# deliberately absent: `bound.__name__` and `bound.__doc__` are answered by
+# C code that calls getattr on the wrapped callable, and MethodType binds
+# any callable, so the read is unwrapped to that callable first instead.
+_INTROSPECTION_SLOT_OWNERS = (
+    type,
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.MethodDescriptorType,
+    types.ModuleType,
+    property,
+    classmethod,
+    staticmethod,
+)
+
+
+def _static_introspection_value(obj: Any, attr: str) -> Any:
+    """The value of an introspection dunder, or ``_REFUSED``.
+
+    The four names sandboxed code may read (``__name__``,
+    ``__qualname__``, ``__module__``, ``__doc__``) are resolved without
+    executing anything the host wrote. A registered class can answer any
+    of them through a metaclass property, a module through PEP 562
+    ``__getattr__``, an instance through ``__getattribute__`` -- plain
+    ``getattr`` would run that code, and a policy that grants a name
+    read would be granting a side effect. So the lookup goes through
+    ``inspect.getattr_static``, which walks ``__dict__``s and invokes no
+    descriptor, and the result is accepted from only two places: a value
+    stored directly in an instance, class, or module ``__dict__``, or a
+    C-level slot on one of the builtin types that keeps these names in
+    the object header. A Python-level descriptor under one of these
+    names is refused unread.
+    """
+    if type(obj) is types.MethodType:
+        # Take the wrapped callable out of the method's own slot and read
+        # the name off that, so an exotic callable's own attribute code
+        # is subject to the same rules as everything else here.
+        try:
+            obj = types.MethodType.__dict__["__func__"].__get__(obj, types.MethodType)
+        except Exception:
+            return _REFUSED
+
+    try:
+        found = inspect.getattr_static(obj, attr)
+    except Exception:
+        return _REFUSED
+
+    # Stored value: getattr_static hands back whatever the __dict__ holds.
+    if found is None or type(found) is str:
+        return found
+
+    kind = type(found)
+    if not (
+        kind is types.GetSetDescriptorType
+        or kind is types.MemberDescriptorType
+        or kind is types.WrapperDescriptorType
+    ):
+        return _REFUSED
+    try:
+        owner = found.__objclass__
+    except Exception:
+        return _REFUSED
+    # Identity, never `in`: a container test compares, and comparing types
+    # can land in a metaclass __eq__ that the host wrote.
+    if not any(owner is allowed for allowed in _INTROSPECTION_SLOT_OWNERS):
+        return _REFUSED
+    try:
+        return found.__get__(obj, type(obj))
+    except Exception:
+        return _REFUSED
+
+
+def _enter_grants(
+    stack: ExitStack,
+    network_access: bool = False,
+    host_fs_access: bool = False,
+    is_host_time: bool = False,
+) -> None:
+    """Hold the given grants until *stack* closes."""
+    if network_access:
+        stack.enter_context(allow_network())
+    if host_fs_access:
+        stack.enter_context(suspend())
+    if is_host_time:
+        stack.enter_context(host_time())
+
+
+def _member_grants(reg: Any, member_name: str) -> tuple[bool, bool, bool]:
+    """``(network_access, host_fs_access, host_time)`` for one member of a
+    registration: its own flags, each widened by a ``configure`` entry for
+    *member_name*. All False without a registration."""
+    if reg is None:
+        return False, False, False
+    network = getattr(reg, "network_access", False)
+    host_fs = getattr(reg, "host_fs_access", False)
+    # getattr: registrations pickled by older versions lack host_time.
+    is_host_time = getattr(reg, "host_time", False)
+    configure = getattr(reg, "configure", None)
+    if configure and member_name in configure:
+        spec = configure[member_name]
+        network = network or spec.network_access
+        host_fs = host_fs or spec.host_fs_access
+        is_host_time = is_host_time or getattr(spec, "host_time", False)
+    return network, host_fs, is_host_time
+
+
+_type_mro = type.__dict__["__mro__"].__get__
+_type_dict = type.__dict__["__dict__"].__get__
+
+
+def _type_attr(tp: type, name: str) -> Any:
+    """*name* as the class dicts along *tp*'s MRO define it, or
+    ``_MISSING``. Reads the dicts only: no descriptor, no metaclass hook."""
+    for klass in _type_mro(tp):
+        found = _type_dict(klass).get(name, _MISSING)
+        if found is not _MISSING:
+            return found
+    return _MISSING
+
+
+# `__getattribute__` implementations that run nothing of the host's to find
+# an attribute, short of the found descriptor's own `__get__`.
+_PLAIN_GETATTRIBUTE = (
+    object.__dict__["__getattribute__"],
+    type.__dict__["__getattribute__"],
+    types.ModuleType.__dict__["__getattribute__"],
+)
+
+# Descriptor types whose `__get__` only binds or reads a slot, in C: reading
+# one through an instance or a class runs nothing of the host's.
+_BINDING_DESCRIPTORS = (
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.MethodDescriptorType,
+    types.ClassMethodDescriptorType,
+    types.WrapperDescriptorType,
+    types.MemberDescriptorType,
+    staticmethod,
+)
+
+
+def _resolution_runs_code(obj: Any, attr: str) -> bool:
+    """Could ``getattr(obj, attr)`` run code the host wrote?
+
+    Answered without running any. True for a type with a
+    ``__getattribute__`` of its own, for a name stored nowhere (a
+    ``__getattr__`` may answer for it), and for a descriptor whose
+    ``__get__`` may call out: ``property``, ``cached_property``, a C-level
+    getter. False for a stored value, and for a function or slot the read
+    only binds or reads. A doubtful case answers True, which costs only a
+    grant held while nothing needed it.
+    """
+    getattribute = _type_attr(type(obj), "__getattribute__")
+    if not any(getattribute is plain for plain in _PLAIN_GETATTRIBUTE):
+        return True
+    try:
+        found = inspect.getattr_static(obj, attr)
+    except Exception:
+        return True
+    kind = type(found)
+    if any(kind is binding for binding in _BINDING_DESCRIPTORS):
+        return False
+    if kind is classmethod:
+        # Up to Python 3.12, a classmethod's __get__ hands a wrapped
+        # descriptor to that descriptor's own __get__ (a classmethod
+        # property); a wrapped function it only binds.
+        return type(found.__func__) is not types.FunctionType
+    return _type_attr(kind, "__get__") is not _MISSING
+
+
+def wrap_privileged(
+    fn: Any,
+    *,
+    network_access: bool = False,
+    host_fs_access: bool = False,
+) -> Any:
+    """Wrap a callable to temporarily grant network/fs privileges.
+
+    A coroutine function gets an async wrapper that holds the grant across
+    the await: its body runs when awaited, not when called, so a grant
+    held only around the call is gone before the body needs it.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            with ExitStack() as stack:
+                _enter_grants(stack, network_access, host_fs_access)
+                return await fn(*args, **kwargs)
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with ExitStack() as stack:
+            _enter_grants(stack, network_access, host_fs_access)
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _module_export(mod: Any, name: str) -> Any:
+    """The value a module's body bound to *name*, or ``_MISSING``.
+
+    Resolution goes through the module's own ``__dict__``, never
+    ``getattr``: ``getattr`` walks the type, so it answers for names the
+    module never defined -- ``__getattribute__`` (which reads any
+    attribute, including the module dict the sandbox's gates live in),
+    ``__dict__`` (that dict itself), ``__class__``, and the rest of the
+    module type's surface.
+
+    Dunders are refused whatever their source. An implementation dunder
+    is type machinery wearing a module's name, and a dunder a module
+    *body* assigned is a name an import would bind into the caller's
+    namespace as though the module had exported it. The introspection
+    dunders a module does answer for describe the module rather than
+    export anything, and ``mod.__doc__`` is how to read those.
+    """
+    if name in MODULE_METADATA_DUNDERS:
+        value = module_metadata(mod, name)
+        return _MISSING if value is NO_METADATA else value
+    if name.startswith("__") and name.endswith("__"):
+        return _MISSING
+    return mod.__dict__.get(name, _MISSING)
+
+
+class _ExecModule(types.ModuleType):
+    """A module the embedder handed to a single execution.
+
+    The embedder chose the contents, so every name it was given is
+    readable -- the policy's member filters describe what sandboxed code
+    may reach on a *registered* module, and have nothing to say about a
+    mapping the embedder wrote out by hand. Nothing else on the object is
+    readable, and nothing at all is writable: a per-exec module that
+    sandboxed code could write to would be a channel from one execution
+    to the next, which is exactly what per-exec means to rule out.
+    """
+
+    __slots__ = ("_st_exposed",)
+
+    def __init__(self, name: str, attributes: Mapping[str, Any]) -> None:
+        super().__init__(name)
+        self.__dict__.update(attributes)
+        object.__setattr__(self, "_st_exposed", frozenset(attributes))
+
+    def _st_refuse_write(self, attr: str) -> "AttributeError":
+        return AttributeError(
+            f"Cannot set attribute '{attr}' on module '{self.__name__}': "
+            "modules provided for this execution are read-only"
+        )
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        raise self._st_refuse_write(attr)
+
+    def __delattr__(self, attr: str) -> None:
+        raise self._st_refuse_write(attr)
+
+    def __dir__(self) -> list[str]:
+        return sorted(self._st_exposed)
+
+
+class _VFSLoader:
+    """Resolves and caches modules from a virtual filesystem.
+
+    Handles parsing, rewriting, compiling, and executing VFS source files
+    into module objects, including package chains for dotted imports.
+    """
+
+    def __init__(
+        self,
+        filesystem: Any,
+        gates: dict[str, Any],
+        root: str = "/",
+    ) -> None:
+        self._filesystem = filesystem
+        self._gates = gates
+        self._cache: dict[str, Any] = {}
+        self._print_fn: Any = None
+        self._help_fn: Any = None
+        self._input_fn: Any = None
+        # Import-resolution base (Policy.module_root): "" for the fs
+        # root so f"{self._root}/mod.py" composes to "/mod.py".
+        self._root = "" if root == "/" else root.rstrip("/")
+
+    def _compile_and_exec(self, mod: Any, source: str, module_name: str) -> None:
+        """Parse, rewrite, compile, and execute VFS source into a module.
+
+        A module's execution namespace IS its ``__dict__``.  The module's
+        own functions and the caller holding the module object therefore
+        read and write one dict: setting ``mod.LIMIT`` changes what
+        ``mod.get()`` reads, and ``patch.object(mod, "fetch", fake)``
+        is what ``mod`` itself calls.  Executing into a copy and
+        assigning the results back would make the module a facade over a
+        snapshot, where both of those silently do nothing.
+
+        Sharing the dict also means a body that raises leaves the module
+        half-populated, so a failed module must never stay importable:
+        the callers drop it from the cache before re-raising, and the
+        next import builds a fresh module object and runs the body
+        again.
+
+        The gates and builtins the module runs on live in that same dict
+        and are unreachable from sandboxed code: the rewriter refuses
+        ``__builtins__`` and ``__st_*`` as source-level names, the
+        attribute gate refuses them as attributes, and the import gate
+        refuses them as ``from <module> import`` targets.
+        """
+        tree = ast.parse(source)
+        future = take_future(tree)
+        rewriter = Rewriter()
+        rewriter.future_flags = future
+        tree = rewriter.visit(tree)
+        ast.fix_missing_locations(tree)
+        code = compile(tree, f"<sandtrap:vfs:{module_name}>", "exec", flags=future)
+
+        ns = mod.__dict__
+        ns["__builtins__"] = make_safe_builtins(
+            self._gates["__st_getattr__"],
+            checkpoint=self._gates["__st_checkpoint__"],
+        )
+        # Provide __import__ so C extensions can import transitive deps.
+        # User-code imports are gated at the AST level.
+        ns["__builtins__"]["__import__"] = _builtins.__import__
+        # Inject print/help/open so VFS modules can use them like top-level code.
+        if self._print_fn is not None:
+            ns["__builtins__"]["print"] = self._print_fn
+        if self._help_fn is not None:
+            ns["__builtins__"]["help"] = self._help_fn
+        if self._input_fn is not None:
+            ns["__builtins__"]["input"] = self._input_fn
+        if self._filesystem is not None:
+            ns["__builtins__"]["open"] = _builtins.open
+        ns["__builtins__"] = _FrozenBuiltins(ns["__builtins__"])
+        ns.update(self._gates)
+
+        exec(code, ns)  # noqa: S102
+
+    def find_module_file(self, top: str, max_dirs: int = 200) -> str | None:
+        """Bounded BFS for ``<top>.py`` anywhere on the VFS — powers the
+        did-you-mean in import errors. Skips the module root itself (a
+        hit there would have resolved normally) and returns the
+        shallowest match.
+
+        Only descends into directories that could legally appear in a
+        dotted import path (valid identifiers, non-dunder): a hit inside
+        ``.git/``, ``__pycache__/``, or ``my-stuff/`` would be a
+        non-actionable suggestion — and every skipped entry saves a
+        round-trip when the filesystem is RPC-bridged (RemoteFS)."""
+        fs = self._filesystem
+        if fs is None:
+            return None
+        target = f"{top}.py"
+        module_root = self._root or "/"
+        queue = ["/"]
+        visited = 0
+        while queue and visited < max_dirs:
+            d = queue.pop(0)
+            visited += 1
+            try:
+                entries = sorted(fs.list(d))
+            except Exception:
+                continue
+            for entry in entries:
+                if entry == target and d.rstrip("/") != module_root.rstrip("/"):
+                    return d.rstrip("/") + "/" + entry
+                if not entry.isidentifier() or (
+                    entry.startswith("__") and entry.endswith("__")
+                ):
+                    continue  # can't ride a dotted import; skip the isdir
+                full = d.rstrip("/") + "/" + entry
+                try:
+                    if fs.isdir(full):
+                        queue.append(full)
+                except Exception:
+                    continue
+        return None
+
+    def resolve_module(self, module_name: str) -> Any:
+        """Try to resolve a module from the VFS.  Returns None if not found.
+
+        ``<name>/__init__.py`` is a package and ``<name>.py`` a module,
+        the package first when both exist, as in CPython.  A dotted
+        name's parent packages are built first, top down, so a package's
+        ``__init__`` has run before any of its submodules does, and a
+        submodule can import from its own package.  A module is cached
+        before its body runs, so a circular import sees it partly built
+        rather than recursing, and it is bound on its parent once it has
+        loaded.  A body that raises takes the module out of the cache,
+        and a package takes its submodules with it: a child its
+        ``__init__`` imported before failing is not importable past the
+        package that never finished.
+        """
+        if self._filesystem is None:
+            return None
+
+        if module_name in self._cache:
+            return self._cache[module_name]
+
+        # Look under the module root (Policy.module_root, default the fs
+        # root), dots → path separators.
+        base = self._root + "/" + module_name.replace(".", "/")
+        path, is_package = base + "/__init__.py", True
+        if not self._filesystem.exists(path):
+            path, is_package = base + ".py", False
+            if not self._filesystem.exists(path):
+                return None
+
+        parent_name, _, leaf_name = module_name.rpartition(".")
+        parent = self._package(parent_name) if parent_name else None
+        if module_name in self._cache:  # the parent's __init__ imported it
+            return self._cache[module_name]
+
+        with self._filesystem.open(path, "r") as f:
+            source = f.read()
+
+        mod = types.ModuleType(module_name)
+        mod.__file__ = path
+        if is_package:
+            mod.__path__ = [base]
+        self._cache[module_name] = mod
+
+        try:
+            self._compile_and_exec(mod, source, module_name)
+        except BaseException:
+            self._cache.pop(module_name, None)
+            if is_package:
+                inside = module_name + "."
+                for name in [n for n in self._cache if n.startswith(inside)]:
+                    del self._cache[name]
+            raise
+
+        if parent is not None:
+            setattr(parent, leaf_name, mod)
+        return mod
+
+    def _package(self, package_name: str) -> Any:
+        """The package a dotted import goes through, built if need be.
+
+        Only reached for a module the VFS holds, so the directory exists.
+        With an ``__init__.py`` it is that package (its own parents
+        first); without one it is a bare package object, as it has always
+        been, bound on its parent so ``import a.b.c`` binds ``a.b``.
+        """
+        if package_name in self._cache:
+            return self._cache[package_name]
+        pkg = self.resolve_module(package_name)
+        if pkg is not None:
+            return pkg
+        grand_name, _, leaf_name = package_name.rpartition(".")
+        grand = self._package(grand_name) if grand_name else None
+        base = self._root + "/" + package_name.replace(".", "/")
+        pkg = types.ModuleType(package_name)
+        pkg.__file__ = base + "/__init__.py"
+        pkg.__path__ = [base]
+        self._cache[package_name] = pkg
+        if grand is not None:
+            setattr(grand, leaf_name, pkg)
+        return pkg
+
+    def ensure_package_chain(self, module_name: str) -> Any:
+        """Resolve a dotted VFS import and return its top-level package.
+
+        ``import pkg.mod`` must bind ``pkg`` in the namespace with
+        ``pkg.mod`` attached as an attribute — matching standard Python
+        import semantics.  :meth:`resolve_module` builds the packages on
+        the way, top down.
+        """
+        leaf = self.resolve_module(module_name)
+        if leaf is None:
+            return None
+        return self._cache[module_name.split(".")[0]]
+
+
+class CancelFlag:
+    """Whether an execution has been cancelled: ``threading.Event``'s
+    ``set``, ``clear`` and ``is_set``, without its lock.
+
+    A process worker sets it from a signal handler (SIGUSR1), which runs
+    on the main thread between two of its bytecodes, the thread that also
+    clears it at the start of every execution. An Event takes the same
+    non-reentrant lock in both, so a signal landing inside ``clear`` left
+    the handler waiting forever on a lock its own thread held, and the
+    worker hung. Nothing waits on a cancel, so the lock bought nothing:
+    each method is one attribute access, atomic under the GIL.
+    """
+
+    __slots__ = ("_set",)
+
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:
+        self._set = True
+
+    def clear(self) -> None:
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+
+def make_gates(
+    policy: Policy,
+    *,
+    _start_time: float | None = None,
+    _cancel_flag: CancelFlag | None = None,
+    _memory_limit_bytes: int | None = None,
+    _start_rss: int | None = None,
+    _filesystem: Any = None,
+    _sandbox_sys: Any = None,
+    _timeout: float | None = None,
+) -> dict[str, Any]:
+    """Create the set of gate functions for a given policy.
+
+    Returns a dict of gate function names to implementations,
+    suitable for injection into the execution namespace.
+    ``_timeout`` replaces the policy's timeout for these gates.
+    """
+    timeout = policy.timeout if _timeout is None else _timeout
+    # Gate dict — populated at the end, but closures reference it so
+    # VFS module compilation can inject the same gates.
+    gates: dict[str, Any] = {}
+
+    # Modules the embedder handed to this execution, by name. Filled in
+    # once the namespace is built (the attribute values are materialized
+    # there, so under worker isolation they are live proxies rather than
+    # markers) and emptied when the execution ends. Importable from
+    # top-level code and from workspace modules alike, because both run
+    # on these gates.
+    exec_modules: dict[str, _ExecModule] = {}
+
+    # VFS module loader (holds its own cache; reads gates dict by
+    # reference). getattr: policies pickled by older versions may lack
+    # module_root.
+    vfs = _VFSLoader(
+        _filesystem,
+        gates,
+        root=getattr(policy, "module_root", "/"),
+    )
+
+    def _caller_lineno(depth: int = 2) -> int | None:
+        """Get the line number of the sandboxed code that triggered a gate."""
+        try:
+            return sys._getframe(depth).f_lineno
+        except (ValueError, AttributeError):
+            return None
+
+    def _import_error_message(module_name: str) -> str:
+        """Distinguish 'not granted' from 'exists, but not where imports
+        resolve'. Filesystem-module imports resolve from the module root
+        (Policy.module_root, default '/') — a bare ``import mod`` for a
+        file at <root>/some/dir/mod.py is the single most common miss,
+        and 'not allowed' misreads as a policy ban (agents give up
+        instead of qualifying the import). When the file exists
+        elsewhere on the VFS, say where and show the fix."""
+        # bare `import mod`: search for mod.py. Dotted with a WRONG
+        # root (`import api._helpers` for /app/api/_helpers.py): the
+        # top segment is a directory, so search for the LEAF file and
+        # derive the right root from where it lives.
+        parts = module_name.split(".")
+        hit = vfs.find_module_file(parts[0])
+        if hit is None and len(parts) > 1:
+            hit = vfs.find_module_file(parts[-1])
+        module_root = vfs._root or "/"
+        if hit is not None:
+            rel = (
+                hit[len(vfs._root) :]
+                if vfs._root and hit.startswith(vfs._root + "/")
+                else (hit if not vfs._root else None)
+            )
+            if rel is not None:
+                dotted = rel[1:-3].replace("/", ".")
+                parent, _, leaf = dotted.rpartition(".")
+                return (
+                    f"No module named '{module_name}' at the module root "
+                    f"(imports of filesystem modules resolve from "
+                    f"'{module_root}'). Found {hit} — try: "
+                    f"from {parent} import {leaf}"
+                )
+            return (
+                f"No module named '{module_name}' at the module root "
+                f"(imports of filesystem modules resolve from "
+                f"'{module_root}'). Found {hit}, which is OUTSIDE the "
+                f"module root — move it under {module_root} to import it"
+            )
+        return f"Import of '{module_name}' is not allowed"
+
+    def _maybe_wrap_privileged(value: Any, reg: Any, member_name: str) -> Any:
+        """Wrap *value* if its registration requires network or host-fs access."""
+        if not callable(value) or reg is None:
+            return value
+        needs_network, needs_host_fs, is_host_time = _member_grants(reg, member_name)
+        if needs_network or needs_host_fs:
+            value = wrap_privileged(
+                value,
+                network_access=needs_network,
+                host_fs_access=needs_host_fs,
+            )
+        if is_host_time:
+            value = wrap_host_time(value)
+        return value
+
+    def __st_getattr__(obj: Any, attr: str) -> Any:
+        if isinstance(obj, _ExecModule):
+            # The module's surface is exactly the mapping the embedder
+            # wrote, so the policy's member filters have nothing to say
+            # about it and anything else simply is not there.
+            if attr in obj._st_exposed:
+                # Straight out of the instance dict, so a mapping key that
+                # collides with the module type's own surface (`__dict__`,
+                # `__class__`) yields the embedder's value rather than the
+                # machinery `getattr` would reach past it for.
+                return obj.__dict__[attr]
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"module '{obj.__name__}' has no attribute '{attr}'{loc}"
+            )
+        # The name is judged before anything runs: a member the policy
+        # refuses never runs its getter, with grants or without.
+        reg = policy._find_registration_for(obj)
+        allowed, check_value = policy._member_allowed(reg, obj, attr)
+        if not allowed:
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"Attribute '{attr}' is not accessible on '{type(obj).__name__}'{loc}"
+            )
+
+        # Intercept str.format / str.format_map to block field traversal
+        if isinstance(obj, str) and attr in ("format", "format_map"):
+            if attr == "format":
+
+                def safe_format(*args: Any, **kwargs: Any) -> str:
+                    return _safe_formatter.vformat(obj, args, kwargs)
+
+                return safe_format
+            else:
+
+                def safe_format_map(mapping: Any) -> str:
+                    return _safe_formatter.vformat(obj, (), mapping)
+
+                return safe_format_map
+
+        # The introspection dunders are readable for the string they
+        # describe the object with, and for nothing else. Resolution is
+        # static, so no attribute code the host wrote runs on the way to
+        # the answer, and the answer counts only if it is an exact str --
+        # a str subclass carries an attribute surface of its own. None
+        # passes for `__doc__` alone, where it is the ordinary answer for
+        # an object with no docstring; a name, a qualified name, and a
+        # module are strings or they are nothing.
+        if attr in INTROSPECTION_DUNDERS:
+            value = _static_introspection_value(obj, attr)
+            if type(value) is str or (value is None and attr == "__doc__"):
+                return value
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"Attribute '{attr}' is not accessible on '{type(obj).__name__}'{loc}"
+            )
+
+        # A module's metadata, read as data or not at all (see
+        # MODULE_METADATA_DUNDERS); the policy let it this far only for a
+        # module.
+        if attr in MODULE_METADATA_DUNDERS:
+            value = module_metadata(obj, attr)
+            if value is not NO_METADATA:
+                return value
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"Attribute '{attr}' is not accessible on '{type(obj).__name__}'{loc}"
+            )
+
+        # A getter -- a property, a module's __getattr__ -- is host code the
+        # registration vouches for as it does the methods, so it runs under
+        # the grants a call of this member would. A read that runs nothing
+        # takes none, which keeps a host_time registration's plain reads
+        # from pausing the clock.
+        grants = _member_grants(reg, attr)
+        if any(grants) and _resolution_runs_code(obj, attr):
+            with ExitStack() as stack:
+                _enter_grants(stack, *grants)
+                value = getattr(obj, attr)
+        else:
+            value = getattr(obj, attr)
+        if check_value and not policy._member_value_allowed(value):
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"Attribute '{attr}' is not accessible on '{type(obj).__name__}'{loc}"
+            )
+        if callable(value):
+            return _maybe_wrap_privileged(value, reg, attr)
+        return value
+
+    def __st_setattr__(obj: Any, attr: str, value: Any) -> None:
+        if isinstance(obj, _ExecModule):
+            raise obj._st_refuse_write(attr)
+        # The introspection dunders are readable, not writable: renaming or
+        # re-documenting an object the sandbox was merely handed is a write
+        # to host state, and the read is what sandboxed code asked for.
+        if (
+            attr in INTROSPECTION_DUNDERS
+            or attr in MODULE_METADATA_DUNDERS
+            or not policy.is_attr_allowed(obj, attr)
+        ):
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"Cannot set attribute '{attr}' on '{type(obj).__name__}'{loc}"
+            )
+        setattr(obj, attr, value)
+
+    def __st_delattr__(obj: Any, attr: str) -> None:
+        if isinstance(obj, _ExecModule):
+            raise obj._st_refuse_write(attr)
+        if (
+            attr in INTROSPECTION_DUNDERS
+            or attr in MODULE_METADATA_DUNDERS
+            or not policy.is_attr_allowed(obj, attr)
+        ):
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise AttributeError(
+                f"Cannot delete attribute '{attr}' on '{type(obj).__name__}'{loc}"
+            )
+        delattr(obj, attr)
+
+    def __st_import__(
+        module_name: str, *, alias: str | None = None, _depth: int = 0
+    ) -> Any:
+        # _depth offsets the caller-frame walks below by the number of extra
+        # frames between user code and here (1 when __st_dynimport__ calls
+        # through), so line numbers and the __main__ proxy still read the
+        # sandboxed frame rather than an intermediate gate frame.
+        # Synthetic safe `sys` (stdin/stdout/stderr/argv) when provided —
+        # takes precedence over the policy so `import sys` returns it
+        # rather than being blocked. Safe by construction (see SandboxSys).
+        if _sandbox_sys is not None and module_name == "sys":
+            return _sandbox_sys
+
+        # Modules the embedder handed to this execution resolve ahead of
+        # the policy allowlist. A name that collides with a grant is
+        # refused when the execution starts, so the order settles only
+        # which gate reports a name neither side owns.
+        exec_mod = exec_modules.get(module_name)
+        if exec_mod is not None:
+            return exec_mod
+
+        # Try policy-registered modules first
+        if policy.is_import_allowed(module_name):
+            if alias is not None:
+                return policy.resolve_module(module_name)
+            top_level = module_name.split(".")[0]
+            return policy.resolve_module(top_level)
+
+        # Try VFS modules (with package chain for dotted imports)
+        if alias is not None or "." not in module_name:
+            mod = vfs.resolve_module(module_name)
+        else:
+            mod = vfs.ensure_package_chain(module_name)
+        if mod is not None:
+            return mod
+
+        # "import main" / "import __main__" — return a namespace proxy so
+        # that LLM-generated code like "from main import X" works when X is
+        # already available in the sandbox globals.
+        if module_name in ("main", "__main__"):
+            caller_globals = sys._getframe(1 + _depth).f_globals
+            proxy = types.ModuleType(module_name)
+            proxy.__dict__.update(
+                {
+                    k: v
+                    for k, v in caller_globals.items()
+                    if not k.startswith("__st_") and k != "__builtins__"
+                }
+            )
+            return proxy
+
+        lineno = _caller_lineno(2 + _depth)
+        loc = f" (line {lineno})" if lineno else ""
+        raise ImportError(_import_error_message(module_name) + loc)
+
+    def __st_importfrom__(
+        module_name: str, name: str, *, _level: int = 0, _depth: int = 0
+    ) -> Any:
+        # Sandbox internals are never importable from anything, a granted
+        # module included. `__builtins__` holds the real `__import__`
+        # (parked there for C extensions) and the `__st_*` gates are the
+        # enforcement machinery itself; both live in the globals of every
+        # module the sandbox runs, so a from-import that reached them
+        # would hand user code the keys to the sandbox. Reading either as
+        # a bare name is refused by the rewriter and as an attribute by
+        # the attribute gate; this is the third door. Sandbox-run modules
+        # (workspace modules and the `main` proxy) go further and export
+        # no dunder at all -- see _module_export.
+        if name == "__builtins__" or name.startswith("__st_"):
+            raise ImportError(
+                f"cannot import name '{name}' from '{module_name}': "
+                "sandbox internals are not importable"
+            )
+
+        # `from sys import stdin, argv, ...` — mirror the __st_import__
+        # synthetic-sys branch (sys is otherwise blocked by policy).
+        if _sandbox_sys is not None and module_name == "sys":
+            if hasattr(_sandbox_sys, name):
+                return getattr(_sandbox_sys, name)
+            raise ImportError(f"cannot import name '{name}' from 'sys'")
+
+        exec_mod = exec_modules.get(module_name)
+        if exec_mod is not None:
+            # Straight out of the instance dict: the exposed set is the
+            # mapping the embedder wrote, and `getattr` would answer for
+            # the module type's own names on top of it.
+            if name in exec_mod._st_exposed:
+                return exec_mod.__dict__[name]
+            raise ImportError(f"cannot import name '{name}' from '{module_name}'")
+
+        if _level > 0:
+            # Relative import — resolve against caller's __file__
+            caller_file = sys._getframe(1 + _depth).f_globals.get("__file__", "")
+            base_dir = posixpath.dirname(caller_file)
+            for _ in range(_level - 1):
+                base_dir = posixpath.dirname(base_dir)
+            # base_dir is an absolute VFS path, but dotted module names
+            # are relative to the module root — strip it before dotting
+            # or resolve_module would prepend the root a second time.
+            if vfs._root and base_dir.startswith(vfs._root):
+                base_dir = base_dir[len(vfs._root) :]
+
+            if module_name:
+                # from .foo import bar → resolve foo relative to base_dir
+                abs_path = base_dir + "/" + module_name.replace(".", "/")
+                abs_module = abs_path.lstrip("/").replace("/", ".")
+            else:
+                # from . import bar → treat bar as a sub-module of base_dir
+                abs_parts = base_dir.strip("/")
+                abs_module = (
+                    (abs_parts.replace("/", ".") + "." + name) if abs_parts else name
+                )
+
+            mod = vfs.resolve_module(abs_module if module_name else abs_module)
+            if mod is not None:
+                if not module_name:
+                    # from . import bar → return the module itself
+                    return mod
+                value = _module_export(mod, name)
+                if value is not _MISSING:
+                    return value
+                raise ImportError(f"cannot import name '{name}' from '{abs_module}'")
+            raise ImportError(
+                f"No module named '{abs_module}' (resolved from relative import)"
+            )
+
+        # Try policy first
+        if policy.is_import_allowed(module_name):
+            # Find effective registration by name to support submodules
+            # of recursive registrations (e.g. from os.path import join
+            # when only os is registered with recursive=True).
+            reg = policy.modules.get(module_name)
+            if reg is None:
+                parts = module_name.split(".")
+                for i in range(len(parts) - 1, 0, -1):
+                    parent = ".".join(parts[:i])
+                    p_reg = policy.modules.get(parent)
+                    if p_reg and p_reg.recursive:
+                        reg = p_reg
+                        break
+            # Resolving the name can run the module's own code (a module
+            # __getattr__, a submodule's first import), which runs under
+            # the member's grants as a getter does. A from-import resolves
+            # once per statement, so it takes them without first asking
+            # whether anything will run.
+            with ExitStack() as stack:
+                _enter_grants(stack, *_member_grants(reg, name))
+                value = policy.resolve_module_member(module_name, name)
+            return _maybe_wrap_privileged(value, reg, name)
+
+        # Try VFS modules
+        mod = vfs.resolve_module(module_name)
+        if mod is not None:
+            value = _module_export(mod, name)
+            if value is not _MISSING:
+                return value
+            # name might be a sub-module (from pkg import sub)
+            sub = vfs.resolve_module(module_name + "." + name)
+            if sub is not None:
+                return sub
+            raise ImportError(f"cannot import name '{name}' from '{module_name}'")
+
+        # module_name might be a package directory without __init__.py
+        sub = vfs.resolve_module(module_name + "." + name)
+        if sub is not None:
+            return sub
+
+        # "from main import X" / "from __main__ import X" — resolve from
+        # the sandbox namespace.  LLMs frequently attempt this pattern to
+        # import globals that are already available in the execution scope.
+        if module_name in ("main", "__main__"):
+            caller_globals = sys._getframe(1 + _depth).f_globals
+            if not (name.startswith("__") and name.endswith("__")):
+                if name in caller_globals:
+                    return caller_globals[name]
+
+        lineno = _caller_lineno(2 + _depth)
+        loc = f" (line {lineno})" if lineno else ""
+        raise ImportError(_import_error_message(module_name) + loc)
+
+    def _submodule_exists(full_name: str) -> bool:
+        """Does *full_name* exist as an importable submodule?
+
+        Existence only -- permission is the caller's business.  This is what
+        separates an absent fromlist entry (tolerated, as CPython tolerates
+        it) from one that exists but fails to load (must propagate).
+        """
+        try:
+            return importlib.util.find_spec(full_name) is not None
+        except (ImportError, AttributeError, ValueError):
+            return False
+
+    def _vfs_package(name: str, fromlist: Any) -> Any:
+        """Resolve a VFS package *directory* named *name*, if there is one.
+
+        ``ensure_package_chain`` only builds parent packages for a *dotted*
+        target, so drive it with a fromlist entry and then walk back down to
+        the package the caller actually asked for.  Returns None when no
+        entry names a real module; failures raised by a module's own body
+        propagate.
+        """
+        for entry in fromlist:
+            if not isinstance(entry, str) or entry == "*":
+                continue
+            top = vfs.ensure_package_chain(f"{name}.{entry}")
+            if top is None:
+                continue
+            obj = top
+            for part in name.split(".")[1:]:
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        return None
+
+    def __st_dynimport__(
+        name: str,
+        globals: Any = None,
+        locals: Any = None,
+        fromlist: Any = (),
+        level: int = 0,
+    ) -> Any:
+        """Policy-gated ``__import__`` for sandboxed code.
+
+        The rewriter redirects every source-level read of ``__import__``
+        here (see ``Rewriter.visit_Name``), so a computed import name lands
+        on the same policy check as an ``import`` statement.  This is safe
+        because the two lookups are genuinely separate in CPython: the
+        ``import`` statement resolves ``__import__`` from the frame's
+        *builtins*, where the real one stays parked for C extensions, while
+        a source-level ``__import__`` is an ordinary name load.  Gating the
+        latter therefore never touches library internals.
+
+        ``globals``/``locals`` are accepted for signature compatibility and
+        ignored -- CPython consults them only to resolve ``level > 0``,
+        which this gate declines.
+        """
+        if level:
+            lineno = _caller_lineno()
+            loc = f" (line {lineno})" if lineno else ""
+            raise ImportError(
+                "Relative __import__ (level > 0) is not supported; use a "
+                f"'from . import ...' statement instead{loc}"
+            )
+
+        if not fromlist:
+            # Bare __import__('a.b') binds the top-level package, which is
+            # exactly __st_import__'s no-alias branch.
+            return __st_import__(name, _depth=1)
+
+        # With a non-empty fromlist CPython returns the module named by
+        # `name` itself; passing the name as its own alias selects that
+        # branch of __st_import__.
+        try:
+            mod = __st_import__(name, alias=name, _depth=1)
+        except ImportError:
+            # A VFS *package directory* doesn't resolve that way: packages
+            # are built by ensure_package_chain, not found as <name>.py.
+            # `from pkg import sub` already works, so the dynamic spelling
+            # of the same import must not be stricter.
+            mod = _vfs_package(name, fromlist)
+            if mod is None:
+                raise
+
+        # CPython also imports each fromlist entry that turns out to be a
+        # submodule, binding it on the parent -- do the same so that
+        # __import__('PIL', fromlist=['Image']).Image resolves for packages
+        # whose __init__ doesn't eager-import its submodules.
+        for entry in fromlist:
+            if not isinstance(entry, str) or entry == "*" or hasattr(mod, entry):
+                continue
+            full = f"{name}.{entry}"
+            if vfs.resolve_module(full) is not None:
+                continue  # VFS submodule; resolving it attached it
+            if not policy.is_import_allowed(full) or not _submodule_exists(full):
+                # Absent or ungranted.  CPython tolerates absent fromlist
+                # entries, and `__import__(m, fromlist=['dummy'])` is a
+                # standard idiom for "give me the leaf, not the top
+                # package".  A denied name resurfaces on the attribute
+                # access that follows, which the policy gates in its own
+                # right.
+                continue
+            # It exists and is granted, so anything raised while loading it
+            # is a real failure -- a missing dependency, an error in its
+            # body, or a StTimeout/StCancelled from a checkpoint (those are
+            # plain Exception subclasses, see errors.StError).  Reducing any
+            # of those to a silent success is how the statement form and
+            # this one drift apart.  Deliberately uncaught.
+            __st_importfrom__(name, entry, _depth=1)
+        return mod
+
+    # Mutable boxes so checkpoint state can be reset for direct calls
+    _tick_counter = [0]
+    _start_time_box = [_start_time]
+    _cancel_flag_box = [_cancel_flag]
+    _memory_box = [_memory_limit_bytes, _start_rss]
+    _in_exec_box = [True]  # True during sb.exec(), False after
+    _callback_depth = [0]  # Tracks nesting depth of callback invocations
+    _host_clock = HostClock(_start_time_box)
+
+    def __st_checkpoint__() -> None:
+        if _cancel_flag_box[0] is not None and _cancel_flag_box[0].is_set():
+            raise StCancelled("Execution cancelled")
+        _tick_counter[0] += 1
+        if policy.tick_limit is not None and _tick_counter[0] > policy.tick_limit:
+            raise StTickLimit(f"Execution exceeded {policy.tick_limit} tick limit")
+        # Paused while a host call is outstanding: what runs then is
+        # sandboxed code the host called back, and the host's time is
+        # not the code's. Ticks still count it.
+        if (
+            _start_time_box[0] is not None
+            and timeout is not None
+            and not _host_clock.paused
+        ):
+            if time.monotonic() - _start_time_box[0] > timeout:
+                raise StTimeout(f"Execution exceeded {timeout}s timeout")
+        if _memory_box[0] is not None and _memory_box[1] is not None:
+            if get_rss_bytes() - _memory_box[1] > _memory_box[0]:
+                raise MemoryError(
+                    f"Execution exceeded {policy.memory_limit}MB memory limit"
+                )
+
+    def __st_capture_context__(fn: Any) -> Any:
+        """Wrap a callable to restore sandbox ContextVars when called outside exec.
+
+        Used in raw mode to ensure that callbacks (NiceGUI on_click, on_change,
+        etc.) retain filesystem and network isolation even though they fire in a
+        different asyncio Task after sb.exec() has returned.
+
+        Captures the current ``current_fs`` and ``network_allowed`` values at
+        decoration time and restores them on every call.  Also resets the
+        checkpoint timer and tick counter so each callback gets a fresh budget.
+        """
+        captured_fs = current_fs.get(None)
+        captured_net = network_allowed.get()
+
+        # No restrictions active — skip wrapping entirely.
+        if captured_fs is None and captured_net:
+            return fn
+
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                if not _in_exec_box[0] and _callback_depth[0] == 0:
+                    _tick_counter[0] = 0
+                    _start_time_box[0] = time.monotonic()
+                _callback_depth[0] += 1
+                tok_fs = (
+                    current_fs.set(captured_fs) if captured_fs is not None else None
+                )
+                tok_net = network_allowed.set(captured_net)
+                tok_clock = current_clock.set(_host_clock)
+                try:
+                    return await fn(*args, **kwargs)
+                finally:
+                    _callback_depth[0] -= 1
+                    current_clock.reset(tok_clock)
+                    network_allowed.reset(tok_net)
+                    if tok_fs is not None:
+                        current_fs.reset(tok_fs)
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                if not _in_exec_box[0] and _callback_depth[0] == 0:
+                    _tick_counter[0] = 0
+                    _start_time_box[0] = time.monotonic()
+                _callback_depth[0] += 1
+                tok_fs = (
+                    current_fs.set(captured_fs) if captured_fs is not None else None
+                )
+                tok_net = network_allowed.set(captured_net)
+                tok_clock = current_clock.set(_host_clock)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _callback_depth[0] -= 1
+                    current_clock.reset(tok_clock)
+                    network_allowed.reset(tok_net)
+                    if tok_fs is not None:
+                        current_fs.reset(tok_fs)
+
+            return wrapper
+
+    gates["__st_tick_counter__"] = _tick_counter
+    gates["__st_start_time__"] = _start_time_box
+    gates["__st_cancel_flag__"] = _cancel_flag_box
+    gates["__st_memory__"] = _memory_box
+    gates["__st_in_exec__"] = _in_exec_box
+    gates["__st_host_clock__"] = _host_clock
+    gates.update(
+        {
+            "__st_getattr__": __st_getattr__,
+            "__st_setattr__": __st_setattr__,
+            "__st_delattr__": __st_delattr__,
+            "__st_import__": __st_import__,
+            "__st_importfrom__": __st_importfrom__,
+            "__st_dynimport__": __st_dynimport__,
+            "__st_checkpoint__": __st_checkpoint__,
+            "__st_capture_context__": __st_capture_context__,
+            "__st_vfs__": vfs,
+            "__st_exec_modules__": exec_modules,
+        }
+    )
+    return gates

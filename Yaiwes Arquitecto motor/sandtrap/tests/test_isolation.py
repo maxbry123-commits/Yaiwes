@@ -1,0 +1,1171 @@
+"""Integration tests for kernel-level isolation.
+
+These tests fork a child process, apply isolation, and verify that
+forbidden operations are actually blocked by the kernel — not just
+by sandtrap's Python-level policy.
+"""
+
+import multiprocessing
+import multiprocessing.connection
+import os
+import signal
+import sys
+from unittest.mock import ANY, patch
+
+import pytest
+
+import sandtrap.process.sandbox
+
+
+def _run_in_child(fn, *args):
+    """Fork a child, run fn(*args), return (exitcode, result_from_pipe)."""
+    parent_conn, child_conn = multiprocessing.Pipe()
+    ctx = multiprocessing.get_context("fork")
+    p = ctx.Process(target=_child_wrapper, args=(child_conn, fn, args), daemon=True)
+    p.start()
+    child_conn.close()
+    p.join(timeout=10)
+    try:
+        result = parent_conn.recv() if parent_conn.poll(0.1) else None
+    except EOFError:
+        result = None
+    parent_conn.close()
+    return p.exitcode, result
+
+
+def _child_wrapper(conn, fn, args):
+    try:
+        result = fn(*args)
+        conn.send(result)
+    except BaseException as e:
+        conn.send(("error", type(e).__name__, str(e)))
+
+
+def _try_writable(backend, root, writable, outside):
+    """Apply *backend* to *root* with *writable* kept writable, then write
+    a file in *writable* (must work) and in *outside* (must be refused)."""
+    import importlib
+
+    apply = importlib.import_module(f"sandtrap.process.{backend}").apply
+    if not apply(root, writable=(writable,)):
+        return ("skipped", f"{backend} not available")
+    try:
+        with open(os.path.join(writable, "spooled.pkl"), "wb") as f:
+            f.write(b"x")
+    except PermissionError:
+        return ("fail", "write in the writable directory was refused")
+    try:
+        with open(os.path.join(outside, "escaped.pkl"), "wb") as f:
+            f.write(b"x")
+        return ("fail", "write outside root and writable succeeded")
+    except PermissionError:
+        return ("ok", "writable directory open, the rest still restricted")
+
+
+def _writable_case(tmp_path, backend):
+    dirs = []
+    for name in ("root", "spool", "outside"):
+        d = tmp_path / name
+        d.mkdir()
+        dirs.append(os.path.realpath(d))
+    exitcode, result = _run_in_child(_try_writable, backend, *dirs)
+    assert exitcode == 0, f"child crashed with exit code {exitcode}"
+    status, msg = result[0], result[1]
+    if status == "skipped":
+        pytest.skip(msg)
+    assert status == "ok", msg
+    assert os.path.exists(os.path.join(dirs[1], "spooled.pkl"))
+
+
+# =====================================================================
+# Landlock (Linux)
+# =====================================================================
+
+
+def _landlock_try_read_outside(root):
+    """Apply Landlock to root, then try to read /etc/hostname."""
+    from sandtrap.process.landlock import apply
+
+    applied = apply(root)
+    if not applied:
+        return ("skipped", "landlock not available")
+
+    try:
+        with open("/etc/hostname") as f:
+            f.read()
+        return ("fail", "read outside root succeeded — landlock did not block")
+    except PermissionError:
+        return ("ok", "read outside root blocked by landlock")
+    except FileNotFoundError:
+        return ("skipped", "/etc/hostname does not exist")
+
+
+def _landlock_try_read_inside(root):
+    """Apply Landlock to root, then read a file inside root."""
+    from sandtrap.process.landlock import apply
+
+    # Create a test file before applying Landlock
+    test_file = os.path.join(root, "test.txt")
+    with open(test_file, "w") as f:
+        f.write("inside")
+
+    applied = apply(root)
+    if not applied:
+        return ("skipped", "landlock not available")
+
+    try:
+        with open(test_file) as f:
+            content = f.read()
+        if content == "inside":
+            return ("ok", "read inside root allowed")
+        return ("fail", f"unexpected content: {content!r}")
+    except Exception as e:
+        return ("fail", f"read inside root blocked: {e}")
+
+
+def _landlock_skipped_when_host_fs(root):
+    """Apply via platform with allow_host_fs=True — Landlock should not apply."""
+    from sandtrap.process.platform import _apply_linux
+    from sandtrap.sandbox import IsolationStatus
+
+    _apply_linux(IsolationStatus(requested=True), root, allow_host_fs=True)
+
+    # If Landlock was skipped, we can read outside root
+    try:
+        with open("/etc/hostname") as f:
+            f.read()
+        return ("ok", "host fs accessible — Landlock correctly skipped")
+    except PermissionError:
+        return ("fail", "read blocked — Landlock should not have applied")
+    except FileNotFoundError:
+        return ("skipped", "/etc/hostname does not exist")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Landlock is Linux-only")
+class TestLandlock:
+    def test_keeps_a_writable_directory_writable(self, tmp_path):
+        _writable_case(tmp_path, "landlock")
+
+    def test_blocks_read_outside_root(self, tmp_path):
+        exitcode, result = _run_in_child(_landlock_try_read_outside, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_allows_read_inside_root(self, tmp_path):
+        exitcode, result = _run_in_child(_landlock_try_read_inside, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_skipped_when_host_fs_allowed(self, tmp_path):
+        """Landlock is not applied when allow_host_fs=True."""
+        exitcode, result = _run_in_child(_landlock_skipped_when_host_fs, str(tmp_path))
+        if exitcode != 0:
+            # Killed by seccomp — need to run without seccomp
+            pytest.skip(f"child killed (exit {exitcode})")
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+
+# =====================================================================
+# seccomp (Linux)
+# =====================================================================
+
+
+def _seccomp_try_execve():
+    """Apply seccomp filter, then try to exec a process."""
+    from sandtrap.process.seccomp import apply
+
+    applied = apply()
+    if not applied:
+        return ("skipped", "seccomp not available")
+
+    try:
+        os.execve("/bin/true", ["/bin/true"], {})
+        return ("fail", "execve succeeded — seccomp did not block")
+    except OSError:
+        return ("ok", "execve blocked by seccomp")
+
+
+def _seccomp_allows_file_io(root):
+    """Apply seccomp filter, verify file I/O still works."""
+    from sandtrap.process.seccomp import apply
+
+    test_file = os.path.join(root, "test.txt")
+    with open(test_file, "w") as f:
+        f.write("hello")
+
+    applied = apply()
+    if not applied:
+        return ("skipped", "seccomp not available")
+
+    try:
+        with open(test_file) as f:
+            content = f.read()
+        if content == "hello":
+            return ("ok", "file I/O works under seccomp")
+        return ("fail", f"unexpected content: {content!r}")
+    except Exception as e:
+        return ("fail", f"file I/O blocked by seccomp: {e}")
+
+
+def _seccomp_try_socket_with_network():
+    """Apply seccomp with allow_network=True, then try creating a socket."""
+    import socket
+
+    from sandtrap.process.seccomp import apply
+
+    applied = apply(allow_network=True)
+    if not applied:
+        return ("skipped", "seccomp not available")
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.close()
+        return ("ok", "socket creation allowed with allow_network=True")
+    except OSError as e:
+        return ("fail", f"socket creation blocked: {e}")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="seccomp is Linux-only")
+class TestSeccomp:
+    def test_blocks_execve(self):
+        exitcode, result = _run_in_child(_seccomp_try_execve)
+        # Child may be killed by seccomp (SIGSYS = -31) or return an error
+        if exitcode != 0:
+            # Killed by seccomp — that's the expected behavior
+            return
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_allows_file_io(self, tmp_path):
+        exitcode, result = _run_in_child(_seccomp_allows_file_io, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_allows_network_when_enabled(self):
+        """seccomp with allow_network=True permits socket creation."""
+        exitcode, result = _run_in_child(_seccomp_try_socket_with_network)
+        if exitcode != 0:
+            # Killed by seccomp — that's a failure for this test
+            pytest.fail(
+                f"child killed (exit {exitcode}) — network syscalls not allowed"
+            )
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+
+# =====================================================================
+# Seatbelt (macOS)
+# =====================================================================
+
+
+def _seatbelt_try_read_outside(root):
+    """Apply Seatbelt to root, then try to read outside root."""
+    from sandtrap.process.seatbelt import apply
+
+    applied = apply(root)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    # /etc/hosts exists on all macOS
+    try:
+        with open("/etc/hosts") as f:
+            f.read()
+        return ("fail", "read outside root succeeded — seatbelt did not block")
+    except PermissionError:
+        return ("ok", "read outside root blocked by seatbelt")
+
+
+def _seatbelt_try_read_inside(root):
+    """Apply Seatbelt to root, then read a file inside root."""
+    from sandtrap.process.seatbelt import apply
+
+    test_file = os.path.join(root, "test.txt")
+    with open(test_file, "w") as f:
+        f.write("inside")
+
+    applied = apply(root)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    try:
+        with open(test_file) as f:
+            content = f.read()
+        if content == "inside":
+            return ("ok", "read inside root allowed")
+        return ("fail", f"unexpected content: {content!r}")
+    except Exception as e:
+        return ("fail", f"read inside root blocked: {e}")
+
+
+def _seatbelt_try_network(root):
+    """Apply Seatbelt to root, then try a network connection."""
+    import socket
+
+    from sandtrap.process.seatbelt import apply
+
+    applied = apply(root)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("1.1.1.1", 80))
+        s.close()
+        return ("fail", "network connect succeeded — seatbelt did not block")
+    except (PermissionError, OSError):
+        return ("ok", "network connect blocked by seatbelt")
+
+
+def _seatbelt_try_network_allowed(root):
+    """Apply Seatbelt with allow_network=True, then try a socket."""
+    import socket
+
+    from sandtrap.process.seatbelt import apply
+
+    applied = apply(root, allow_network=True)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    try:
+        # Just create and immediately close a socket — enough to verify
+        # the kernel isn't blocking socket creation
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.close()
+        return ("ok", "socket creation allowed by seatbelt")
+    except PermissionError:
+        return ("fail", "socket creation blocked — allow_network=True not effective")
+
+
+def _seatbelt_try_host_fs_allowed(root):
+    """Apply Seatbelt with allow_host_fs=True, then read outside root."""
+    from sandtrap.process.seatbelt import apply
+
+    applied = apply(root, allow_host_fs=True)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    try:
+        with open("/etc/hosts") as f:
+            content = f.read()
+        if content:
+            return ("ok", "host fs read allowed by seatbelt")
+        return ("fail", "empty content")
+    except PermissionError:
+        return ("fail", "read outside root blocked — allow_host_fs=True not effective")
+
+
+def _seatbelt_try_host_fs_allowed_network_denied(root):
+    """Apply Seatbelt with allow_host_fs=True but allow_network=False."""
+    import socket
+
+    from sandtrap.process.seatbelt import apply
+
+    applied = apply(root, allow_host_fs=True, allow_network=False)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    # Host FS should be accessible
+    try:
+        with open("/etc/hosts") as f:
+            f.read()
+    except PermissionError:
+        return ("fail", "host fs read blocked — allow_host_fs=True not effective")
+
+    # Network should still be blocked
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("1.1.1.1", 80))
+        s.close()
+        return ("fail", "network connect succeeded — should be blocked")
+    except (PermissionError, OSError):
+        return ("ok", "host fs allowed, network blocked")
+
+
+def _seatbelt_try_no_root(tmp_dir):
+    """Apply Seatbelt with root=None — FS should be unrestricted."""
+    from sandtrap.process.seatbelt import apply
+
+    applied = apply(None)
+    if not applied:
+        return ("skipped", "seatbelt not available")
+
+    try:
+        with open("/etc/hosts") as f:
+            content = f.read()
+        if content:
+            return ("ok", "host fs read allowed when root=None")
+        return ("fail", "empty content")
+    except PermissionError:
+        return ("fail", "read blocked — root=None should leave FS unrestricted")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+class TestSeatbelt:
+    def test_keeps_a_writable_directory_writable(self, tmp_path):
+        _writable_case(tmp_path, "seatbelt")
+
+    def test_blocks_read_outside_root(self, tmp_path):
+        exitcode, result = _run_in_child(_seatbelt_try_read_outside, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_allows_read_inside_root(self, tmp_path):
+        exitcode, result = _run_in_child(_seatbelt_try_read_inside, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_blocks_network(self, tmp_path):
+        exitcode, result = _run_in_child(_seatbelt_try_network, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_allows_network_when_enabled(self, tmp_path):
+        exitcode, result = _run_in_child(_seatbelt_try_network_allowed, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_allows_host_fs_when_enabled(self, tmp_path):
+        exitcode, result = _run_in_child(_seatbelt_try_host_fs_allowed, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_host_fs_allowed_but_network_denied(self, tmp_path):
+        """allow_host_fs=True does not inadvertently allow network."""
+        exitcode, result = _run_in_child(
+            _seatbelt_try_host_fs_allowed_network_denied, str(tmp_path)
+        )
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+    def test_no_root_leaves_fs_unrestricted(self, tmp_path):
+        """root=None means no filesystem restriction."""
+        exitcode, result = _run_in_child(_seatbelt_try_no_root, str(tmp_path))
+        assert exitcode == 0, f"child crashed with exit code {exitcode}"
+        status, msg = result[0], result[1]
+        if status == "skipped":
+            pytest.skip(msg)
+        assert status == "ok", msg
+
+
+# =====================================================================
+# Platform dispatch (apply_isolation)
+# =====================================================================
+
+
+class TestApplyIsolation:
+    def test_mode_none_is_noop(self):
+        """isolation='none' skips all kernel-level restrictions."""
+        from sandtrap.process.platform import apply_isolation
+
+        # Should not raise or call any platform-specific code
+        apply_isolation("none", "/tmp/test")
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux-only")
+    def test_auto_dispatches_to_linux(self, tmp_path):
+        """apply_isolation('auto') calls _apply_linux on Linux."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_linux") as mock:
+            apply_isolation("auto", str(tmp_path))
+            mock.assert_called_once_with(
+                ANY,
+                str(tmp_path),
+                allow_network=False,
+                allow_host_fs=False,
+                writable=(),
+            )
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only")
+    def test_auto_dispatches_to_darwin(self, tmp_path):
+        """apply_isolation('auto') calls _apply_darwin on macOS."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_darwin") as mock:
+            apply_isolation("auto", str(tmp_path))
+            mock.assert_called_once_with(
+                ANY,
+                str(tmp_path),
+                allow_network=False,
+                allow_host_fs=False,
+                writable=(),
+            )
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only")
+    def test_allow_network_forwarded_to_darwin(self, tmp_path):
+        """apply_isolation forwards allow_network to platform function."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_darwin") as mock:
+            apply_isolation("auto", str(tmp_path), allow_network=True)
+            mock.assert_called_once_with(
+                ANY, str(tmp_path), allow_network=True, allow_host_fs=False, writable=()
+            )
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux-only")
+    def test_allow_network_forwarded_to_linux(self, tmp_path):
+        """apply_isolation forwards allow_network to platform function."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_linux") as mock:
+            apply_isolation("auto", str(tmp_path), allow_network=True)
+            mock.assert_called_once_with(
+                ANY, str(tmp_path), allow_network=True, allow_host_fs=False, writable=()
+            )
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only")
+    def test_allow_host_fs_forwarded_to_darwin(self, tmp_path):
+        """apply_isolation forwards allow_host_fs to platform function."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_darwin") as mock:
+            apply_isolation("auto", str(tmp_path), allow_host_fs=True, writable=())
+            mock.assert_called_once_with(
+                ANY, str(tmp_path), allow_network=False, allow_host_fs=True, writable=()
+            )
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux-only")
+    def test_allow_host_fs_forwarded_to_linux(self, tmp_path):
+        """apply_isolation forwards allow_host_fs to platform function."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_linux") as mock:
+            apply_isolation("auto", str(tmp_path), allow_host_fs=True, writable=())
+            mock.assert_called_once_with(
+                ANY, str(tmp_path), allow_network=False, allow_host_fs=True, writable=()
+            )
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only")
+    def test_both_flags_forwarded_to_darwin(self, tmp_path):
+        """apply_isolation forwards both allow_network and allow_host_fs."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_darwin") as mock:
+            apply_isolation(
+                "auto",
+                str(tmp_path),
+                allow_network=True,
+                allow_host_fs=True,
+                writable=(),
+            )
+            mock.assert_called_once_with(
+                ANY, str(tmp_path), allow_network=True, allow_host_fs=True, writable=()
+            )
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux-only")
+    def test_both_flags_forwarded_to_linux(self, tmp_path):
+        """apply_isolation forwards both allow_network and allow_host_fs."""
+        from sandtrap.process.platform import apply_isolation
+
+        with patch("sandtrap.process.platform._apply_linux") as mock:
+            apply_isolation(
+                "auto",
+                str(tmp_path),
+                allow_network=True,
+                allow_host_fs=True,
+                writable=(),
+            )
+            mock.assert_called_once_with(
+                ANY, str(tmp_path), allow_network=True, allow_host_fs=True, writable=()
+            )
+
+    def test_root_none_forwarded(self):
+        """apply_isolation passes root=None through to platform function."""
+        from sandtrap.process.platform import apply_isolation
+
+        platform_fn = (
+            "sandtrap.process.platform._apply_darwin"
+            if sys.platform == "darwin"
+            else "sandtrap.process.platform._apply_linux"
+        )
+        with patch(platform_fn) as mock:
+            apply_isolation("auto", None, allow_network=True)
+            mock.assert_called_once_with(
+                ANY, None, allow_network=True, allow_host_fs=False, writable=()
+            )
+
+
+# =====================================================================
+# IsolationStatus / fail-closed behaviour
+# =====================================================================
+
+
+class TestIsolationStatus:
+    def test_not_requested_never_degraded(self):
+        from sandtrap.sandbox import IsolationStatus
+
+        # process mode: no kernel restrictions requested, so no shortfall.
+        assert IsolationStatus(requested=False).degraded is False
+
+    def test_all_applied_not_degraded(self):
+        from sandtrap.sandbox import IsolationStatus
+
+        s = IsolationStatus(
+            requested=True, platform="linux", seccomp=True, landlock=True
+        )
+        assert s.degraded is False
+
+    def test_requested_but_mechanism_unavailable_is_degraded(self):
+        from sandtrap.sandbox import IsolationStatus
+
+        s = IsolationStatus(
+            requested=True, platform="linux", seccomp=True, landlock=False
+        )
+        assert s.degraded is True
+
+    def test_requested_but_platform_offers_nothing_is_degraded(self):
+        from sandtrap.sandbox import IsolationStatus
+
+        # e.g. an unsupported platform: every flag stays None.
+        assert IsolationStatus(requested=True, platform="win32").degraded is True
+
+    def test_skipped_mechanism_none_does_not_count(self):
+        from sandtrap.sandbox import IsolationStatus
+
+        # Landlock intentionally skipped (no confined root) but seccomp applied.
+        s = IsolationStatus(
+            requested=True, platform="linux", seccomp=True, landlock=None
+        )
+        assert s.degraded is False
+
+
+def _force_kernel_unavailable(monkeypatch):
+    """Make every kernel mechanism report unavailable, so kernel mode
+    degrades on any platform.  Patched before the worker forks, so the
+    child inherits the patched module functions via fork."""
+    import sandtrap.process.landlock as landlock
+    import sandtrap.process.seatbelt as seatbelt
+    import sandtrap.process.seccomp as seccomp
+
+    monkeypatch.setattr(landlock, "apply", lambda *a, **k: False)
+    monkeypatch.setattr(seccomp, "apply", lambda *a, **k: False)
+    monkeypatch.setattr(seatbelt, "apply", lambda *a, **k: False)
+
+
+class TestFailClosedDecision:
+    """The fail-closed decision itself, exercised directly.
+
+    ``_verify_isolation`` reads a status and decides: accept, warn, or refuse.
+    It is entirely parent-side and never touches the start method, so testing
+    it through a real worker only adds a requirement the code does not have --
+    that the worker be *made* to report degraded, which needs fork's inherited
+    memory to patch. That was a property of the test, and it left the decision
+    unverified for workers created any other way.
+    """
+
+    def _sandbox(self, **kwargs):
+        from sandtrap import Policy
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        # Constructed, never entered: no worker is involved in this decision.
+        return ProcessSandbox(Policy(timeout=5.0), isolation="auto", **kwargs)
+
+    def _degraded(self):
+        from sandtrap.sandbox import IsolationStatus
+
+        return IsolationStatus(requested=True, platform="linux", seccomp=False)
+
+    def test_degraded_status_is_refused_by_default(self):
+        from sandtrap import IsolationUnavailable
+
+        with pytest.raises(IsolationUnavailable, match="could not be fully applied"):
+            self._sandbox()._verify_isolation(self._degraded())
+
+    def test_missing_status_counts_as_unconfirmed_and_refused(self):
+        """Fail-closed means unconfirmed is a failure, not a pass."""
+        from sandtrap import IsolationUnavailable
+
+        with pytest.raises(IsolationUnavailable, match="status missing"):
+            self._sandbox()._verify_isolation(None)
+
+    def test_allow_degraded_warns_instead_of_raising(self):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self._sandbox(allow_degraded=True)._verify_isolation(self._degraded())
+        assert any("reduced isolation" in str(w.message) for w in caught)
+
+    def test_a_fully_applied_status_passes_quietly(self):
+        import warnings
+
+        from sandtrap.sandbox import IsolationStatus
+
+        applied = IsolationStatus(requested=True, platform="linux", seccomp=True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self._sandbox()._verify_isolation(applied)
+        assert not caught
+
+    def test_process_mode_never_refuses(self):
+        """isolation="process" requests no kernel restrictions, so a missing
+        or degraded status is not a shortfall against anything."""
+        from sandtrap import Policy
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        sb = ProcessSandbox(Policy(timeout=5.0), isolation="none")
+        sb._verify_isolation(None)
+        sb._verify_isolation(self._degraded())
+
+
+# End-to-end wiring: the worker really does report a degraded status and the
+# parent really does act on it. Fork-only because forcing the worker's report
+# means patching this process and relying on inheritance -- the decision above
+# is what covers every start method.
+@pytest.mark.fork_only
+class TestFailClosed:
+    def test_kernel_raises_when_isolation_unavailable(self, monkeypatch):
+        """Default (allow_degraded=False): degraded kernel isolation is a
+        loud failure at worker startup, not a silent downgrade."""
+        from sandtrap import IsolationUnavailable, Policy, sandbox
+
+        _force_kernel_unavailable(monkeypatch)
+        policy = Policy(timeout=5.0, tick_limit=100_000)
+        with pytest.raises(IsolationUnavailable):
+            with sandbox(policy, isolation="kernel") as sb:
+                sb.exec("x = 1")
+
+    def test_allow_degraded_warns_and_proceeds(self, monkeypatch):
+        """allow_degraded=True downgrades the failure to a warning and
+        reports the shortfall on ExecResult.isolation."""
+        import warnings
+
+        from sandtrap import Policy, sandbox
+
+        _force_kernel_unavailable(monkeypatch)
+        policy = Policy(timeout=5.0, tick_limit=100_000)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            with sandbox(policy, isolation="kernel", allow_degraded=True) as sb:
+                result = sb.exec("x = 2")
+        assert result.namespace.get("x") == 2
+        assert result.isolation is not None
+        assert result.isolation.degraded is True
+        assert any(
+            issubclass(x.category, RuntimeWarning)
+            and "reduced isolation" in str(x.message)
+            for x in w
+        )
+
+    def test_process_mode_reports_status_not_degraded(self):
+        """isolation='process' requests no kernel restrictions, so it is
+        never degraded and never raises."""
+        from sandtrap import Policy, sandbox
+
+        policy = Policy(timeout=5.0, tick_limit=100_000)
+        with sandbox(policy, isolation="process") as sb:
+            result = sb.exec("x = 3")
+        assert result.isolation is not None
+        assert result.isolation.requested is False
+        assert result.isolation.degraded is False
+
+    def test_kernel_raises_when_status_missing(self, monkeypatch):
+        """Fail-closed on an unconfirmable status: if kernel isolation was
+        requested but the worker reports no IsolationStatus (version skew /
+        a dropped field), 'unconfirmed' is treated as failure, not a pass."""
+        import sandtrap.process.platform as platform
+        from sandtrap import IsolationUnavailable, Policy, sandbox
+
+        # Simulate a worker that hands back a bare ReadyMsg (isolation=None).
+        # The local ``from .platform import apply_isolation`` in the worker
+        # picks up this patched attribute, inherited via fork.
+        monkeypatch.setattr(platform, "apply_isolation", lambda *a, **k: None)
+        policy = Policy(timeout=5.0, tick_limit=100_000)
+        with pytest.raises(IsolationUnavailable, match="status missing"):
+            with sandbox(policy, isolation="kernel") as sb:
+                sb.exec("x = 1")
+
+    def test_missing_status_ignored_for_process_mode(self, monkeypatch):
+        """A missing status is only a failure when kernel isolation was
+        requested — process mode asks for none, so it must not raise."""
+        import sandtrap.process.platform as platform
+        from sandtrap import Policy, sandbox
+
+        monkeypatch.setattr(platform, "apply_isolation", lambda *a, **k: None)
+        policy = Policy(timeout=5.0, tick_limit=100_000)
+        with sandbox(policy, isolation="process") as sb:
+            result = sb.exec("x = 4")
+        assert result.namespace.get("x") == 4
+
+
+# =====================================================================
+# available() functions
+# =====================================================================
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only")
+class TestSeatbeltAvailable:
+    def test_available_returns_bool(self):
+        from sandtrap.process.seatbelt import available
+
+        result = available()
+        assert isinstance(result, bool)
+
+    def test_available_matches_apply(self, tmp_path):
+        """available() and apply() should agree."""
+        from sandtrap.process.seatbelt import apply, available
+
+        if not available():
+            pytest.skip("seatbelt not available")
+
+        exitcode, result = _run_in_child(
+            lambda root: ("ok", apply(root)), str(tmp_path)
+        )
+        assert exitcode == 0
+        assert result[1] is True
+
+
+class TestSeatbeltUnavailable:
+    def test_available_false_on_non_darwin(self):
+        from sandtrap.process.seatbelt import available
+
+        with patch("sandtrap.process.seatbelt.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            assert available() is False
+
+    def test_apply_false_on_non_darwin(self):
+        from sandtrap.process.seatbelt import apply
+
+        with patch("sandtrap.process.seatbelt.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            assert apply("/tmp") is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux-only")
+class TestLandlockAvailable:
+    def test_available_returns_bool(self):
+        from sandtrap.process.landlock import available
+
+        result = available()
+        assert isinstance(result, bool)
+
+
+class TestLandlockUnavailable:
+    def test_available_false_on_non_linux(self):
+        from sandtrap.process.landlock import available
+
+        with patch("sandtrap.process.landlock.sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            assert available() is False
+
+    def test_apply_false_on_non_linux(self):
+        from sandtrap.process.landlock import apply
+
+        with patch("sandtrap.process.landlock.sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            assert apply("/tmp") is False
+
+    def test_apply_warns_when_package_missing(self):
+        """apply() warns and returns False if landlock package is missing."""
+        import warnings
+
+        from sandtrap.process.landlock import apply
+
+        with patch("sandtrap.process.landlock.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            with patch.dict("sys.modules", {"landlock": None}):
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    result = apply("/tmp")
+                assert result is False
+                assert any("landlock" in str(x.message).lower() for x in w)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux-only")
+class TestSeccompAvailable:
+    def test_available_returns_bool(self):
+        from sandtrap.process.seccomp import available
+
+        result = available()
+        assert isinstance(result, bool)
+
+
+class TestSeccompUnavailable:
+    def test_available_false_on_non_linux(self):
+        from sandtrap.process.seccomp import available
+
+        with patch("sandtrap.process.seccomp.sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            assert available() is False
+
+    def test_apply_false_on_non_linux(self):
+        from sandtrap.process.seccomp import apply
+
+        with patch("sandtrap.process.seccomp.sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            assert apply() is False
+
+
+class TestInitDeathClassification:
+    """How a worker that died before ready is diagnosed.
+
+    Pure classification over an exit status, so it needs no worker and no
+    particular start method -- which matters, because the advice differs by
+    start method and driving it through a real worker hid that for a while.
+    """
+
+    class _Dead:
+        def __init__(self, exitcode):
+            self.exitcode = exitcode
+
+        def join(self, timeout=None):
+            pass
+
+    def test_a_forked_worker_crashing_natively_is_fork_hostility(self):
+        import signal
+
+        from sandtrap import StForkUnsafe
+        from sandtrap.process.sandbox import _init_death_error
+
+        error = _init_death_error(self._Dead(-signal.SIGSEGV), "fork")
+        assert isinstance(error, StForkUnsafe)
+        assert "re-forks the same host process" in str(error)
+
+    def test_a_spawned_worker_crashing_natively_is_not(self):
+        """It inherited nothing, so fork advice would send someone to fix a
+        process they aren't forking -- the misdiagnosis this test exists for."""
+        import signal
+
+        from sandtrap import StForkUnsafe
+        from sandtrap.process.sandbox import _init_death_error
+
+        for method in ("spawn", "forkserver"):
+            error = _init_death_error(self._Dead(-signal.SIGSEGV), method)
+            assert not isinstance(error, StForkUnsafe), method
+            message = str(error)
+            assert "inherited nothing" in message
+            assert "re-forks" not in message
+            assert "ARROW_DEFAULT_MEMORY_POOL" not in message  # fork-only remedy
+
+    def test_a_clean_nonzero_exit_is_never_fork_hostility(self):
+        from sandtrap import StForkUnsafe
+        from sandtrap.process.sandbox import _init_death_error
+
+        for method in ("fork", "spawn"):
+            error = _init_death_error(self._Dead(1), method)
+            assert not isinstance(error, StForkUnsafe)
+            assert "stderr" in str(error)
+
+    def test_an_external_kill_says_so(self):
+        import signal
+
+        from sandtrap.process.sandbox import _init_death_error
+
+        error = _init_death_error(self._Dead(-signal.SIGKILL), "fork")
+        assert "out-of-memory killer or a supervisor" in str(error)
+
+
+# Patches the parent and relies on fork to carry it into the child; a
+# spawned worker re-imports pristine modules and never sees it.
+@pytest.mark.fork_only
+class TestForkUnsafeError:
+    """A worker that dies before ReadyMsg must be named, not looped on.
+
+    Respawning re-forks the same host process, so this condition never
+    clears on its own (issue #33). The error has to say so.
+    """
+
+    def _sandbox(self):
+        from sandtrap import Policy
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        return ProcessSandbox(Policy(timeout=5.0))
+
+    def test_init_death_raises_st_fork_unsafe(self):
+        """Simulate the fork-hostile signature: child dies before ready."""
+        from sandtrap import StForkUnsafe
+
+        sb = self._sandbox()
+        # EOF before ReadyMsg with a crash signal is what a child that dies
+        # in fork-broken C-library setup produces.
+        with patch.object(
+            multiprocessing.connection.Connection, "recv", side_effect=EOFError
+        ):
+            with patch.object(
+                sandtrap.process.sandbox, "_exit_signal", return_value=signal.SIGSEGV
+            ):
+                with pytest.raises(StForkUnsafe) as exc:
+                    sb.__enter__()
+        sb.shutdown()
+
+        msg = str(exc.value)
+        assert "died during initialisation" in msg
+        assert "Respawning will not clear this" in msg
+        assert "ARROW_DEFAULT_MEMORY_POOL" in msg
+        assert 'isolation="none"' in msg
+
+    def test_stays_catchable_as_runtime_error(self):
+        """This path raised a bare RuntimeError before; keep that working."""
+        sb = self._sandbox()
+        with patch.object(
+            multiprocessing.connection.Connection, "recv", side_effect=EOFError
+        ):
+            with patch.object(
+                sandtrap.process.sandbox, "_exit_signal", return_value=signal.SIGSEGV
+            ):
+                with pytest.raises(RuntimeError):
+                    sb.__enter__()
+        sb.shutdown()
+
+    def test_timeout_is_not_reported_as_fork_unsafe(self):
+        """A slow worker is not a fork-hostile one -- don't conflate them."""
+        from sandtrap import StForkUnsafe
+
+        sb = self._sandbox()
+        with patch.object(
+            multiprocessing.connection.Connection, "poll", return_value=False
+        ):
+            with pytest.raises(RuntimeError) as exc:
+                sb.__enter__()
+        sb.shutdown()
+
+        assert not isinstance(exc.value, StForkUnsafe)
+        assert "did not become ready" in str(exc.value)
+
+    def test_signal_death_is_named(self):
+        """A segfaulted worker should say so, not just 'exited'."""
+        from sandtrap.process.sandbox import _describe_exit
+
+        class FakeProc:
+            exitcode = -11  # SIGSEGV
+
+            def join(self, timeout=None):
+                pass
+
+        assert "SIGSEGV" in _describe_exit(FakeProc())
+
+    def test_clean_worker_error_is_not_fork_unsafe(self):
+        """A policy failure reports itself; it isn't a fork problem."""
+        from sandtrap import StForkUnsafe
+        from sandtrap.process.protocol import WorkerErrorMsg
+
+        sb = self._sandbox()
+        with patch.object(
+            multiprocessing.connection.Connection,
+            "recv",
+            return_value=WorkerErrorMsg(message="policy blew up"),
+        ):
+            with pytest.raises(RuntimeError) as exc:
+                sb.__enter__()
+        sb.shutdown()
+
+        assert not isinstance(exc.value, StForkUnsafe)
+        assert "failed to initialise" in str(exc.value)
+
+    def test_setup_failure_is_reported_not_misdiagnosed(self):
+        """A pre-worker_main failure must surface its own traceback.
+
+        _worker_entry does fallible work (descriptor neutralization, the
+        worker import) before worker_main installs reporting. Left
+        unreported it reaches the parent as a bare EOF, indistinguishable
+        from a native crash -- and would earn fork-hostility advice that
+        has nothing to do with the actual cause.
+        """
+        from sandtrap import Policy, StForkUnsafe
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        def boom(fds):
+            raise OSError(24, "Too many open files")
+
+        with patch.object(sandtrap.process.sandbox, "_neutralize_inherited_fds", boom):
+            sb = ProcessSandbox(Policy(timeout=5.0), close_fds=True)
+            with pytest.raises(RuntimeError) as exc:
+                sb.__enter__()
+            sb.shutdown()
+
+        assert not isinstance(exc.value, StForkUnsafe)
+        assert "Too many open files" in str(exc.value)
+
+    def test_crash_signal_is_fork_unsafe(self):
+        """A native crash is the fork-hostility signature."""
+        from sandtrap import Policy, StForkUnsafe
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        def crash(fds):
+            # Runs in the child. Silence the inherited faulthandler so the
+            # deliberate crash doesn't dump a traceback into the test log.
+            import faulthandler
+
+            faulthandler.disable()
+            os.kill(os.getpid(), signal.SIGSEGV)
+
+        with patch.object(sandtrap.process.sandbox, "_neutralize_inherited_fds", crash):
+            sb = ProcessSandbox(Policy(timeout=5.0), close_fds=True)
+            with pytest.raises(StForkUnsafe) as exc:
+                sb.__enter__()
+            sb.shutdown()
+
+        assert "SIGSEGV" in str(exc.value)
+
+    def test_silent_nonzero_exit_is_not_fork_unsafe(self):
+        """A child that exits without reporting isn't necessarily fork-hostile."""
+        from sandtrap import Policy, StForkUnsafe
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        def bail(fds):
+            os._exit(1)
+
+        with patch.object(sandtrap.process.sandbox, "_neutralize_inherited_fds", bail):
+            sb = ProcessSandbox(Policy(timeout=5.0), close_fds=True)
+            with pytest.raises(RuntimeError) as exc:
+                sb.__enter__()
+            sb.shutdown()
+
+        assert not isinstance(exc.value, StForkUnsafe)
+        assert "status 1" in str(exc.value)
+        assert "stderr" in str(exc.value)
+
+    def test_external_kill_is_not_fork_unsafe(self):
+        """SIGKILL points at an OOM killer or supervisor, not fork state."""
+        from sandtrap import Policy, StForkUnsafe
+        from sandtrap.process.sandbox import ProcessSandbox
+
+        def killed(fds):
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        with patch.object(
+            sandtrap.process.sandbox, "_neutralize_inherited_fds", killed
+        ):
+            sb = ProcessSandbox(Policy(timeout=5.0), close_fds=True)
+            with pytest.raises(RuntimeError) as exc:
+                sb.__enter__()
+            sb.shutdown()
+
+        assert not isinstance(exc.value, StForkUnsafe)
+        assert "SIGKILL" in str(exc.value)
+        assert "out-of-memory" in str(exc.value)
