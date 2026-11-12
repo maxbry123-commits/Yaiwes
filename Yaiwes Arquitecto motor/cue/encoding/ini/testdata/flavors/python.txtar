@@ -1,0 +1,69 @@
+#flavor: python
+-- in.ini --
+# Sample setup.cfg, modelled on a Python packaging configuration read by
+# configparser with its default settings.
+[metadata]
+Name = mypkg
+version = 1.2.3
+summary = A sample package
+long_description = The first line of the description
+    the second line
+    the third line
+license = Apache-2.0
+
+[options] ; read by setuptools
+python_requires: >=3.9
+zip_safe: False
+include_package_data: True
+install_requires =
+    requests
+
+    click
+
+[DEFAULT]
+verbose = 1
+-- in.cue --
+// A setup.cfg as one would write it in CUE for configparser.
+metadata: {
+	Name:             "mypkg"
+	version:          "1.2.3"
+	long_description: "The first line of the description\nthe second line"
+}
+options: {
+	python_requires:  ">=3.9"
+	install_requires: "\nrequests\n\nclick"
+}
+-- out/decode/default --
+invalid line: the second line:
+    in.ini:8:1
+-- out/decode/flavor --
+metadata: {
+	name:             "mypkg"
+	version:          "1.2.3"
+	summary:          "A sample package"
+	long_description: "The first line of the description\nthe second line\nthe third line"
+	license:          "Apache-2.0"
+}
+options: {
+	python_requires:      ">=3.9"
+	zip_safe:             "False"
+	include_package_data: "True"
+	install_requires:     "\nrequests\n\nclick"
+}
+DEFAULT: verbose: "1"
+-- out/encode/default --
+cannot write string at metadata.long_description: no spelling decodes back to it; set Config.Quotes to QuotesEscaped to allow it:
+    in.cue:5:2
+-- out/encode/flavor --
+[metadata]
+Name = mypkg
+version = 1.2.3
+long_description = The first line of the description
+	the second line
+
+[options]
+python_requires = >=3.9
+install_requires =
+	requests
+
+	click

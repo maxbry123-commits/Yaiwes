@@ -1,0 +1,37 @@
+[package]
+name = "validation-failures"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+# Used by macro output, which cargo-machete cannot see.
+[package.metadata.cargo-machete]
+ignored = ["cloacina-workflow"]
+
+[workspace]
+
+[[bin]]
+name = "missing_dependency"
+path = "src/missing_dependency.rs"
+
+[[bin]]
+name = "circular_dependency"
+path = "src/circular_dependency.rs"
+
+[[bin]]
+name = "duplicate_task_ids"
+path = "src/duplicate_task_ids.rs"
+
+[[bin]]
+name = "missing_workflow_task"
+path = "src/missing_workflow_task.rs"
+
+[dependencies]
+cloacina = { path = "../../../../crates/cloacina" }
+cloacina-workflow = { path = "../../../../crates/cloacina-workflow" }
+cloacina-macros = { path = "../../../../crates/cloacina-macros" }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+
+[build-dependencies]
+cloacina-build = { path = "../../../../crates/cloacina-build" }

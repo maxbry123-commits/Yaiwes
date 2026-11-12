@@ -1,0 +1,138 @@
+/*
+ *  Copyright 2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! `cloacina-python`'s implementation of `cloacina::python_runtime::PythonRuntime`.
+//!
+//! A process that wants Python support (the server today, any future
+//! Python-enabled service) calls [`install`] at startup to register this
+//! runtime into cloacina core's dispatch slot. After that, uploaded
+//! Python packages are loaded through the runtime just like Rust ones
+//! are loaded through fidius.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use cloacina::computation_graph::scheduler::ComputationGraphDeclaration;
+use cloacina::python_runtime::{LoadedPythonWorkflow, PythonRuntime, register_python_runtime};
+use cloacina::runtime::Runtime;
+use cloacina::task::TaskNamespace;
+
+/// Zero-state runtime — every method thin-wraps the crate-local helpers.
+pub struct CloacinaPythonRuntime;
+
+impl PythonRuntime for CloacinaPythonRuntime {
+    fn load_workflow_package(
+        &self,
+        archive_data: &[u8],
+        staging_dir: &Path,
+        tenant_id: &str,
+        runtime: &Arc<Runtime>,
+    ) -> Result<LoadedPythonWorkflow, String> {
+        std::fs::create_dir_all(staging_dir)
+            .map_err(|e| format!("Failed to create Python staging dir: {}", e))?;
+
+        let extracted = crate::package_loader::extract_python_package(archive_data, staging_dir)
+            .map_err(|e| format!("Failed to extract Python package: {}", e))?;
+
+        pyo3::Python::initialize();
+        let task_namespaces: Vec<TaskNamespace> =
+            crate::loader::import_and_register_python_workflow_named(
+                &extracted.workflow_dir,
+                &extracted.vendor_dir,
+                &extracted.entry_module,
+                &extracted.package_name,
+                &extracted.workflow_name,
+                tenant_id,
+                runtime.clone(),
+            )
+            .map_err(|e| format!("Python workflow import failed: {}", e))?;
+
+        // Capture each task's dependency edges from the scoped Runtime while it
+        // is still alive — Python tasks live on the Runtime, not in a cdylib, so
+        // this is the only place the dependency graph is reachable host-side.
+        // We strip namespaces down to local task ids so the shape matches the
+        // Rust path's persisted task list. (CLOACI-T-0672)
+        let tasks = task_namespaces
+            .iter()
+            .map(|ns| {
+                let dependencies = runtime
+                    .get_task(ns)
+                    .map(|task| {
+                        task.dependencies()
+                            .iter()
+                            .map(|dep| dep.task_id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                cloacina::python_runtime::PythonTaskNode {
+                    id: ns.task_id.clone(),
+                    dependencies,
+                }
+            })
+            .collect();
+
+        Ok(LoadedPythonWorkflow {
+            task_namespaces,
+            tasks,
+            workflow_name: extracted.workflow_name,
+        })
+    }
+
+    fn load_cg_package(
+        &self,
+        archive_data: &[u8],
+        staging_dir: &Path,
+        tenant_id: &str,
+        graph_name: &str,
+        entry_module: &str,
+        accumulator_overrides: &[cloacina_workflow_plugin::types::AccumulatorConfig],
+        runtime: &Arc<Runtime>,
+    ) -> Result<Option<ComputationGraphDeclaration>, String> {
+        std::fs::create_dir_all(staging_dir)
+            .map_err(|e| format!("Failed to create Python CG staging dir: {}", e))?;
+
+        let extracted = crate::package_loader::extract_python_package(archive_data, staging_dir)
+            .map_err(|e| format!("Failed to extract Python CG package: {}", e))?;
+
+        pyo3::Python::initialize();
+        // CLOACI-T-0921: the packaged loader knows tenant + package at import
+        // time; the Python package identity is the entry module's top-level name.
+        let package_name = entry_module.split('.').next().unwrap_or(entry_module);
+        crate::loader::import_python_computation_graph(
+            &extracted.workflow_dir,
+            &extracted.vendor_dir,
+            entry_module,
+            graph_name,
+            Some(tenant_id),
+            Some(package_name),
+            runtime.clone(),
+        )
+        .map_err(|e| format!("Python CG import failed: {}", e))?;
+
+        Ok(crate::computation_graph::build_python_graph_declaration(
+            graph_name,
+            Some(tenant_id.to_string()),
+            accumulator_overrides,
+        ))
+    }
+}
+
+/// Install [`CloacinaPythonRuntime`] as this process's Python runtime.
+/// Idempotent — subsequent calls are no-ops. Call once at startup from
+/// any binary that wants to load Python packages.
+pub fn install() {
+    register_python_runtime(Arc::new(CloacinaPythonRuntime));
+}

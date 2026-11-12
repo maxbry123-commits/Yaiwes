@@ -1,0 +1,36 @@
+-- in.cue --
+import "encoding/yaml"
+
+// issue3972: Tests that yaml.Marshal with list comprehensions over conditionally
+// defined fields works correctly in evalv3. https://cuelang.org/issue/3972
+issue3972: {
+	// yaml uses Syntax to convert CUE to YAML. Ensure that unresolved values
+	// are properly handled.
+	// out0 is unused by the result but must come first to reproduce the issue.
+	output: out0: "static" @test(eq, "static")
+
+	input: inputStatic: "static"
+	if false {
+		input: inputNever: "never"
+	}
+
+	derived: derivedStatic: "static"
+	if false {
+		derived: derivedNever: input.inputNever
+	}
+
+	_out1: [for svc, _ in derived {svc}]
+	output: out1: yaml.Marshal(_out1) @test(eq, "- derivedStatic\n")
+}
+-- out/eval/stats --
+Leaks:  2
+Freed:  11
+Reused: 1
+Allocs: 12
+Retain: 0
+
+Unifications: 13
+Conjuncts:    14
+Disjuncts:    0
+
+NumCloseIDs: 5

@@ -1,0 +1,19 @@
+-- in.cue --
+// File-level @test(eq, VALUE) where a pattern constraint contributes
+// to the output — the eq check applies to the whole file.
+
+{[string]~(X,_): baz: X}
+bar: {}
+@test(eq, {bar: baz: "bar"})
+-- out/eval/stats --
+Leaks:  0
+Freed:  3
+Reused: 0
+Allocs: 3
+Retain: 0
+
+Unifications: 3
+Conjuncts:    5
+Disjuncts:    0
+
+NumCloseIDs: 1

@@ -1,0 +1,8 @@
+# A field whose schema allows several scalar kinds has no protobuf type.
+-- errors.cue --
+a?: string | int
+-- input.textproto --
+a: 1
+-- out/decode --
+textproto: unsupported type for field a:
+    input.textproto:1:1

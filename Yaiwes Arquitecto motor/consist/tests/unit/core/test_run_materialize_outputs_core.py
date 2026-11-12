@@ -1,0 +1,1910 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
+import uuid
+
+import pandas as pd
+import pytest
+
+from consist import Tracker
+from consist.core.fs import FileSystemManager
+from consist.core.materialize import (
+    PlannedMaterialization,
+    build_run_output_materialize_plan,
+    hydrate_run_outputs,
+    hydrate_run_outputs_to_destinations,
+    materialize_artifact,
+    materialize_planned_outputs,
+)
+from consist.models.artifact import Artifact
+from consist.models.run import Run
+
+
+class StubDb:
+    def __init__(
+        self, *, outputs_by_run: dict[str, list[Artifact]], runs: dict[str, Run]
+    ):
+        self.outputs_by_run = outputs_by_run
+        self.runs = runs
+
+    def get_output_artifacts_for_run(self, run_id: str) -> list[Artifact]:
+        return list(self.outputs_by_run.get(run_id, []))
+
+    def get_run(self, run_id: str) -> Run | None:
+        return self.runs.get(run_id)
+
+
+def _run(run_id: str, *, run_dir: Path, mounts: dict[str, str] | None = None) -> Run:
+    return Run(
+        id=run_id,
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={
+            "_physical_run_dir": str(run_dir),
+            "mounts": dict(mounts or {}),
+        },
+    )
+
+
+def _artifact(
+    key: str,
+    uri: str,
+    *,
+    run_id: str | None = None,
+    driver: str = "csv",
+    hash_value: str | None = None,
+    meta: dict | None = None,
+) -> Artifact:
+    return Artifact(
+        id=uuid.uuid4(),
+        key=key,
+        container_uri=uri,
+        driver=driver,
+        hash=hash_value,
+        run_id=run_id,
+        meta=dict(meta or {}),
+    )
+
+
+def _stub_tracker(
+    *,
+    run_dir: Path,
+    outputs_by_run: dict[str, list[Artifact]],
+    runs: dict[str, Run],
+    mounts: dict[str, str] | None = None,
+):
+    db = StubDb(outputs_by_run=outputs_by_run, runs=runs)
+    return SimpleNamespace(
+        db=db,
+        fs=FileSystemManager(run_dir, mounts),
+        run_dir=run_dir,
+        allow_external_paths=True,
+        identity=SimpleNamespace(hashing_strategy="full"),
+        engine=None,
+        get_run=db.get_run,
+        get_parent_artifact=lambda artifact: None,
+    )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_materialize_artifact_restores_file_from_recovery_root(tmp_path: Path) -> None:
+    recovery_root = tmp_path / "archive"
+    source = recovery_root / "outputs" / "a.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("value\n1\n", encoding="utf-8")
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        run_id="producer",
+        hash_value=_sha256(source),
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={"producer": _run("producer", run_dir=tmp_path / "missing")},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="if-present",
+    )
+
+    assert result.status == "materialized_from_recovery_root"
+    assert result.resolvable
+    assert result.path == (tmp_path / "restore" / "outputs" / "a.csv").resolve()
+    assert result.source_path == source.resolve()
+    assert result.artifact.as_path() == result.path
+    assert result.path.read_text(encoding="utf-8") == "value\n1\n"
+
+
+def test_materialize_artifact_prefers_source_root_over_other_roots(
+    tmp_path: Path,
+) -> None:
+    recovery_root = tmp_path / "archive"
+    (recovery_root / "outputs").mkdir(parents=True)
+    (recovery_root / "outputs" / "a.csv").write_text(
+        "value\narchive\n", encoding="utf-8"
+    )
+    historical_root = tmp_path / "producer"
+    (historical_root / "outputs").mkdir(parents=True)
+    (historical_root / "outputs" / "a.csv").write_text(
+        "value\nhistorical\n", encoding="utf-8"
+    )
+    override_root = tmp_path / "override"
+    override_source = override_root / "outputs" / "a.csv"
+    override_source.parent.mkdir(parents=True)
+    override_source.write_text("value\noverride\n", encoding="utf-8")
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        run_id="producer",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={"producer": _run("producer", run_dir=historical_root)},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=override_root,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "materialized_from_source_root"
+    assert result.source_path == override_source.resolve()
+    assert result.path.read_text(encoding="utf-8") == "value\noverride\n"
+
+
+def test_materialize_artifact_uses_historical_owning_run_metadata(
+    tmp_path: Path,
+) -> None:
+    historical_root = tmp_path / "producer"
+    source = historical_root / "outputs" / "a.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("value\n2\n", encoding="utf-8")
+    artifact = _artifact("table", "./outputs/a.csv", run_id="producer")
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={"producer": _run("producer", run_dir=historical_root)},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "materialized_from_historical_root"
+    assert result.source_path == source.resolve()
+
+
+def test_materialize_artifact_historical_artifact_does_not_use_current_workspace(
+    tmp_path: Path,
+) -> None:
+    current_workspace = tmp_path / "workspace"
+    current_file = current_workspace / "outputs" / "a.csv"
+    current_file.parent.mkdir(parents=True)
+    current_file.write_text("value\ncurrent-workspace\n", encoding="utf-8")
+    artifact = _artifact("table", "./outputs/a.csv", run_id="producer")
+    tracker = _stub_tracker(
+        run_dir=current_workspace,
+        outputs_by_run={},
+        runs={"producer": _run("producer", run_dir=tmp_path / "missing_producer")},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "missing_source"
+    assert not result.resolvable
+    assert not (tmp_path / "restore" / "outputs" / "a.csv").exists()
+
+
+def test_materialize_artifact_returns_already_present(tmp_path: Path) -> None:
+    destination = tmp_path / "restore" / "outputs" / "a.csv"
+    destination.parent.mkdir(parents=True)
+    destination.write_text("value\nexisting\n", encoding="utf-8")
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        hash_value=_sha256(destination),
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="if-present",
+    )
+
+    assert result.status == "already_present"
+    assert result.resolvable
+    assert result.artifact.as_path() == destination.resolve()
+
+
+def test_materialize_artifact_reports_skipped_unmapped(tmp_path: Path) -> None:
+    artifact = _artifact("table", str(tmp_path / "absolute.csv"))
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "skipped_unmapped"
+    assert not result.resolvable
+
+
+def test_materialize_artifact_reports_missing_source(tmp_path: Path) -> None:
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        meta={"recovery_roots": [str(tmp_path / "archive")]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "missing_source"
+    assert result.target_path == (tmp_path / "restore" / "outputs" / "a.csv").resolve()
+
+
+def test_materialize_artifact_reports_hash_mismatch(tmp_path: Path) -> None:
+    recovery_root = tmp_path / "archive"
+    source = recovery_root / "outputs" / "a.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("value\nactual\n", encoding="utf-8")
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        hash_value="0" * 64,
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="if-present",
+    )
+
+    assert result.status == "hash_mismatch"
+    assert not result.resolvable
+    assert not (tmp_path / "restore" / "outputs" / "a.csv").exists()
+
+
+def test_materialize_artifact_blocks_symlink_destination(tmp_path: Path) -> None:
+    target_root = tmp_path / "restore"
+    destination = target_root / "outputs" / "a.csv"
+    destination.parent.mkdir(parents=True)
+    destination.symlink_to(tmp_path / "elsewhere.csv")
+    artifact = _artifact("table", "./outputs/a.csv")
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=target_root,
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "symlink_destination"
+    assert not result.resolvable
+
+
+def test_materialize_artifact_blocks_symlink_recovery_source(tmp_path: Path) -> None:
+    outside_source = tmp_path / "outside.csv"
+    outside_source.write_text("value\noutside\n", encoding="utf-8")
+    recovery_root = tmp_path / "archive"
+    source = recovery_root / "outputs" / "a.csv"
+    source.parent.mkdir(parents=True)
+    source.symlink_to(outside_source)
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "failed"
+    assert "Symlink detected in source path" in (result.message or "")
+    assert not result.resolvable
+    assert not (tmp_path / "restore" / "outputs" / "a.csv").exists()
+
+
+def test_materialize_artifact_blocks_symlink_parent_in_recovery_source(
+    tmp_path: Path,
+) -> None:
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "a.csv").write_text("value\noutside\n", encoding="utf-8")
+    recovery_root = tmp_path / "archive"
+    recovery_root.mkdir()
+    (recovery_root / "outputs").symlink_to(outside_dir, target_is_directory=True)
+    artifact = _artifact(
+        "table",
+        "./outputs/a.csv",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "failed"
+    assert "Symlink detected in source path" in (result.message or "")
+    assert not result.resolvable
+    assert not (tmp_path / "restore" / "outputs" / "a.csv").exists()
+
+
+def test_materialize_artifact_supports_directory_sources(tmp_path: Path) -> None:
+    recovery_root = tmp_path / "archive"
+    source_dir = recovery_root / "outputs" / "dir"
+    source_dir.mkdir(parents=True)
+    (source_dir / "part.txt").write_text("x", encoding="utf-8")
+    artifact = _artifact(
+        "directory",
+        "./outputs/dir",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "materialized_from_recovery_root"
+    assert result.resolvable
+    assert (tmp_path / "restore" / "outputs" / "dir" / "part.txt").read_text(
+        encoding="utf-8"
+    ) == "x"
+
+
+def test_materialize_artifact_directory_manifest_skips_corrupted_historical_root_for_valid_recovery_root(
+    tmp_path: Path,
+) -> None:
+    from consist.core.directory_artifacts import build_directory_manifest
+
+    historical_root = tmp_path / "historical"
+    historical_dir = historical_root / "outputs" / "skims.zarr"
+    (historical_dir / "nested").mkdir(parents=True)
+    (historical_dir / "nested" / "0.0").write_bytes(b"valid-chunk")
+
+    recovery_root = tmp_path / "archive"
+    recovery_dir = recovery_root / "outputs" / "skims.zarr"
+    (recovery_dir / "nested").mkdir(parents=True)
+    (recovery_dir / "nested" / "0.0").write_bytes(b"valid-chunk")
+
+    manifest = build_directory_manifest(recovery_dir)
+    # Corrupt the historical root copy so single-artifact materialization must
+    # skip it and recover from recovery_root.
+    (historical_dir / "nested" / "0.0").write_bytes(b"corrupted-chunk")
+
+    producer_run = _run("producer", run_dir=historical_root)
+    artifact = _artifact(
+        "skims",
+        "./outputs/skims.zarr",
+        run_id="producer",
+        driver="zarr",
+        hash_value=manifest["tree_hash"],
+        meta={
+            "directory_artifact": True,
+            "directory_manifest": manifest,
+            "recovery_roots": [str(recovery_root)],
+        },
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"producer": [artifact]},
+        runs={"producer": producer_run},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="if-present",
+    )
+
+    assert result.status == "materialized_from_recovery_root"
+    assert result.resolvable
+    assert (
+        tmp_path / "restore" / "outputs" / "skims.zarr" / "nested" / "0.0"
+    ).read_bytes() == b"valid-chunk"
+
+    # When all candidate roots are corrupted, materialize_artifact should report
+    # hash_mismatch rather than missing_source.
+    (recovery_dir / "nested" / "0.0").write_bytes(b"also-corrupted")
+    corrupt_result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore_corrupt",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="if-present",
+    )
+    assert corrupt_result.status == "hash_mismatch"
+    assert not corrupt_result.resolvable
+
+
+def test_materialize_artifact_direct_fallback_uses_tracker_uri_before_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = tmp_path / "cwd"
+    cwd_source = cwd / "outputs" / "a.csv"
+    cwd_source.parent.mkdir(parents=True)
+    cwd_source.write_text("value\nwrong-cwd\n", encoding="utf-8")
+
+    workspace = tmp_path / "workspace"
+    tracker_source = workspace / "outputs" / "a.csv"
+    tracker_source.parent.mkdir(parents=True)
+    tracker_source.write_text("value\ntracker\n", encoding="utf-8")
+
+    monkeypatch.chdir(cwd)
+    artifact = _artifact("table", "./outputs/a.csv")
+    tracker = _stub_tracker(
+        run_dir=workspace,
+        outputs_by_run={},
+        runs={},
+    )
+
+    result = materialize_artifact(
+        tracker,
+        artifact,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        allowed_base=None,
+        preserve_existing=True,
+        on_missing="warn",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "materialized_from_artifact_uri"
+    assert result.source_path == tracker_source.resolve()
+    assert result.path.read_text(encoding="utf-8") == "value\ntracker\n"
+
+
+def test_tracker_materialize_artifact_returns_detached_resolvable_artifact(
+    tmp_path: Path,
+) -> None:
+    tracker = Tracker(
+        run_dir=tmp_path / "workspace",
+        db_path=None,
+        allow_external_paths=True,
+    )
+    source = tracker.run_dir / "outputs" / "a.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("value\n3\n", encoding="utf-8")
+    artifact = _artifact("table", "./outputs/a.csv")
+
+    result = tracker.materialize_artifact(
+        artifact,
+        target_root=tmp_path / "fresh",
+        validate_content_hash="never",
+    )
+
+    assert result.status == "materialized_from_artifact_uri"
+    assert result.resolvable
+    assert result.artifact.as_path() == result.path
+    assert result.path.read_text(encoding="utf-8") == "value\n3\n"
+
+
+def test_build_plan_detects_duplicate_output_keys(tmp_path: Path) -> None:
+    run = _run("consumer", run_dir=tmp_path / "consumer")
+    outputs = [
+        _artifact("shared", "./outputs/a.csv", run_id="consumer"),
+        _artifact("shared", "./outputs/b.csv", run_id="consumer"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": run},
+    )
+
+    with pytest.raises(ValueError, match="duplicate output keys"):
+        build_run_output_materialize_plan(
+            tracker,
+            run,
+            target_root=tmp_path / "restore",
+            source_root=None,
+            keys=None,
+            preserve_existing=True,
+            db_fallback="if_ingested",
+        )
+
+
+def test_build_plan_validates_requested_keys_strictly(tmp_path: Path) -> None:
+    run = _run("consumer", run_dir=tmp_path / "consumer")
+    outputs = [_artifact("present", "./outputs/a.csv", run_id="consumer")]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": run},
+    )
+
+    with pytest.raises(KeyError, match="missing"):
+        build_run_output_materialize_plan(
+            tracker,
+            run,
+            target_root=tmp_path / "restore",
+            source_root=None,
+            keys=["present", "missing"],
+            preserve_existing=True,
+            db_fallback="if_ingested",
+        )
+
+
+def test_build_plan_marks_absolute_and_file_uris_unmapped(tmp_path: Path) -> None:
+    run = _run("consumer", run_dir=tmp_path / "consumer")
+    outputs = [
+        _artifact("absolute", "/tmp/data.csv", run_id="consumer"),
+        _artifact("file_uri", "file:///tmp/data.csv", run_id="consumer"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert plan == []
+    assert sorted(result.skipped_unmapped) == ["absolute", "file_uri"]
+
+
+def test_build_plan_marks_missing_historical_metadata_unmapped(tmp_path: Path) -> None:
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    missing_workspace_metadata = Run(
+        id="producer_workspace",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    missing_mount_metadata = Run(
+        id="producer_mount",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={"_physical_run_dir": str(tmp_path / "producer_mount")},
+    )
+    outputs = [
+        _artifact("workspace", "./outputs/a.csv", run_id="producer_workspace"),
+        _artifact("mounted", "outputs://beam/skims.csv", run_id="producer_mount"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={
+            "consumer": selected_run,
+            "producer_workspace": missing_workspace_metadata,
+            "producer_mount": missing_mount_metadata,
+        },
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert plan == []
+    assert sorted(result.skipped_unmapped) == ["mounted", "workspace"]
+
+
+def test_build_plan_dedupes_shared_container_outputs(tmp_path: Path) -> None:
+    producer_dir = tmp_path / "producer"
+    source_path = producer_dir / "outputs" / "shared.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("value\n1\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=producer_dir)
+    outputs = [
+        _artifact("a", "./outputs/shared.csv", run_id="producer"),
+        _artifact("b", "./outputs/shared.csv", run_id="producer"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].keys == ("a", "b")
+    assert (
+        plan[0].destination
+        == (tmp_path / "restore" / "outputs" / "shared.csv").resolve()
+    )
+
+
+def test_build_plan_reports_destination_collisions(tmp_path: Path) -> None:
+    producer_a_dir = tmp_path / "producer_a"
+    producer_b_dir = tmp_path / "producer_b"
+    producer_a_dir.mkdir(parents=True, exist_ok=True)
+    producer_b_dir.mkdir(parents=True, exist_ok=True)
+    (producer_a_dir / "same.csv").write_text("a\n1\n", encoding="utf-8")
+    (producer_b_dir / "same.csv").write_text("a\n2\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    run_a = _run("producer_a", run_dir=producer_a_dir)
+    run_b = _run("producer_b", run_dir=producer_b_dir)
+    outputs = [
+        _artifact("left", "./same.csv", run_id="producer_a"),
+        _artifact("right", "workspace://same.csv", run_id="producer_b"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={
+            "consumer": selected_run,
+            "producer_a": run_a,
+            "producer_b": run_b,
+        },
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert plan == []
+    assert sorted(result.failed) == [
+        (
+            "left",
+            f"destination collision at {(tmp_path / 'restore' / 'same.csv').resolve()}",
+        ),
+        (
+            "right",
+            f"destination collision at {(tmp_path / 'restore' / 'same.csv').resolve()}",
+        ),
+    ]
+
+
+def test_build_plan_uses_mount_snapshot_and_source_root_override(
+    tmp_path: Path,
+) -> None:
+    historical_mount = tmp_path / "historical_outputs"
+    archive_root = tmp_path / "archive_outputs"
+    current_mount = tmp_path / "current_outputs"
+    archive_file = archive_root / "beam" / "skims.csv"
+    archive_file.parent.mkdir(parents=True, exist_ok=True)
+    archive_file.write_text("value\n3\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run(
+        "producer",
+        run_dir=tmp_path / "producer",
+        mounts={"outputs": str(historical_mount)},
+    )
+    output = _artifact("skims", "outputs://beam/skims.csv", run_id="producer")
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+        mounts={"outputs": str(current_mount)},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=archive_root,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_path == archive_file.resolve()
+    assert plan[0].relative_path == Path("beam") / "skims.csv"
+
+
+def test_build_plan_uses_recovery_roots_for_workspace_outputs(
+    tmp_path: Path,
+) -> None:
+    recovery_root = tmp_path / "archive"
+    recovery_file = recovery_root / "outputs" / "a.csv"
+    recovery_file.parent.mkdir(parents=True, exist_ok=True)
+    recovery_file.write_text("value\n7\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=tmp_path / "missing_producer")
+    output = _artifact(
+        "table",
+        "./outputs/a.csv",
+        run_id="producer",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_path == recovery_file.resolve()
+    assert plan[0].relative_path == Path("outputs") / "a.csv"
+
+
+def test_build_plan_uses_recovery_roots_for_mount_outputs_without_snapshot(
+    tmp_path: Path,
+) -> None:
+    recovery_root = tmp_path / "archive_mount"
+    recovery_file = recovery_root / "reports" / "summary.csv"
+    recovery_file.parent.mkdir(parents=True, exist_ok=True)
+    recovery_file.write_text("value\n8\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=tmp_path / "producer")
+    output = _artifact(
+        "summary",
+        "outputs://reports/summary.csv",
+        run_id="producer",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_path == recovery_file.resolve()
+    assert plan[0].relative_path == Path("reports") / "summary.csv"
+
+
+def test_build_plan_prefers_historical_source_over_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    producer_dir = tmp_path / "producer"
+    historical_file = producer_dir / "outputs" / "table.csv"
+    historical_file.parent.mkdir(parents=True, exist_ok=True)
+    historical_file.write_text("historical\n", encoding="utf-8")
+
+    recovery_root = tmp_path / "archive"
+    recovery_file = recovery_root / "outputs" / "table.csv"
+    recovery_file.parent.mkdir(parents=True, exist_ok=True)
+    recovery_file.write_text("archive\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=producer_dir)
+    output = _artifact(
+        "table",
+        "./outputs/table.csv",
+        run_id="producer",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_path == historical_file.resolve()
+
+
+def test_build_plan_prefers_source_root_over_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    recovery_root = tmp_path / "archive"
+    recovery_file = recovery_root / "outputs" / "table.csv"
+    recovery_file.parent.mkdir(parents=True, exist_ok=True)
+    recovery_file.write_text("archive\n", encoding="utf-8")
+
+    override_root = tmp_path / "override"
+    override_file = override_root / "outputs" / "table.csv"
+    override_file.parent.mkdir(parents=True, exist_ok=True)
+    override_file.write_text("override\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=tmp_path / "missing_producer")
+    output = _artifact(
+        "table",
+        "./outputs/table.csv",
+        run_id="producer",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=override_root,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_path == override_file.resolve()
+
+
+def test_build_plan_prefers_recovery_roots_over_db_export(
+    tmp_path: Path,
+) -> None:
+    recovery_root = tmp_path / "archive"
+    recovery_file = recovery_root / "outputs" / "table.csv"
+    recovery_file.parent.mkdir(parents=True, exist_ok=True)
+    recovery_file.write_text("value\n11\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=tmp_path / "missing_producer")
+    output = _artifact(
+        "table",
+        "./outputs/table.csv",
+        run_id="producer",
+        driver="csv",
+        meta={"is_ingested": True, "recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_kind == "filesystem"
+    assert plan[0].source_path == recovery_file.resolve()
+
+
+def test_build_plan_rejects_existing_symlink_even_with_preserve_existing(
+    tmp_path: Path,
+) -> None:
+    producer_dir = tmp_path / "producer"
+    source_path = producer_dir / "outputs" / "result.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("value\n1\n", encoding="utf-8")
+
+    restore_root = tmp_path / "restore"
+    symlink_target = tmp_path / "real.csv"
+    symlink_target.write_text("value\n2\n", encoding="utf-8")
+    symlink_path = restore_root / "outputs" / "result.csv"
+    symlink_path.parent.mkdir(parents=True, exist_ok=True)
+    symlink_path.symlink_to(symlink_target)
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=producer_dir)
+    outputs = [_artifact("result", "./outputs/result.csv", run_id="producer")]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=restore_root,
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert plan == []
+    assert result.skipped_existing == []
+    assert result.failed == [
+        ("result", f"Symlink detected in destination path: {symlink_path}")
+    ]
+
+
+def test_build_plan_falls_back_to_artifact_mount_root(tmp_path: Path) -> None:
+    mount_root = tmp_path / "archived_mount"
+    source_path = mount_root / "reports" / "summary.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("value\n5\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = Run(
+        id="producer",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={"_physical_run_dir": str(tmp_path / "producer")},
+    )
+    output = _artifact(
+        "summary",
+        "outputs://reports/summary.csv",
+        run_id="producer",
+        meta={"mount_root": str(mount_root)},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restore",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert result.failed == []
+    assert len(plan) == 1
+    assert plan[0].source_path == source_path.resolve()
+
+
+def test_materialize_planned_outputs_overwrites_existing_files(tmp_path: Path) -> None:
+    source = tmp_path / "source.csv"
+    source.write_text("value\n9\n", encoding="utf-8")
+    destination = tmp_path / "restore" / "source.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("value\n0\n", encoding="utf-8")
+
+    artifact = _artifact("out", "./source.csv")
+    plan = [
+        PlannedMaterialization(
+            artifact=artifact,
+            keys=("out",),
+            source_kind="filesystem",
+            source_path=source,
+            destination=destination,
+            relative_path=Path("source.csv"),
+        )
+    ]
+
+    tracker = SimpleNamespace(engine=None)
+    result = materialize_planned_outputs(
+        plan,
+        tracker=tracker,
+        allowed_base=tmp_path,
+        on_missing="raise",
+        preserve_existing=False,
+    )
+
+    assert result.materialized_from_filesystem["out"] == str(destination.resolve())
+    assert destination.read_text(encoding="utf-8") == "value\n9\n"
+
+
+def test_build_plan_reports_structural_collision_even_when_destination_exists(
+    tmp_path: Path,
+) -> None:
+    producer_a_dir = tmp_path / "producer_a"
+    producer_b_dir = tmp_path / "producer_b"
+    producer_a_dir.mkdir(parents=True, exist_ok=True)
+    producer_b_dir.mkdir(parents=True, exist_ok=True)
+    (producer_a_dir / "same.csv").write_text("a\n1\n", encoding="utf-8")
+    (producer_b_dir / "same.csv").write_text("a\n2\n", encoding="utf-8")
+
+    restore_root = tmp_path / "restore"
+    existing_destination = restore_root / "same.csv"
+    existing_destination.parent.mkdir(parents=True, exist_ok=True)
+    existing_destination.write_text("a\n0\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    run_a = _run("producer_a", run_dir=producer_a_dir)
+    run_b = _run("producer_b", run_dir=producer_b_dir)
+    outputs = [
+        _artifact("left", "./same.csv", run_id="producer_a"),
+        _artifact("right", "workspace://same.csv", run_id="producer_b"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={
+            "consumer": selected_run,
+            "producer_a": run_a,
+            "producer_b": run_b,
+        },
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=restore_root,
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert plan == []
+    assert result.skipped_existing == []
+    assert sorted(result.failed) == [
+        ("left", f"destination collision at {existing_destination}"),
+        ("right", f"destination collision at {existing_destination}"),
+    ]
+
+
+def test_materialize_planned_outputs_enforces_allowed_base_in_warn_mode(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.csv"
+    source.write_text("value\n1\n", encoding="utf-8")
+    artifact = _artifact("outside", "./source.csv")
+    plan = [
+        PlannedMaterialization(
+            artifact=artifact,
+            keys=("outside",),
+            source_kind="filesystem",
+            source_path=source,
+            destination=tmp_path / "outside.csv",
+            relative_path=Path("outside.csv"),
+        )
+    ]
+
+    tracker = SimpleNamespace(engine=None)
+    result = materialize_planned_outputs(
+        plan,
+        tracker=tracker,
+        allowed_base=tmp_path / "sandbox",
+        on_missing="warn",
+        preserve_existing=True,
+    )
+
+    assert result.failed
+    assert result.failed[0][0] == "outside"
+
+
+def test_materialize_planned_outputs_captures_copy_failures_in_warn_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.csv"
+    source.write_text("value\n1\n", encoding="utf-8")
+    destination = tmp_path / "restore" / "source.csv"
+    artifact = _artifact("copy_failure", "./source.csv")
+    plan = [
+        PlannedMaterialization(
+            artifact=artifact,
+            keys=("copy_failure",),
+            source_kind="filesystem",
+            source_path=source,
+            destination=destination,
+            relative_path=Path("source.csv"),
+        )
+    ]
+
+    def _raise_copy_error(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("consist.core.materialize.shutil.copy2", _raise_copy_error)
+
+    result = materialize_planned_outputs(
+        plan,
+        tracker=SimpleNamespace(engine=None),
+        allowed_base=tmp_path,
+        on_missing="warn",
+        preserve_existing=True,
+    )
+
+    assert result.materialized == {}
+    assert result.failed == [("copy_failure", "denied")]
+    assert not destination.exists()
+
+
+def test_materialize_run_outputs_db_fallback_restores_ingested_csv(
+    tracker, run_dir: Path
+) -> None:
+    import warnings
+
+    output_path = run_dir / "outputs" / "table.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"value": [1, 2]}).to_csv(output_path, index=False)
+
+    with tracker.start_run("producer", model="producer", cache_mode="overwrite"):
+        artifact = tracker.log_artifact(output_path, key="table", direction="output")
+
+    tracker.ingest(artifact)
+    output_path.unlink()
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        result = tracker.materialize_run_outputs(
+            "producer",
+            target_root=run_dir / "restored",
+            db_fallback="if_ingested",
+        )
+
+    index_reflection_warnings = [
+        w for w in caught_warnings if "reflection on indices" in str(w.message)
+    ]
+    assert not index_reflection_warnings
+
+    restored_path = run_dir / "restored" / "outputs" / "table.csv"
+    assert result.materialized_from_db == {"table": str(restored_path.resolve())}
+    assert restored_path.exists()
+    restored = pd.read_csv(restored_path)
+    assert restored["value"].tolist() == [1, 2]
+
+
+def test_materialize_run_outputs_db_fallback_handles_attached_catalog_with_same_table(
+    tracker, run_dir: Path
+) -> None:
+    output_path = run_dir / "outputs" / "table.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"value": [10, 20]}).to_csv(output_path, index=False)
+
+    with tracker.start_run(
+        "producer_attached", model="producer", cache_mode="overwrite"
+    ):
+        artifact = tracker.log_artifact(output_path, key="table", direction="output")
+
+    tracker.ingest(artifact)
+    output_path.unlink()
+
+    attached_db = run_dir / "attached_other.duckdb"
+    with tracker.engine.begin() as conn:
+        conn.exec_driver_sql(f"ATTACH '{attached_db}' AS attached_other")
+        conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS attached_other.global_tables")
+        conn.exec_driver_sql(
+            'CREATE TABLE attached_other.global_tables."table" '
+            "(consist_artifact_id VARCHAR, value BIGINT, extra_col VARCHAR)"
+        )
+
+    try:
+        result = tracker.materialize_run_outputs(
+            "producer_attached",
+            target_root=run_dir / "restored_attached",
+            db_fallback="if_ingested",
+        )
+    finally:
+        with tracker.engine.begin() as conn:
+            conn.exec_driver_sql("DETACH DATABASE IF EXISTS attached_other")
+
+    restored_path = run_dir / "restored_attached" / "outputs" / "table.csv"
+    assert result.materialized_from_db == {"table": str(restored_path.resolve())}
+    assert restored_path.exists()
+    restored = pd.read_csv(restored_path)
+    assert restored["value"].tolist() == [10, 20]
+    assert "extra_col" not in restored.columns
+
+
+def test_materialize_run_outputs_allows_current_mount_root_as_target(
+    tracker, run_dir: Path
+) -> None:
+    workspace_root = run_dir.parent / "workspace_mount"
+    tracker.fs.mounts = {"workspace": str(workspace_root.resolve())}
+    tracker.mounts = tracker.fs.mounts
+
+    output_path = run_dir / "outputs" / "table.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"value": [1]}).to_csv(output_path, index=False)
+
+    with tracker.start_run(
+        "producer_mount_target", model="producer", cache_mode="overwrite"
+    ):
+        tracker.log_artifact(output_path, key="table", direction="output")
+
+    result = tracker.materialize_run_outputs(
+        "producer_mount_target",
+        target_root=workspace_root,
+    )
+
+    restored_path = workspace_root / "outputs" / "table.csv"
+    assert result.materialized_from_filesystem == {
+        "table": str(restored_path.resolve())
+    }
+    assert restored_path.exists()
+
+
+def test_materialize_run_outputs_db_fallback_empty_export_is_missing_source(
+    tracker, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_path = run_dir / "outputs" / "empty.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"value": [1]}).to_csv(output_path, index=False)
+
+    with tracker.start_run("producer_empty", model="producer", cache_mode="overwrite"):
+        artifact = tracker.log_artifact(output_path, key="empty", direction="output")
+
+    tracker.ingest(artifact)
+    output_path.unlink()
+
+    monkeypatch.setattr(
+        "consist.core.materialize.pd.read_sql",
+        lambda *_args, **_kwargs: pd.DataFrame(),
+    )
+
+    result = tracker.materialize_run_outputs(
+        "producer_empty",
+        target_root=run_dir / "restored_empty",
+        db_fallback="if_ingested",
+        on_missing="warn",
+    )
+
+    restored_path = run_dir / "restored_empty" / "outputs" / "empty.csv"
+    assert result.materialized == {}
+    assert result.skipped_missing_source == ["empty"]
+    assert not restored_path.exists()
+
+
+def test_build_plan_reports_unsupported_ingested_driver_clearly(
+    tmp_path: Path,
+) -> None:
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=tmp_path / "producer")
+    output = _artifact(
+        "table_json",
+        "./outputs/table.json",
+        run_id="producer",
+        driver="json",
+        meta={"is_ingested": True},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [output]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    plan, result = build_run_output_materialize_plan(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restored_json",
+        source_root=None,
+        keys=None,
+        preserve_existing=True,
+        db_fallback="if_ingested",
+    )
+
+    assert plan == []
+    assert result.materialized == {}
+    assert result.failed == [
+        (
+            "table_json",
+            "unsupported DB export for ingested driver 'json'",
+        )
+    ]
+
+
+def test_hydrate_run_outputs_returns_detached_artifact_views(
+    tracker, run_dir: Path
+) -> None:
+    output_path = run_dir / "outputs" / "table.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("value\n1\n", encoding="utf-8")
+
+    with tracker.start_run(
+        "producer_hydrate", model="producer", cache_mode="overwrite"
+    ):
+        logged = tracker.log_artifact(output_path, key="table", direction="output")
+
+    historical_artifact = tracker.get_run_outputs("producer_hydrate")["table"]
+
+    hydrated = tracker.hydrate_run_outputs(
+        "producer_hydrate",
+        target_root=run_dir / "restored_hydrate",
+        keys=["table"],
+    )
+
+    restored_path = (run_dir / "restored_hydrate" / "outputs" / "table.csv").resolve()
+    result = hydrated["table"]
+    assert result.status == "materialized_from_filesystem"
+    assert result.resolvable is True
+    assert result.path == restored_path
+    assert result.artifact is not historical_artifact
+    assert result.artifact.hash == historical_artifact.hash == logged.hash
+    assert result.artifact.container_uri == historical_artifact.container_uri
+    assert result.artifact.path == restored_path
+    assert result.artifact.as_path() == restored_path
+    assert result.artifact.as_path(tracker=tracker) == output_path
+    assert hydrated.paths == {"table": restored_path}
+    assert list(hydrated.resolvable) == ["table"]
+    assert hydrated.complete is True
+    assert hydrated.source_run_id == "producer_hydrate"
+    assert historical_artifact.as_path() == output_path
+
+
+def test_hydrate_run_outputs_preserves_parent_artifact_id(
+    tracker, run_dir: Path
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    output_path = run_dir / "outputs" / "tables.h5"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(output_path, "w") as handle:
+        handle.create_dataset("households", data=[1, 2, 3])
+
+    with tracker.start_run(
+        "producer_h5_hydrate", model="producer", cache_mode="overwrite"
+    ):
+        container, _ = tracker.log_h5_container(
+            output_path,
+            key="tables",
+            discover_tables=False,
+        )
+        tracker.log_h5_table(
+            output_path,
+            table_path="/households",
+            key="households",
+            parent=container,
+        )
+
+    historical_artifact = tracker.get_run_outputs("producer_h5_hydrate")["households"]
+
+    hydrated = tracker.hydrate_run_outputs(
+        "producer_h5_hydrate",
+        target_root=run_dir / "restored_h5_hydrate",
+        keys=["households"],
+    )
+
+    result = hydrated["households"]
+    assert result.artifact is not historical_artifact
+    assert result.artifact.parent_artifact_id == historical_artifact.parent_artifact_id
+    assert result.artifact.meta["parent_id"] == historical_artifact.meta["parent_id"]
+
+
+def test_hydrate_run_outputs_preserves_unhashed_artifacts(tmp_path: Path) -> None:
+    producer_dir = tmp_path / "producer"
+    source = producer_dir / "outputs" / "table.csv"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value\n1\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=producer_dir)
+    outputs = [_artifact("table", "./outputs/table.csv", run_id="producer")]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    hydrated = hydrate_run_outputs(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restored",
+        source_root=None,
+        keys=["table"],
+        allowed_base=tmp_path,
+        preserve_existing=True,
+        on_missing="raise",
+        db_fallback="never",
+    )
+
+    result = hydrated["table"]
+    assert result.status == "materialized_from_filesystem"
+    assert result.resolvable is True
+    assert result.artifact.hash is None
+
+
+def test_hydrate_run_outputs_warn_mode_returns_mixed_keyed_statuses(
+    tmp_path: Path,
+) -> None:
+    producer_dir = tmp_path / "producer"
+    existing_source = producer_dir / "outputs" / "good.csv"
+    existing_source.parent.mkdir(parents=True, exist_ok=True)
+    existing_source.write_text("value\n1\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=producer_dir)
+    outputs = [
+        _artifact("good", "./outputs/good.csv", run_id="producer"),
+        _artifact("missing", "./outputs/missing.csv", run_id="producer"),
+        _artifact("absolute", "/tmp/data.csv", run_id="producer"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+
+    result = hydrate_run_outputs(
+        tracker,
+        selected_run,
+        target_root=tmp_path / "restored",
+        source_root=None,
+        keys=None,
+        allowed_base=tmp_path,
+        preserve_existing=True,
+        on_missing="warn",
+        db_fallback="never",
+    )
+
+    assert result["good"].status == "materialized_from_filesystem"
+    assert result["good"].resolvable is True
+    assert result["missing"].status == "missing_source"
+    assert result["missing"].resolvable is False
+    assert result["absolute"].status == "skipped_unmapped"
+    assert result["absolute"].path is None
+    assert result.paths == {
+        "good": (tmp_path / "restored" / "outputs" / "good.csv").resolve()
+    }
+    assert list(result.failed_keys) == []
+    assert result.complete is False
+
+
+def test_hydrate_run_outputs_to_destinations_restores_unrelated_file_and_directory_paths(
+    tracker, run_dir: Path
+) -> None:
+    file_source = run_dir / "outputs" / "summary.csv"
+    directory_source = run_dir / "outputs" / "tables"
+    file_source.parent.mkdir(parents=True, exist_ok=True)
+    file_source.write_text("value\n1\n", encoding="utf-8")
+    directory_source.mkdir()
+    (directory_source / "part.csv").write_text("value\n2\n", encoding="utf-8")
+
+    with tracker.start_run("destination_run", model="producer", cache_mode="overwrite"):
+        tracker.log_artifact(file_source, key="summary", direction="output")
+        tracker.log_artifact(directory_source, key="tables", direction="output")
+
+    summary_destination = run_dir / "staged" / "analysis.csv"
+    tables_destination = run_dir / "different" / "tables_copy"
+    historical_summary = tracker.get_run_outputs("destination_run")["summary"]
+    hydrated = tracker.hydrate_run_outputs_to_destinations(
+        "destination_run",
+        destinations_by_key={
+            "summary": summary_destination,
+            "tables": tables_destination,
+        },
+    )
+
+    assert hydrated.source_run_id == "destination_run"
+    assert hydrated["summary"].path == summary_destination.resolve()
+    assert hydrated["summary"].status == "materialized_from_filesystem"
+    assert hydrated["summary"].artifact is not historical_summary
+    assert hydrated["summary"].artifact.id == historical_summary.id
+    assert hydrated["summary"].artifact.as_path() == summary_destination.resolve()
+    assert summary_destination.read_text(encoding="utf-8") == "value\n1\n"
+    assert hydrated["tables"].path == tables_destination.resolve()
+    assert hydrated["tables"].status == "materialized_from_filesystem"
+    assert (tables_destination / "part.csv").read_text(encoding="utf-8") == "value\n2\n"
+
+
+def test_hydrate_run_outputs_to_destinations_rejects_unknown_keys_before_copy(
+    tracker, run_dir: Path
+) -> None:
+    source = run_dir / "outputs" / "summary.csv"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value\n1\n", encoding="utf-8")
+    with tracker.start_run(
+        "unknown_destination_key", model="producer", cache_mode="overwrite"
+    ):
+        tracker.log_artifact(source, key="summary", direction="output")
+
+    destination = run_dir / "staged" / "summary.csv"
+    with pytest.raises(KeyError, match="not found"):
+        tracker.hydrate_run_outputs_to_destinations(
+            "unknown_destination_key",
+            destinations_by_key={"unknown": destination},
+        )
+    assert not destination.exists()
+
+
+def test_hydrate_run_outputs_to_destinations_reports_normalized_collisions(
+    tracker, run_dir: Path
+) -> None:
+    first = run_dir / "outputs" / "first.csv"
+    second = run_dir / "outputs" / "second.csv"
+    first.parent.mkdir(parents=True, exist_ok=True)
+    first.write_text("value\n1\n", encoding="utf-8")
+    second.write_text("value\n2\n", encoding="utf-8")
+    with tracker.start_run(
+        "collision_destination_run", model="producer", cache_mode="overwrite"
+    ):
+        tracker.log_artifact(first, key="first", direction="output")
+        tracker.log_artifact(second, key="second", direction="output")
+
+    destination = run_dir / "staged" / "same.csv"
+    hydrated = tracker.hydrate_run_outputs_to_destinations(
+        "collision_destination_run",
+        destinations_by_key={
+            "first": destination,
+            "second": destination.parent / "." / destination.name,
+        },
+    )
+
+    assert hydrated["first"].status == "failed"
+    assert hydrated["second"].status == "failed"
+    assert "destination collision" in hydrated["first"].message
+    assert not destination.exists()
+
+
+def test_hydrate_run_outputs_to_destinations_validates_every_destination_before_copy(
+    tracker, run_dir: Path
+) -> None:
+    source = run_dir / "outputs" / "summary.csv"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value\n1\n", encoding="utf-8")
+    with tracker.start_run(
+        "destination_policy_run", model="producer", cache_mode="overwrite"
+    ):
+        tracker.log_artifact(source, key="summary", direction="output")
+
+    outside_destination = run_dir.parent / "outside" / "summary.csv"
+    with pytest.raises(ValueError, match="outside allowed base"):
+        tracker.hydrate_run_outputs_to_destinations(
+            "destination_policy_run",
+            destinations_by_key={"summary": outside_destination},
+        )
+    assert not outside_destination.exists()
+
+
+def test_hydrate_run_outputs_to_destinations_rejects_output_set_artifacts(
+    tracker, run_dir: Path
+) -> None:
+    parent_path = run_dir / "outputs" / "set-parent"
+    member_path = parent_path / "member.csv"
+    manifest_path = run_dir / "outputs" / "set-manifest.json"
+    parent_path.mkdir(parents=True)
+    member_path.write_text("value\n1\n", encoding="utf-8")
+    manifest_path.write_text("{}\n", encoding="utf-8")
+
+    with tracker.start_run(
+        "output_set_destination_run", model="producer", cache_mode="overwrite"
+    ):
+        manifest = tracker.log_artifact(
+            manifest_path,
+            key="set_manifest",
+            driver="json",
+            direction="output",
+            output_set_manifest=True,
+        )
+        parent = tracker.log_artifact(
+            parent_path,
+            key="set_parent",
+            driver="artifact_set",
+            direction="output",
+            artifact_set=True,
+            output_set_key="set_parent",
+            manifest_artifact_id=str(manifest.id),
+        )
+        tracker.log_artifact(
+            member_path,
+            key="set_member",
+            direction="output",
+            parent_artifact_id=parent.id,
+            output_set_key="set_parent",
+            output_set_member=True,
+            output_set_relative_path="member.csv",
+        )
+
+    for key in ("set_parent", "set_member", "set_manifest"):
+        destination = run_dir / "staged" / f"{key}.out"
+        with pytest.raises(ValueError, match="OutputSet hydration is deferred"):
+            tracker.hydrate_run_outputs_to_destinations(
+                "output_set_destination_run",
+                destinations_by_key={key: destination},
+            )
+        assert not destination.exists()
+
+
+def test_hydrate_run_outputs_to_destinations_collides_before_unmapped_resolution(
+    tmp_path: Path,
+) -> None:
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    outputs = [
+        _artifact("first", "/tmp/first.csv", run_id="consumer"),
+        _artifact("second", "/tmp/second.csv", run_id="consumer"),
+    ]
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": outputs},
+        runs={"consumer": selected_run},
+    )
+    destination = tmp_path / "restored" / "same.csv"
+
+    hydrated = hydrate_run_outputs_to_destinations(
+        tracker,
+        selected_run,
+        destinations_by_key={
+            "first": destination,
+            "second": destination.parent / "." / destination.name,
+        },
+        source_root=None,
+        allowed_base=tmp_path,
+        preserve_existing=True,
+        on_missing="warn",
+        db_fallback="never",
+    )
+
+    assert hydrated["first"].status == "failed"
+    assert hydrated["second"].status == "failed"
+    for output in hydrated.values():
+        assert output.message is not None
+        assert "destination collision" in output.message
+    assert not destination.exists()
+
+
+def test_hydrate_run_outputs_to_destinations_prefers_source_root(
+    tmp_path: Path,
+) -> None:
+    historical_root = tmp_path / "historical"
+    recovery_root = tmp_path / "recovery"
+    source_root = tmp_path / "source_override"
+    for root, marker in (
+        (historical_root, "historical"),
+        (recovery_root, "recovery"),
+        (source_root, "source-root"),
+    ):
+        source = root / "outputs" / "table.csv"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"value\n{marker}\n", encoding="utf-8")
+
+    selected_run = _run("consumer", run_dir=tmp_path / "consumer")
+    producing_run = _run("producer", run_dir=historical_root)
+    artifact = _artifact(
+        "table",
+        "./outputs/table.csv",
+        run_id="producer",
+        meta={"recovery_roots": [str(recovery_root)]},
+    )
+    tracker = _stub_tracker(
+        run_dir=tmp_path / "workspace",
+        outputs_by_run={"consumer": [artifact]},
+        runs={"consumer": selected_run, "producer": producing_run},
+    )
+    destination = tmp_path / "staged" / "unrelated.csv"
+
+    hydrated = hydrate_run_outputs_to_destinations(
+        tracker,
+        selected_run,
+        destinations_by_key={"table": destination},
+        source_root=source_root,
+        allowed_base=tmp_path,
+        preserve_existing=True,
+        on_missing="raise",
+        db_fallback="never",
+    )
+
+    assert hydrated["table"].status == "materialized_from_filesystem"
+    assert destination.read_text(encoding="utf-8") == "value\nsource-root\n"
+
+
+def test_hydrate_run_outputs_to_destinations_preserves_existing_destination(
+    tracker, run_dir: Path
+) -> None:
+    source = run_dir / "outputs" / "summary.csv"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value\nsource\n", encoding="utf-8")
+    with tracker.start_run(
+        "preserve_destination_run", model="producer", cache_mode="overwrite"
+    ):
+        tracker.log_artifact(source, key="summary", direction="output")
+
+    destination = run_dir / "staged" / "existing.csv"
+    destination.parent.mkdir(parents=True)
+    destination.write_text("value\nexisting\n", encoding="utf-8")
+    hydrated = tracker.hydrate_run_outputs_to_destinations(
+        "preserve_destination_run",
+        destinations_by_key={"summary": destination},
+    )
+
+    assert hydrated["summary"].status == "preserved_existing"
+    assert hydrated["summary"].resolvable is True
+    assert destination.read_text(encoding="utf-8") == "value\nexisting\n"
+
+
+def test_hydrate_run_outputs_to_destinations_missing_source_honors_on_missing(
+    tracker, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = run_dir / "outputs" / "summary.csv"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value\nsource\n", encoding="utf-8")
+    with tracker.start_run(
+        "missing_destination_run", model="producer", cache_mode="overwrite"
+    ):
+        tracker.log_artifact(source, key="summary", direction="output")
+
+    def missing_materialization(*args, **kwargs):
+        raise FileNotFoundError("source path disappeared")
+
+    monkeypatch.setattr(
+        "consist.core.materialize._materialize_path", missing_materialization
+    )
+    destination = run_dir / "staged" / "summary.csv"
+    warned = tracker.hydrate_run_outputs_to_destinations(
+        "missing_destination_run",
+        destinations_by_key={"summary": destination},
+        on_missing="warn",
+    )
+    assert warned["summary"].status == "missing_source"
+
+    with pytest.raises(FileNotFoundError, match="source path disappeared"):
+        tracker.hydrate_run_outputs_to_destinations(
+            "missing_destination_run",
+            destinations_by_key={"summary": destination},
+            on_missing="raise",
+        )

@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""
+File-level Import Dependency Graph — cache-backed file dependency analysis.
+
+Builds a directed graph of file-to-file import dependencies from the
+pre-indexed AST cache. Enables:
+  - Reverse dependency lookup: "who imports this file?"
+  - Forward dependency lookup: "what does this file import?"
+  - File-level blast radius: "if I change X, which files are affected?"
+  - Circular dependency detection
+  - Module coupling analysis
+
+CodeGraph parity: equivalent to CodeGraph's file-dependency-graph feature.
+Extends P0 AST cache with a new graph dimension beyond the function-level
+call graph.
+"""
+
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from .constants import (
+    JS_TS_INDEX_SUFFIXES,
+    JS_TS_LANGUAGES,
+    JS_TS_MODULE_EXTS,
+)
+from .import_dependents import import_entries
+from .import_graph_submodules import python_submodule_targets_from_text
+from .languages.lang_extension_map import EXT_TO_LANG
+
+logger = logging.getLogger(__name__)
+
+_PY_FROM_IMPORT_RE = re.compile(r"^from\s+(?P<module>[a-zA-Z_][\w.]*)(?:\s+import\s+)")
+_PY_BARE_IMPORT_RE = re.compile(r"^import\s+(?P<module>[a-zA-Z_][\w.]*)")
+_PY_RELATIVE_IMPORT_RE = re.compile(
+    r"^from\s+(?P<dots>\.{1,})(?P<module>\w[\w.]*)\s+import"
+)
+
+_JS_REQUIRE_RE = re.compile(r"""require\s*\(\s*['"](?P<path>\..*?)['"]\s*\)""")
+_JS_ESM_IMPORT_RE = re.compile(r"""import\s+.*?\s+from\s+['"](?P<path>\..*?)['"]""")
+
+_PY_STDLIB_PREFIXES = frozenset(
+    {
+        "os",
+        "sys",
+        "re",
+        "json",
+        "math",
+        "time",
+        "datetime",
+        "pathlib",
+        "collections",
+        "itertools",
+        "functools",
+        "typing",
+        "abc",
+        "io",
+        "hashlib",
+        "logging",
+        "subprocess",
+        "threading",
+        "multiprocessing",
+        "asyncio",
+        "dataclasses",
+        "enum",
+        "copy",
+        "glob",
+        "fnmatch",
+        "traceback",
+        "inspect",
+        "importlib",
+        "unittest",
+        "argparse",
+        "configparser",
+        "tempfile",
+        "shutil",
+        "textwrap",
+        "string",
+        "struct",
+        "pickle",
+        "sqlite3",
+        "csv",
+        "xml",
+        "html",
+        "http",
+        "urllib",
+        "email",
+        "socket",
+        "ssl",
+        "select",
+        "signal",
+        "mmap",
+        "ctypes",
+        "queue",
+        "heapq",
+        "bisect",
+        "array",
+        "weakref",
+        "types",
+        "contextlib",
+        "operator",
+        "numbers",
+        "decimal",
+        "fractions",
+        "random",
+        "statistics",
+        "pprint",
+        "locale",
+        "gettext",
+        "base64",
+        "binascii",
+        "codecs",
+        "difflib",
+        "linecache",
+        "tokenize",
+        "dis",
+        "platform",
+        "errno",
+        "atexit",
+        "warnings",
+        "gc",
+        "resource",
+        "posixpath",
+        "ntpath",
+        "genericpath",
+        "stat",
+        "filecmp",
+        "tarfile",
+        "zipfile",
+        "gzip",
+        "bz2",
+        "lzma",
+        "zlib",
+        "secrets",
+        "uuid",
+        "pdb",
+        "profile",
+        "timeit",
+        "tracemalloc",
+        "venv",
+        "site",
+        "code",
+        "codeop",
+        "compileall",
+        "py_compile",
+        "symtable",
+        "parser",
+        "ast",
+        "builtins",
+        "__future__",
+        "_thread",
+    }
+)
+
+
+@dataclass
+class ImportEdge:
+    source_file: str
+    target_file: str
+    import_text: str
+    line: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source_file,
+            "target": self.target_file,
+            "import": self.import_text,
+            "line": self.line,
+        }
+
+
+@dataclass
+class ImportGraphResult:
+    edges: list[ImportEdge] = field(default_factory=list)
+    file_count: int = 0
+    edge_count: int = 0
+    cycles: list[list[str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "file_count": self.file_count,
+            "edge_count": self.edge_count,
+            "edges": [e.to_dict() for e in self.edges],
+            "cycles": self.cycles,
+        }
+
+
+def _file_lookup(project_files: set[str]) -> dict[str, str]:
+    """Index ``project_files`` by separator-agnostic key → original key.
+
+    The AST cache stores ``file_path`` POSIX-style (forward slashes) while both
+    resolvers build candidates with ``os.path.join``/``normpath``, which emits
+    backslashes on Windows. The membership test therefore never matched for any
+    project with a subdirectory, so ``ImportGraph`` produced ZERO edges on
+    Windows for both Python and JS/TS. Linux CI could not see it because
+    ``normpath`` is already POSIX there. (Found while writing the public-API
+    end-to-end test for #1312.)
+
+    Values are the ORIGINAL keys so returned edges reference real cache paths.
+    """
+    return {path.replace("\\", "/"): path for path in project_files}
+
+
+def _is_rooted(path: str) -> bool:
+    """判断路径是否从根目录起算（含 Windows 上无盘符的 ``\\proj\\x.py``）。
+
+    Python 3.13 起 Windows 的 ``os.path.isabs`` 不再把无盘符的根路径视为绝对路径，
+    这类路径若按相对路径查表会静默返回 0 个依赖（develop windows 3.13 CI, 2026-10-16）。
+    """
+    return os.path.isabs(path) or os.path.splitdrive(path)[1][:1] in ("/", "\\")
+
+
+def _match_file(candidate: str, lookup: dict[str, str]) -> str | None:
+    """Return the project file matching ``candidate``, ignoring separator style."""
+    return lookup.get(os.path.normpath(candidate).replace("\\", "/"))
+
+
+def _resolve_python_import(
+    import_text: str,
+    source_file: str,
+    project_files: set[str],
+    project_root: str,
+) -> str | None:
+    """Resolve a Python import statement to a project-relative file path."""
+    lookup = _file_lookup(project_files)
+    rel_src = (
+        os.path.relpath(source_file, project_root)
+        if os.path.isabs(source_file)
+        else source_file
+    )
+
+    m = _PY_RELATIVE_IMPORT_RE.match(import_text)
+    if m:
+        num_dots = len(m.group("dots"))
+        module = m.group("module")
+        src_dir = os.path.dirname(rel_src)
+        for _ in range(num_dots - 1):
+            src_dir = os.path.dirname(src_dir)
+        parts = module.split(".") if module else []
+        candidate = os.path.join(src_dir, *parts) if parts else src_dir
+        for suffix in (".py", os.path.join("__init__.py", "")):
+            if suffix.endswith(os.sep):
+                test = candidate + os.sep + "__init__.py"
+            else:
+                test = candidate + suffix
+            hit = _match_file(test, lookup)
+            if hit is not None:
+                return hit
+        return _match_file(os.path.join(candidate, "__init__.py"), lookup)
+
+    m = _PY_FROM_IMPORT_RE.match(import_text)
+    if not m:
+        m = _PY_BARE_IMPORT_RE.match(import_text)
+    if not m:
+        return None
+
+    module = m.group("module")
+    top_level = module.split(".")[0]
+    if top_level in _PY_STDLIB_PREFIXES:
+        return None
+
+    parts = module.split(".")
+    hit = _match_file(os.path.join(*parts) + ".py", lookup)
+    if hit is not None:
+        return hit
+
+    return _match_file(os.path.join(*parts, "__init__.py"), lookup)
+
+
+def _resolve_js_import(
+    import_text: str,
+    source_file: str,
+    project_files: set[str],
+    project_root: str,
+) -> str | None:
+    """Resolve a JS/TS require/import to a project-relative file path."""
+    rel_src = (
+        os.path.relpath(source_file, project_root)
+        if os.path.isabs(source_file)
+        else source_file
+    )
+    src_dir = os.path.dirname(rel_src)
+
+    m = _JS_REQUIRE_RE.search(import_text) or _JS_ESM_IMPORT_RE.search(import_text)
+    if not m:
+        return None
+
+    req_path = m.group("path")
+    candidate = os.path.normpath(os.path.join(src_dir, req_path))
+
+    lookup = _file_lookup(project_files)
+    for suffix in ("", *JS_TS_MODULE_EXTS, *JS_TS_INDEX_SUFFIXES):
+        hit = _match_file(candidate + suffix, lookup)
+        if hit is not None:
+            return hit
+    return None
+
+
+class ImportGraph:
+    """
+    File-level import dependency graph built from cached AST data.
+
+    Uses the pre-indexed AST cache's import data to build a directed graph
+    of file-to-file dependencies. Resolves Python dotted imports and
+    JS/TS relative imports to actual project files.
+    """
+
+    def __init__(self, project_root: str) -> None:
+        self.project_root = os.path.abspath(project_root)
+        self._edges: list[ImportEdge] = []
+        self._forward: dict[str, list[ImportEdge]] = {}
+        self._reverse: dict[str, list[ImportEdge]] = {}
+        self._project_files: set[str] = set()
+        self._built = False
+
+    def build(self) -> ImportGraphResult:
+        """Build the import graph from AST cache data."""
+        if self._built:
+            return self._make_result()
+
+        from .ast_cache import ASTCache
+
+        try:
+            cache = ASTCache(self.project_root)
+        except Exception:
+            logger.warning("Failed to open AST cache for import graph")
+            return ImportGraphResult()
+
+        try:
+            # #1596：带行号读取，依赖条目不再一律报告 line 0。
+            imports_by_file = import_entries(cache)
+        finally:
+            cache.close()
+
+        self._project_files = set(imports_by_file.keys())
+        lookup = _file_lookup(self._project_files)
+        nodes = set(lookup)
+
+        for source_file, imports in imports_by_file.items():
+            if not isinstance(imports, list):
+                continue
+            for imp in imports:
+                imp_text = imp["text"] if isinstance(imp, dict) else imp
+                if not isinstance(imp_text, str):
+                    continue
+                resolved = self._resolve_import(imp_text, source_file)
+                targets = [] if resolved is None else [resolved]
+                targets += self._submodule_targets(imp_text, source_file, lookup, nodes)
+                line = int(imp.get("line") or 0) if isinstance(imp, dict) else 0
+                for target in dict.fromkeys(targets):
+                    if target != source_file:
+                        self._add_edge(source_file, target, imp_text, line)
+
+        self._built = True
+        return self._make_result()
+
+    def _add_edge(
+        self, source_file: str, target: str, import_text: str, line: int = 0
+    ) -> None:
+        edge = ImportEdge(source_file, target, import_text, line=line)
+        self._edges.append(edge)
+        self._forward.setdefault(source_file, []).append(edge)
+        self._reverse.setdefault(target, []).append(edge)
+
+    @staticmethod
+    def _submodule_targets(
+        import_text: str, source_file: str, lookup: dict[str, str], nodes: set[str]
+    ) -> list[str]:
+        """``from pkg import sub`` 同时依赖 ``pkg/sub.py``（#1579，规则同 #1566）。"""
+        if EXT_TO_LANG.get(os.path.splitext(source_file)[1].lower()) != "python":
+            return []
+        source_rel = source_file.replace("\\", "/")
+        hits = python_submodule_targets_from_text(import_text, source_rel, nodes)
+        return [lookup[hit] for hit in hits]
+
+    def _resolve_import(self, import_text: str, source_file: str) -> str | None:
+        """Route an import statement to the resolver for its SOURCE language.
+
+        Dispatch is on the source file's language, never on the statement text.
+        ``import `` is ambiguous — it opens both a Python import and an ESM
+        import — so a text-prefix check sent every ESM statement
+        (``import { run } from './util'``) to the Python resolver, and the JS
+        branch was reachable only via ``require(...)``. That made the JS
+        extension probe dead code for exactly the .mjs/.mts files it exists
+        to serve. (Codex review on #1312.)
+        """
+        language = EXT_TO_LANG.get(os.path.splitext(source_file)[1].lower(), "")
+        if language in JS_TS_LANGUAGES:
+            return _resolve_js_import(
+                import_text, source_file, self._project_files, self.project_root
+            )
+        if language == "python":
+            return _resolve_python_import(
+                import_text, source_file, self._project_files, self.project_root
+            )
+        # A mapped language that is neither JS/TS nor Python. Its extractor
+        # records import text in that language's own idiom, and some of those
+        # forms are Python-shaped: measured through `ImportGraph.build()`, Go's
+        # `import "x"` and Java's `import a.b;` both arrive here.
+        #
+        # The historical arm that sniffed `require(` / `from '` / `from "` for a
+        # JS-shaped statement is gone. It was unreachable: every file that can
+        # carry recorded imports has an extension in EXT_TO_LANG, so a JS/TS file
+        # is routed by language above, and no other extractor (measured across
+        # C, Go, Java, Rust, Lua, Ruby, PHP) emits those forms. A branch no
+        # public input can reach is what RFC-0028 §3.1 exists to delete rather
+        # than leave standing; its unit tests passed while it was dead.
+        if import_text.startswith("from ") or import_text.startswith("import "):
+            return _resolve_python_import(
+                import_text, source_file, self._project_files, self.project_root
+            )
+        return None
+
+    def _make_result(self) -> ImportGraphResult:
+        return ImportGraphResult(
+            edges=list(self._edges),
+            file_count=len(self._project_files),
+            edge_count=len(self._edges),
+            cycles=self._detect_cycles(),
+        )
+
+    def _graph_key(self, file_path: str) -> str:
+        """把调用方路径映射为图中实际使用的缓存键（忽略分隔符风格）。
+
+        缓存键使用 ``/``；Windows 上绝对路径经 ``relpath`` 或调用方传入的相对路径
+        会带 ``\\``，直接查表必然落空并静默返回 0 个依赖（#1558, dogfood 2026-10-14）。
+        未命中任何已知文件时原样返回，保持"未知文件 → 空结果"的既有语义。
+        """
+        rel = (
+            os.path.relpath(os.path.abspath(file_path), self.project_root)
+            if _is_rooted(file_path)
+            else file_path
+        )
+        if rel.startswith(".."):
+            # macOS 的 /var → /private/var：调用方传入的路径已 realpath 而根目录没有，
+            # relpath 会落到根目录之外并静默返回空依赖（#1579 macOS CI）。
+            rel = os.path.relpath(
+                os.path.realpath(file_path), os.path.realpath(self.project_root)
+            )
+        known = self._project_files | self._forward.keys() | self._reverse.keys()
+        return _match_file(rel, _file_lookup(known)) or rel
+
+    def dependents_of(self, file_path: str) -> list[dict[str, Any]]:
+        """Find all files that import the given file (reverse deps)."""
+        if not self._built:
+            self.build()
+        edges = self._reverse.get(self._graph_key(file_path), [])
+        return [e.to_dict() for e in edges]
+
+    def dependencies_of(self, file_path: str) -> list[dict[str, Any]]:
+        """Find all files that the given file imports (forward deps)."""
+        if not self._built:
+            self.build()
+        edges = self._forward.get(self._graph_key(file_path), [])
+        return [e.to_dict() for e in edges]
+
+    def blast_radius(self, file_path: str, max_depth: int = 10) -> dict[str, Any]:
+        """Compute transitive reverse deps — all files affected by changing this file."""
+        if not self._built:
+            self.build()
+        rel = self._graph_key(file_path)
+        visited: set[str] = set()
+        frontier = [rel]
+        depth_map: dict[str, int] = {rel: 0}
+
+        while frontier:
+            current = frontier.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            current_depth = depth_map.get(current, 0)
+            if current_depth >= max_depth:
+                continue
+            for edge in self._reverse.get(current, []):
+                dep = edge.source_file
+                if dep not in visited:
+                    depth_map[dep] = current_depth + 1
+                    frontier.append(dep)
+
+        affected = visited - {rel}
+        depth_sorted = sorted(affected, key=lambda f: (depth_map.get(f, 0), f))
+        return {
+            "file": rel,
+            "direct_dependents": len(self._reverse.get(rel, [])),
+            "transitive_dependents": len(affected),
+            "affected_files": [
+                {"file": f, "depth": depth_map.get(f, 0)} for f in depth_sorted
+            ],
+        }
+
+    def _detect_cycles(self) -> list[list[str]]:
+        """Detect import cycles using DFS."""
+        cycles: list[list[str]] = []
+        visited: set[str] = set()
+        in_stack: set[str] = set()
+        path: list[str] = []
+
+        def _dfs(node: str) -> None:
+            if len(cycles) >= 20:
+                return
+            visited.add(node)
+            in_stack.add(node)
+            path.append(node)
+
+            for edge in self._forward.get(node, []):
+                target = edge.target_file
+                if target in in_stack:
+                    idx = path.index(target)
+                    cycle = path[idx:] + [target]
+                    cycles.append(list(cycle))
+                elif target not in visited:
+                    _dfs(target)
+
+            path.pop()
+            in_stack.discard(node)
+
+        for node in sorted(self._project_files):
+            if node not in visited:
+                _dfs(node)
+
+        return cycles
+
+    def summary(self) -> dict[str, Any]:
+        """Return summary statistics."""
+        if not self._built:
+            self.build()
+        fan_out = {f: len(e) for f, e in self._forward.items() if e}
+        fan_in = {f: len(e) for f, e in self._reverse.items() if e}
+        return {
+            "file_count": self._project_files and len(self._project_files) or 0,
+            "edge_count": len(self._edges),
+            "files_with_imports": len(fan_out),
+            "files_imported_by_others": len(fan_in),
+            "cycle_count": len(self._detect_cycles()),
+            "most_imported": sorted(fan_in.items(), key=lambda x: -x[1])[:10],
+            "most_importing": sorted(fan_out.items(), key=lambda x: -x[1])[:10],
+        }

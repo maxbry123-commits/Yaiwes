@@ -1,0 +1,75 @@
+# A let chain derived from a value with a circular self-reference resolved
+# incorrectly depending on the order of the concrete data fields. The result
+# must not depend on field ordering.
+# https://cuelang.org/issue/4357
+-- in.cue --
+import "strings"
+
+// xFirst declares the field referencing the shared let (x) before the source
+// field (id); this is the ordering that used to fail.
+xFirst: {
+	x:  "B"
+	id: "A:B"
+
+	let s = strings.Split(id, ":")
+	let b = s[1]
+
+	id!: "\(s[0]):\(b)"
+	x!:  "\(b)"
+}
+
+// idFirst declares the source field (id) first; this ordering always passed.
+idFirst: {
+	id: "A:B"
+	x:  "B"
+
+	let s = strings.Split(id, ":")
+	let b = s[1]
+
+	id!: "\(s[0]):\(b)"
+	x!:  "\(b)"
+}
+
+// requiredCycle exercises a let whose value resolves through required fields
+// to a genuine cycle: x is a.b, which only ever exists as a cycle placeholder
+// because its required subfields never become concrete. Recomputing such a
+// cached placeholder on every access used to loop indefinitely; evaluation
+// must terminate (here with "required field not present" errors).
+requiredCycle: {
+	a!: b!: {c!: d!: _}
+	a: {}
+	let x = a.b
+	o: x.c.d
+}
+-- out/compile --
+--- in.cue
+{
+  xFirst: {
+    x: "B"
+    id: "A:B"
+    let s#1 = 〈import;strings〉.Split(〈0;id〉, ":")
+    let b#2 = 〈0;let s#1〉[1]
+    id!: "\(〈0;let s#1〉[0]):\(〈0;let b#2〉)"
+    x!: "\(〈0;let b#2〉)"
+  }
+  idFirst: {
+    id: "A:B"
+    x: "B"
+    let s#3 = 〈import;strings〉.Split(〈0;id〉, ":")
+    let b#4 = 〈0;let s#3〉[1]
+    id!: "\(〈0;let s#3〉[0]):\(〈0;let b#4〉)"
+    x!: "\(〈0;let b#4〉)"
+  }
+  requiredCycle: {
+    a!: {
+      b!: {
+        c!: {
+          d!: _
+        }
+      }
+    }
+    a: {}
+    let x#5 = 〈0;a〉.b
+    o: 〈0;let x#5〉.c.d
+  }
+}

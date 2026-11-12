@@ -1,0 +1,8 @@
+# A number field with an empty value.
+-- errors.cue --
+a?: int
+-- input.textproto --
+a:
+-- out/decode --
+textproto: invalid number "":
+    input.textproto:1:1

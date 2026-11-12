@@ -1,0 +1,41 @@
+-- in.cue --
+a: {
+	if b {
+		a: "foo"
+	}
+	b: true
+}
+c: {
+	a: 3
+	if a > 1 {
+		a: 3
+	}
+}
+d: {
+	a: int
+	if a > 1 {
+		a: 3
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    if 〈0;b〉 {
+      a: "foo"
+    }
+    b: true
+  }
+  c: {
+    a: 3
+    if (〈0;a〉 > 1) {
+      a: 3
+    }
+  }
+  d: {
+    a: int
+    if (〈0;a〉 > 1) {
+      a: 3
+    }
+  }
+}

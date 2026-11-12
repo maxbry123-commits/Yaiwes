@@ -1,0 +1,36 @@
+# The old prefix alias syntax (X=) is only accepted below v0.18.0, where
+# @experiment(aliasv2) is stable; pin the language version so
+# that this test keeps exercising it.
+-- cue.mod/module.cue --
+module: "test.example"
+language: version: "v0.17.0"
+-- in.cue --
+X=a: int
+b:   a
+c:   X
+-- out/resolve/in --
+4[X]:   Scope: 0[<nil>]     Node: 0[]
+5[a]:   Scope: 0[<nil>]     Node: 0[]
+6[int]: Scope: 0[<nil>]     Node: 0[]
+8[b]:   Scope: 0[<nil>]     Node: 0[]
+9[a]:   Scope: 1[*ast.File] Node: 6[int]
+11[c]:  Scope: 0[<nil>]     Node: 0[]
+12[X]:  Scope: 1[*ast.File] Node: 2[X=a: int]
+Unresolved: 6[int]
+-- dynamic.cue --
+X=("foo"): int
+Y="\(X)":  string
+a:         X
+b:         Y
+-- out/resolve/dynamic --
+4[X]:       Scope: 0[<nil>]     Node: 0[]
+5[int]:     Scope: 0[<nil>]     Node: 0[]
+8[Y]:       Scope: 0[<nil>]     Node: 0[]
+9[X]:       Scope: 1[*ast.File] Node: 2[X=("foo"): int]
+10[string]: Scope: 0[<nil>]     Node: 0[]
+12[a]:      Scope: 0[<nil>]     Node: 0[]
+13[X]:      Scope: 1[*ast.File] Node: 2[X=("foo"): int]
+15[b]:      Scope: 0[<nil>]     Node: 0[]
+16[Y]:      Scope: 1[*ast.File] Node: 6[Y="\(X)": string]
+Unresolved: 5[int]
+Unresolved: 10[string]

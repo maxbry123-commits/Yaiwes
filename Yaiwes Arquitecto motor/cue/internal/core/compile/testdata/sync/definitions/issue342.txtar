@@ -1,0 +1,57 @@
+# Tests that Fill() followed by Validate(concrete) succeeds for complex disjunction
+# definitions under dynamic (interpolated) keys, as it does for static keys.
+# https://cuelang.org/issue/342
+-- in.cue --
+X: {
+	#Simple: {
+		ref: string
+	}
+
+	#Complex: {
+		{
+			ref: string
+		} | {
+			local: string
+		}
+	}
+
+
+	var: "bar"
+
+	// Validate(concrete) after Fill() on Complex.ref from a "static" key will succeed
+	"test_1": #Complex
+
+	// Validate(concrete) after Fill() on "#Simple.ref" from a "dynamic" key will succeed
+	"test_2_\(var)": #Simple
+
+	// Validate(concrete) after Fill() on Complex.ref from a "dynamic" key will fail
+	"test_3_\(var)": #Complex
+
+	test_3_bar: ref: "FOO"
+}
+
+Z: X.test_3_bar.ref
+-- out/compile --
+--- in.cue
+{
+  X: {
+    #Simple: {
+      ref: string
+    }
+    #Complex: {
+      ({
+        ref: string
+      }|{
+        local: string
+      })
+    }
+    var: "bar"
+    test_1: 〈0;#Complex〉
+    "test_2_\(〈0;var〉)": 〈0;#Simple〉
+    "test_3_\(〈0;var〉)": 〈0;#Complex〉
+    test_3_bar: {
+      ref: "FOO"
+    }
+  }
+  Z: 〈0;X〉.test_3_bar.ref
+}

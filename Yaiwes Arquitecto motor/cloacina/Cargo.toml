@@ -1,0 +1,56 @@
+[workspace]
+members = ["crates/cloacina", "crates/cloacina-api-types", "crates/cloacina-client", "crates/cloacina-build", "crates/cloacinactl", "crates/cloacina-server", "crates/cloacina-agent", "crates/cloacina-compiler", "crates/cloacina-macros", "crates/cloacina-workflow-plugin", "crates/cloacina-testing", "crates/cloacina-workflow", "crates/cloacina-computation-graph", "crates/cloacina-constructor-contract", "crates/cloacina-python"]
+exclude = ["examples/*", "providers/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.12.0"
+edition = "2024"
+rust-version = "1.99"
+authors = ["Dylan Storey <dylan.storey@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/colliery-io/cloacina"
+homepage = "https://github.com/colliery-io/cloacina"
+documentation = "https://colliery-io.github.io/cloacina/"
+readme = "README.md"
+keywords = []
+categories = []
+
+[workspace.dependencies]
+async-trait = { version = "0.1" }
+inventory = { version = "0.3" }
+once_cell = { version = "1.19.0" }
+serde_json = { version = "1.0" }
+# default-features = false: cloacina's defaults include postgres; every internal
+# consumer opts into its own backend. Setting it here (not just in the members)
+# is REQUIRED — Cargo ignores a member's `default-features = false` when the
+# workspace dep omits it, which silently leaks postgres/libpq into sqlite-only
+# builds (CLOACI-I-0134 follow-up).
+cloacina = { version = "0.12.0", path = "crates/cloacina", default-features = false }
+cloacina-api-types = { version = "0.12.0", path = "crates/cloacina-api-types" }
+cloacina-build = { version = "0.12.0", path = "crates/cloacina-build" }
+cloacina-client = { version = "0.12.0", path = "crates/cloacina-client" }
+cloacina-computation-graph = { version = "0.12.0", path = "crates/cloacina-computation-graph" }
+cloacina-macros = { version = "0.12.0", path = "crates/cloacina-macros" }
+cloacina-python = { version = "0.12.0", path = "crates/cloacina-python", default-features = false }
+cloacina-workflow = { version = "0.12.0", path = "crates/cloacina-workflow" }
+cloacina-workflow-plugin = { version = "0.12.0", path = "crates/cloacina-workflow-plugin" }
+cloacina-constructor-contract = { version = "0.12.0", path = "crates/cloacina-constructor-contract" }
+clap = { version = "4.0", features = ["derive", "env"] }
+anyhow = { version = "1.0" }
+toml = { version = "1" }
+bincode = { version = "1.3" }
+
+# fidius — the plugin/FFI framework. Collapsed to workspace deps (CLOACI-T-0897):
+# these were pinned as 11 independent "0.5.6" literals across 7 crates, the exact
+# version-drift class I-0134 exists to prevent. They must move in lockstep — the
+# wire is positional bincode, so two different fidius versions in one build mean
+# two incompatible copies of the FFI types.
+#
+# 0.5.7 adds the plugin -> host callback channel (`#[host_interface]`) that
+# CLOACI-T-0897's packaged `defer_until` needs. It is an ABI-additive patch, so
+# packages built against 0.5.6 load unchanged.
+fidius = { version = "0.5.7" }
+fidius-core = { version = "0.5.7" }
+fidius-host = { version = "0.5.7" }
+fidius-macro = { version = "0.5.7" }

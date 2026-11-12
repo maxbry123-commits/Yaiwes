@@ -1,0 +1,25 @@
+-- in.cue --
+a: t & {c:  5} // {c:5,d:15}
+b: ti & {c: 7} // {c:7,d:21}
+t: {
+	c: number
+	d: c * 3
+}
+ti: t & {c: int}
+-- out/compile --
+--- in.cue
+{
+  a: (〈0;t〉 & {
+    c: 5
+  })
+  b: (〈0;ti〉 & {
+    c: 7
+  })
+  t: {
+    c: number
+    d: (〈0;c〉 * 3)
+  }
+  ti: (〈0;t〉 & {
+    c: int
+  })
+}

@@ -1,0 +1,25 @@
+[package]
+name = "cloacina-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Procedural macros for the cloacina workflow orchestration library."
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+once_cell.workspace = true
+proc-macro2 = { version = "1.0" }
+quote = { version = "1.0" }
+serde_json.workspace = true
+syn = { version = "3", features = ["full"] }
+thiserror = { version = "2" }

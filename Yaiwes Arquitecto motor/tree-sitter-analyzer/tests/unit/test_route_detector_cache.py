@@ -1,0 +1,582 @@
+"""Tests for route cache persistence, handler-name quality, envelope consistency, and version invalidation."""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from tree_sitter_analyzer.mcp.tools.route_detector_tool import RouteDetectorTool
+from tree_sitter_analyzer.registry.route_cache import RouteCache
+from tree_sitter_analyzer.route_detector import RouteDetector
+
+# ---------------------------------------------------------------------------
+# PERF-1: content-hash route cache
+# ---------------------------------------------------------------------------
+
+
+class TestRouteCachePersistence:
+    """The content-hash cache must survive across RouteDetector instances
+    and avoid re-parsing files whose mtime+content are unchanged."""
+
+    def test_warm_pass_uses_cache(self, flask_project: Path):
+        d1 = RouteDetector(str(flask_project))
+        first = d1.detect_all()
+        s1 = d1.cache_stats()
+        assert s1["misses"] == 1
+        assert s1["hits"] == 0
+
+        d2 = RouteDetector(str(flask_project))
+        second = d2.detect_all()
+        s2 = d2.cache_stats()
+        assert s2["hits"] == 1
+        assert s2["misses"] == 0
+        # Same URL pattern set across runs.
+        assert sorted(r.url_pattern for r in first) == sorted(
+            r.url_pattern for r in second
+        )
+
+    def test_cache_invalidates_on_content_change(self, multi_framework_project: Path):
+        d1 = RouteDetector(str(multi_framework_project))
+        d1.detect_all()
+
+        # Modify app.py to add a new route — mtime + content both change.
+        # Other files (api.py, routes.js) must stay as cache hits.
+        app = multi_framework_project / "app.py"
+        app.write_text(
+            app.read_text() + "\n@app.route('/new')\ndef brand_new():\n    return 'x'\n"
+        )
+
+        d2 = RouteDetector(str(multi_framework_project))
+        routes = d2.detect_all()
+        urls = {r.url_pattern for r in routes}
+        assert "/new" in urls
+        # The two unchanged files should still be cache hits.
+        s = d2.cache_stats()
+        assert s["hits"] == 2
+        assert s["misses"] == 1  # the modified app.py
+
+    def test_cache_disabled_flag(self, flask_project: Path):
+        d = RouteDetector(str(flask_project), cache_enabled=False)
+        d.detect_all()
+        s = d.cache_stats()
+        assert s["enabled"] is False
+        assert s["hits"] == 0
+        assert s["misses"] == 0
+
+    def test_results_identical_with_and_without_cache(self, flask_project: Path):
+        cached = RouteDetector(str(flask_project)).detect_all()
+        # Re-instantiate after caching to force going through cache path.
+        cached_via_db = RouteDetector(str(flask_project)).detect_all()
+        no_cache = RouteDetector(str(flask_project), cache_enabled=False).detect_all()
+
+        def key(rs: list) -> list:
+            return sorted(
+                (r.http_method, r.url_pattern, r.handler_name, r.framework) for r in rs
+            )
+
+        assert key(cached) == key(cached_via_db) == key(no_cache)
+
+    def test_warm_pass_rescans_no_file_and_returns_identical_routes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """PERF-1 regression guard（#1751：断言缓存行为本身，不再比较毫秒级耗时比）。
+
+        暖运行（缓存已填充、文件未变）不得重新扫描或解析任何文件——每个文件的
+        扫描与解析都经过 ``detect_file``——且结果与不用缓存的冷运行逐项相同。
+        缓存被关闭或快速路径失效时，暖运行会对每个文件调用 ``detect_file``。
+        """
+        project = tmp_path / "perf_project"
+        project.mkdir()
+        for i in range(60):
+            (project / f"app_{i}.py").write_text(
+                "from flask import Flask\n"
+                f"app = Flask('m{i}')\n"
+                + "".join(
+                    f"@app.route('/r{i}_{j}')\ndef h_{i}_{j}():\n    return 'x'\n\n"
+                    for j in range(3)
+                )
+            )
+        scanned: list[str] = []
+        original = RouteDetector.detect_file
+
+        def counting(self, file_path: str):
+            scanned.append(file_path)
+            return original(self, file_path)
+
+        monkeypatch.setattr(RouteDetector, "detect_file", counting)
+
+        def key(routes: list) -> list:
+            return sorted(
+                (
+                    r.file_path,
+                    r.line_number,
+                    r.http_method,
+                    r.url_pattern,
+                    r.handler_name,
+                )
+                for r in routes
+            )
+
+        cold = RouteDetector(str(project), cache_enabled=False).detect_all()
+        assert (len(scanned), len(cold)) == (60, 60 * 3)
+
+        primed = RouteDetector(str(project)).detect_all()
+        assert len(scanned) == 120  # 填充缓存：每个文件扫描一次
+        scanned.clear()
+
+        warm_detector = RouteDetector(str(project))
+        warm = warm_detector.detect_all()
+        assert scanned == []
+        assert warm_detector.cache_stats()["hits"] == 60
+        assert key(warm) == key(primed) == key(cold)
+
+    def test_route_cache_creates_db_file(self, flask_project: Path, tmp_path: Path):
+        db = tmp_path / "subdir" / "routes.db"
+        cache = RouteCache(db)
+        assert db.exists()
+        stats = cache.stats()
+        assert stats == {"file_count": 0, "total_bytes": 0}
+
+    def test_route_cache_round_trip(self, tmp_path: Path):
+        db = tmp_path / "routes.db"
+        cache = RouteCache(db)
+        sample = [
+            {
+                "http_method": "GET",
+                "url_pattern": "/x",
+                "handler_name": "h",
+                "file_path": "/p",
+                "line_number": 1,
+                "framework": "flask",
+                "language": "python",
+            }
+        ]
+        cache.put("/p", "deadbeef", 12345, sample)
+        assert cache.get("/p", "deadbeef") == sample
+        # Wrong hash → miss.
+        assert cache.get("/p", "0badcafe") is None
+        # Stat hit.
+        assert cache.get_by_stat("/p", 12345) == sample
+        assert cache.get_by_stat("/p", 99999) is None
+        # Bulk hit.
+        bulk = cache.bulk_get_by_stat([("/p", 12345), ("/missing", 0)])
+        assert bulk == {"/p": sample}
+
+    def test_close_releases_connection_and_allows_lazy_reopen(self, tmp_path: Path):
+        """close 必须立即释放连接，并保持重复调用和后续复用安全。"""
+        cache = RouteCache(tmp_path / "routes.db")
+        connection = cache._conn()
+
+        cache.close()
+        cache.close()
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+        assert cache.stats() == {"file_count": 0, "total_bytes": 0}
+
+    def test_close_releases_connections_created_by_worker_threads(self, tmp_path: Path):
+        """共享缓存关闭时必须回收其他线程创建的连接。"""
+        cache = RouteCache(tmp_path / "routes.db")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            worker_connection = pool.submit(cache._conn).result()
+            cache.close()
+
+            with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+                worker_connection.execute("SELECT 1")
+            assert pool.submit(cache.stats).result() == {
+                "file_count": 0,
+                "total_bytes": 0,
+            }
+
+    def test_connection_setup_failure_closes_partial_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """连接初始化失败时不能遗留已打开的底层句柄。"""
+        cache = RouteCache(tmp_path / "routes.db")
+        cache.close()
+        cache._local = threading.local()
+
+        class BrokenConnection:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def execute(self, _statement: str) -> None:
+                raise sqlite3.OperationalError("pragma failed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        broken = BrokenConnection()
+        monkeypatch.setattr(sqlite3, "connect", lambda *_args, **_kwargs: broken)
+
+        with pytest.raises(sqlite3.OperationalError, match="pragma failed"):
+            cache._conn()
+        assert broken.closed is True
+
+    def test_connection_open_racing_close_retries_current_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """连接创建与 close 竞态时必须丢弃旧代连接并重试。"""
+        cache = RouteCache(tmp_path / "routes.db")
+        cache.close()
+        cache._local = threading.local()
+        original_connect = sqlite3.connect
+        opened: list[sqlite3.Connection] = []
+
+        def connect_with_one_close(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            opened.append(connection)
+            if len(opened) == 1:
+                cache.close()
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", connect_with_one_close)
+
+        current = cache._conn()
+
+        assert current is opened[1]
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            opened[0].execute("SELECT 1")
+        assert current.execute("SELECT 1").fetchone()[0] == 1
+
+    def test_detector_finalizer_swallows_close_failure(self, tmp_path: Path):
+        """析构兜底不能让缓存关闭异常逃逸到解释器。"""
+        detector = RouteDetector(str(tmp_path), cache_enabled=False)
+
+        class BrokenCache:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+                raise sqlite3.OperationalError("close failed")
+
+        broken = BrokenCache()
+        detector._cache = broken  # type: ignore[assignment]
+
+        detector.__del__()
+
+        assert broken.close_calls == 1
+
+    def test_tool_rebind_closes_previous_detector_cache(self, tmp_path: Path):
+        """切换项目根时不能把旧 routes.db 连接留给垃圾回收。"""
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        tool = RouteDetectorTool(str(first))
+        detector = tool._get_detector()
+        assert detector._cache is not None
+        connection = detector._cache._conn()
+
+        tool.set_project_path(str(second))
+
+        assert tool._detector is None
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+
+# ---------------------------------------------------------------------------
+# Finding F4: handler-name quality for non-callable second args
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerNameQuality:
+    """``handler_name`` must never silently be the URL pattern or a junk
+    arg-spec when the call's callable slot holds something that is not a
+    function reference (object literal, middleware array, etc.).
+
+    Round-17 finding F4: ``app.post('/x', { fn: handler })`` used to report
+    ``handler_name == '/x'`` because the extractor fell back to ``args[0]``
+    after failing to match the second arg. We now return ``<object>`` for
+    object-literal slots and ``<inline>`` for inline function expressions.
+    """
+
+    @staticmethod
+    def _handlers_by_url(project: Path) -> dict[str, str]:
+        # Cache stores prior results by content hash — bypass it so we
+        # measure the *current* extractor, not last round's cached output.
+        routes = RouteDetector(str(project), cache_enabled=False).detect_all()
+        return {r.url_pattern: r.handler_name for r in routes}
+
+    def test_inline_arrow_function_returns_inline(self, tmp_path: Path):
+        from tests.unit.conftest import _write
+
+        _write(
+            tmp_path,
+            "arrow.js",
+            """\
+const express = require('express');
+const app = express();
+app.get('/health', (req, res) => res.send('ok'));
+app.post('/users', async (req, res) => { res.json({}); });
+""",
+        )
+        handlers = self._handlers_by_url(tmp_path)
+        assert handlers["/health"] == "<inline>", (
+            f"F4: arrow-function callback must surface as '<inline>', "
+            f"got {handlers['/health']!r}"
+        )
+        assert handlers["/users"] == "<inline>"
+
+    def test_named_function_reference_returns_identifier(self, tmp_path: Path):
+        from tests.unit.conftest import _write
+
+        _write(
+            tmp_path,
+            "named.js",
+            """\
+const express = require('express');
+const app = express();
+app.get('/users', listUsers);
+app.post('/users/:id', userCtrl.create);
+app.delete('/users/:id', wrap(removeUser));
+""",
+        )
+        handlers = self._handlers_by_url(tmp_path)
+        # Bare identifier.
+        assert handlers["/users"] == "listUsers"
+        # Member expression — keep the chain so callers can resolve it.
+        assert handlers["/users/:id"] in ("userCtrl.create", "wrap(removeUser)"), (
+            "F4: named-reference handler shape regressed; "
+            f"got {handlers['/users/:id']!r}"
+        )
+
+    def test_object_literal_handler_returns_object_marker(self, tmp_path: Path):
+        """The big bug: an object literal callback slot must NOT surface
+        the URL pattern as ``handler_name``."""
+        from tests.unit.conftest import _write
+
+        _write(
+            tmp_path,
+            "object.js",
+            """\
+const express = require('express');
+const app = express();
+app.post('/save', { method: 'GET', fn: handler });
+app.put('/update', { handler: doUpdate, schema: schema });
+""",
+        )
+        handlers = self._handlers_by_url(tmp_path)
+        assert handlers["/save"] == "<object>", (
+            f"F4: object-literal slot must surface as '<object>', "
+            f"not as URL pattern. Got {handlers['/save']!r}"
+        )
+        assert handlers["/update"] == "<object>"
+        # Crucial negative assertion: handler must NEVER equal the URL
+        # itself (the bug we are fixing).
+        assert handlers["/save"] != "/save"
+        assert handlers["/update"] != "/update"
+
+    def test_middleware_array_skipped_real_handler_wins(self, tmp_path: Path):
+        """``app.get('/x', [mw1, mw2], realHandler)`` — handler must be the
+        final callable, not the middleware array."""
+        from tests.unit.conftest import _write
+
+        _write(
+            tmp_path,
+            "with_mw.js",
+            """\
+const express = require('express');
+const app = express();
+app.get('/with-array', ['mw1', 'mw2'], finalHandler);
+""",
+        )
+        handlers = self._handlers_by_url(tmp_path)
+        assert handlers["/with-array"] == "finalHandler", (
+            f"F4: middleware-array slot must be skipped; "
+            f"final identifier should win. Got {handlers['/with-array']!r}"
+        )
+        # Belt-and-braces: never the URL.
+        assert handlers["/with-array"] != "/with-array"
+
+    def test_handler_never_starts_with_slash(self, tmp_path: Path):
+        """Whatever the callback slot looks like, the handler name must
+        never be a URL pattern (regression-guard for the whole class)."""
+        from tests.unit.conftest import _write
+
+        _write(
+            tmp_path,
+            "mixed.js",
+            """\
+const express = require('express');
+const app = express();
+app.get('/a', { obj: 1 });
+app.post('/b', ['mw'], cb);
+app.put('/c', (req, res) => {});
+app.delete('/d', namedHandler);
+""",
+        )
+        handlers = self._handlers_by_url(tmp_path)
+        for url, handler in handlers.items():
+            assert not handler.startswith("/"), (
+                f"F4: handler_name {handler!r} for {url!r} looks like a URL — "
+                "extractor fell back to the wrong arg."
+            )
+
+
+# ---------------------------------------------------------------------------
+# r37f7-F4: envelope self-consistency + cache version invalidation
+# ---------------------------------------------------------------------------
+
+
+class TestRouteEnvelopeConsistency:
+    """r37f7-F4: ``mode=summary`` used to return ``total_routes=N`` next to
+    ``routes: []`` for N>0 — a self-contradicting envelope. The fix
+    populates ``routes`` from the same ``detect_all()`` result that powers
+    the aggregate counts so ``len(routes) == total_routes`` and
+    ``len(by_framework) == 0 ⇔ total_routes == 0`` always hold.
+    """
+
+    @staticmethod
+    def _run(tool: RouteDetectorTool, args: dict) -> dict:
+        return asyncio.run(tool.execute(args))
+
+    def test_summary_envelope_is_internally_consistent_on_empty_project(
+        self, tmp_path: Path
+    ):
+        """A project with no web-framework code must produce a fully
+        consistent envelope: empty routes list, zero total, empty
+        ``by_framework`` dict, and a summary_line that names zeros.
+        """
+        (tmp_path / "lib.py").write_text(
+            "def add(a, b):\n    return a + b\n",
+            encoding="utf-8",
+        )
+        tool = RouteDetectorTool(str(tmp_path))
+        result = self._run(tool, {"mode": "summary", "output_format": "json"})
+        assert result["routes"] == []
+        assert result["total_routes"] == 0
+        assert result["by_framework"] == {}
+        assert result["by_method"] == {}
+        # F4 contract: routes/total_routes invariant.
+        assert len(result["routes"]) == result["total_routes"]
+        # F4 contract: total==0 ⇔ no frameworks.
+        assert (result["total_routes"] == 0) == (len(result["by_framework"]) == 0)
+        assert result["summary_line"] == "0 routes across 0 frameworks"
+
+    def test_summary_envelope_routes_match_total_on_populated_project(
+        self, flask_project: Path
+    ):
+        """When ``total_routes > 0`` the ``routes`` list must contain the
+        actual route entries — not an empty placeholder that lies about the
+        count.
+        """
+        tool = RouteDetectorTool(str(flask_project))
+        result = self._run(tool, {"mode": "summary", "output_format": "json"})
+        assert result["total_routes"] == 3
+        # The critical F4 invariant: list length matches the count claim.
+        assert len(result["routes"]) == result["total_routes"]
+        # Aggregates derived from the same list so their cardinality matches.
+        frameworks = set(result["by_framework"].keys())
+        frameworks_from_routes = {r["framework"] for r in result["routes"]}
+        assert frameworks == frameworks_from_routes
+
+    @pytest.mark.slow_ok
+    def test_tree_sitter_analyzer_project_reports_zero_routes(self):
+        """Regression guard for the original F4 reproducer: running the
+        tool against this repo (which has no Flask/Django/FastAPI/Express/
+        Spring code) must return ``total_routes==0`` and an empty
+        ``routes`` list.
+
+        Before the fix, a stale ``.ast-cache/routes.db`` produced by an
+        earlier (looser) version of ``scan_express_routes`` kept returning
+        ``apiClient.post('/save')`` as an Express route — the cache was
+        keyed by content hash only, so a scanner-logic change couldn't
+        invalidate it. The fix adds a ``scanner_version`` meta row that
+        wipes pre-tightening rows on init.
+        """
+        import os as _os
+
+        # Walk up to the repo root (containing pyproject.toml).
+        here = Path(__file__).resolve()
+        repo_root = next(
+            (p for p in here.parents if (p / "pyproject.toml").exists()),
+            None,
+        )
+        if repo_root is None or not (repo_root / "tree_sitter_analyzer").is_dir():
+            pytest.skip("tree-sitter-analyzer repo root not found from this test file")
+        if _os.environ.get("TSA_SKIP_REPO_DOGFOOD"):
+            pytest.skip("TSA_SKIP_REPO_DOGFOOD set")
+        tool = RouteDetectorTool(str(repo_root))
+        result = self._run(tool, {"mode": "summary", "output_format": "json"})
+        assert result["total_routes"] == 0, (
+            f"tree-sitter-analyzer has no web frameworks; "
+            f"got total_routes={result['total_routes']!r}, "
+            f"routes={result['routes']!r}"
+        )
+        assert result["routes"] == []
+        assert result["by_framework"] == {}
+
+
+class TestRouteCacheVersionInvalidation:
+    """r37f7-F4: bumping ``_SCANNER_VERSION`` must wipe stale rows so a
+    scanner-logic change (e.g. tightening the express receiver whitelist)
+    propagates to warm-cache callers.
+
+    Prior to F4, the cache was keyed by ``(file_path, content_hash)``
+    only. A file that yielded a false-positive route under v1 of the
+    scanner would keep returning that false positive on every warm pass
+    because the file content was unchanged.
+    """
+
+    def test_version_mismatch_clears_cache(self, tmp_path: Path):
+        from tree_sitter_analyzer.registry import route_cache as cache_module
+
+        db_path = tmp_path / "routes.db"
+        # Seed the cache with one row at the current scanner version.
+        cache = cache_module.RouteCache(db_path)
+        cache.put(
+            "/fake/path.py",
+            "deadbeef",
+            123456789,
+            [
+                {
+                    "http_method": "GET",
+                    "url_pattern": "/legacy",
+                    "handler_name": "h",
+                    "file_path": "/fake/path.py",
+                    "line_number": 1,
+                    "framework": "express",
+                    "language": "javascript",
+                }
+            ],
+        )
+        # Sanity: the row is present.
+        assert cache.get("/fake/path.py", "deadbeef") is not None
+
+        # Simulate a scanner-logic bump by re-opening the cache under a
+        # newer SCANNER_VERSION. The old row must be evicted.
+        new_version = cache_module._SCANNER_VERSION + 1
+        monkey_version_attr = "_SCANNER_VERSION"
+        original = getattr(cache_module, monkey_version_attr)
+        try:
+            setattr(cache_module, monkey_version_attr, new_version)
+            cache2 = cache_module.RouteCache(db_path)
+        finally:
+            setattr(cache_module, monkey_version_attr, original)
+        assert cache2.get("/fake/path.py", "deadbeef") is None, (
+            "Cache row produced by an older scanner version must be evicted "
+            "when SCANNER_VERSION increases — otherwise scanner tightenings "
+            "never reach warm-cache callers."
+        )
+
+    def test_version_match_preserves_cache(self, tmp_path: Path):
+        from tree_sitter_analyzer.registry import route_cache as cache_module
+
+        db_path = tmp_path / "routes.db"
+        cache = cache_module.RouteCache(db_path)
+        cache.put(
+            "/fake/keep.py",
+            "cafef00d",
+            42,
+            [],
+        )
+        # Reopen at the *same* version — row must survive.
+        cache2 = cache_module.RouteCache(db_path)
+        assert cache2.get("/fake/keep.py", "cafef00d") == []

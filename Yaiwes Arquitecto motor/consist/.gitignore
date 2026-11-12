@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+docs-internal
+
+*.duckdb
+tmp/
+
+
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+# Virtual environments
+.venv
+
+# IDE
+.idea
+/examples/runs/
+/examples/generated/
+/graphify-out/
+/runs/
+/tests-temp/

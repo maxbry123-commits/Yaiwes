@@ -1,0 +1,96 @@
+-- in.cue --
+package lpcorpus
+
+#Value:   {type: "int"} | {type: "float"} | {type: "string"}
+
+foo: [{type: "float"}] & [...#Value]
+foo: [{type: "float"}] & [...#Value]
+foo: [{type: "float"}] & [...#Value]
+foo: [{type: "float"}] & [...#Value]
+foo: [{type: "float"}] & [...#Value]
+foo: [{type: "string"}] & [...#Value]
+foo: [{type: "string"}] & [...#Value]
+foo: [{type: "string"}] & [...#Value]
+foo: [{type: "float"}] & [...#Value]
+foo: [{type: "float"}] & [...#Value]
+-- out/compile --
+--- in.cue
+{
+  #Value: ({
+    type: "int"
+  }|{
+    type: "float"
+  }|{
+    type: "string"
+  })
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "string"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "string"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "string"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+  foo: ([
+    {
+      type: "float"
+    },
+  ] & [
+    ...〈1;#Value〉,
+  ])
+}

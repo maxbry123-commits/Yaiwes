@@ -1,0 +1,17 @@
+-- in.cue --
+a: 1 != 2
+b: 1 != null
+c: true == null
+d: null != {}
+e: null == []
+f: 0 == 0.0 // types are unified first TODO: make this consistent
+-- out/compile --
+--- in.cue
+{
+  a: (1 != 2)
+  b: (1 != null)
+  c: (true == null)
+  d: (null != {})
+  e: (null == [])
+  f: (0 == 0.0)
+}

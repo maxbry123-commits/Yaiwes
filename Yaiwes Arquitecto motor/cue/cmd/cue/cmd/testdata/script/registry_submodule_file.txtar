@@ -1,0 +1,41 @@
+# A file in the main module at the path of a submodule, or of a
+# directory within it, does not hide the packages of the submodule.
+
+exec cue eval .
+cmp stdout expect-stdout
+-- expect-stdout --
+a: {
+    f: true
+    g: true
+}
+-- cue.mod/module.cue --
+module: "main.org"
+language: version: "v0.8.0"
+
+deps: {
+	"main.org/foo@v0": {
+		default: true
+		v: "v0.0.1"
+	}
+}
+-- main.cue --
+package main
+import (
+	"main.org/foo"
+	"main.org/foo/bar"
+)
+a: {
+	f: foo.f
+	g: bar.g
+}
+-- foo --
+A file named like the submodule.
+-- _registry/main.org_foo_v0.0.1/cue.mod/module.cue --
+module: "main.org/foo@v0"
+language: version: "v0.8.0"
+-- _registry/main.org_foo_v0.0.1/foo.cue --
+package foo
+f: true
+-- _registry/main.org_foo_v0.0.1/bar/bar.cue --
+package bar
+g: true

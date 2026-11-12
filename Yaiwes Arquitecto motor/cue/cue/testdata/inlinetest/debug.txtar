@@ -1,0 +1,60 @@
+-- in.cue --
+// debugCheck: compare debug-printer output via @test(debugCheck, ...) attributes.
+
+// ── scalar value ─────────────────────────
+
+debugCheckScalar: 42 @test(debugCheck, "(int){ 42 }")
+
+// ── struct value ─────────────────────────
+
+debugCheckStruct: {
+	@test(debugCheck, """
+		(struct){
+		  a: (int){ 1 }
+		  b: (int){ 2 }
+		}
+		""")
+	a: 1
+	b: 2
+}
+
+// ── computed struct ───────────────────────
+
+debugCheckComputed: {
+	@test(debugCheck, """
+		(struct){
+		  x: (int){ 10 }
+		  y: (int){ 20 }
+		}
+		""")
+	x: 10
+	y: x * 2
+}
+
+// ── version override: v3 debugCheck takes precedence ──
+// Both default and v3 have the same expected output here,
+// verifying that versioned attrs are accepted and applied correctly.
+
+debugCheckVersioned: {
+	@test(debugCheck, """
+		(struct){
+		  z: (int){ 99 }
+		}
+		""")
+	@test(debugCheck:v3, """
+		(struct){
+		  z: (int){ 99 }
+		}
+		""")
+	z: 99
+}
+-- out/eval/stats --
+Leaks:  0
+Freed:  10
+Reused: 3
+Allocs: 7
+Retain: 0
+
+Unifications: 10
+Conjuncts:    10
+Disjuncts:    0

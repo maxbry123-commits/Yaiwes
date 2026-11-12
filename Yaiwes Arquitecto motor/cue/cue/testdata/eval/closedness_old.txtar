@@ -1,0 +1,828 @@
+# Pinned to v0.17.0: these groups cover how several embeddings union the
+# fields a closed struct allows, how an embedded definition closes its
+# embedder recursively, and which fields an embedding exempts from the
+# closedness of a field it declares, which explicitopen changes from v0.18.0
+# on; the new semantics are covered by definitions/explicitopen.txtar.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- embed.cue --
+patterns: shallow: {
+	#a: [>="k"]: int
+	#b: [<="m"]: int
+	#c: [>="w"]: int
+	#d: [<="y"]: int
+
+	single: {
+		X:   #a  // "k" <= x
+		err: X @test(err, code=eval, path=j, contains="field not allowed", pos=[1:8])
+		err: j: 3
+
+		ok: X @test(eq, {k: 3})
+		ok: k: 3
+	}
+
+	and: p1: {
+		X: #a & #b // "k" <= x && x <= "m"
+
+		err: X @test(err, code=eval, path=j, contains="field not allowed", pos=[-16:6, 1:8])
+		err: j: 3
+
+		ok: X @test(eq, {k: 3})
+		ok: k: 3
+	}
+
+	and: p2: {
+		X:   #b & #a  // "k" <= x && x <= "m"
+		err: X @test(err, code=eval, path=j, contains="field not allowed", pos=[-25:6, 1:8])
+		err: j: 3
+
+		ok: X @test(eq, {k: 3})
+		ok: k: 3
+	}
+
+	andEmbed: p1: {
+		X: {#a & #b} // "k" <= x && x <= "m"
+
+		err: X @test(err, code=eval, path=j, contains="field not allowed", pos=[-35:6, 1:8])
+		err: j: 3
+
+		ok: X @test(eq, {k: 3})
+		ok: k: 3
+	}
+
+	andEmbed: p2: {
+		X:   {#b & #a}  // "k" <= x && x <= "m"
+		err: X @test(err, code=eval, path=j, contains="field not allowed", pos=[-44:6, 1:8])
+		err: j: 3
+
+		ok: X @test(eq, {k: 3})
+		ok: k: 3
+	}
+
+	orEmbed: p1: {
+		X: {#a, #b} // "k" <= x && x <= "m"
+
+		ok1: X @test(eq, {j: 3})
+		ok1: j: 3
+
+		ok2: X @test(eq, {k: 3})
+		ok2: k: 3
+	}
+
+	orEmbed: p2: {
+		X:   {#b, #a}  // "k" <= x && x <= "m"
+		ok1: X @test(eq, {j: 3})
+		ok1: j: 3
+
+		ok2: X @test(eq, {k: 3})
+		ok2: k: 3
+	}
+
+	andOrEmbed: t1: p1: {
+		// ("k" <= x && x <= "m")  || ("w" <= x && x <= "y")
+		X: {
+			#a & #b
+			#c & #d
+		}
+		err1: X @test(eq, {j: 3})
+		err1: j: 3
+
+		ok1: X @test(eq, {k: 3})
+		ok1: k: 3
+	}
+
+	andOrEmbed: t1: p2: {
+		// ("k" <= x && x <= "m")  || ("w" <= x && x <= "y")
+		X: {
+			#c & #d
+			#a & #b
+		}
+		err1: X @test(eq, {j: 3})
+		err1: j: 3
+
+		ok1: X @test(eq, {k: 3})
+		ok1: k: 3
+	}
+
+	andOrEmbed: t2: {
+		// ("k" <= x && x <= "m")  || ("w" <= x && x <= "y") || x == "p"
+		X: {
+			#a & #b
+			#c & #d
+			["p"]: int
+		}
+		err1: X @test(eq, {j: 3})
+		err1: j: 3
+
+		ok1: X @test(eq, {k: 3})
+		ok1: k: 3
+
+		ok2: X @test(eq, {p: 3})
+		ok2: p: 3
+	}
+
+	// The last indirection is not a definition.
+	indirect: {
+		a: [>="k"]: int
+		#a: a
+
+		p1: { // XXX // link to code
+			X:    #a
+			err1: X @test(err, code=eval, path=j, contains="field not allowed", pos=[1:10])
+			err1: j: 3
+
+			err2: X & __no_sharing
+			err2: j: 3 @test(err, code=eval, contains="field not allowed", pos=[0:10])
+
+			ok: X
+			ok: k: 3 @test(eq, 3)
+		}
+
+		p2: {
+			#a: a & __no_sharing
+			X:  #a
+
+			err1: X
+			err1: j: 3 @test(err, code=eval, contains="field not allowed", pos=[0:10])
+
+			err2: X & __no_sharing @test(err, code=eval, path=j, contains="field not allowed", pos=[1:10])
+			err2: j: 3
+
+			ok: X @test(eq, {k: 3})
+			ok: k: 3
+		}
+
+		p3: {
+			X: #a & __no_sharing
+
+			err1: X @test(err, code=eval, path=j, contains="field not allowed", pos=[1:10])
+			err1: j: 3
+
+			err2: X & __no_sharing @test(err, code=eval, path=j, contains="field not allowed", pos=[1:10])
+			err2: j: 3
+
+			ok: X @test(eq, {k: 3})
+			ok: k: 3
+		}
+
+		p4: {
+			#a: a & __no_sharing
+			X:  #a
+			X:  #a & __no_sharing
+
+			err1: X @test(err, code=eval, path=j, contains="field not allowed", pos=[1:10])
+			err1: j: 3
+
+			err2: X & __no_sharing @test(err, code=eval, path=j, contains="field not allowed", pos=[1:10])
+			err2: j: 3
+
+			ok: X @test(eq, {k: 3})
+			ok: k: 3
+		}
+	}
+}
+
+patterns: nested: {
+	#a: x: y: [>="k"]: int
+	#b: x: y: [<="m"]: int
+	#c: x: y: [>="w"]: int
+	#d: x: y: [<="y"]: int
+
+	single: {
+		X:   #a  // "k" <= x
+		err: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:14])
+		err: x: y: j: 3
+
+		ok: X @test(eq, {x: {y: {k: 3}}})
+		ok: x: y: k: 3
+	}
+
+	and: p1: {
+		X: #a & #b // "k" <= x && x <= "m"
+
+		err: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[-16:12, 1:14])
+		err: x: y: j: 3
+
+		ok: X @test(eq, {x: {y: {k: 3}}})
+		ok: x: y: k: 3
+	}
+
+	and: p2: {
+		X:   #b & #a  // "k" <= x && x <= "m"
+		err: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[-25:12, 1:14])
+		err: x: y: j: 3
+
+		ok: X @test(eq, {x: {y: {k: 3}}})
+		ok: x: y: k: 3
+	}
+
+	andEmbed: p1: {
+		X: {#a & #b} // "k" <= x && x <= "m"
+
+		err: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[-35:12, 1:14])
+		err: x: y: j: 3
+
+		ok: X @test(eq, {x: {y: {k: 3}}})
+		ok: x: y: k: 3
+	}
+
+	andEmbed: p2: {
+		X:   {#b & #a}  // "k" <= x && x <= "m"
+		err: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[-44:12, 1:14])
+		err: x: y: j: 3
+
+		ok: X @test(eq, {x: {y: {k: 3}}})
+		ok: x: y: k: 3
+	}
+
+	orEmbed: p1: {
+		X: {#a, #b} // "k" <= x && x <= "m"
+
+		ok1: X @test(eq, {x: {y: {j: 3}}})
+		ok1: x: y: j: 3
+
+		ok2: X @test(eq, {x: {y: {k: 3}}})
+		ok2: x: y: k: 3
+	}
+
+	orEmbed: p2: {
+		X:   {#b, #a}  // "k" <= x && x <= "m"
+		ok1: X @test(eq, {x: {y: {j: 3}}})
+		ok1: x: y: j: 3
+
+		ok2: X @test(eq, {x: {y: {k: 3}}})
+		ok2: x: y: k: 3
+	}
+
+	andOrEmbed: t1: p1: {
+		// ("k" <= x && x <= "m")  || ("w" <= x && x <= "y")
+		X: {
+			#a & #b
+			#c & #d
+		}
+		err1: X @test(eq, {x: {y: {j: 3}}})
+		err1: x: y: j: 3
+
+		ok1: X @test(eq, {x: {y: {k: 3}}})
+		ok1: x: y: k: 3
+	}
+
+	andOrEmbed: t1: p2: {
+		// ("k" <= x && x <= "m")  || ("w" <= x && x <= "y")
+		X: {
+			#c & #d
+			#a & #b
+		}
+		err1: X @test(eq, {x: {y: {j: 3}}})
+		err1: x: y: j: 3
+
+		ok1: X @test(eq, {x: {y: {k: 3}}})
+		ok1: x: y: k: 3
+	}
+
+	andOrEmbed: t2: {
+		// ("k" <= x && x <= "m")  || ("w" <= x && x <= "y") || x == "p"
+		X: {
+			#a & #b
+			#c & #d
+			["p"]: int
+		}
+		err1: X @test(eq, {x: {y: {j: 3}}})
+		err1: x: y: j: 3
+
+		ok1: X @test(eq, {x: {y: {k: 3}}})
+		ok1: x: y: k: 3
+
+		ok2: X @test(eq, {x: {y: {p: 3}}})
+		ok2: x: y: p: 3
+	}
+
+	// The last indirection is not a definition.
+	indirect: {
+		a: x: y: [>="k"]: int
+		#a: a
+
+		p1: {
+			X:    #a
+			err1: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err1: x: y: j: 3
+
+			err2: X & __no_sharing @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err2: x: y: j: 3
+
+			ok: X @test(eq, {x: {y: {k: 3}}})
+			ok: x: y: k: 3
+		}
+
+		p2: {
+			#a: a & __no_sharing
+			X:  #a
+
+			err1: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err1: x: y: j: 3
+
+			err2: X & __no_sharing @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err2: x: y: j: 3
+
+			ok: X @test(eq, {x: {y: {k: 3}}})
+			ok: x: y: k: 3
+		}
+
+		p3: {
+			X: #a & __no_sharing
+
+			err1: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err1: x: y: j: 3
+
+			err2: X & __no_sharing @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err2: x: y: j: 3
+
+			ok: X @test(eq, {x: {y: {k: 3}}})
+			ok: x: y: k: 3
+		}
+
+		p4: {
+			#a: a & __no_sharing
+			X:  #a
+			X:  #a & __no_sharing
+
+			err1: X @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err1: x: y: j: 3
+
+			err2: X & __no_sharing @test(err, code=eval, path=x.y.j, contains="field not allowed", pos=[1:16])
+			err2: x: y: j: 3
+
+			ok: X @test(eq, {x: {y: {k: 3}}})
+			ok: x: y: k: 3
+		}
+	}
+} @test(err, code=eval, contains="field not allowed", pos=[168:16])
+
+// Embedding a definition doesn't recursively close the embedder: closedness
+// is not propagated correctly when a definition is embedded in an open struct.
+// https://cuelang.org/issue/2241
+issue2241: {
+	#close: {}
+
+	a: {
+		x: q: 2
+		#close
+	}
+
+	b: a
+	b: x: r: 4
+} @test(err, code=eval, path=b.x.r, contains="field not allowed", pos=[9:8])
+-- ellipsis.cue --
+// An ellipsis in a conjunct of a field of an embedded struct opens only that
+// conjunct; the field's other conjuncts still close it against fields added
+// from outside the embedding.
+embedOpenConjunct: closeAfter: {
+	s: {{a: {...} & close({x?: _})}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: closeBefore: {
+	s: {{a: close({x?: _}) & {...}}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: definition: {
+	s: {{a: {...} & #C}}
+	s: a: y: 1
+	#C: x?: _
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: pattern: {
+	s: {{a: {...} & close({{[=~"^x-"]: _}})}}
+	s: a: "x-1": 1
+	s: a: y:     1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[3:8])
+}
+embedOpenConjunct: deeper: {
+	s: {{{a: {...} & close({x?: _})}}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: nestedField: {
+	s: {{a: b: {...} & close({x?: _})}}
+	s: a: b: y: 1
+	@test(err, code=eval, path=s.a.b.y, contains="field not allowed", pos=[2:11])
+}
+embedOpenConjunct: viaReference: {
+	s: {#E}
+	s: a: y: 1
+	#E: a: {...} & close({x?: _})
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: sibling: {
+	s: {{a: {...} & close({x?: _})}, z: 1}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: openOuter: {
+	s: {{a: {...} & close({x?: _})}, ...}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: comprehension: {
+	s: {if true {a: {...} & close({x?: _})}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: siblingEmbed: {
+	s: {{a: close({x?: _}), {a: {...}}}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: twoSiblingEmbeds: {
+	s: {{a: close({x?: _}), {a: {...}}, {a: {...}}}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: twoNestedEmbeds: {
+	s: {{a: close({x?: _}), {{a: {...}}}, {{a: {...}}}}}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+// A nested literal closed by such a conjunction in an embedding stays
+// closed to fields added from outside the enclosing literal, while a
+// field declared beside it in that literal is allowed.
+embedOpenConjunct: nestedLiteral: {
+	s: {{#B}, a: {{...} & close({x?: _})}}
+	s: a: y: 1
+	#B: k?: string
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+embedOpenConjunct: nestedSibling: {
+	s: {{#B}, a: {{...} & close({x?: _})}, a: y: 1}
+	#B: k?: string
+	@test(eq, {s: {a: {y: 1, x?: _}, k?: string}, #B: {k?: string}})
+}
+embedOpenConjunct: notEmbedded: {
+	s: {a: {...} & close({x?: _})}
+	s: a: y: 1
+	@test(err, code=eval, path=s.a.y, contains="field not allowed", pos=[2:8])
+}
+
+// Without a closed conjunct, the ellipsis leaves the field open.
+embedOpenConjunct: openOnly: {
+	s: {{a: {...}}}
+	s: a: y: 1
+	@test(eq, {s: a: y: 1})
+}
+
+// A field declared beside the embedding, or opened by an ellipsis beside it,
+// is not checked against the closedness of the embedding.
+embedOpenConjunct: declaredBeside: {
+	s: {{a: {...} & close({x?: _})}, a: y: 1}
+	@test(eq, {s: a: {x?: _, y: 1}})
+}
+embedOpenConjunct: openBeside: {
+	s: {{a: close({x?: _})}, a: {...}}
+	s: a: y: 1
+	@test(eq, {s: a: {x?: _, y: 1}})
+}
+
+// An ellipsis beside an embedded definition allows fields added from outside
+// the embedding, along with anything below them.
+embedOpenConjunct: openNested: {
+	s: {{v: {#B, ...}}}
+	s: v: other: [true]
+	s: v: more: z: 1
+	#B: k?: string
+	@test(eq, {
+		s: {
+			v: {
+				other: [true]
+				more: {z: 1}
+				k?: string
+			}
+		}
+		#B: {k?: string}
+	})
+}
+
+// An ellipsis in an embedded struct opens the embedder, so that fields can
+// be added to it, but not the regular fields it declares, which the
+// definition embedded beside it closes as it does without the ellipsis.
+// This holds whether the embedder is written in place or reached through
+// a reference, and a definition which embeds the opened struct stays
+// closed.
+openEmbed: nestedDirect: {
+	s: {{#B, ...}, h: {i: 1}}
+	s: h: extra: 1
+	#B: k?: string
+	@test(err, code=eval, path=s.h.extra, contains="field not allowed", pos=[2:8])
+}
+openEmbed: nestedReference: {
+	t: {{#B, ...}, h: {i: 1}}
+	s: t
+	s: h: extra: 1
+	#B: k?: string
+	@test(err, code=eval, path=s.h.extra, contains="field not allowed", pos=[3:8])
+}
+openEmbed: topReference: {
+	t: {{#B, ...}, h: {i: 1}}
+	s: t
+	s: extra: 1
+	#B: k?: string
+	@test(eq, {
+		t: {h: {i: 1}, k?: string}
+		s: {h: {i: 1}, extra: 1, k?: string}
+		#B: {k?: string}
+	})
+}
+openEmbed: inDefinition: {
+	#X: {{#B, ...}, h: {i: 1}}
+	s: #X
+	s: h: extra: 1
+	#B: k?: string
+	@test(err, code=eval, path=s.h.extra, contains="field not allowed", pos=[3:8])
+}
+// A field declared beside a nested literal in the embedded struct which
+// holds it, or in a literal enclosing that one, is allowed as well.
+openEmbed: besideNested: {
+	s: {{#B}, {h: {#C, i: 1}, h: {j: 1}}}
+	t: {{#B}, if true {h: {#C, i: 1}, h: j: 1}}
+	u: {{#B}, g: {{#E}, h: {#C, i: 1}}, g: h: j: 1}
+	#B: k?: string
+	#C: i: int
+	#E: e?: int
+	@test(eq, {
+		s: {h: {i: 1, j: 1}, k?: string}
+		t: {h: {i: 1, j: 1}, k?: string}
+		u: {g: {h: {i: 1, j: 1}, e?: int}, k?: string}
+		#B: {k?: string}
+		#C: {i: int}
+		#E: {e?: int}
+	})
+}
+openEmbed: inEmbedded: {
+	s: {{#B, h: {i: 1}, ...}}
+	s: h: extra: 1
+	t: {{#B, h: {i: 1}}}
+	t: h: extra: 1
+	#B: k?: string
+	@test(err, code=eval, path=s.h.extra, contains="field not allowed", pos=[2:8])
+	@test(err, code=eval, path=t.h.extra, contains="field not allowed", pos=[4:8])
+}
+// The opened struct may itself be held by an embedding or a comprehension
+// of another struct, whose own embedded definition does not close it:
+// fields can be added to the opened struct, but not to the regular fields
+// it declares.
+openEmbed: heldBySibling: {
+	s: {{#A}, {b: {{#B, ...}, g: {h: 1}}}}
+	s: b: g: y: 1
+	s: b: x: 1 @test(eq, 1)
+	t: {{#A}, if true {b: {{#B, ...}, g: {h: 1}}}}
+	t: b: g: y: 1
+	u: {{b: {{#B, ...}, g: {h: 1}}}}
+	u: b: g: y: 1
+	#A: pa?: int
+	#B: pb?: int
+	@test(err, code=eval, path=s.b.g.y, contains="field not allowed", pos=[2:11])
+	@test(err, code=eval, path=t.b.g.y, contains="field not allowed", pos=[5:11])
+	@test(err, code=eval, path=u.b.g.y, contains="field not allowed", pos=[7:11])
+}
+
+// An ellipsis in an embedded struct opens the fields of the embedder, but
+// not the contents of a field which a sibling embedding or a comprehension
+// declares with a definition, nor those of a definition such a field
+// refers to. An ellipsis which the sibling embedding declares on the field
+// itself does open it.
+openEmbed: siblingEmbedding: {
+	s: {{#B, ...}, {h: {#C, i: 1}}} @test(err, code=eval, contains="field not allowed", at=h.extra)
+	s: h: extra: 1
+	#B: k?: string
+	#C: i: int
+}
+openEmbed: siblingComprehension: {
+	s: {{#B, ...}, if true {h: {#C, i: 1}}} @test(err, code=eval, contains="field not allowed", at=h.extra)
+	s: h: extra: 1
+	#B: k?: string
+	#C: i: int
+}
+openEmbed: siblingReference: {
+	s: {{#B, ...}, {h: #C}} @test(err, code=eval, contains="field not allowed", at=h.extra)
+	s: h: extra: 1
+	#B: k?: string
+	#C: i: int
+}
+openEmbed: siblingDeep: {
+	s: {{#B, ...}, {h: #C}} @test(err, code=eval, contains="field not allowed", at=h.sub.extra)
+	s: h: sub: extra: 1
+	#B: k?: string
+	#C: {i: int, sub?: j?: int}
+}
+// Nor does an ellipsis in an embedded definition open a field which a
+// definition embedded beside it declares: the fields of a definition the
+// embedder is unified with are not allowed in it either.
+openEmbed: outerDefinition: {
+	s: #T & {#D, #E} @test(err, code=eval, contains="field not allowed", at=f.j)
+	#D: f: i: 1
+	#E: {...}
+	#T: f: {i: int, j: int}
+}
+openEmbed: siblingField: {
+	s: {{#B, h: {...}}, {h: {#C, i: 1}}}
+	s: h: extra: 1
+	#B: k?: string
+	#C: i: int
+	@test(eq, {
+		s: {h: {i: 1, extra: 1}, k?: string}
+		#B: {k?: string}
+		#C: {i: int}
+	})
+}
+// A field of the embedder which embeds a definition is not opened by the
+// ellipsis either, also when the embedder is reached through a reference.
+openEmbed: definitionDirect: {
+	s: {{#B, ...}, f: {#F}}
+	s: f: extra: 1
+	#B: k?: string
+	#F: a?: int
+	@test(err, code=eval, path=s.f.extra, contains="field not allowed", pos=[2:8])
+}
+openEmbed: definitionReference: {
+	t: {{#B, ...}, f: {#F}}
+	s: t
+	s: f: extra: 1
+	#B: k?: string
+	#F: a?: int
+	@test(err, code=eval, path=s.f.extra, contains="field not allowed", pos=[3:8])
+}
+-- reroot.cue --
+// indirect tests cases where a reference indirectly crosses a node that
+// references a definition, thereby indirectly referencing it.
+indirect: {
+	embed: err1: {
+		#A: {
+			x: {#x, #y}
+			zx: x.a
+		}
+
+		#x: {a: b: 1}
+		#y: {a: c: 2}
+
+		b: #A
+
+		b1: b.zx
+		b1: d: 1 // This fails as b.zx crosses a reference to definition.
+		@test(err, at=b1.d, code=eval, contains="field not allowed")
+	}
+	closed: err1: {
+		X: {
+			// refer to a value that will be closed after unification in another struct.
+			a: b
+			b: {}
+			a: e: 1
+		}
+		Y: X
+		Y: {
+			b: c
+			c: #X
+		}
+		#X: {}
+		@test(err, at=Y.a.e, code=eval, contains="field not allowed", pos=[5:7])
+	}
+}
+-- out/errors.txt --
+[eval] embedOpenConjunct.closeAfter.s.a.y: field not allowed:
+    ./ellipsis.cue:6:8
+[eval] embedOpenConjunct.closeBefore.s.a.y: field not allowed:
+    ./ellipsis.cue:11:8
+[eval] embedOpenConjunct.definition.s.a.y: field not allowed:
+    ./ellipsis.cue:16:8
+[eval] embedOpenConjunct.pattern.s.a.y: field not allowed:
+    ./ellipsis.cue:23:8
+[eval] embedOpenConjunct.deeper.s.a.y: field not allowed:
+    ./ellipsis.cue:28:8
+[eval] embedOpenConjunct.nestedField.s.a.b.y: field not allowed:
+    ./ellipsis.cue:33:11
+[eval] embedOpenConjunct.viaReference.s.a.y: field not allowed:
+    ./ellipsis.cue:38:8
+[eval] embedOpenConjunct.sibling.s.a.y: field not allowed:
+    ./ellipsis.cue:44:8
+[eval] embedOpenConjunct.openOuter.s.a.y: field not allowed:
+    ./ellipsis.cue:49:8
+[eval] embedOpenConjunct.comprehension.s.a.y: field not allowed:
+    ./ellipsis.cue:54:8
+[eval] embedOpenConjunct.siblingEmbed.s.a.y: field not allowed:
+    ./ellipsis.cue:59:8
+[eval] embedOpenConjunct.twoSiblingEmbeds.s.a.y: field not allowed:
+    ./ellipsis.cue:64:8
+[eval] embedOpenConjunct.twoNestedEmbeds.s.a.y: field not allowed:
+    ./ellipsis.cue:69:8
+[eval] embedOpenConjunct.nestedLiteral.s.a.y: field not allowed:
+    ./ellipsis.cue:77:8
+[eval] embedOpenConjunct.notEmbedded.s.a.y: field not allowed:
+    ./ellipsis.cue:88:8
+[eval] openEmbed.nestedDirect.s.h.extra: field not allowed:
+    ./ellipsis.cue:138:8
+[eval] openEmbed.nestedReference.s.h.extra: field not allowed:
+    ./ellipsis.cue:145:8
+[eval] openEmbed.inDefinition.s.h.extra: field not allowed:
+    ./ellipsis.cue:163:8
+[eval] openEmbed.inEmbedded.s.h.extra: field not allowed:
+    ./ellipsis.cue:187:8
+[eval] openEmbed.inEmbedded.t.h.extra: field not allowed:
+    ./ellipsis.cue:189:8
+[eval] openEmbed.heldBySibling.s.b.g.y: field not allowed:
+    ./ellipsis.cue:200:11
+[eval] openEmbed.heldBySibling.t.b.g.y: field not allowed:
+    ./ellipsis.cue:203:11
+[eval] openEmbed.heldBySibling.u.b.g.y: field not allowed:
+    ./ellipsis.cue:205:11
+[eval] openEmbed.siblingEmbedding.s.h.extra: field not allowed:
+    ./ellipsis.cue:220:8
+[eval] openEmbed.siblingComprehension.s.h.extra: field not allowed:
+    ./ellipsis.cue:226:8
+[eval] openEmbed.siblingReference.s.h.extra: field not allowed:
+    ./ellipsis.cue:232:8
+[eval] openEmbed.siblingDeep.s.h.sub.extra: field not allowed:
+    ./ellipsis.cue:238:13
+[eval] openEmbed.outerDefinition.s.f.j: field not allowed:
+    ./ellipsis.cue:249:18
+[eval] openEmbed.definitionDirect.s.f.extra: field not allowed:
+    ./ellipsis.cue:266:8
+[eval] openEmbed.definitionReference.s.f.extra: field not allowed:
+    ./ellipsis.cue:274:8
+[eval] patterns.shallow.single.err.j: field not allowed:
+    ./embed.cue:10:8
+[eval] patterns.shallow.and.p1.err.j: field not allowed:
+    ./embed.cue:3:6
+    ./embed.cue:20:8
+[eval] patterns.shallow.and.p2.err.j: field not allowed:
+    ./embed.cue:3:6
+    ./embed.cue:29:8
+[eval] patterns.shallow.andEmbed.p1.err.j: field not allowed:
+    ./embed.cue:3:6
+    ./embed.cue:39:8
+[eval] patterns.shallow.andEmbed.p2.err.j: field not allowed:
+    ./embed.cue:3:6
+    ./embed.cue:48:8
+[eval] patterns.shallow.indirect.p1.err1.j: field not allowed:
+    ./embed.cue:124:10
+[eval] patterns.shallow.indirect.p1.err2.j: field not allowed:
+    ./embed.cue:127:10
+[eval] patterns.shallow.indirect.p2.err1.j: field not allowed:
+    ./embed.cue:138:10
+[eval] patterns.shallow.indirect.p2.err2.j: field not allowed:
+    ./embed.cue:141:10
+[eval] patterns.shallow.indirect.p3.err1.j: field not allowed:
+    ./embed.cue:151:10
+[eval] patterns.shallow.indirect.p3.err2.j: field not allowed:
+    ./embed.cue:154:10
+[eval] patterns.shallow.indirect.p4.err1.j: field not allowed:
+    ./embed.cue:166:10
+[eval] patterns.shallow.indirect.p4.err2.j: field not allowed:
+    ./embed.cue:169:10
+[eval] patterns.nested.single.err.x.y.j: field not allowed:
+    ./embed.cue:186:14
+[eval] patterns.nested.and.p1.err.x.y.j: field not allowed:
+    ./embed.cue:179:12
+    ./embed.cue:196:14
+[eval] patterns.nested.and.p2.err.x.y.j: field not allowed:
+    ./embed.cue:179:12
+    ./embed.cue:205:14
+[eval] patterns.nested.andEmbed.p1.err.x.y.j: field not allowed:
+    ./embed.cue:179:12
+    ./embed.cue:215:14
+[eval] patterns.nested.andEmbed.p2.err.x.y.j: field not allowed:
+    ./embed.cue:179:12
+    ./embed.cue:224:14
+[eval] patterns.nested.indirect.p1.err1.x.y.j: field not allowed:
+    ./embed.cue:300:16
+[eval] patterns.nested.indirect.p1.err2.x.y.j: field not allowed:
+    ./embed.cue:303:16
+[eval] patterns.nested.indirect.p2.err1.x.y.j: field not allowed:
+    ./embed.cue:314:16
+[eval] patterns.nested.indirect.p2.err2.x.y.j: field not allowed:
+    ./embed.cue:317:16
+[eval] patterns.nested.indirect.p3.err1.x.y.j: field not allowed:
+    ./embed.cue:327:16
+[eval] patterns.nested.indirect.p3.err2.x.y.j: field not allowed:
+    ./embed.cue:330:16
+[eval] patterns.nested.indirect.p4.err1.x.y.j: field not allowed:
+    ./embed.cue:342:16
+[eval] patterns.nested.indirect.p4.err2.x.y.j: field not allowed:
+    ./embed.cue:345:16
+[eval] issue2241.b.x.r: field not allowed:
+    ./embed.cue:365:8
+[eval] indirect.embed.err1.b1.d: field not allowed:
+    ./reroot.cue:16:7
+[eval] indirect.closed.err1.Y.a.e: field not allowed:
+    ./reroot.cue:24:7
+-- out/eval/stats --
+Leaks:  0
+Freed:  682
+Reused: 649
+Allocs: 33
+Retain: 0
+
+Unifications: 682
+Conjuncts:    1776
+Disjuncts:    0
+
+NumCloseIDs: 623

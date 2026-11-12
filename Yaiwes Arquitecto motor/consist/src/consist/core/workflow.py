@@ -1,0 +1,2765 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+import inspect
+import os
+import uuid
+import functools
+import concurrent.futures
+import multiprocessing
+from collections.abc import Iterable, Mapping as MappingABC
+from types import MappingProxyType, TracebackType
+from typing import (
+    List,
+    Optional,
+    Dict,
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    Iterator,
+    Union,
+    cast,
+    Tuple,
+)
+
+from consist.models.artifact import Artifact, set_tracker_ref
+from consist.models.run import (
+    ConsistRecord,
+    RunResult,
+    CouplerSnapshotPhase,
+)
+from consist.core.materialize import (
+    MaterializedArtifact,
+    materialize_artifact,
+)
+from typing import TYPE_CHECKING
+from consist.core.coupler import Coupler
+from consist.core.orchestration import (
+    resolve_callable,
+    execute_worker_run,
+    BatchRunSpec,
+    ExecutionSpec,
+    PythonCallableTarget,
+    RunSpecResult,
+    BatchResult,
+)
+from consist.core.error_messages import format_problem_cause_fix
+from consist.core.metadata_resolver import MetadataResolver, ResolvedStepIdentity
+from consist.core.resolved_binding import (
+    ArtifactIdentity,
+    ResolvedBinding,
+    TrackedArtifactLocator,
+    _create_strict_binding_invocation_context,
+    step_contract_identity,
+)
+from consist.core.run_invocation import resolve_run_invocation
+from consist.core.run_options import resolve_trace_output_policy
+from consist.digest import normalize_json
+from consist.types import (
+    ArtifactRef,
+    BindingResult,
+    CacheOptions,
+    CodeIdentityMode,
+    ExecutionOptions,
+    FacetLike,
+    InputBindingMode,
+    IdentityInputs,
+    OutputArtifactSpec,
+    OutputPolicyOptions,
+    OutputPathRef,
+    OutputSet,
+    RunCompletionArchivePolicy,
+    RunInputRef,
+)
+from pathlib import Path
+
+if TYPE_CHECKING:
+    from consist.core.config_canonicalization import (
+        CanonicalizationSnapshot,
+        ConfigAdapter,
+    )
+    from consist.core.tracker import Tracker
+
+
+def _raise_unexpected_kwargs(kwargs: Mapping[str, Any]) -> None:
+    names = sorted(kwargs.keys())
+    if not names:
+        return
+    if len(names) == 1:
+        raise TypeError(f"unexpected keyword argument '{names[0]}'")
+    joined = "', '".join(names)
+    raise TypeError(f"unexpected keyword arguments '{joined}'")
+
+
+def _scenario_header_code_identity() -> None:
+    """Anchor the structural Scenario header to Consist's workflow code."""
+
+
+@dataclass(frozen=True, slots=True)
+class StepIdentity:
+    """One Scenario-owned, pre-resolved Python step identity.
+
+    Obtain this value from :meth:`ScenarioContext.resolve_step_identity` and
+    pass it back to :meth:`ScenarioContext.run`. The public fields are stable
+    inputs for a strict binding; the remaining fields prevent that preflight
+    result from being reused for a different Scenario invocation.
+    """
+
+    name: str
+    model: str
+    step_contract_identity: str
+    _resolved_identity: ResolvedStepIdentity = field(repr=False, compare=False)
+    _owner_token: object = field(repr=False, compare=False)
+    _fn: Callable[..., Any] = field(repr=False, compare=False)
+    _name_argument: Optional[str] = field(repr=False, compare=False)
+    _model_argument: Optional[str] = field(repr=False, compare=False)
+    _year: Optional[int] = field(repr=False, compare=False)
+    _iteration: Optional[int] = field(repr=False, compare=False)
+    _phase: Optional[str] = field(repr=False, compare=False)
+    _stage: Optional[str] = field(repr=False, compare=False)
+    _runtime_kwargs: Mapping[str, Any] | None = field(repr=False, compare=False)
+
+
+class OutputCapture:
+    """
+    Holder for artifacts collected inside a ``capture_outputs`` context.
+
+    The tracker yields this object so callers can inspect which artifacts were
+    automatically logged once the context exits.
+    """
+
+    def __init__(self) -> None:
+        """
+        Initialize an empty artifact buffer.
+        """
+        self.artifacts: List[Artifact] = []
+
+
+class RunContext:
+    """
+    Provide run-aware helpers to a Python callable.
+
+    Consist injects this object when ``inject_context`` is enabled. It exposes
+    output locations, artifact logging helpers, and canonicalization facts
+    without requiring application code to access a global tracker.
+
+    Parameters
+    ----------
+    tracker : Tracker
+        Active tracker for the executing run.
+    canonicalization : CanonicalizationSnapshot, optional
+        Immutable observations from the applied config plan. These are
+        canonicalization-time facts, not final staged or container paths.
+
+    Notes
+    -----
+    Cache hits and native container executions do not invoke the Python
+    callable, so they do not receive this context.
+
+    Examples
+    --------
+    >>> def my_step(ctx: RunContext):
+    ...     output_path = ctx.run_dir / "results.csv"
+    ...     ctx.log_artifact(output_path, "results")
+    """
+
+    def __init__(
+        self,
+        tracker: "Tracker",
+        *,
+        canonicalization: Optional["CanonicalizationSnapshot"] = None,
+    ) -> None:
+        self._tracker = tracker
+        self._canonicalization = canonicalization
+
+    @property
+    def canonicalization(self) -> Optional["CanonicalizationSnapshot"]:
+        """
+        Immutable facts from the applied config canonicalization, if any.
+
+        This snapshot describes references observed while Consist
+        canonicalized configuration. It does not identify the final paths a
+        staged or containerized model will consume.
+
+        Returns
+        -------
+        Optional[CanonicalizationSnapshot]
+            The applied canonicalization snapshot, or ``None`` when the run
+            did not configure an adapter.
+        """
+        return self._canonicalization
+
+    @property
+    def run_dir(self) -> Path:
+        """
+        Run-specific output directory for the active step.
+
+        Returns
+        -------
+        Path
+            The directory where this step should write outputs by default. This
+            value is derived from the active run and respects any per-run
+            artifact directory overrides.
+        """
+        path = self._tracker.run_artifact_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def output_dir(self, namespace: Optional[str] = None) -> Path:
+        """
+        Resolve the managed output directory for the active run.
+
+        Parameters
+        ----------
+        namespace : Optional[str], optional
+            Optional relative subdirectory under the managed run output directory.
+
+        Returns
+        -------
+        Path
+            Absolute directory path for managed outputs. The directory is created
+            if it does not exist.
+        """
+        base_dir = self.run_dir.resolve()
+        if namespace is None:
+            return base_dir
+
+        if not isinstance(namespace, str):
+            raise TypeError("namespace must be a string or None.")
+
+        normalized = namespace.strip()
+        if not normalized:
+            return base_dir
+
+        namespace_path = Path(normalized)
+        if namespace_path.is_absolute():
+            raise ValueError("namespace must be a relative path.")
+
+        resolved = (base_dir / namespace_path).resolve()
+        try:
+            resolved.relative_to(base_dir)
+        except ValueError as exc:
+            raise ValueError(
+                f"namespace must resolve under {base_dir}; got {resolved}"
+            ) from exc
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
+
+    def output_path(self, key: str, ext: str = "parquet") -> Path:
+        """
+        Resolve a deterministic managed output path for the active run.
+
+        Parameters
+        ----------
+        key : str
+            Artifact key used as the output filename stem. Relative path segments
+            are allowed to organize outputs into subdirectories.
+        ext : str, default "parquet"
+            File extension to append. Leading dots are ignored and the extension
+            is normalized to lowercase.
+
+        Returns
+        -------
+        Path
+            Absolute managed output path. Parent directories are created if needed.
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string.")
+        normalized_key = key.strip()
+        if not normalized_key:
+            raise ValueError("key must be a non-empty string.")
+
+        if not isinstance(ext, str):
+            raise TypeError("ext must be a string.")
+        normalized_ext = ext.strip().lstrip(".").lower()
+        if not normalized_ext:
+            raise ValueError("ext must be a non-empty string.")
+
+        base_dir = self.output_dir().resolve()
+        resolved = (base_dir / f"{normalized_key}.{normalized_ext}").resolve()
+        try:
+            resolved.relative_to(base_dir)
+        except ValueError as exc:
+            raise ValueError(
+                f"output key must resolve under {base_dir}; got {resolved}"
+            ) from exc
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        return resolved
+
+    def log_artifact(self, *args: Any, **kwargs: Any) -> Artifact:
+        """
+        Log an artifact within the active run.
+
+        This is a thin wrapper around ``Tracker.log_artifact``.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments forwarded to ``Tracker.log_artifact``.
+        **kwargs : Any
+            Keyword arguments forwarded to ``Tracker.log_artifact``.
+
+        Returns
+        -------
+        Artifact
+            The logged artifact.
+        """
+        return self._tracker.log_artifact(*args, **kwargs)
+
+    def log_input(self, *args: Any, **kwargs: Any) -> Artifact:
+        """
+        Log an input artifact within the active run.
+
+        This is a thin wrapper around ``Tracker.log_input``.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments forwarded to ``Tracker.log_input``.
+        **kwargs : Any
+            Keyword arguments forwarded to ``Tracker.log_input``.
+
+        Returns
+        -------
+        Artifact
+            The logged input artifact.
+        """
+        return self._tracker.log_input(*args, **kwargs)
+
+    def log_output(self, *args: Any, **kwargs: Any) -> Artifact:
+        """
+        Log an output artifact within the active run.
+
+        This is a thin wrapper around ``Tracker.log_output``.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments forwarded to ``Tracker.log_output``.
+        **kwargs : Any
+            Keyword arguments forwarded to ``Tracker.log_output``.
+
+        Returns
+        -------
+        Artifact
+            The logged output artifact.
+        """
+        return self._tracker.log_output(*args, **kwargs)
+
+    def log_artifacts(self, *args: Any, **kwargs: Any) -> Dict[str, Artifact]:
+        """
+        Log multiple artifacts within the active run.
+
+        This is a thin wrapper around ``Tracker.log_artifacts``.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments forwarded to ``Tracker.log_artifacts``.
+        **kwargs : Any
+            Keyword arguments forwarded to ``Tracker.log_artifacts``.
+
+        Returns
+        -------
+        Dict[str, Artifact]
+            Mapping of artifact keys to logged artifacts.
+        """
+        return self._tracker.log_artifacts(*args, **kwargs)
+
+    def log_meta(self, **kwargs: Any) -> None:
+        """
+        Update metadata for the active run.
+
+        This is a thin wrapper around ``Tracker.log_meta``.
+
+        Parameters
+        ----------
+        **kwargs : Any
+            Metadata key/value pairs to merge into the run record.
+        """
+        self._tracker.log_meta(**kwargs)
+
+    def set_output_meta(
+        self,
+        key: str,
+        meta: Mapping[str, Any],
+        *,
+        merge: bool = True,
+    ) -> None:
+        """
+        Attach or queue metadata for an output artifact key during step execution.
+
+        This is a thin wrapper around ``Tracker.set_output_meta``. If an output
+        with ``key`` has already been logged in the current run, its metadata is
+        updated immediately; otherwise the metadata is queued and applied when the
+        declared output is finalized at the end of the step.
+
+        Parameters
+        ----------
+        key : str
+            Declared or logged output artifact key to update.
+        meta : Mapping[str, Any]
+            JSON-serializable metadata mapping to merge into (or replace on) the
+            output artifact's ``meta`` dictionary.
+        merge : bool, default True
+            When ``True``, merge ``meta`` into existing user metadata on the
+            output artifact. When ``False``, replace existing user metadata while
+            preserving Consist system metadata keys.
+
+        Raises
+        ------
+        RuntimeError
+            If no run is currently active.
+        ValueError
+            If ``key`` is empty or whitespace-only.
+        TypeError
+            If ``meta`` is not a mapping or does not normalize to a JSON object.
+        """
+        self._tracker.set_output_meta(key, meta, merge=merge)
+
+    set_pending_output_meta = set_output_meta
+
+    def set_archive_root(
+        self,
+        archive_root: Union[
+            str,
+            os.PathLike[str],
+            Callable[[], Optional[Union[str, os.PathLike[str]]]],
+            None,
+        ],
+        *,
+        mode: Literal["copy"] = "copy",
+        prepend_source_mount_root: bool = True,
+    ) -> None:
+        """
+        Set, override, or disable the run-completion archive root for the active step.
+
+        This is a thin wrapper around ``Tracker.set_archive_root``.
+
+        Parameters
+        ----------
+        archive_root : Union[str, os.PathLike[str], Callable[[], Optional[Union[str, os.PathLike[str]]]], None]
+            Destination directory path, a zero-argument callable returning an
+            optional destination path, or ``None`` to disable run-completion
+            archival for the active step.
+        mode : Literal["copy"], default "copy"
+            Archive transfer mode (``"copy"``).
+        prepend_source_mount_root : bool, default True
+            When ``True``, nest archived files under the last path segment of the
+            source mount root to prevent layout collisions across mounts.
+
+        Raises
+        ------
+        RuntimeError
+            If no run is currently active.
+        ValueError
+            If ``archive_root`` is an empty string or ``mode`` is invalid.
+        TypeError
+            If ``archive_root`` or ``prepend_source_mount_root`` has an invalid type.
+        """
+        self._tracker.set_archive_root(
+            archive_root,
+            mode=mode,
+            prepend_source_mount_root=prepend_source_mount_root,
+        )
+
+    @property
+    def inputs(self) -> Dict[str, Artifact]:
+        """
+        Mapping of input artifact keys to artifacts for the active step.
+
+        Returns
+        -------
+        Dict[str, Artifact]
+            Dictionary of input artifacts keyed by their semantic keys. Raises a
+            ``RuntimeError`` if accessed outside an active run.
+        """
+        current_consist = self._tracker.current_consist
+        if current_consist is None:
+            raise RuntimeError("No active run context is available.")
+        return {a.key: a for a in current_consist.inputs}
+
+    def load(self, key_or_artifact: Union[str, Artifact]) -> Any:
+        """
+        Load data from an input artifact by key or from an Artifact instance.
+
+        Parameters
+        ----------
+        key_or_artifact : Union[str, Artifact]
+            Input artifact key from ``inputs`` or an Artifact object.
+
+        Returns
+        -------
+        Any
+            Loaded data (driver-dependent).
+        """
+        if isinstance(key_or_artifact, str):
+            key_or_artifact = self.inputs[key_or_artifact]
+        return self._tracker.load(key_or_artifact)
+
+    @contextmanager
+    def capture_outputs(
+        self, directory: Path, pattern: str = "*"
+    ) -> Iterator[OutputCapture]:
+        """
+        Capture files written under ``directory`` and log them as outputs on exit.
+
+        Parameters
+        ----------
+        directory : Path
+            Directory to monitor for new or modified files.
+        pattern : str, default "*"
+            Glob pattern for files to capture.
+
+        Yields
+        ------
+        OutputCapture
+            Container listing artifacts that were logged during the context.
+        """
+        with self._tracker.capture_outputs(directory, pattern=pattern) as cap:
+            yield cap
+
+
+@dataclass(frozen=True, slots=True)
+class RestoredCouplerSnapshotResult(MappingABC[str, Artifact]):
+    """Key-indexed recovery result for coupler snapshot restoration.
+
+    Provides mapping semantics over the restored artifacts while exposing
+    diagnostic metadata such as pruned keys and materialization outcomes.
+    """
+
+    artifacts: Dict[str, Artifact] = field(default_factory=dict)
+    pruned_keys: Tuple[str, ...] = ()
+    outcomes: Dict[str, MaterializedArtifact] = field(default_factory=dict)
+
+    def __getitem__(self, key: str) -> Artifact:
+        return self.artifacts[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.artifacts)
+
+    def __len__(self) -> int:
+        return len(self.artifacts)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.artifacts
+
+
+class ScenarioContext:
+    """
+    A context manager for grouping multiple steps into a single "scenario".
+
+    A scenario creates a parent run (the "header") that aggregates the
+    results, metadata, and lineage of all steps executed within its block.
+    It provides a `coupler` to pass artifacts between steps, making it
+    ideal for multi-stage simulation workflows.
+
+    Attributes
+    ----------
+    coupler : Coupler
+        Scenario-local artifact registry for passing outputs between steps.
+        Supports runtime-declared output validation.
+
+    Examples
+    --------
+    ```python
+    with tracker.scenario("base_case") as sc:
+        # Step 1: Pre-process
+        sc.run(preprocess_fn, inputs={"raw": "data.csv"}, outputs=["clean"])
+        # Step 2: Model (reads "clean" from the coupler automatically)
+        sc.run(model_fn, input_keys=["clean"], outputs=["results"])
+    ```
+    """
+
+    def __init__(
+        self,
+        tracker: "Tracker",
+        name: str,
+        config: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        model: str = "scenario",
+        step_cache_hydration: Optional[str] = None,
+        name_template: Optional[str] = None,
+        cache_epoch: Optional[int] = None,
+        coupler: Optional[Coupler] = None,
+        require_outputs: Optional[Iterable[str]] = None,
+        output_sets: Optional[Mapping[str, OutputSet]] = None,
+        resume_from_run_id: Optional[str] = None,
+        resume_phase: CouplerSnapshotPhase = "post",
+        step_run_completion_archive: Optional[
+            Union[
+                RunCompletionArchivePolicy,
+                Callable[[str], Optional[RunCompletionArchivePolicy]],
+            ]
+        ] = None,
+        **kwargs: Any,
+    ):
+        if (
+            step_run_completion_archive is not None
+            and not isinstance(step_run_completion_archive, RunCompletionArchivePolicy)
+            and not callable(step_run_completion_archive)
+        ):
+            raise TypeError(
+                "step_run_completion_archive must be a RunCompletionArchivePolicy, "
+                "a callable returning RunCompletionArchivePolicy | None, or None."
+            )
+        self.tracker = tracker
+        self.name = name
+        self.model = model
+        self.config_arg = config or {}
+        self.tags = tags or []
+        self._step_tags = self._coerce_step_tags(kwargs.pop("step_tags", None))
+        self._step_facet = kwargs.pop("step_facet", None)
+        self.kwargs = kwargs
+        self.step_cache_hydration = step_cache_hydration
+        self.step_run_completion_archive = step_run_completion_archive
+        self.name_template = name_template
+        self.cache_epoch = cache_epoch
+        self.output_sets = output_sets
+        self.resume_from_run_id = resume_from_run_id
+        self.resume_phase = resume_phase
+
+        # Internal State
+        self._header_record: Optional[ConsistRecord] = None
+        self._suspended_cache_mode: Optional[str] = None
+        self._inputs: Dict[str, Artifact] = {}
+        self._first_step_started: bool = False
+        self._last_step_name: Optional[str] = None
+        self._step_identity_owner = object()
+        self._step_ordinal: int = 0
+
+        # ARTIFACT STORAGE ARCHITECTURE
+        # ==============================
+        # Artifacts flow through multiple storage locations:
+        #
+        # 1. ConsistRecord.run.outputs (in-memory list, authoritative during run)
+        #    - Populated by hydrate_cache_hit_outputs() on cache hit
+        #    - Populated by tracker.log_artifact() when step produces outputs
+        #    - Each artifact is independent (deep-cloned on cache hit)
+        #
+        # 2. coupler._artifacts (dict, convenience access for scenarios)
+        #    - Populated from ConsistRecord.run.outputs via coupler.update()
+        #    - Allows step code to access outputs by key: coupler.get("key")
+        #    - Automatically synced after each tracker.run() call
+        #
+        # 3. Tracker._artifact_cache (internal, for runtime tracking)
+        #    - Derived from ConsistRecord.run.outputs
+        #    - Used for convenience lookups within tracker
+        #
+        # SYNCHRONIZATION POINTS:
+        # - After cache hit: hydrate_cache_hit_outputs() → record.outputs → coupler.update()
+        # - After user log: log_artifact() → record.outputs → coupler.update()
+        # - Consistency: Artifacts in coupler are independent copies (no cross-run mutations)
+        #
+        self.coupler = coupler or Coupler(tracker=tracker)
+        if self.coupler.tracker is None:
+            self.coupler.tracker = tracker
+        if require_outputs:
+            self.coupler.require_outputs(*require_outputs)
+
+    def _resolve_step_run_completion_archive(
+        self,
+        step_name: str,
+        step_policy: Optional[Union[RunCompletionArchivePolicy, Literal[False]]],
+    ) -> Optional[RunCompletionArchivePolicy]:
+        if step_policy is False:
+            return None
+        if isinstance(step_policy, RunCompletionArchivePolicy):
+            return step_policy
+        scenario_policy = self.step_run_completion_archive
+        if scenario_policy is None:
+            return None
+        if isinstance(scenario_policy, RunCompletionArchivePolicy):
+            return scenario_policy
+        resolved = scenario_policy(step_name)
+        if resolved is None or resolved is False:
+            return None
+        if not isinstance(resolved, RunCompletionArchivePolicy):
+            raise TypeError(
+                "step_run_completion_archive callable must return a "
+                "RunCompletionArchivePolicy or None."
+            )
+        return resolved
+
+    @property
+    def run_id(self) -> str:
+        """
+        Run ID of the scenario header.
+
+        Returns
+        -------
+        str
+            The run ID for the scenario header (or the scenario name if the
+            header has not been created yet).
+        """
+        return self._header_record.run.id if self._header_record else self.name
+
+    @property
+    def config(self) -> MappingProxyType:
+        """
+        Read-only view of the scenario configuration.
+
+        Returns
+        -------
+        MappingProxyType
+            Immutable mapping of configuration values for the scenario. Updates
+            are applied by changing inputs to the scenario, not by mutating this
+            mapping.
+        """
+        if self._header_record:
+            return MappingProxyType(self._header_record.config)
+        return MappingProxyType(self.config_arg)
+
+    @property
+    def inputs(self) -> MappingProxyType:
+        """
+        Read-only view of registered exogenous inputs.
+
+        Returns
+        -------
+        MappingProxyType
+            Immutable mapping of input keys to artifacts added via ``add_input``.
+            This reflects only scenario-level inputs, not step inputs.
+        """
+        return MappingProxyType(self._inputs)
+
+    def add_input(self, path: ArtifactRef, key: str, **kwargs) -> Artifact:
+        """
+        Log an external input artifact to the scenario header run.
+
+        Parameters
+        ----------
+        path : ArtifactRef
+            Path (or prebuilt ``Artifact``) representing the input.
+        key : str
+            Semantic key for the artifact.
+        **kwargs : Any
+            Additional metadata forwarded to ``Tracker.log_artifact``.
+
+        Returns
+        -------
+        Artifact
+            Logged artifact associated with the scenario.
+
+        Raises
+        ------
+        RuntimeError
+            If a step has already started or the scenario context is inactive.
+        """
+        if self._first_step_started:
+            raise RuntimeError(
+                "Cannot add scenario inputs after first step has started. "
+                "Register all inputs before calling scenario.trace()."
+            )
+
+        if not self._header_record:
+            raise RuntimeError("Scenario not active. Use within 'with' block.")
+
+        # Temporarily restore header context to log artifact
+        # This allows us to use standard log_artifact logic without keeping run active
+        prev_consist = self.tracker.current_consist
+        self.tracker.current_consist = self._header_record
+        try:
+            artifact = self.tracker.log_artifact(
+                path, key=key, direction="input", **kwargs
+            )
+        finally:
+            self.tracker.current_consist = prev_consist
+
+        self._inputs[key] = artifact
+        return artifact
+
+    @property
+    def meta(self) -> Mapping[str, Any]:
+        """
+        Read-only view of scenario header run metadata.
+
+        Returns
+        -------
+        Mapping[str, Any]
+            Immutable view of the scenario header run's ``meta`` dictionary.
+
+        Raises
+        ------
+        RuntimeError
+            If the scenario context is inactive.
+        """
+        if not self._header_record:
+            raise RuntimeError("Scenario not active. Use within 'with' block.")
+        return MappingProxyType(self._header_record.run.meta or {})
+
+    def log_meta(self, **metadata: Any) -> None:
+        """
+        Record key-value metadata on the scenario header run and persist immediately.
+
+        Unlike ``Tracker.log_meta``, which requires an active step run,
+        ``ScenarioContext.log_meta`` targets the suspended scenario header run
+        within an active ``with tracker.scenario(...) as sc:`` block.
+
+        Parameters
+        ----------
+        **metadata : Any
+            JSON-serializable metadata keys and values to merge into the scenario
+            header run's ``meta`` dictionary. Keys ``stage`` and ``phase`` are
+            also promoted to top-level ``Run`` fields when provided as strings.
+
+        Raises
+        ------
+        RuntimeError
+            If the scenario context is inactive.
+        """
+        if not self._header_record:
+            raise RuntimeError("Scenario not active. Use within 'with' block.")
+        if not metadata:
+            return
+
+        prev = self.tracker.current_consist
+        self.tracker.current_consist = self._header_record
+        try:
+            self._header_record.run.updated_at = datetime.now(timezone.utc)
+            self.tracker.log_meta(**metadata)
+        finally:
+            self.tracker.current_consist = prev
+
+    def declare_outputs(
+        self,
+        *names: str,
+        required: bool | Mapping[str, bool] = False,
+        warn_undefined: bool = False,
+        description: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """
+        Declare outputs that should be present in the scenario coupler.
+
+        Parameters
+        ----------
+        *names : str
+            Output keys to declare.
+        required : bool | Mapping[str, bool], default False
+            Whether declared outputs are required. A mapping allows per-key
+            overrides.
+        warn_undefined : bool, default False
+            If True, warn when outputs are logged that were not declared.
+        description : Optional[Mapping[str, str]], optional
+            Human-readable descriptions for declared outputs.
+        """
+        self.coupler.declare_outputs(
+            *names,
+            required=required,
+            warn_undefined=warn_undefined,
+            description=description,
+        )
+
+    def require_outputs(
+        self,
+        *names: str,
+        required: bool | Mapping[str, bool] = True,
+        warn_undefined: bool = False,
+        description: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """
+        Declare required outputs that must be present at scenario exit.
+
+        This is a convenience wrapper around ``declare_outputs`` that defaults
+        ``required=True``.
+
+        Parameters
+        ----------
+        *names : str
+            Output keys to require.
+        required : bool | Mapping[str, bool], default True
+            Whether required outputs are enforced. A mapping allows per-key
+            overrides.
+        warn_undefined : bool, default False
+            If True, warn when outputs are logged that were not declared.
+        description : Optional[Mapping[str, str]], optional
+            Human-readable descriptions for required outputs.
+        """
+        self.coupler.require_outputs(
+            *names,
+            required=required,
+            warn_undefined=warn_undefined,
+            description=description,
+        )
+
+    def collect_by_keys(
+        self, artifacts: Mapping[str, Artifact], *keys: str, prefix: str = ""
+    ) -> Dict[str, Artifact]:
+        """
+        Collect explicit artifacts into the scenario coupler by key.
+
+        Parameters
+        ----------
+        artifacts : Mapping[str, Artifact]
+            Source artifacts mapping (usually outputs from a step).
+        *keys : str
+            Keys to collect from the mapping.
+        prefix : str, default ""
+            Optional prefix to apply to collected keys in the coupler.
+
+        Returns
+        -------
+        Dict[str, Artifact]
+            The collected artifacts keyed by their (possibly prefixed) names.
+        """
+        return self.coupler.collect_by_keys(artifacts, *keys, prefix=prefix)
+
+    def capture_coupler_snapshot(
+        self,
+        phase: CouplerSnapshotPhase,
+        run_id: Optional[str] = None,
+        step_ordinal: Optional[int] = None,
+    ) -> None:
+        """
+        Persist a relational snapshot of the current coupler state.
+
+        Parameters
+        ----------
+        phase : CouplerSnapshotPhase
+            The lifecycle phase ("init", "pre", or "post").
+        run_id : Optional[str], default None
+            Run identifier for the snapshot. Defaults to the scenario run_id.
+        step_ordinal : Optional[int], default None
+            Step ordinal within the scenario. Defaults to self._step_ordinal.
+        """
+        if self.tracker.db is None:
+            return
+        target_run_id = run_id or self.run_id
+        ordinal = self._step_ordinal if step_ordinal is None else step_ordinal
+        artifacts = dict(self.coupler.items())
+        self.tracker.db.sync_run_coupler_snapshot(
+            run_id=target_run_id,
+            phase=phase,
+            scenario_run_id=self.run_id,
+            step_ordinal=ordinal,
+            artifacts=artifacts,
+        )
+
+    def _maybe_capture_init_snapshot(self) -> None:
+        """
+        Capture the initial coupler seed snapshot (phase='init', step_ordinal=0)
+        before the first child step begins if the coupler contains seeded artifacts.
+        """
+        if (
+            not self._first_step_started
+            and self._step_ordinal == 0
+            and len(self.coupler) > 0
+        ):
+            self.capture_coupler_snapshot(
+                phase="init", run_id=self.run_id, step_ordinal=0
+            )
+
+    def _classify_coupler_artifact_scheme(
+        self,
+        artifact: Artifact,
+        effective_remappable_schemes: Mapping[str, Path],
+    ) -> Literal["workspace_managed", "external_mount"]:
+        """Classify artifact container URI as workspace-managed or external mount."""
+        uri = artifact.container_uri
+        if not uri:
+            return "workspace_managed"
+        if "://" not in uri:
+            return "workspace_managed"
+        scheme = uri.split("://", 1)[0]
+        if scheme in ("file", "workspace"):
+            return "workspace_managed"
+        if scheme in effective_remappable_schemes:
+            return "workspace_managed"
+        return "external_mount"
+
+    def _extract_recovery_roots(
+        self,
+        artifact: Artifact,
+        source_root: Optional[Union[str, Path]] = None,
+    ) -> List[str]:
+        """Extract and preserve recovery roots, appending source_root if provided."""
+        roots: List[str] = list(artifact.recovery_roots)
+        if source_root is not None:
+            source_root_str = str(Path(source_root).resolve())
+            if source_root_str not in roots:
+                roots.append(source_root_str)
+        return roots
+
+    def _check_or_materialize_local_artifact(
+        self,
+        art: Artifact,
+        key: str,
+        source_root: Optional[Path],
+        effective_remappable_schemes: Mapping[str, Path],
+        validate_content_hash: Literal["never", "if-present", "always"],
+    ) -> MaterializedArtifact:
+        """Check for local artifact presence or recover into tracker.run_dir."""
+        existing_path: Optional[Path] = None
+        try:
+            candidate = Path(self.tracker.resolve_uri(art.container_uri))
+            if candidate.exists():
+                existing_path = candidate
+        except (ValueError, RuntimeError, OSError, TypeError):
+            pass
+
+        if existing_path is None and art.abs_path:
+            try:
+                candidate = Path(art.abs_path)
+                if candidate.exists():
+                    existing_path = candidate
+            except (ValueError, RuntimeError, OSError, TypeError):
+                pass
+
+        if existing_path is not None:
+            resolved_existing = existing_path.resolve()
+            detached = art.model_copy(deep=True)
+            detached.abs_path = str(resolved_existing)
+            return MaterializedArtifact(
+                artifact=detached,
+                key=key,
+                path=resolved_existing,
+                source_path=None,
+                target_path=resolved_existing,
+                status="preserved_existing",
+                resolvable=True,
+            )
+
+        if self.tracker.run_dir:
+            return materialize_artifact(
+                self.tracker,
+                art,
+                target_root=Path(self.tracker.run_dir).resolve(),
+                source_root=source_root,
+                allowed_base=None,
+                preserve_existing=True,
+                on_missing="warn",
+                validate_content_hash=validate_content_hash,
+                scheme_prefixes=effective_remappable_schemes,
+            )
+
+        detached_missing = art.model_copy(deep=True)
+        detached_missing.abs_path = None
+        return MaterializedArtifact(
+            artifact=detached_missing,
+            key=key,
+            path=None,
+            source_path=None,
+            target_path=None,
+            status="missing_source",
+            message=f"Artifact {key!r} not found at local paths.",
+            resolvable=False,
+        )
+
+    def restore_coupler_snapshot(
+        self,
+        run_id: Optional[str] = None,
+        *,
+        scenario_run_id: Optional[str] = None,
+        phase: CouplerSnapshotPhase = "post",
+        year: Optional[int] = None,
+        iteration: Optional[int] = None,
+        stage: Optional[str] = None,
+        model_name: Optional[str] = None,
+        before_step_ordinal: Optional[int] = None,
+        clear_existing: bool = False,
+        fallback_to_completed_outputs: bool = True,
+        target_root: Optional[Union[str, Path]] = None,
+        source_root: Optional[Union[str, Path]] = None,
+        remappable_schemes: Optional[
+            Union[Iterable[str], Mapping[str, Union[str, Path]]]
+        ] = None,
+        prune_unrecoverable: bool = False,
+        validate_content_hash: Literal["never", "if-present", "always"] = "never",
+    ) -> RestoredCouplerSnapshotResult:
+        """
+        Restore coupler artifacts from DuckDB snapshots or completed step outputs.
+
+        Parameters
+        ----------
+        run_id : Optional[str], default None
+            If provided, loads snapshot for this specific run_id and phase.
+            If None, finds the latest matching snapshot in the scenario.
+        scenario_run_id : Optional[str], default None
+            Target scenario run ID when querying snapshots or fallback outputs.
+            Defaults to self.run_id if not provided.
+        phase : CouplerSnapshotPhase, default "post"
+            Snapshot phase to restore ("init", "pre", or "post").
+        year : Optional[int], default None
+            Filter for latest snapshot matching year.
+        iteration : Optional[int], default None
+            Filter for latest snapshot matching iteration.
+        stage : Optional[str], default None
+            Filter for latest snapshot matching stage.
+        model_name : Optional[str], default None
+            Filter for latest snapshot matching model_name.
+        before_step_ordinal : Optional[int], default None
+            Filter for snapshots strictly before this step ordinal.
+        clear_existing : bool, default False
+            If True, clears the coupler before applying the restored artifacts.
+            If False, overlays onto the existing coupler contents.
+        fallback_to_completed_outputs : bool, default True
+            If True and no snapshot rows are found, synthesizes the coupler state
+            from completed child step outputs in DuckDB.
+        target_root : Optional[Union[str, Path]], default None
+            Root below which restored artifacts are rematerialized.
+        source_root : Optional[Union[str, Path]], default None
+            Source directory containing historical artifacts to copy from.
+        remappable_schemes : Optional[Union[Iterable[str], Mapping[str, Union[str, Path]]]], default None
+            URI scheme mappings or overrides for resolving sub-mount paths.
+        prune_unrecoverable : bool, default False
+            If True, artifacts whose bytes are missing or unrecoverable are omitted
+            from the returned mapping and evicted from the scenario coupler.
+        validate_content_hash : {"never", "if-present", "always"}, default "never"
+            Policy for content hash verification during materialization. Defaults
+            to "never" to prevent startup latency regressions.
+
+        Returns
+        -------
+        RestoredCouplerSnapshotResult
+            Mapping of restored artifacts keyed by role_key, with diagnostic
+            metadata for pruned keys and materialization outcomes.
+        """
+        if self.tracker.db is None:
+            return RestoredCouplerSnapshotResult()
+
+        if clear_existing:
+            self.coupler.clear()
+
+        artifacts: Dict[str, Artifact] = {}
+        restored_step_ordinal: int = 0
+        target_scenario_id = scenario_run_id or self.run_id
+
+        if run_id is not None:
+            artifacts, step_ord = self.tracker.db.get_run_coupler_snapshot_details(
+                run_id, phase=phase, must_exist=False
+            )
+            if artifacts:
+                restored_step_ordinal = step_ord
+            else:
+                # Check if run_id was a scenario header ID with step snapshots
+                found = self.tracker.db.find_latest_scenario_coupler_snapshot(
+                    run_id,
+                    phase=phase,
+                    year=year,
+                    iteration=iteration,
+                    stage=stage,
+                    model_name=model_name,
+                    before_step_ordinal=before_step_ordinal,
+                )
+                if found is not None:
+                    _, matched_ordinal, artifacts = found
+                    restored_step_ordinal = matched_ordinal
+                elif fallback_to_completed_outputs:
+                    artifacts, restored_step_ordinal = (
+                        self.tracker.db.synthesize_coupler_snapshot_from_history(
+                            run_id=run_id,
+                            scenario_run_id=target_scenario_id,
+                            phase=phase,
+                            year=year,
+                            iteration=iteration,
+                            stage=stage,
+                            model_name=model_name,
+                            before_step_ordinal=before_step_ordinal,
+                            backfill=True,
+                        )
+                    )
+        else:
+            found = self.tracker.db.find_latest_scenario_coupler_snapshot(
+                target_scenario_id,
+                phase=phase,
+                year=year,
+                iteration=iteration,
+                stage=stage,
+                model_name=model_name,
+                before_step_ordinal=before_step_ordinal,
+            )
+            if found is not None:
+                _, matched_ordinal, artifacts = found
+                restored_step_ordinal = matched_ordinal
+            elif fallback_to_completed_outputs:
+                artifacts, restored_step_ordinal = (
+                    self.tracker.db.synthesize_coupler_snapshot_from_history(
+                        run_id=None,
+                        scenario_run_id=target_scenario_id,
+                        phase=phase,
+                        year=year,
+                        iteration=iteration,
+                        stage=stage,
+                        model_name=model_name,
+                        before_step_ordinal=before_step_ordinal,
+                        backfill=True,
+                    )
+                )
+
+        if target_root is None and not prune_unrecoverable:
+            if artifacts:
+                for art in artifacts.values():
+                    set_tracker_ref(art, self.tracker)
+                self.coupler.update(artifacts)
+            if restored_step_ordinal > 0:
+                if phase == "pre":
+                    effective_ordinal = max(0, restored_step_ordinal - 1)
+                else:
+                    effective_ordinal = restored_step_ordinal
+                self._step_ordinal = max(self._step_ordinal, effective_ordinal)
+            return RestoredCouplerSnapshotResult(artifacts=artifacts)
+
+        resolved_target_root: Path
+        if target_root is not None:
+            resolved_target_root = Path(target_root).resolve()
+            resolved_target_root.mkdir(parents=True, exist_ok=True)
+        elif self.tracker.run_dir:
+            resolved_target_root = Path(self.tracker.run_dir).resolve()
+        else:
+            resolved_target_root = Path.cwd().resolve()
+
+        resolved_source_root = (
+            Path(source_root).resolve() if source_root is not None else None
+        )
+
+        effective_remappable_schemes: Dict[str, Path] = {"workspace": Path(".")}
+        for scheme, mount_path in self.tracker.fs.mounts.items():
+            try:
+                resolved_mount = Path(mount_path).resolve()
+                rel = resolved_mount.relative_to(resolved_target_root)
+                effective_remappable_schemes[scheme] = rel
+            except (ValueError, RuntimeError):
+                pass
+
+        if remappable_schemes is not None:
+            if isinstance(remappable_schemes, MappingABC):
+                for scheme, prefix in remappable_schemes.items():
+                    if isinstance(scheme, str) and isinstance(prefix, (str, Path)):
+                        effective_remappable_schemes[scheme] = Path(prefix)
+            elif isinstance(remappable_schemes, Iterable):
+                for scheme in remappable_schemes:
+                    if scheme in effective_remappable_schemes:
+                        continue
+                    if scheme in self.tracker.fs.mounts:
+                        try:
+                            rel = (
+                                Path(self.tracker.fs.mounts[scheme])
+                                .resolve()
+                                .relative_to(resolved_target_root)
+                            )
+                            effective_remappable_schemes[scheme] = rel
+                        except (ValueError, RuntimeError):
+                            effective_remappable_schemes[scheme] = Path(scheme)
+                    else:
+                        effective_remappable_schemes[scheme] = Path(scheme)
+
+        normalize_validate_hash: Literal["never", "if-present", "always"]
+        if validate_content_hash in ("never", "always"):
+            normalize_validate_hash = validate_content_hash
+        else:
+            normalize_validate_hash = "if-present"
+
+        restored_artifacts: Dict[str, Artifact] = {}
+        outcomes: Dict[str, MaterializedArtifact] = {}
+        pruned_keys_list: List[str] = []
+
+        for key, art in artifacts.items():
+            scheme_classification = self._classify_coupler_artifact_scheme(
+                art, effective_remappable_schemes
+            )
+            if scheme_classification == "external_mount":
+                set_tracker_ref(art, self.tracker)
+                restored_artifacts[key] = art
+                self.coupler.set(key, art)
+                outcomes[key] = MaterializedArtifact(
+                    artifact=art,
+                    key=key,
+                    path=art.as_path(self.tracker),
+                    source_path=None,
+                    target_path=art.as_path(self.tracker),
+                    status="preserved_existing",
+                    resolvable=True,
+                )
+                continue
+
+            if target_root is not None:
+                outcome = materialize_artifact(
+                    self.tracker,
+                    art,
+                    target_root=resolved_target_root,
+                    source_root=resolved_source_root,
+                    allowed_base=None,
+                    preserve_existing=True,
+                    on_missing="warn",
+                    validate_content_hash=normalize_validate_hash,
+                    scheme_prefixes=effective_remappable_schemes,
+                )
+            else:
+                outcome = self._check_or_materialize_local_artifact(
+                    art=art,
+                    key=key,
+                    source_root=resolved_source_root,
+                    effective_remappable_schemes=effective_remappable_schemes,
+                    validate_content_hash=normalize_validate_hash,
+                )
+
+            outcomes[key] = outcome
+
+            if outcome.resolvable:
+                hydrated_art = outcome.artifact
+                if outcome.path is not None:
+                    hydrated_art.abs_path = str(outcome.path)
+                meta = dict(hydrated_art.meta or {})
+
+                uri = hydrated_art.container_uri
+                if (
+                    not uri
+                    or uri.startswith("workspace://")
+                    or uri.startswith("./")
+                    or "://" not in uri
+                ):
+                    meta["mount_root"] = str(resolved_target_root)
+                else:
+                    scheme = uri.split("://", 1)[0]
+                    prefix = effective_remappable_schemes.get(scheme)
+                    if prefix is not None:
+                        meta["mount_root"] = str(
+                            (resolved_target_root / prefix).resolve()
+                        )
+                    else:
+                        meta["mount_root"] = str(resolved_target_root)
+
+                recovery_roots = self._extract_recovery_roots(
+                    hydrated_art, source_root=source_root
+                )
+                if recovery_roots or "recovery_roots" in meta:
+                    meta["recovery_roots"] = recovery_roots
+                hydrated_art.meta = meta
+                set_tracker_ref(hydrated_art, self.tracker)
+
+                restored_artifacts[key] = hydrated_art
+                self.coupler.set(key, hydrated_art)
+            else:
+                if prune_unrecoverable:
+                    if not clear_existing:
+                        self.coupler.pop(key, None)
+                    pruned_keys_list.append(key)
+                else:
+                    unresolvable_art = outcome.artifact
+                    set_tracker_ref(unresolvable_art, self.tracker)
+                    restored_artifacts[key] = unresolvable_art
+                    self.coupler.set(key, unresolvable_art)
+
+        if restored_step_ordinal > 0:
+            if phase == "pre":
+                effective_ordinal = max(0, restored_step_ordinal - 1)
+            else:
+                effective_ordinal = restored_step_ordinal
+            self._step_ordinal = max(self._step_ordinal, effective_ordinal)
+
+        return RestoredCouplerSnapshotResult(
+            artifacts=restored_artifacts,
+            pruned_keys=tuple(pruned_keys_list),
+            outcomes=outcomes,
+        )
+
+    def find_latest_coupler_snapshot(
+        self,
+        *,
+        scenario_run_id: Optional[str] = None,
+        phase: Optional[CouplerSnapshotPhase] = None,
+        year: Optional[int] = None,
+        iteration: Optional[int] = None,
+        stage: Optional[str] = None,
+        model_name: Optional[str] = None,
+        before_step_ordinal: Optional[int] = None,
+    ) -> Optional[Tuple[str, int, Dict[str, Artifact]]]:
+        """
+        Find the latest coupler snapshot for this scenario (or a specified scenario)
+        matching the given filters.
+
+        Delegates to DatabaseManager.find_latest_scenario_coupler_snapshot.
+        """
+        if self.tracker.db is None:
+            return None
+        target_scenario_id = scenario_run_id or self.run_id
+        result = self.tracker.db.find_latest_scenario_coupler_snapshot(
+            target_scenario_id,
+            phase=phase,
+            year=year,
+            iteration=iteration,
+            stage=stage,
+            model_name=model_name,
+            before_step_ordinal=before_step_ordinal,
+        )
+        if result is None:
+            return None
+        matched_run_id, matched_ordinal, artifacts = result
+        for art in artifacts.values():
+            set_tracker_ref(art, self.tracker)
+        return (matched_run_id, matched_ordinal, artifacts)
+
+    def _coerce_keys(self, value: Optional[Iterable[str] | str]) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return list(value)
+
+    def _coerce_step_tags(self, value: Optional[Iterable[str]]) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raise TypeError("step_tags must be an iterable of strings, not a str.")
+        return list(value)
+
+    def _merge_step_tags(self, tags: Optional[List[str]]) -> Optional[List[str]]:
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        for source in (tags, self._step_tags):
+            if not source:
+                continue
+            for tag in source:
+                if tag in seen:
+                    continue
+                seen.add(tag)
+                merged.append(tag)
+
+        return merged or None
+
+    def _merge_step_facet(self, facet: Optional[FacetLike]) -> Optional[FacetLike]:
+        if self._step_facet is None and facet is None:
+            return None
+
+        merged: Dict[str, Any] = {}
+        if self._step_facet is not None:
+            merged.update(self._coerce_mapping(self._step_facet, "step_facet"))
+        if facet is not None:
+            merged.update(self._coerce_mapping(facet, "facet"))
+        return normalize_json(merged)
+
+    def _resolve_input_value(self, value: RunInputRef) -> ArtifactRef:
+        def _resolve_coupler_ref(ref: str) -> Optional[ArtifactRef]:
+            if ref in self.coupler:
+                return self.coupler.require(ref)
+            return None
+
+        return self.tracker._resolve_input_reference(
+            value,
+            type_label="Scenario inputs",
+            missing_path_error=format_problem_cause_fix(
+                problem="Scenario input path does not exist: {path!s}",
+                cause=(
+                    "The provided scenario input path is missing or not accessible."
+                ),
+                fix=(
+                    "Use an existing path, or pass a Coupler key from a prior step. "
+                    "For the recommended path, use consist.refs(...) between steps."
+                ),
+            ),
+            missing_string_error=format_problem_cause_fix(
+                problem=(
+                    "Scenario input string did not resolve: {value!r} "
+                    "(checked path: {path!s})."
+                ),
+                cause=("The string is neither a Coupler key nor an existing path."),
+                fix=(
+                    "Use a Coupler key produced earlier in the scenario, or provide "
+                    "a valid file path. For the recommended path, use consist.refs(...)."
+                ),
+            ),
+            string_ref_resolver=_resolve_coupler_ref,
+        )
+
+    def _resolve_inputs(
+        self,
+        inputs: Optional[Union[Mapping[str, RunInputRef], Iterable[RunInputRef]]],
+        input_keys: Optional[Iterable[str] | str],
+        optional_input_keys: Optional[Iterable[str] | str],
+    ) -> Optional[Union[Dict[str, ArtifactRef], List[ArtifactRef]]]:
+        resolved_inputs: Optional[Union[Dict[str, ArtifactRef], List[ArtifactRef]]] = (
+            None
+        )
+        if inputs is not None:
+            if isinstance(inputs, MappingABC):
+                resolved_dict: Dict[str, ArtifactRef] = {}
+                typed_inputs = cast(Mapping[str, RunInputRef], inputs)
+                for key, value in typed_inputs.items():
+                    if not isinstance(key, str):
+                        raise TypeError(
+                            f"inputs mapping keys must be str (got {type(key)})."
+                        )
+                    resolved_dict[key] = self._resolve_input_value(value)
+                resolved_inputs = resolved_dict
+            else:
+                resolved_inputs = [self._resolve_input_value(v) for v in list(inputs)]
+
+        for key in self._coerce_keys(input_keys):
+            artifact = self.coupler.require(key)
+            if resolved_inputs is None:
+                resolved_inputs = {key: artifact}
+            elif isinstance(resolved_inputs, dict):
+                resolved_inputs.setdefault(key, artifact)
+            else:
+                resolved_inputs.append(artifact)
+
+        for key in self._coerce_keys(optional_input_keys):
+            artifact = self.coupler.get(key)
+            if artifact is None:
+                continue
+            if resolved_inputs is None:
+                resolved_inputs = {key: artifact}
+            elif isinstance(resolved_inputs, dict):
+                resolved_inputs.setdefault(key, artifact)
+            else:
+                resolved_inputs.append(artifact)
+
+        return resolved_inputs
+
+    def _promote_inputs_for_binding(
+        self,
+        inputs: Optional[Union[Mapping[str, RunInputRef], Iterable[RunInputRef]]],
+        input_binding: InputBindingMode,
+    ) -> Optional[Union[Mapping[str, RunInputRef], Iterable[RunInputRef]]]:
+        if input_binding == "none" or inputs is None:
+            return inputs
+        if isinstance(inputs, (list, tuple)):
+            if all(isinstance(value, str) for value in inputs) and all(
+                value in self.coupler for value in inputs
+            ):
+                return {value: value for value in inputs}
+        return inputs
+
+    def _resolve_output_paths(
+        self, output_paths: Optional[Mapping[str, OutputPathRef]]
+    ) -> Optional[Dict[str, OutputPathRef]]:
+        if output_paths is None:
+            return None
+        resolved_output_paths: Dict[str, OutputPathRef] = {}
+        for key, ref in output_paths.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"output_paths mapping keys must be str (got {type(key)})."
+                )
+            output_ref = ref.path if isinstance(ref, OutputArtifactSpec) else ref
+            if not isinstance(output_ref, (Artifact, str, Path)):
+                raise TypeError(
+                    "output_paths mapping values must be Artifact, Path, str, "
+                    f"or OutputArtifactSpec (got {type(ref)})."
+                )
+            if isinstance(output_ref, str) and output_ref in self.coupler:
+                path = self.coupler.path(output_ref)
+                if path is None:
+                    raise RuntimeError(
+                        format_problem_cause_fix(
+                            problem=(
+                                f"Coupler key {output_ref!r} has no path to use for "
+                                f"output_paths[{key!r}]."
+                            ),
+                            cause=(
+                                "The referenced Coupler artifact has no materialized "
+                                "path."
+                            ),
+                            fix=(
+                                "Log the artifact with a real path before reusing it in "
+                                "output_paths, or provide an explicit filesystem path."
+                            ),
+                        )
+                    )
+                resolved_output_paths[str(key)] = (
+                    replace(ref, path=path)
+                    if isinstance(ref, OutputArtifactSpec)
+                    else path
+                )
+            else:
+                resolved_output_paths[str(key)] = ref
+        return resolved_output_paths
+
+    def resolve_step_identity(
+        self,
+        fn: Callable[..., Any],
+        *,
+        name: Optional[str] = None,
+        model: Optional[str] = None,
+        year: Optional[int] = None,
+        iteration: Optional[int] = None,
+        phase: Optional[str] = None,
+        stage: Optional[str] = None,
+        execution_options: Optional[ExecutionOptions] = None,
+    ) -> StepIdentity:
+        """Resolve a Python step identity once for strict-binding preflight.
+
+        ``execution_options.runtime_kwargs`` supplies the runtime metadata
+        context. Pass the resulting value to ``run(step_identity=...)`` with
+        the same runtime kwargs; ``run`` reuses this name/model resolution and
+        rejects a different callable or dynamic context.
+        """
+        if not self._header_record:
+            raise RuntimeError("Scenario not active. Use within 'with' block.")
+        runtime_kwargs = (
+            dict(execution_options.runtime_kwargs)
+            if execution_options is not None
+            and execution_options.runtime_kwargs is not None
+            else None
+        )
+        resolver = MetadataResolver(
+            default_name_template=self.name_template,
+            allow_template=True,
+            apply_step_defaults=True,
+        )
+        resolved = resolver.resolve_identity(
+            fn=fn,
+            name=name,
+            model=model,
+            year=year,
+            iteration=iteration,
+            phase=phase,
+            stage=stage,
+            consist_settings=self.tracker.settings,
+            consist_workspace=self.tracker.run_dir,
+            consist_state=self._header_record,
+            runtime_kwargs=runtime_kwargs,
+            missing_name_error="ScenarioContext.run requires a run name.",
+        )
+        frozen_runtime_kwargs = (
+            MappingProxyType(dict(runtime_kwargs))
+            if runtime_kwargs is not None
+            else None
+        )
+        return StepIdentity(
+            name=resolved.name,
+            model=resolved.model,
+            step_contract_identity=step_contract_identity(fn, resolved.name),
+            _resolved_identity=resolved,
+            _owner_token=self._step_identity_owner,
+            _fn=fn,
+            _name_argument=name,
+            _model_argument=model,
+            _year=year,
+            _iteration=iteration,
+            _phase=phase,
+            _stage=stage,
+            _runtime_kwargs=frozen_runtime_kwargs,
+        )
+
+    def run(
+        self,
+        fn: Optional[Callable[..., Any]] = None,
+        name: Optional[str] = None,
+        *,
+        run_id: Optional[str] = None,
+        model: Optional[str] = None,
+        step_identity: StepIdentity | None = None,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        adapter: Optional["ConfigAdapter"] = None,
+        config_plan_ingest: bool = True,
+        config_plan_profile_schema: bool = False,
+        inputs: Optional[
+            Union[Mapping[str, RunInputRef], Iterable[RunInputRef]]
+        ] = None,
+        input_keys: Optional[Iterable[str] | str] = None,
+        optional_input_keys: Optional[Iterable[str] | str] = None,
+        binding: Optional[BindingResult | ResolvedBinding] = None,
+        depends_on: Optional[List[RunInputRef]] = None,
+        tags: Optional[List[str]] = None,
+        facet: Optional[FacetLike] = None,
+        facet_from: Optional[List[str]] = None,
+        facet_schema_version: Optional[Union[str, int]] = None,
+        facet_index: Optional[bool] = None,
+        identity_inputs: IdentityInputs = None,
+        year: Optional[int] = None,
+        iteration: Optional[int] = None,
+        phase: Optional[str] = None,
+        stage: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        outputs: Optional[List[str]] = None,
+        output_paths: Optional[Mapping[str, OutputPathRef]] = None,
+        output_sets: Optional[Mapping[str, OutputSet]] = None,
+        profile_file_schema: bool | Literal["if_changed"] | None = None,
+        capture_dir: Optional[Path] = None,
+        capture_pattern: str = "*",
+        cache_options: Optional[CacheOptions] = None,
+        output_policy: Optional[OutputPolicyOptions] = None,
+        execution_options: Optional[ExecutionOptions] = None,
+    ) -> RunResult:
+        """
+        Execute a cached scenario step and update the Coupler with outputs.
+
+        This method wraps ``Tracker.run`` while ensuring the scenario header
+        is updated with step metadata and artifacts.
+        Decorator metadata is resolved once by the scenario before it delegates
+        the fully resolved invocation to ``Tracker.run``. In particular,
+        decorated ``input_keys`` and ``optional_input_keys`` are compatibility
+        metadata and do not cause a deprecation warning solely because of this
+        internal handoff.
+        Use ``execution_options.runtime_kwargs`` for runtime-only inputs and
+        `consist.require_runtime_kwargs` to validate required keys.
+        For direct workflow code, prefer primitive `inputs=` kwargs and, when
+        needed, the direct `input_keys=` / `optional_input_keys=` compatibility
+        surfaces. For complex or externally orchestrated workflows that already
+        resolved the binding plan, pass ``binding=BindingResult(...)`` instead;
+        `binding` is an execution envelope and is mutually exclusive with the
+        primitive input kwargs.
+        Pass policy controls via ``cache_options``, ``output_policy``,
+        and ``execution_options``.
+
+        ``adapter`` and ``identity_inputs`` are the public identity-related
+        kwargs.
+        ``profile_file_schema`` is the scenario-step equivalent of
+        ``Tracker.run(..., profile_file_schema=...)``: it profiles named
+        tabular inputs and declared tabular outputs logged during this step.
+
+        Examples
+        --------
+        Direct workflow code:
+
+        ```python
+        sc.run(
+            fn=step,
+            inputs={"raw": raw_path},
+            execution_options=ExecutionOptions(input_binding="paths"),
+        )
+
+        sc.run(
+            fn=step,
+            inputs={"raw": consist.ref(previous_result, key="raw")},
+            execution_options=ExecutionOptions(input_binding="loaded"),
+        )
+        ```
+
+        Orchestrator-facing execution envelope:
+
+        ```python
+        sc.run(
+            fn=step,
+            binding=BindingResult(
+                inputs={"raw": raw_path},
+                input_keys=["data"],
+                optional_input_keys=["maybe"],
+            ),
+            execution_options=ExecutionOptions(input_binding="paths"),
+        )
+        ```
+
+        `binding` cannot be combined with primitive `inputs`, `input_keys`, or
+        `optional_input_keys`.
+        """
+        if not self._header_record:
+            raise RuntimeError("Scenario not active. Use within 'with' block.")
+
+        func_name = getattr(fn, "__name__", None) if fn is not None else None
+        if (
+            fn is not None
+            and func_name is None
+            and name is None
+            and step_identity is None
+        ):
+            raise ValueError("ScenarioContext.run requires a run name.")
+        if fn is None and name is None:
+            raise ValueError("ScenarioContext.run requires name when fn is None.")
+
+        if step_identity is not None:
+            if step_identity._owner_token is not self._step_identity_owner:
+                raise ValueError(
+                    "Step identity belongs to a different ScenarioContext."
+                )
+            if fn is not step_identity._fn:
+                raise ValueError("Step identity was resolved for a different callable.")
+            if name is not None or model is not None:
+                raise ValueError(
+                    "step_identity cannot be combined with name or model overrides."
+                )
+            supplied_dynamic_values = {
+                "year": year,
+                "iteration": iteration,
+                "phase": phase,
+                "stage": stage,
+            }
+            preflight_dynamic_values = {
+                "year": step_identity._year,
+                "iteration": step_identity._iteration,
+                "phase": step_identity._phase,
+                "stage": step_identity._stage,
+            }
+            mismatched_values = [
+                key
+                for key, value in supplied_dynamic_values.items()
+                if value is not None and value != preflight_dynamic_values[key]
+            ]
+            if mismatched_values:
+                raise ValueError(
+                    "Step identity dynamic context differs for: "
+                    + ", ".join(mismatched_values)
+                )
+            runtime_kwargs = (
+                execution_options.runtime_kwargs
+                if execution_options is not None
+                else None
+            )
+            if dict(runtime_kwargs or {}) != dict(step_identity._runtime_kwargs or {}):
+                raise ValueError("Step identity runtime kwargs differ from preflight.")
+            name = step_identity._name_argument
+            model = step_identity._model_argument
+            year = step_identity._year
+            iteration = step_identity._iteration
+            phase = step_identity._phase
+            stage = step_identity._stage
+
+        strict_binding = binding if isinstance(binding, ResolvedBinding) else None
+        if binding is not None:
+            if (
+                inputs is not None
+                or input_keys is not None
+                or optional_input_keys is not None
+            ):
+                raise ValueError(
+                    format_problem_cause_fix(
+                        problem=(
+                            "ScenarioContext.run received both binding and primitive "
+                            "input kwargs."
+                        ),
+                        cause=(
+                            "binding=... is a complete execution envelope for "
+                            "scenario inputs, so it cannot be combined with "
+                            "inputs=..., input_keys=..., or optional_input_keys=...."
+                        ),
+                        fix=(
+                            "Pass either binding=BindingResult(...) or the primitive "
+                            "input kwargs, but not both."
+                        ),
+                    )
+                )
+            if strict_binding is not None:
+                bound_inputs: dict[str, Artifact] = {}
+                resolved_by_id: dict[uuid.UUID, Artifact] = {}
+                for parameter, resolved_input in strict_binding.inputs.items():
+                    locator = resolved_input.artifact.locator
+                    if not isinstance(locator, TrackedArtifactLocator):
+                        raise ValueError(
+                            f"Resolved binding locator is unsupported for {parameter!r}."
+                        )
+                    artifact = resolved_by_id.get(locator.artifact_id)
+                    if artifact is None:
+                        artifact = self.tracker.get_artifact(locator.artifact_id)
+                        if artifact is None:
+                            raise ValueError(
+                                f"Resolved binding artifact is unavailable for {parameter!r}."
+                            )
+                        resolved_by_id[locator.artifact_id] = artifact
+                    if (
+                        ArtifactIdentity.from_artifact(artifact)
+                        != resolved_input.artifact.identity
+                    ):
+                        raise ValueError(
+                            f"Resolved binding artifact identity changed for {parameter!r}."
+                        )
+                    bound_inputs[parameter] = artifact
+                invocation_inputs = bound_inputs
+                input_keys = None
+                optional_input_keys = None
+            else:
+                assert isinstance(binding, BindingResult)
+                invocation_inputs = binding.inputs
+                input_keys = binding.input_keys
+                optional_input_keys = binding.optional_input_keys
+        else:
+            invocation_inputs = inputs
+
+        requested_input_binding = (
+            execution_options.input_binding if execution_options is not None else None
+        )
+        if (
+            requested_input_binding is None
+            and execution_options is not None
+            and execution_options.load_inputs is True
+        ):
+            requested_input_binding = "loaded"
+        if requested_input_binding in {"loaded", "paths"}:
+            invocation_inputs = self._promote_inputs_for_binding(
+                invocation_inputs,
+                requested_input_binding,
+            )
+
+        resolved_invocation = resolve_run_invocation(
+            fn=fn,
+            name=name,
+            model=model,
+            description=description,
+            config=config,
+            adapter=adapter,
+            identity_inputs=identity_inputs,
+            inputs=invocation_inputs,
+            input_keys=input_keys,
+            optional_input_keys=optional_input_keys,
+            tags=tags,
+            facet=facet,
+            facet_from=facet_from,
+            facet_schema_version=facet_schema_version,
+            facet_index=facet_index,
+            year=year,
+            iteration=iteration,
+            phase=phase,
+            stage=stage,
+            outputs=outputs,
+            output_paths=output_paths,
+            output_sets=output_sets,
+            cache_options=cache_options,
+            output_policy=output_policy,
+            execution_options=execution_options,
+            default_name_template=self.name_template,
+            allow_template=True,
+            apply_step_defaults=True,
+            consist_settings=self.tracker.settings,
+            consist_workspace=self.tracker.run_dir,
+            consist_state=self._header_record,
+            missing_name_error="ScenarioContext.run requires a run name.",
+            python_missing_fn_error="Tracker.run requires a callable fn.",
+            pre_resolved_step_identity=(
+                step_identity._resolved_identity if step_identity is not None else None
+            ),
+        )
+
+        resolved_name = resolved_invocation.name
+        resolved_model = resolved_invocation.model
+        resolved_description = resolved_invocation.description
+        resolved_config = resolved_invocation.config
+        resolved_adapter = resolved_invocation.adapter
+        resolved_identity_inputs = resolved_invocation.identity_inputs
+        resolved_tags = resolved_invocation.tags
+        resolved_facet = resolved_invocation.facet
+        resolved_facet_index = resolved_invocation.facet_index
+        resolved_outputs = resolved_invocation.outputs
+        resolved_output_paths = resolved_invocation.output_paths
+        resolved_inputs = resolved_invocation.inputs
+        resolved_input_keys = resolved_invocation.input_keys
+        resolved_optional_input_keys = resolved_invocation.optional_input_keys
+        resolved_facet_from = resolved_invocation.facet_from
+        resolved_facet_schema_version = resolved_invocation.facet_schema_version
+        resolved_cache_mode = resolved_invocation.cache_mode
+        resolved_cache_hydration = resolved_invocation.cache_hydration
+        resolved_cache_version = resolved_invocation.cache_version
+        resolved_validate_cached_outputs = resolved_invocation.validate_cached_outputs
+        resolved_input_binding = resolved_invocation.input_binding
+        resolved_output_mismatch = resolved_invocation.output_mismatch
+        resolved_output_missing = resolved_invocation.output_missing
+        resolved_executor = resolved_invocation.executor
+        resolved_container = resolved_invocation.container
+        runtime_kwargs_dict = resolved_invocation.runtime_kwargs
+        resolved_inject_context = resolved_invocation.inject_context
+        cache_epoch = resolved_invocation.cache_epoch
+        resolved_tags = self._merge_step_tags(resolved_tags)
+        resolved_facet = self._merge_step_facet(resolved_facet)
+
+        if run_id is None:
+            run_id = f"{self.run_id}_{resolved_name}_{uuid.uuid4().hex[:8]}"
+        if parent_run_id is None:
+            parent_run_id = self.run_id
+
+        strict_snapshot_paths: dict[str, Path] | None = None
+        strict_binding_context = None
+        if strict_binding is not None:
+            if self.tracker.db is None:
+                raise RuntimeError(
+                    "ResolvedBinding requires metadata persistence for invocation evidence."
+                )
+            if fn is None:
+                raise ValueError("ResolvedBinding requires a Python callable.")
+            if strict_binding.step_name != resolved_name:
+                raise ValueError(
+                    "Resolved binding step name does not match the run name."
+                )
+            resolved_contract_identity = (
+                step_identity.step_contract_identity
+                if step_identity is not None
+                else step_contract_identity(fn, resolved_name)
+            )
+            if resolved_contract_identity != strict_binding.step_contract_identity:
+                raise ValueError(
+                    "Resolved binding step contract does not match callable."
+                )
+            if resolved_input_binding != "paths":
+                raise ValueError(
+                    "Resolved binding destinations require input_binding='paths'."
+                )
+            if resolved_executor != "python":
+                raise ValueError("ResolvedBinding only supports executor='python'.")
+            parameters = inspect.signature(fn).parameters
+            unexpected = sorted(set(strict_binding.inputs) - set(parameters))
+            if unexpected:
+                raise ValueError(
+                    "Resolved binding parameters are absent from callable: "
+                    + ", ".join(unexpected)
+                )
+            strict_snapshot_paths = {}
+            for parameter, resolved_input in strict_binding.inputs.items():
+                destination = resolved_input.destination
+                if (
+                    destination is None
+                    or destination.is_absolute()
+                    or ".." in destination.parts
+                ):
+                    raise ValueError(
+                        "Resolved binding destinations must be relative run-owned paths."
+                    )
+                snapshot_path = (
+                    self.tracker.run_dir / ".resolved-bindings" / run_id / destination
+                )
+                if snapshot_path.exists():
+                    raise ValueError(
+                        "Resolved binding snapshot destination must be fresh."
+                    )
+                strict_snapshot_paths[parameter] = snapshot_path
+            strict_binding_context = _create_strict_binding_invocation_context(
+                strict_binding=strict_binding,
+                identity_digest=strict_binding.identity_digest(),
+                evidence_json=strict_binding.evidence_json(),
+                input_artifact_ids=tuple(
+                    str(resolved_input.artifact.artifact_id)
+                    for resolved_input in strict_binding.inputs.values()
+                ),
+            )
+
+        self._maybe_capture_init_snapshot()
+        self._first_step_started = True
+        self._last_step_name = resolved_name
+        self._step_ordinal += 1
+        self.capture_coupler_snapshot(phase="pre", run_id=run_id)
+
+        effective_cache_hydration = (
+            resolved_cache_hydration
+            if resolved_cache_hydration is not None
+            else self.step_cache_hydration
+        )
+        effective_run_completion_archive = self._resolve_step_run_completion_archive(
+            resolved_name,
+            resolved_invocation.run_completion_archive,
+        )
+
+        promoted_inputs = self._promote_inputs_for_binding(
+            resolved_inputs, resolved_input_binding
+        )
+        resolved_inputs = self._resolve_inputs(
+            promoted_inputs, resolved_input_keys, resolved_optional_input_keys
+        )
+        resolved_output_paths = self._resolve_output_paths(resolved_output_paths)
+
+        resolved_cache_epoch = (
+            cache_epoch
+            if cache_epoch is not None
+            else (
+                self.cache_epoch
+                if self.cache_epoch is not None
+                else getattr(self.tracker, "_cache_epoch", None)
+            )
+        )
+
+        result = self.tracker.run(
+            fn=fn,
+            name=resolved_name,
+            run_id=run_id,
+            model=resolved_model,
+            description=resolved_description,
+            config=resolved_config,
+            adapter=resolved_adapter,
+            config_plan_ingest=config_plan_ingest,
+            config_plan_profile_schema=config_plan_profile_schema,
+            inputs=resolved_inputs,
+            input_keys=None,
+            optional_input_keys=None,
+            depends_on=depends_on,
+            tags=resolved_tags,
+            facet=resolved_facet,
+            facet_from=resolved_facet_from,
+            facet_schema_version=resolved_facet_schema_version,
+            facet_index=resolved_facet_index,
+            identity_inputs=resolved_identity_inputs,
+            year=year,
+            iteration=iteration,
+            phase=phase,
+            stage=stage,
+            parent_run_id=parent_run_id,
+            outputs=resolved_outputs,
+            output_paths=resolved_output_paths,
+            output_sets=resolved_invocation.output_sets,
+            profile_file_schema=profile_file_schema,
+            capture_dir=capture_dir,
+            capture_pattern=capture_pattern,
+            cache_options=CacheOptions(
+                cache_mode=resolved_cache_mode,
+                cache_hydration=effective_cache_hydration,
+                cache_hydration_failure=resolved_invocation.cache_hydration_failure,
+                cache_version=resolved_cache_version,
+                cache_epoch=resolved_cache_epoch,
+                validate_cached_outputs=resolved_validate_cached_outputs,
+                validate_materialized_inputs=(
+                    resolved_invocation.validate_materialized_inputs
+                ),
+                code_identity=resolved_invocation.code_identity,
+                code_identity_extra_deps=resolved_invocation.code_identity_extra_deps,
+            ),
+            output_policy=OutputPolicyOptions(
+                output_mismatch=resolved_output_mismatch,
+                output_missing=resolved_output_missing,
+                run_completion_archive=effective_run_completion_archive,
+            ),
+            execution_options=ExecutionOptions(
+                input_binding=resolved_input_binding,
+                input_paths=(
+                    strict_snapshot_paths
+                    if strict_snapshot_paths is not None
+                    else resolved_invocation.input_paths
+                ),
+                input_materialization=(
+                    "requested"
+                    if strict_snapshot_paths is not None
+                    else resolved_invocation.input_materialization
+                ),
+                input_materialization_mode=(
+                    resolved_invocation.input_materialization_mode
+                ),
+                requested_input_artifact_ids=(
+                    {
+                        parameter: str(resolved_input.artifact.artifact_id)
+                        for parameter, resolved_input in strict_binding.inputs.items()
+                    }
+                    if strict_binding is not None
+                    else None
+                ),
+                executor=resolved_executor,
+                container=resolved_container,
+                runtime_kwargs=runtime_kwargs_dict,
+                inject_context=resolved_inject_context,
+            ),
+            _apply_step_defaults=False,
+            _strict_binding_context=strict_binding_context,
+        )
+
+        if result.outputs:
+            self.coupler.update(result.outputs)
+
+        record = self.tracker.last_run
+        if record and self._header_record:
+            self._record_step_in_parent(record.run, record.inputs, record.outputs)
+
+        return result
+
+    @contextmanager
+    def trace(
+        self,
+        name: str,
+        *,
+        run_id: Optional[str] = None,
+        model: Optional[str] = None,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        adapter: Optional["ConfigAdapter"] = None,
+        config_plan_ingest: bool = True,
+        config_plan_profile_schema: bool = False,
+        inputs: Optional[
+            Union[Mapping[str, RunInputRef], Iterable[RunInputRef]]
+        ] = None,
+        input_keys: Optional[Iterable[str] | str] = None,
+        optional_input_keys: Optional[Iterable[str] | str] = None,
+        depends_on: Optional[List[RunInputRef]] = None,
+        tags: Optional[List[str]] = None,
+        facet: Optional[FacetLike] = None,
+        facet_from: Optional[List[str]] = None,
+        facet_schema_version: Optional[Union[str, int]] = None,
+        facet_index: Optional[bool] = None,
+        identity_inputs: IdentityInputs = None,
+        year: Optional[int] = None,
+        iteration: Optional[int] = None,
+        parent_run_id: Optional[str] = None,
+        outputs: Optional[List[str]] = None,
+        output_paths: Optional[Mapping[str, OutputPathRef]] = None,
+        capture_dir: Optional[Path] = None,
+        capture_pattern: str = "*",
+        cache_mode: str = "reuse",
+        cache_hydration: Optional[str] = None,
+        cache_version: Optional[int] = None,
+        cache_epoch: Optional[int] = None,
+        validate_cached_outputs: str = "lazy",
+        code_identity: Optional[CodeIdentityMode] = None,
+        code_identity_extra_deps: Optional[List[str]] = None,
+        output_mismatch: str = "warn",
+        output_missing: str = "warn",
+        output_policy: Optional[OutputPolicyOptions] = None,
+        run_completion_archive: Optional[
+            Union[RunCompletionArchivePolicy, Literal[False]]
+        ] = None,
+    ):
+        """
+        Manual tracing context manager for scenario steps.
+
+        This wraps ``Tracker.trace`` to log a step while allowing inline code
+        blocks. Use ``ScenarioContext.run`` when you want function execution
+        to be skipped on cache hits.
+
+        ``adapter`` and ``identity_inputs`` are the public identity-related
+        kwargs.
+        """
+        if not self._header_record:
+            raise RuntimeError("Scenario not active. Use within 'with' block.")
+
+        resolved_output_policy = resolve_trace_output_policy(
+            output_policy=output_policy,
+            output_mismatch=output_mismatch,
+            output_missing=output_missing,
+            run_completion_archive=run_completion_archive,
+        )
+
+        resolved_invocation = resolve_run_invocation(
+            fn=None,
+            name=name,
+            model=model,
+            description=description,
+            config=config,
+            adapter=adapter,
+            identity_inputs=identity_inputs,
+            inputs=inputs,
+            input_keys=input_keys,
+            optional_input_keys=optional_input_keys,
+            tags=tags,
+            facet=facet,
+            facet_from=facet_from,
+            facet_schema_version=facet_schema_version,
+            facet_index=facet_index,
+            year=year,
+            iteration=iteration,
+            phase=None,
+            stage=None,
+            outputs=outputs,
+            output_paths=output_paths,
+            output_sets=None,
+            cache_options=CacheOptions(
+                cache_mode=cache_mode,
+                cache_hydration=cache_hydration,
+                cache_version=cache_version,
+                cache_epoch=cache_epoch,
+                validate_cached_outputs=validate_cached_outputs,
+                validate_materialized_inputs=None,
+                code_identity=code_identity,
+                code_identity_extra_deps=code_identity_extra_deps,
+            ),
+            output_policy=resolved_output_policy,
+            execution_options=None,
+            default_name_template=self.name_template,
+            allow_template=True,
+            apply_step_defaults=True,
+            consist_settings=self.tracker.settings,
+            consist_workspace=self.tracker.run_dir,
+            consist_state=self._header_record,
+            missing_name_error="ScenarioContext.trace requires a step name.",
+            python_missing_fn_error="Tracker.trace requires a callable fn.",
+            allow_python_without_fn=True,
+        )
+
+        resolved_name = resolved_invocation.name
+        resolved_model = resolved_invocation.model
+        resolved_description = resolved_invocation.description
+        resolved_config = resolved_invocation.config
+        resolved_adapter = resolved_invocation.adapter
+        resolved_identity_inputs = resolved_invocation.identity_inputs
+        resolved_tags = self._merge_step_tags(resolved_invocation.tags)
+        resolved_facet = self._merge_step_facet(resolved_invocation.facet)
+        resolved_outputs = resolved_invocation.outputs
+        resolved_output_paths = self._resolve_output_paths(
+            resolved_invocation.output_paths
+        )
+        resolved_inputs = self._resolve_inputs(
+            resolved_invocation.inputs,
+            resolved_invocation.input_keys,
+            resolved_invocation.optional_input_keys,
+        )
+        resolved_facet_from = resolved_invocation.facet_from
+        resolved_facet_schema_version = resolved_invocation.facet_schema_version
+        resolved_cache_mode = resolved_invocation.cache_mode
+        resolved_cache_hydration = resolved_invocation.cache_hydration
+        resolved_cache_version = resolved_invocation.cache_version
+        resolved_validate_cached_outputs = resolved_invocation.validate_cached_outputs
+        resolved_cache_epoch = resolved_invocation.cache_epoch
+
+        if run_id is None:
+            run_id = f"{self.run_id}_{resolved_name}"
+        if parent_run_id is None:
+            parent_run_id = self.run_id
+
+        self._maybe_capture_init_snapshot()
+        self._first_step_started = True
+        self._last_step_name = resolved_name
+        self._step_ordinal += 1
+        self.capture_coupler_snapshot(phase="pre", run_id=run_id)
+
+        effective_cache_hydration = (
+            resolved_cache_hydration or self.step_cache_hydration
+        )
+        effective_run_completion_archive = self._resolve_step_run_completion_archive(
+            resolved_name,
+            resolved_invocation.run_completion_archive,
+        )
+
+        try:
+            self.tracker._active_coupler = self.coupler
+            with self.tracker.trace(
+                name=resolved_name,
+                run_id=run_id,
+                model=resolved_model,
+                description=resolved_description,
+                config=resolved_config,
+                adapter=resolved_adapter,
+                config_plan_ingest=config_plan_ingest,
+                config_plan_profile_schema=config_plan_profile_schema,
+                inputs=resolved_inputs,
+                input_keys=None,
+                optional_input_keys=None,
+                depends_on=depends_on,
+                tags=resolved_tags,
+                facet=resolved_facet,
+                facet_from=resolved_facet_from,
+                facet_schema_version=resolved_facet_schema_version,
+                facet_index=resolved_invocation.facet_index,
+                identity_inputs=resolved_identity_inputs,
+                year=year,
+                iteration=iteration,
+                parent_run_id=parent_run_id,
+                outputs=resolved_outputs,
+                output_paths=resolved_output_paths,
+                capture_dir=capture_dir,
+                capture_pattern=capture_pattern,
+                cache_mode=resolved_cache_mode,
+                cache_hydration=effective_cache_hydration,
+                cache_version=resolved_cache_version,
+                cache_epoch=resolved_cache_epoch,
+                validate_cached_outputs=resolved_validate_cached_outputs,
+                validate_materialized_inputs=(
+                    resolved_invocation.validate_materialized_inputs
+                ),
+                code_identity=resolved_invocation.code_identity,
+                code_identity_extra_deps=resolved_invocation.code_identity_extra_deps,
+                output_mismatch=resolved_invocation.output_mismatch,
+                output_missing=resolved_invocation.output_missing,
+                output_policy=OutputPolicyOptions(
+                    output_mismatch=resolved_invocation.output_mismatch,
+                    output_missing=resolved_invocation.output_missing,
+                    run_completion_archive=effective_run_completion_archive,
+                ),
+            ) as t:
+                if t.is_cached:
+                    current_consist = t.current_consist
+                    if current_consist and current_consist.outputs:
+                        for artifact in current_consist.outputs:
+                            if artifact.key:
+                                self.coupler.set(artifact.key, artifact)
+                yield t
+        finally:
+            self.tracker._active_coupler = None
+            record = self.tracker.last_run
+            if record and self._header_record:
+                if record.outputs:
+                    self.coupler.update({a.key: a for a in record.outputs})
+                self._record_step_in_parent(record.run, record.inputs, record.outputs)
+
+    def _coerce_mapping(self, obj: Any, label: str) -> Dict[str, Any]:
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(mode="json")
+        if hasattr(obj, "dict") and hasattr(obj, "json"):
+            return obj.dict()
+        if isinstance(obj, Mapping):
+            return dict(obj)
+        raise ValueError(
+            f"ScenarioContext {label} must be a mapping or Pydantic model."
+        )
+
+    def _as_artifact_list(self, value: Any) -> List[Artifact]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, Artifact)]
+        if isinstance(value, tuple):
+            return [item for item in value if isinstance(item, Artifact)]
+        if isinstance(value, Mapping):
+            return [item for item in value.values() if isinstance(item, Artifact)]
+        if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+            return [item for item in value if isinstance(item, Artifact)]
+        return []
+
+    def _extract_facet_from_config(
+        self, config: Optional[Any], facet_from: List[str]
+    ) -> Dict[str, Any]:
+        if config is None:
+            raise ValueError("facet_from requires a config to extract from.")
+        config_dict = self._coerce_mapping(config, "config")
+        missing = [key for key in facet_from if key not in config_dict]
+        if missing:
+            raise KeyError(f"facet_from keys not found in config: {missing}")
+        return {key: config_dict[key] for key in facet_from}
+
+    def _record_step_in_parent(self, child_run, child_inputs, child_outputs):
+        header_record = self._header_record
+        if header_record is None:
+            return
+
+        if child_run.meta is None:
+            child_run.meta = {}
+        if child_run.meta.get("scenario_id") != self.run_id:
+            child_run.meta["scenario_id"] = self.run_id
+            if self.tracker.persistence is not None:
+                self.tracker.persistence.sync_run(child_run)
+
+        parent_run = header_record.run
+        parent_inputs_list = header_record.inputs
+        parent_outputs_list = header_record.outputs
+
+        # --- Smart Merge Logic ---
+        parent_output_ids = {a.id for a in parent_outputs_list}
+        parent_input_ids = {a.id for a in parent_inputs_list}
+
+        # Merge Outputs
+        for artifact in child_outputs:
+            if artifact.id not in parent_output_ids:
+                parent_outputs_list.append(artifact)
+                parent_output_ids.add(artifact.id)
+
+        # Merge Inputs
+        for artifact in child_inputs:
+            if (
+                artifact.id not in parent_input_ids
+                and artifact.id not in parent_output_ids
+            ):
+                parent_inputs_list.append(artifact)
+                parent_input_ids.add(artifact.id)
+
+        # --- Record Metadata ---
+        summary = {
+            "id": child_run.id,
+            "model": child_run.model_name,
+            "status": child_run.status,
+            "description": child_run.description,
+            "started_at": (
+                child_run.started_at.isoformat() if child_run.started_at else None
+            ),
+            "ended_at": child_run.ended_at.isoformat() if child_run.ended_at else None,
+            "duration_seconds": child_run.duration_seconds,
+            "inputs": {str(a.id): a.key for a in child_inputs},
+            "outputs": {str(a.id): a.key for a in child_outputs},
+        }
+
+        if "steps" not in parent_run.meta:
+            parent_run.meta["steps"] = []
+
+        parent_run.meta["steps"].append(summary)
+
+        output_ids = list(dict.fromkeys(artifact.id for artifact in child_outputs))
+        input_ids = list(
+            dict.fromkeys(
+                artifact.id
+                for artifact in child_inputs
+                if artifact.id not in parent_output_ids
+            )
+        )
+
+        # --- Force Flush ---
+        current_state = self.tracker.current_consist
+        self.tracker.current_consist = self._header_record
+        try:
+            self.tracker.persistence.flush_json()
+            if output_ids:
+                self.tracker.persistence.sync_run_with_links(
+                    parent_run,
+                    artifact_ids=output_ids,
+                    direction="output",
+                )
+            else:
+                self.tracker.persistence.sync_run(parent_run)
+
+            if self.tracker.db and input_ids:
+                self.tracker.db.link_artifacts_to_run_bulk(
+                    artifact_ids=input_ids,
+                    run_id=parent_run.id,
+                    direction="input",
+                )
+        finally:
+            self.tracker.current_consist = current_state
+
+        self.capture_coupler_snapshot(phase="post", run_id=child_run.id)
+
+    def __enter__(self) -> "ScenarioContext":
+        # Enforce No Nesting
+        if self.tracker.current_consist is not None:
+            raise RuntimeError(
+                "Cannot start scenario: another run or scenario is active. "
+                "Nested scenarios are not supported."
+            )
+
+        # Ensure tag exists
+        if "scenario_header" not in self.tags:
+            self.tags.append("scenario_header")
+
+        # 1. Start Header Run
+        # We use begin_run directly to initialize state
+        run_id = self.kwargs.pop("run_id", self.name)
+        # Coupler is a runtime-only object and should not be serialized into run meta.
+        self.kwargs.pop("coupler", None)
+        header_kwargs = dict(self.kwargs)
+        header_kwargs["_consist_code_identity_callable"] = (
+            _scenario_header_code_identity
+        )
+        self.tracker.begin_run(
+            run_id=run_id,
+            model=self.model,
+            config=self.config_arg,
+            tags=self.tags,
+            **header_kwargs,
+        )
+
+        # 2. Capture & Suspend
+        # Save the record and clear the tracker's active state
+        self._header_record = self.tracker.current_consist
+        self._suspended_cache_options = self.tracker.suspend_cache_options()
+        self.tracker.current_consist = None
+
+        # Note: We leave the tracker pushed to the global context stack.
+        # This ensures calls to `consist.log_artifact()` fail with our custom error
+        # rather than "No active tracker".
+
+        self._step_ordinal = 0
+        if self.tracker.db:
+            self._step_ordinal = self.tracker.db.get_max_coupler_snapshot_ordinal(
+                self.run_id
+            )
+            if self.resume_from_run_id:
+                self.restore_coupler_snapshot(
+                    run_id=self.resume_from_run_id,
+                    phase=self.resume_phase,
+                    fallback_to_completed_outputs=True,
+                    clear_existing=False,
+                )
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> bool:
+        missing_error: Optional[RuntimeError] = None
+        missing_outputs: list[str] = []
+        if exc_type is None:
+            missing_outputs = self.coupler.missing_declared_outputs()
+            if missing_outputs:
+                missing_error = RuntimeError(
+                    f"Scenario missing declared outputs: {', '.join(missing_outputs)}."
+                )
+
+        # 1. Restore Header Context
+        self.tracker.current_consist = self._header_record
+        if self._suspended_cache_options is not None:
+            self.tracker.restore_cache_options(self._suspended_cache_options)
+        if self._header_record is None:
+            raise RuntimeError("Scenario header record was not captured.")
+
+        # 2. Handle Status
+        status = "failed" if exc_type or missing_error else "completed"
+        error_for_end_run: Optional[Exception] = None
+        if missing_error is not None:
+            error_for_end_run = missing_error
+        elif isinstance(exc_val, Exception):
+            error_for_end_run = exc_val
+        if exc_type or missing_error:
+            # Enrich metadata with failure context
+            self._header_record.run.meta["failed_with"] = str(exc_val or missing_error)
+            if self._last_step_name:
+                self._header_record.run.meta["failed_step"] = self._last_step_name
+            if missing_outputs:
+                self._header_record.run.meta["missing_outputs"] = missing_outputs
+
+        # 3. End Run
+        # This handles DB sync, JSON flush, and event emission
+        import logging
+
+        logging.debug(
+            f"[ScenarioContext] Ending header {self.run_id} with status={status}"
+        )
+        self.tracker.end_run(status=status, error=error_for_end_run)
+
+        # 4. Final Cleanup
+        # end_run sets current_consist to None, but we ensure it matches expected state
+        self.tracker.current_consist = None
+        self._header_record = None
+        self._suspended_cache_mode = None
+
+        if missing_error:
+            raise missing_error
+
+        return False  # Propagate exceptions
+
+    def map_runs(
+        self,
+        rows: Iterable[Dict[str, Any]],
+        fn: str,
+        name_template: Optional[str] = None,
+        model: Optional[str] = None,
+        config_from: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        facet_from: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        max_workers: Optional[int] = None,
+        backend: str = "processes",
+        cancel_pending_on_failure: bool = False,
+        expected_outputs: Optional[List[str]] = None,
+    ) -> "BatchResult":
+        """
+        Fan out parameter sweep runs in parallel under the parent scenario.
+
+        Parameters
+        ----------
+        rows : Iterable[Dict[str, Any]]
+            Rows of inputs/parameter combinations to sweep.
+        fn : str
+            Importable module-path string reference (e.g. "my_module:run_case").
+            Direct callables are not supported for the process backend.
+        name_template : Optional[str]
+            Optional string template to format run names (e.g. "case-{case_id}").
+        model : Optional[str]
+            The model name for categorizing child runs. Defaults to function name.
+        config_from : Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]
+            Optional function to transform a row into a run configuration dict.
+        facet_from : Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]
+            Optional function to extract facets from a row.
+        max_workers : Optional[int]
+            The maximum number of parallel workers. Defaults to executor default.
+        backend : str, default "processes"
+            The backend executor: "processes" (ProcessPoolExecutor) or "threads" (ThreadPoolExecutor).
+        cancel_pending_on_failure : bool, default False
+            If True, make a best-effort attempt to cancel futures that have not
+            started after the first observed failure. Already-running workers may
+            still complete.
+
+        Returns
+        -------
+        BatchResult
+            The aggregated results of the parallel run execution.
+        """
+        # 1. Validate the callable early in the parent process
+        resolve_callable(fn)
+
+        # 2. Get the parent tracker configuration
+        tracker_config = self.tracker.to_config()
+
+        # 3. Build the execution specs
+        exec_specs: list[ExecutionSpec] = []
+        for idx, row in enumerate(rows):
+            # Compute run ID / name
+            if name_template:
+                try:
+                    run_name = name_template.format(**row)
+                except Exception:
+                    run_name = f"case-{idx}"
+            else:
+                run_name = f"case-{idx}"
+
+            run_id = f"{self.run_id}-{run_name}-{uuid.uuid4().hex[:6]}"
+
+            config = config_from(row) if config_from else row
+            facets = facet_from(row) if facet_from else {}
+
+            merged_tags = self._merge_step_tags([]) or []
+            merged_facet = self._merge_step_facet(facets) or {}
+
+            target = PythonCallableTarget(callable_ref=fn)
+            run_spec = BatchRunSpec(
+                run_id=run_id,
+                model=model or fn,
+                config=config,
+                tags=merged_tags,
+                facets=dict(merged_facet),
+                parent_run_id=self.run_id,
+                expected_outputs=expected_outputs,
+            )
+            exec_spec = ExecutionSpec(
+                run_id=f"exec-{run_id}",
+                parent_run_id=self.run_id,
+                target=target,
+                run_spec=run_spec,
+            )
+            exec_specs.append(exec_spec)
+
+        if not exec_specs:
+            return BatchResult(
+                total_count=0,
+                success_count=0,
+                failure_count=0,
+                cache_hit_count=0,
+            )
+
+        # 4. Select executor
+        if backend != "processes":
+            raise NotImplementedError(
+                f"Backend {backend!r} is not supported. Currently, only 'processes' "
+                "is implemented to prevent database write contention and catalog collisions."
+            )
+
+        ctx = multiprocessing.get_context("spawn")
+        executor_cls = functools.partial(
+            concurrent.futures.ProcessPoolExecutor, mp_context=ctx
+        )
+
+        results: list[RunSpecResult | None] = [None] * len(exec_specs)
+        failed_specs: list[BatchRunSpec] = []
+        success_count = 0
+        failure_count = 0
+        cache_hit_count = 0
+
+        child_tracker_config = tracker_config.model_copy(
+            update={"db_skip_schema_init": True}
+        )
+        tracker_config_dict = child_tracker_config.model_dump()
+
+        with executor_cls(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(execute_worker_run, tracker_config_dict, spec): (
+                    idx,
+                    spec,
+                )
+                for idx, spec in enumerate(exec_specs)
+            }
+
+            for future in concurrent.futures.as_completed(futures):
+                idx, spec = futures[future]
+                try:
+                    res = future.result()
+                except Exception as e:
+                    import traceback
+
+                    res = RunSpecResult(
+                        spec_id=spec.run_spec.run_id,
+                        run_id=spec.run_spec.run_id,
+                        status="failed",
+                        cache_hit=False,
+                        error_message=str(e),
+                        error_traceback=traceback.format_exc(),
+                    )
+
+                results[idx] = res
+
+                if res.status == "success":
+                    success_count += 1
+                    if res.cache_hit:
+                        cache_hit_count += 1
+                else:
+                    failure_count += 1
+                    failed_specs.append(spec.run_spec)
+                    if cancel_pending_on_failure:
+                        for pending_fut in futures:
+                            pending_fut.cancel()
+                        break
+
+        child_run_ids = [
+            r.persisted_run_id
+            for r in results
+            if r is not None and r.persisted_run_id is not None
+        ]
+
+        return BatchResult(
+            total_count=len(exec_specs),
+            success_count=success_count,
+            failure_count=failure_count,
+            cache_hit_count=cache_hit_count,
+            child_run_ids=child_run_ids,
+            failed_specs=failed_specs,
+            results=[r for r in results if r is not None],
+        )

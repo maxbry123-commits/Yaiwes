@@ -1,0 +1,231 @@
+-- functions.input --
+@experiment(functions)
+
+sum: func(
+    _~x: int,
+    // left operand
+    a: int = 5,
+    req!: string,
+    opt?: bool,
+) -> int: call(x, a: a, req: req)
+
+mixed: sum(1, req: "x")
+
+defaults: func(
+    _~n: int = 0,
+    int = 1,
+    a: int = 2,
+    // a default followed by an attribute
+    c: int = 3 @tag(y),
+    d: {port: int} = {port: 80},
+    // a name-only parameter with a default
+    b!: string = "x",
+) -> int: a
+
+inline: func(a: int=2, b: int = base + 1) -> int: a
+
+// A comment after "=" or ":" trails its parameter; a comment on its own
+// line before a default or a constraint leads the parameter. A parameter
+// list with a comment closes on its own line, so that a // comment
+// cannot swallow the closing parenthesis or a following parameter.
+commented: func(a: int = // after the bind token
+    2, b: int =
+    // before the default
+    3, c:
+    // before the constraint
+    int = 4) -> int: a
+trailingLast: func(a: int = 2 // after the last parameter
+    ) -> int: a
+
+partialLabel: add(a: 1, ...)
+partialPos:   add(1, ...)
+partialNone:  add(...)
+partialMany:  add(1, 2, ...)
+
+tagged: func(a: int @tag(x), b: int @foo() @bar()) -> int: a + b
+
+open:      func(a: int, ...) -> number
+openOnly:  func(...) -> int
+openMulti: func(
+    // first operand
+    a: int,
+    b?: string,
+    ...
+) -> int
+
+// Parameters and named arguments keep their line breaks, and a named
+// argument keeps the comments around its label.
+multiline: func(
+    a: int,
+    b: int,
+) -> int: a + b
+multilineCall: multiline(
+    // the first operand
+    a: 1,
+    b: 2,
+)
+namedComments: add(
+    // doc a
+    a: 1, // trailing a
+    b: // after colon
+        2,
+)
+colonComment: add(a: // after colon
+    1)
+colonCommentNext: add(a: // after colon
+    1, b: 2)
+valueDoc: add(a:
+    // before the value
+    1, b: 2,
+)
+valueDocBlank: add(1,
+
+    b:
+    // before the value
+    2,
+)
+partialBreak: func(a: int,
+    b: int) -> int
+partialBreakCall: add(a: 1,
+    b: 2)
+
+// After an argument or parameter which ends in an opener on the line
+// of "(", one which starts a new line keeps the indent, as do "..."
+// and comments.
+shareNamed: add(a: {
+    x: 1
+},
+    b: 2)
+shareEllipsis: add(1, 2,
+    ...)
+shareEllipsisComment: add(1, // c
+    ...)
+sharePost: add(x, b: 1
+    // post
+)
+shareFunc: func(a: {
+    x: int
+},
+    b: int) -> int
+shareFuncOpen: func(a: [
+    int,
+],
+    ...) -> int
+shareColonPost: add(x, b:
+    // after colon
+
+    1)
+-- out/format/functions.golden --
+@experiment(functions)
+
+sum: func(
+	_~(x): int,
+	// left operand
+	a: int = 5,
+	req!: string,
+	opt?: bool,
+) -> int: call(x, a: a, req: req)
+
+mixed: sum(1, req: "x")
+
+defaults: func(
+	_~(n): int = 0,
+	int = 1,
+	a: int = 2,
+	// a default followed by an attribute
+	c: int = 3 @tag(y),
+	d: {port: int} = {port: 80},
+	// a name-only parameter with a default
+	b!: string = "x",
+) -> int: a
+
+inline: func(a: int = 2, b: int = base + 1) -> int: a
+
+// A comment after "=" or ":" trails its parameter; a comment on its own
+// line before a default or a constraint leads the parameter. A parameter
+// list with a comment closes on its own line, so that a // comment
+// cannot swallow the closing parenthesis or a following parameter.
+commented: func(a: int = 2, // after the bind token
+	// before the default
+	b: int = 3,
+	// before the constraint
+	c: int = 4,
+) -> int: a
+trailingLast: func(a: int = 2, // after the last parameter
+) -> int: a
+
+partialLabel: add(a: 1, ...)
+partialPos:   add(1, ...)
+partialNone:  add(...)
+partialMany:  add(1, 2, ...)
+
+tagged: func(a: int @tag(x), b: int @foo() @bar()) -> int: a + b
+
+open:     func(a: int, ...) -> number
+openOnly: func(...) -> int
+openMulti: func(
+	// first operand
+	a: int,
+	b?: string,
+	...
+) -> int
+
+// Parameters and named arguments keep their line breaks, and a named
+// argument keeps the comments around its label.
+multiline: func(
+	a: int,
+	b: int,
+) -> int: a + b
+multilineCall: multiline(
+	// the first operand
+	a: 1,
+	b: 2,
+)
+namedComments: add(
+	// doc a
+	a: 1, // trailing a
+	b: 2, // after colon
+)
+colonComment: add(a: 1, // after colon
+)
+colonCommentNext: add(a: 1, // after colon
+	b: 2)
+valueDoc: add(
+	// before the value
+	a: 1, b: 2,
+)
+valueDocBlank: add(1,
+
+	// before the value
+	b: 2,
+)
+partialBreak: func(a: int,
+	b: int) -> int
+partialBreakCall: add(a: 1,
+	b: 2)
+
+// After an argument or parameter which ends in an opener on the line
+// of "(", one which starts a new line keeps the indent, as do "..."
+// and comments.
+shareNamed: add(a: {
+	x: 1
+},
+	b: 2)
+shareEllipsis: add(1, 2,
+	...)
+shareEllipsisComment: add(1, // c
+	...)
+sharePost: add(x, b: 1,
+	// post
+)
+shareFunc: func(a: {
+	x: int
+},
+	b: int) -> int
+shareFuncOpen: func(a: [
+	int,
+],
+	...) -> int
+shareColonPost: add(x, b: 1,
+	// after colon
+)

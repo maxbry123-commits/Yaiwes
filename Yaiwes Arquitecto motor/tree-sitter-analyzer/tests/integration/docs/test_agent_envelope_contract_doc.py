@@ -1,0 +1,105 @@
+"""Drift test for docs/agent-envelope-contract.md (#520).
+
+The envelope-contract guide documents the canonical verdict alphabet
+(:data:`tree_sitter_analyzer.mcp.tools.tool_response.CANONICAL_VERDICTS`).
+
+Hand-copied lists rot. This test extracts the documented sets from the
+marked tables in the doc and asserts EXACT set equality with the live
+constants, in both directions: a verdict/field added to the source without
+a doc update goes red, and a stale doc row that no longer exists in the
+source also goes red.
+"""
+
+import re
+from pathlib import Path
+
+from tree_sitter_analyzer.cache.admission import ADMISSION_CODES, CAUSE_CODES
+from tree_sitter_analyzer.mcp.tools.callers_reasons import COMPLETENESS_REASONS
+from tree_sitter_analyzer.mcp.tools.tool_response import CANONICAL_VERDICTS
+
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+DOC_PATH = PROJECT_ROOT / "docs" / "agent-envelope-contract.md"
+
+
+def _extract_marked_table_tokens(content: str, marker: str) -> set[str]:
+    """Return the first-column backticked tokens of the table between
+    ``<!-- drift:<marker>:start -->`` and ``<!-- drift:<marker>:end -->``.
+    """
+    section_re = re.compile(
+        rf"<!-- drift:{marker}:start -->(.*?)<!-- drift:{marker}:end -->",
+        re.DOTALL,
+    )
+    match = section_re.search(content)
+    assert match is not None, (
+        f"docs/agent-envelope-contract.md is missing the "
+        f"<!-- drift:{marker}:start/end --> markers"
+    )
+    tokens = set()
+    for line in match.group(1).splitlines():
+        row = re.match(r"\|\s*`([A-Za-z_]+)`", line)
+        if row:
+            tokens.add(row.group(1))
+    return tokens
+
+
+class TestAgentEnvelopeContractDoc:
+    def test_doc_exists(self) -> None:
+        assert DOC_PATH.exists(), (
+            "docs/agent-envelope-contract.md does not exist (#520)"
+        )
+
+    def test_verdict_alphabet_matches_canonical_set(self) -> None:
+        documented = _extract_marked_table_tokens(
+            DOC_PATH.read_text(encoding="utf-8"), "verdict-alphabet"
+        )
+        assert documented == set(CANONICAL_VERDICTS), (
+            f"verdict table drifted from CANONICAL_VERDICTS: "
+            f"missing from doc={sorted(set(CANONICAL_VERDICTS) - documented)}, "
+            f"stale in doc={sorted(documented - set(CANONICAL_VERDICTS))}"
+        )
+
+    def test_completeness_reasons_match_closed_set(self) -> None:
+        # #1632：原因码表与 COMPLETENESS_REASONS 双向完全一致。
+        documented = _extract_marked_table_tokens(
+            DOC_PATH.read_text(encoding="utf-8"), "completeness-reasons"
+        )
+        assert documented == set(COMPLETENESS_REASONS)
+
+    def test_index_admission_codes_match_contract(self) -> None:
+        # RFC-0032 slice 4：准入码表的码、机器字段与原因码与源码双向一致。
+        content = DOC_PATH.read_text(encoding="utf-8")
+        assert _extract_marked_table_tokens(content, "index-admission-codes") == set(
+            ADMISSION_CODES
+        )
+        section = content.split("<!-- drift:index-admission-codes:start -->")[1]
+        rows = {}
+        for line in section.split("<!-- drift:index-admission-codes:end -->")[
+            0
+        ].splitlines():
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) == 6 and cells[0].startswith("`INDEX_"):
+                causes = set(re.findall(r"`(INDEX_[A-Z_]+)`", cells[4]))
+                rows[cells[0].strip("`")] = (
+                    cells[1] == "true",
+                    int(cells[2]),
+                    cells[3].strip("`"),
+                    causes,
+                )
+        assert rows == {
+            code: (
+                contract.retryable,
+                contract.retry_after_ms,
+                contract.next_action,
+                {cause for cause, mapped in CAUSE_CODES.items() if mapped == code},
+            )
+            for code, contract in ADMISSION_CODES.items()
+        }
+
+    def test_cross_links_present(self) -> None:
+        """CODEMAPS/mcp-tools.md must link the page."""
+        content = (PROJECT_ROOT / "docs" / "CODEMAPS" / "mcp-tools.md").read_text(
+            encoding="utf-8"
+        )
+        assert "agent-envelope-contract.md" in content, (
+            "docs/CODEMAPS/mcp-tools.md does not link docs/agent-envelope-contract.md"
+        )

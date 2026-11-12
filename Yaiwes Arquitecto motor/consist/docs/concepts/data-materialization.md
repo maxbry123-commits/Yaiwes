@@ -1,0 +1,338 @@
+# Data Storage and Ingestion Strategy
+
+This guide explains when to keep data on disk as cold files versus ingesting
+tabular artifacts into DuckDB for SQL analysis and database fallback.
+
+Canonical one-line definitions for cold/hot data, hybrid views, and
+ingestion live in [Core Concepts Overview](overview.md). This page focuses on
+decision criteria and implementation patterns.
+
+This is different from filesystem materialization in
+[Caching and Hydration](caching-and-hydration.md), where Consist copies,
+exports, or stages bytes so a local path exists. Ingestion is a database storage
+choice; filesystem materialization is a byte-location/recovery operation.
+
+!!! note "Recommended path"
+    For standard execution flow, prefer `tracker.run(...)`, `tracker.trace(...)`,
+    or `consist.scenario(...)` with `scenario.run(...)` / `scenario.trace(...)`.
+    The ingestion snippets below use low-level lifecycle APIs
+    (`tracker.start_run(...)`, `tracker.log_artifact(...)`) because ingestion is
+    attached to explicit artifact logging.
+
+---
+
+## Why the Distinction Matters
+
+Simulation workflows produce many artifacts across runs. Comparing results requires querying across runs—but ingesting every output doubles your database size. The cold/hot distinction lets you choose: keep storage efficient for artifacts you rarely query, enable SQL analysis for artifacts you compare frequently.
+
+The tradeoff: ingested data is queryable and recoverable; cold data requires keeping original files but adds no database overhead.
+
+---
+
+## Two Storage Modes
+
+**Cold Data**: File-backed artifacts with provenance metadata but no SQL query
+surface until ingested.
+
+**Hot Data**: Ingested artifacts in DuckDB for SQL analytics, indexing, and
+optional recovery when source files are missing.
+
+---
+
+## When to Ingest
+
+Ingest when you need:
+
+- SQL-native analytics over many runs
+- Schema tracking and exportable SQLModel stubs
+- Recovery of tabular data if files are missing
+- Cross-run comparisons via unified SQL views
+
+Ingest key tabular outputs you compare across runs:
+
+- **Transportation**: Trip tables, skim matrices, mode choice summaries
+- **Electric grid**: Aggregated metrics (monthly averages, distribution-level summaries)
+- **Urban planning**: Parcel or zoning summaries, development capacity estimates
+
+Ingestion is appropriate for outputs where (1) you need SQL queries across runs, and (2) the storage cost is acceptable—ingestion approximately doubles storage for that artifact. For a 500MB output compared across 100 runs, ingestion adds ~50GB to the database.
+
+---
+
+## When to Stay Cold
+
+Keep data as cold files when:
+
+- Storage duplication is unacceptable (multi-GB rasters, video files, binary blobs)
+- Data already lives in an external system
+- No cross-run SQL analysis is needed
+
+Cold data lives only on disk; provenance metadata is tracked but data is not queryable via SQL or included in hybrid views until ingested.
+
+---
+
+## Ingesting Artifacts
+
+!!! note "Advanced lifecycle examples"
+    The following snippets intentionally show explicit run lifecycle calls for
+    ingestion control. Keep regular compute steps on the explicit
+    tracker/scenario execution path.
+
+Install the optional DLT dependency:
+
+```bash
+pip install "consist[ingest]"
+```
+
+Basic usage:
+
+```python
+from consist import Tracker
+
+tracker = Tracker(run_dir="./runs", db_path="./provenance.duckdb")
+
+with tracker.start_run("ingest_example", model="demo"):
+    artifact = tracker.log_artifact("data/people.csv", key="people", driver="csv")
+    tracker.ingest(artifact)
+```
+
+Ingest explicit data payloads (dicts, DataFrames, generators):
+
+```python
+with tracker.start_run("ingest_inline", model="demo"):
+    artifact = tracker.log_artifact("inputs/people.json", key="people")
+    tracker.ingest(artifact, data=[{"id": 1, "name": "A"}])
+```
+
+---
+
+## Strict Schema Ingestion
+
+Provide a SQLModel schema to validate data:
+
+```python
+from sqlmodel import SQLModel, Field
+
+class Person(SQLModel, table=True):
+    __tablename__ = "people"
+    id: int = Field(primary_key=True)
+    name: str
+
+with tracker.start_run("strict_ingest", model="demo"):
+    artifact = tracker.log_artifact("data/people.csv", key="people", schema=Person)
+    tracker.ingest(artifact, schema=Person)
+```
+
+`log_artifact(..., schema=Person)` tags the artifact with logical schema
+metadata; it does not validate the file by itself. The validation happens during
+`tracker.ingest(..., schema=Person)`, where strict mode rejects incompatible data
+rather than silently coercing it.
+
+---
+
+## Provenance Columns
+
+Ingested tables include system columns:
+
+| Column | Purpose |
+|--------|---------|
+| `consist_run_id` | Run that created this row |
+| `consist_artifact_id` | Source artifact |
+| `consist_year`, `consist_iteration` | Scenario dimensions (optional) |
+
+These enable joins across runs and filtering by scenario or year in hybrid views.
+
+---
+
+## Hybrid Views
+
+Hybrid views are SQL views that union hot data (ingested into DuckDB) with cold data (read from files on disk). Query both as one logical table without requiring all data in the database.
+
+Register a SQLModel schema to activate a view:
+
+```python
+from sqlmodel import SQLModel, Field
+
+class Person(SQLModel, table=True):
+    __tablename__ = "people"
+    person_id: int = Field(primary_key=True)
+    age: int
+
+tracker = Tracker(
+    run_dir="./runs",
+    db_path="./provenance.duckdb",
+    schemas=[Person],
+)
+
+VPerson = tracker.views.Person
+```
+
+Once registered, you can query across all runs (both ingested and cold data):
+
+```python
+import consist
+
+persons = consist.ibis_view(tracker, model=Person)
+summary = (
+    persons.filter(persons.age >= 18)
+    .group_by(persons.consist_year)
+    .agg(avg_age=persons.age.mean())
+)
+rows = summary.to_pandas()
+```
+
+Use `consist.run_query(...)` when you need explicit SQLAlchemy / SQLModel
+queries or database-native SQL over tracker tables and views. For lazy analysis
+over typed tracker views, `consist.ibis_view(...)` is the recommended surface.
+For schema-driven cross-artifact analysis, create a grouped view and query it
+with `consist.ibis_grouped_view(...)`.
+
+For schema/facet-driven cross-key analysis, use
+[Grouped Views](grouped-views.md) to create one view over many artifacts that
+share a schema identity instead of a single `concept_key`.
+
+---
+
+## Loading Behavior & Database Fallback
+
+`consist.load(...)` reads from the filesystem. If files are missing and the artifact was ingested, database fallback recovers data:
+
+| Policy | Behavior |
+|--------|----------|
+| `inputs-only` (default) | Recover inside active run for declared inputs only |
+| `always` | Recover whenever artifact is ingested |
+| `never` | Disable recovery |
+
+Example:
+
+```python
+df = consist.load_df(artifact, tracker=tracker, db_fallback="always")
+```
+
+## Choosing A Query Surface
+
+Use the narrowest surface that matches the task:
+
+- `consist.load_df(...)` for one artifact when you want an eager pandas DataFrame.
+- `consist.ibis_view(...)` or `consist.ibis_connection(...)` when you want lazy,
+  dataframe-style analysis over a Consist DuckDB view. This is the recommended
+  surface for tabular tracker analysis when you are willing to install the
+  optional `consist[ibis]` extra.
+- `consist.ibis_grouped_view(...)` when you want the same lazy Ibis surface but
+  need to aggregate or compare many artifacts through a grouped DuckDB view.
+- `consist.run_query(...)` when you need explicit SQLAlchemy / SQLModel queries
+  or hand-written SQL against Consist tables or views.
+- Call Ibis after the current SQLAlchemy session or run has released its DuckDB
+  connection; the adapter opens a separate DuckDB handle for analysis.
+
+Example:
+
+```python
+persons = consist.ibis_view(tracker, model=Person)
+summary = persons.filter(persons.age >= 18).group_by("home_zone_id").count()
+```
+
+---
+
+## Loader Kwargs
+
+`consist.load(...)` validates loader kwargs and raises `ValueError` for unsupported options.
+
+| Driver | Supported kwargs |
+|--------|-----------------|
+| `parquet` | `columns` |
+| `csv` | `columns`, `delimiter`, `header` (alias: `sep`) |
+| `json` | `orient`, `dtype`, `convert_axes`, `convert_dates`, `precise_float`, `date_unit`, `encoding`, `lines`, `compression`, `typ` |
+| `h5_table` | `columns`, `where`, `start`, `stop` |
+
+Use `consist.load_relation(...)` to manage DuckDB Relation lifecycle explicitly. Use `consist.load_df(...)` for DataFrame with automatic cleanup.
+
+---
+
+## GeoParquet and Spatial Artifacts
+
+GeoParquet is supported only when you log it explicitly:
+
+```python
+artifact = tracker.log_artifact(
+    "outputs/parcels.parquet",
+    key="parcels",
+    driver="geoparquet",
+)
+```
+
+Without an explicit driver, Consist keeps the existing generic `.parquet`
+behavior. The artifact is inferred as `driver="parquet"`, `load(...)` returns a
+DuckDB relation, and `is_spatial_artifact(...)` returns `False`.
+
+Spatial ingestion records lightweight metadata only: bounds, CRS, geometry
+types, geometry column, feature count, and columns. It does not ingest geometry
+rows into hot database storage, and it does not reconstruct GeoParquet from hot
+DB state.
+
+For direct cold-file spatial queries in DuckDB, load the spatial extension
+after it is installed locally, then read the file from its path:
+
+```python
+from pathlib import Path
+
+import duckdb
+
+path = artifact.as_path(tracker)
+
+con = duckdb.connect()
+con.sql("LOAD spatial")
+nearby = con.sql(
+    """
+    SELECT
+        parcel_id,
+        ST_Distance_Sphere(
+            ST_Centroid(geometry),
+            ST_Point(-122.3321, 47.6062)
+        ) AS distance_m
+    FROM read_parquet(?)
+    WHERE distance_m < 1000
+    ORDER BY distance_m
+    """,
+    params=[str(path)],
+)
+```
+
+Use the returned relation for SQL exploration against the file on disk. In this
+example, DuckDB Spatial reads the GeoParquet geometry column and computes each
+parcel centroid's spherical distance from a reference point. The pattern stays
+explicit: Consist tracks the artifact and DuckDB queries the cold file directly.
+
+---
+
+## Schema Export Workflow
+
+For curated schemas with explicit PK/FK constraints: ingest tabular data, run schema export to generate a SQLModel stub, then edit and register the stub for views. See [schema-export.md](../schema-export.md) for details.
+
+---
+
+## HDF5 Native Support Roadmap
+
+Currently `h5_table` uses a staging bridge (`pandas.read_hdf(...)` + `conn.from_df(...)`). Native HDF5 support will replace this with DuckDB's HDF5 extension for direct queries.
+
+**Remaining work**: switch `h5_table` to `hdf5_read(...)` once stable, validate extension version pinning, handle PyTables/object dtype edge cases, update schema capture for native relation path, add performance testing.
+
+**Benefits**: zero-copy streaming reads, lower memory usage, consistent SQL workflows across Parquet/CSV/HDF5.
+
+---
+
+## Decision Summary
+
+| Need | Approach | When |
+|------|----------|------|
+| Query results across runs in SQL | Ingest | Cross-run comparisons, storage cost acceptable |
+| Minimize database size | Stay cold | Large files, no cross-run SQL analysis |
+| Query ingested and raw files together | Hybrid views | Mixed—some runs ingested, some not |
+| Recover data if files deleted | Ingest | Need resilience to file deletion |
+
+---
+
+## See Also
+
+- **[Caching & Hydration](caching-and-hydration.md)** — How filesystem materialization interacts with caching
+- **[DLT Loader Guide](../dlt-loader-guide.md)** — Detailed ingestion patterns using DLT
+- **[Schema Export](../schema-export.md)** — Generate and manage schemas for ingested data

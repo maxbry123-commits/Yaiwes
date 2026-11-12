@@ -1,0 +1,353 @@
+---
+# Default values for cloacina-server.
+# CLOACI-I-0111 / T-0605.
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  repository: ghcr.io/colliery-io/cloacina-server
+  # Defaults to .Chart.AppVersion when empty so a `helm install` without
+  # --set image.tag pins to the chart's stated app version.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Replicas + scheduling
+# ---------------------------------------------------------------------------
+replicaCount: 1
+
+# Strategy. RollingUpdate is the right default — server is HTTP-stateless
+# (state lives in Postgres), connections drain naturally.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+nodeSelector: {}
+tolerations: []
+# Pod affinity/anti-affinity. Leave empty ({}) to get the chart's DEFAULT soft
+# pod-anti-affinity (CLOACI-T-0819): a preferred (whenUnsatisfiable-equivalent)
+# spread of server replicas across hostnames, so replicaCount>1 lands on
+# different nodes when possible without ever blocking scheduling. Set any value
+# here to fully override the default.
+affinity: {}
+
+# ---------------------------------------------------------------------------
+# High availability (CLOACI-T-0819)
+#
+# The server is safe to run with replicaCount>1: the autoscaler/reconciler
+# leader is gated by a Postgres advisory lock (ADR CLOACI-A-0008), so extra
+# replicas serve HTTP without double-driving the control loop. A
+# PodDisruptionBudget keeps a minimum available during voluntary disruptions
+# (node drains, rolling updates).
+#
+# NOTE: there is deliberately NO HorizontalPodAutoscaler. The control-plane
+# back-pressure autoscaler is the scaling mechanism — it sees per-tenant signal
+# (utilization, limits) that an HPA's CPU/memory metrics cannot.
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  # Rendered only when enabled AND replicaCount > 1 (a PDB over a single replica
+  # would block all voluntary disruption of that pod).
+  enabled: true
+  minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Resources — modest defaults; bump for production load.
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# ---------------------------------------------------------------------------
+# Database
+#
+# Two paths:
+#   1. database.url  — bring-your-own-Postgres. Recommended for prod.
+#                       Set databaseUrlSecretRef instead if the URL contains
+#                       credentials you don't want in values.
+#   2. postgresql.enabled=true — install Bitnami's postgresql subchart in-cluster.
+#                       Convenient for demos and dev clusters.
+# ---------------------------------------------------------------------------
+database:
+  # Plaintext URL. Mutually exclusive with databaseUrlSecretRef.
+  url: ""
+
+databaseUrlSecretRef:
+  # Name of an existing Secret holding the DATABASE_URL value.
+  name: ""
+  # Key inside that Secret.
+  key: DATABASE_URL
+
+# Embedded Postgres subchart (CLOACI-T-0610). Disabled by default —
+# operators bring their own managed Postgres in production. Enabled
+# instances run a single Deployment + Service + PVC around the
+# official docker.io/library/postgres image.
+#
+# All values here are forwarded to the local `charts/postgresql/`
+# subchart; full surface lives at
+# `charts/cloacina-server/charts/postgresql/values.yaml`.
+postgresql:
+  enabled: false
+  image:
+    repository: postgres
+    tag: "17"
+  auth:
+    username: cloacina
+    password: cloacina
+    database: cloacina
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: ""
+
+# ---------------------------------------------------------------------------
+# API key bootstrap
+#
+# On first start cloacina-server generates an admin API key and prints it
+# to stdout. To pin a known value, store it in a Secret and reference it
+# here — the chart wires it as CLOACINA_BOOTSTRAP_KEY.
+# ---------------------------------------------------------------------------
+apiKeySecretRef:
+  name: ""
+  key: bootstrap-key
+
+# ---------------------------------------------------------------------------
+# Server CLI knobs
+# ---------------------------------------------------------------------------
+server:
+  bind: "0.0.0.0:8080"
+  # When true, `cloacina-server` rejects unsigned packages.
+  requireSignatures: false
+  # Trusted org UUID for signature verification — required if requireSignatures.
+  verificationOrgId: ""
+  # LRU cap on per-tenant DefaultRunner instances.
+  tenantRunnerCacheSize: 256
+  # Drain timeout (seconds) for in-flight workflows during tenant deletion.
+  tenantDeletionDrainTimeoutSeconds: 30
+  # Extra environment vars merged into the container's env list.
+  # Example:
+  #   extraEnv:
+  #     - name: RUST_LOG
+  #       value: info,cloacina=debug
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Fleet actuator (CLOACI-I-0127 / T-0814)
+#
+# The server can auto-scale a per-tenant pool of cloacina-agent workloads.
+# `actuator` selects the substrate and is OFF by default — existing installs
+# are completely unchanged (no ServiceAccount, no RBAC, no actuator env are
+# rendered unless you opt in).
+#
+#   none        — actuation off (default).
+#   kubernetes  — scale a per-tenant `cloacina-agent` Deployment in the
+#                 tenant's OWN namespace (REQ-007). Renders the least-privilege
+#                 RBAC below (REQ-006) and binds it to the server pod.
+#
+# The Docker actuator (CLOACINA_FLEET_ACTUATOR=docker) is a dev-only substrate
+# and is not offered through this chart.
+# ---------------------------------------------------------------------------
+fleet:
+  actuator: none
+
+  # Agent image the actuator runs for each tenant (CLOACINA_AGENT_IMAGE).
+  agentImage: ghcr.io/colliery-io/cloacina-agent:latest
+
+  # Server URL injected into spawned agents as CLOACINA_SERVER
+  # (CLOACINA_AGENT_SERVER_URL). Empty → the release's in-cluster Service FQDN
+  # (http://<fullname>.<namespace>.svc.cluster.local:<port>). The FQDN is required
+  # because agents run in per-tenant namespaces (cloacina-tenant-<t>), from which
+  # the short Service name does not resolve.
+  agentServerUrl: ""
+
+  # ServiceAccount the server runs as when the actuator is enabled. The chart
+  # creates it (and the RBAC below) only when actuator=kubernetes.
+  serviceAccount:
+    # Name override; empty → "<fullname>-fleet".
+    name: ""
+    annotations: {}
+
+  # Resource requests + limits for each actuator-created cloacina-agent pod
+  # (CLOACI-T-0819), rendered as CLOACINA_AGENT_* env on the server and applied
+  # by the actuator. Tuned to the agent's real footprint: it embeds a CPython
+  # interpreter (PyO3) and unpacks a workflow/+vendor/ tree, so the memory limit
+  # is generous to avoid OOM-killing a Python-packaged workflow.
+  agentResources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  # Per-tenant agent NetworkPolicy (CLOACI-T-0819, REQ-007 defense-in-depth).
+  # When enabled, the actuator installs a NetworkPolicy in each tenant namespace:
+  # default-deny ingress, egress allowed ONLY to cluster DNS + the cloacina-server.
+  # This is defense-in-depth — the server-side ABAC (NFR-004) remains the real
+  # tenant-isolation boundary; the policy never weakens a server-side check.
+  # Defaults ON when actuator=kubernetes; set enabled=false to disable.
+  networkPolicy:
+    enabled: true
+    # Namespace the cluster DNS service runs in (DNS egress is allowed there).
+    dnsNamespace: kube-system
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Reactor affinity (CLOACI-T-0851 / ADR CLOACI-A-0012 Amendment 3)
+# ---------------------------------------------------------------------------
+# Under per-reactor leadership exactly ONE replica runs a given reactor. An
+# event injected on any other replica must reach the owner. Steering the
+# request to the owner keeps injection on the hot path; relaying it through the
+# durable outbox instead would put steady-state stream ingest on Postgres.
+#
+# Enabling this makes each replica advertise its POD IP when it claims a
+# reactor. (Pod IP rather than a per-pod DNS name: Kubernetes only creates
+# per-pod A records when a pod sets both `hostname` and `subdomain`, which
+# Deployment replicas cannot do distinctly — and a stale IP self-corrects
+# because the address is republished on every claim.)
+#
+# Only meaningful with replicaCount > 1. A single-replica deployment always owns
+# every reactor locally, so there is nothing to steer and leaving this off costs
+# nothing.
+reactorAffinity:
+  # Inject CLOACINA_ADVERTISED_ADDRESS (http://<podIP>:<service.port>).
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: cloacina.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: cloacina-tls
+  #   hosts:
+  #     - cloacina.example.com
+
+# ---------------------------------------------------------------------------
+# Probes — kubelet hits /health (liveness, startup) and /ready (readiness).
+# Server registers both at the root, not under /v1/.
+# ---------------------------------------------------------------------------
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 5
+  failureThreshold: 60
+
+# ---------------------------------------------------------------------------
+# Pod / container security
+#
+# The image runs as uid/gid 10001 by default; reflect that here so any
+# admission controller (PodSecurity, Kyverno) is happy.
+# ---------------------------------------------------------------------------
+podSecurityContext:
+  fsGroup: 10001
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# A small writable volume for /home/cloacina (cloacina-server writes
+# nothing critical there but readOnlyRootFilesystem still requires
+# emptyDirs for any tmp use).
+podAnnotations: {}
+podLabels: {}
+
+# ---------------------------------------------------------------------------
+# Compiler (CLOACI-I-0111)
+#
+# The cloacina-compiler builds uploaded Rust packages. Enable it to compile
+# packages in-cluster; without it, uploaded Rust packages stay `pending`.
+# Tenant-level isolation is the security boundary (run one compiler per
+# tenant via --tenant-schema); the per-build process sandbox was excised
+# 2026-07-11 and may return as an optional layer later.
+# ---------------------------------------------------------------------------
+compiler:
+  enabled: false
+  replicaCount: 1
+  image:
+    # Defaults to the server repo with `-compiler` swapped in, tag = AppVersion.
+    repository: ""
+    tag: ""
+  bind: "0.0.0.0:9000"
+  pollIntervalMs: 1000
+  # Extra CLI args, e.g. ["--cargo-flags-replace=build", "--cargo-flags-replace=--lib"]
+  # (full override of the default cargo flag list, dropping --frozen/--offline
+  # for online in-cluster builds) or ["--tenant-schema", "acme"] for a
+  # per-tenant build-isolation compiler. `--cargo-flag=<flag>` APPENDS to the
+  # defaults instead.
+  extraArgs:
+    - "--cargo-flags-replace=build"
+    - "--cargo-flags-replace=--lib"
+  extraEnv: []
+  # emptyDir size limit for the shared cargo target cache.
+  buildCacheSize: 8Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  # Mirrors the server container hardening.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# ---------------------------------------------------------------------------
+# ServiceMonitor (Prometheus operator)
+# ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

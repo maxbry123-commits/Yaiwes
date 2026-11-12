@@ -1,0 +1,17 @@
+-- in.cue --
+a: true && true
+b: true || false
+c: false == true
+d: false != true
+e: true & true
+f: true & false
+-- out/compile --
+--- in.cue
+{
+  a: (true && true)
+  b: (true || false)
+  c: (false == true)
+  d: (false != true)
+  e: (true & true)
+  f: (true & false)
+}

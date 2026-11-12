@@ -1,0 +1,66 @@
+---
+icon: lucide/book-open
+---
+
+# API reference
+
+The API reference is organized into two tiers:
+
+- **Essentials**: the preferred execution path for most users (`Tracker.run`, `Tracker.trace`, `scenario`)
+- **Advanced**: lifecycle, decorators, and lower-level utilities for integrations
+
+## Start Here
+
+1. [API Essentials](essentials.md)
+2. [API Advanced](advanced.md)
+3. [Public API](public_api.md) for complete surface-area inventory
+
+## Essentials entry points
+
+| If you need | Start here | Why |
+|---|---|---|
+| One cache-aware function call | [`Tracker.run`](tracker.md#consist.core.tracker.Tracker.run) | Explicit tracker ownership without compatibility warnings |
+| External CLI command, script, or binary | [`Tracker.exec`](tracker.md#command-execution-exec) | Zero-wrapper execution recording, sidecar logging, and baseline diffs |
+| Multi-step workflow with shared context | [`consist.scenario`](api_helpers.md#consist.api.scenario) | Groups steps and lineage under one scenario header |
+| Always-execute run-scoped block | [`Tracker.trace`](tracker.md#consist.core.tracker.Tracker.trace) | Records provenance but executes block every time |
+| Multi-run grouping and pairwise comparison | [`RunSet`](runset.md#runset-and-alignment) / [`consist.run_set`](api_helpers.md#consist.api.run_set) | Fluent partitioning, recency selection, and alignment |
+
+## Minimal first run
+
+```python
+from pathlib import Path
+import consist
+from consist import Tracker
+
+tracker = Tracker(run_dir="./runs", db_path="./provenance.duckdb")
+
+def write_answer() -> Path:
+    out = consist.output_path("answer", ext="txt")
+    out.write_text("42\n")
+    return out
+
+with consist.use_tracker(tracker):
+    result = consist.run(fn=write_answer, outputs=["answer"])
+
+print(result.outputs["answer"].path)
+```
+
+## API pages (full)
+
+- [API Essentials](essentials.md)
+- [API Advanced](advanced.md)
+- [Public API](public_api.md)
+- [API Helpers](api_helpers.md)
+- [Tracker](tracker.md)
+- [Workflow Contexts](workflow.md)
+- [Step Contracts](step_contracts.md)
+- [Artifact](artifact.md)
+- [Run](run.md)
+- [RunSet and Alignment](runset.md)
+- [Views](views.md)
+- [Matrix Views](matrix.md)
+- [Materialization](materialize.md)
+- [Indexing](indexing.md)
+- [Artifact Admission](admission.md)
+- [Content & Tabular Digests](digest.md)
+- [Identity Manager](identity.md)

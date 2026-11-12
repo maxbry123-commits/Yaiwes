@@ -1,0 +1,36 @@
+-- in.cue --
+a: {
+	{[string]~(A,_): {name: A}}
+
+	{[string]~(A,_): {kind: A}}
+}
+a: "A": _
+a: "C": _
+a: "E": {c: "bar"}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    {
+      [string]: {
+        name: 〈1;-〉
+      }
+    }
+    {
+      [string]: {
+        kind: 〈1;-〉
+      }
+    }
+  }
+  a: {
+    A: _
+  }
+  a: {
+    C: _
+  }
+  a: {
+    E: {
+      c: "bar"
+    }
+  }
+}

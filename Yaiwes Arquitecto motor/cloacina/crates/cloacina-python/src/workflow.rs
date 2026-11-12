@@ -1,0 +1,518 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+use super::task::{pop_workflow_context, push_workflow_context};
+use super::workflow_context::PyWorkflowContext;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
+/// Python wrapper for WorkflowBuilder
+#[pyclass(name = "WorkflowBuilder")]
+pub struct PyWorkflowBuilder {
+    inner: cloacina::WorkflowBuilder,
+    context: PyWorkflowContext,
+}
+
+#[pymethods]
+impl PyWorkflowBuilder {
+    /// Create a new WorkflowBuilder with namespace context
+    #[new]
+    #[pyo3(signature = (name, *, tenant = None, package = None, workflow = None))]
+    pub fn new(
+        name: &str,
+        tenant: Option<&str>,
+        package: Option<&str>,
+        workflow: Option<&str>,
+    ) -> Self {
+        let context = PyWorkflowContext::new(
+            tenant.unwrap_or("public"),
+            package.unwrap_or("embedded"),
+            workflow.unwrap_or(name),
+        );
+
+        let (tenant_id, _package_name, _workflow_id) = context.as_components();
+        let workflow_builder = cloacina::Workflow::builder(name).tenant(tenant_id);
+
+        PyWorkflowBuilder {
+            inner: workflow_builder,
+            context,
+        }
+    }
+
+    /// Set the workflow description
+    pub fn description(&mut self, description: &str) {
+        self.inner = self.inner.clone().description(description);
+    }
+
+    /// Add a tag to the workflow
+    pub fn tag(&mut self, key: &str, value: &str) {
+        self.inner = self.inner.clone().tag(key, value);
+    }
+
+    /// Add a task to the workflow by ID or function reference
+    pub fn add_task(&mut self, py: Python, task: Py<PyAny>) -> PyResult<()> {
+        match task.extract::<String>(py) {
+            Ok(task_id) => {
+                let rt = crate::runtime_scope::current_runtime().ok_or_else(|| {
+                    PyValueError::new_err("WorkflowBuilder.add_task called outside a Runtime scope")
+                })?;
+
+                let (tenant_id, package_name, workflow_id) = self.context.as_components();
+                let task_namespace =
+                    cloacina::TaskNamespace::new(tenant_id, package_name, workflow_id, &task_id);
+
+                let task_instance = rt.get_task(&task_namespace).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "Task '{}' not found in registry. Make sure it was decorated with @task.",
+                        task_id
+                    ))
+                })?;
+
+                self.inner = self
+                    .inner
+                    .clone()
+                    .add_task(task_instance)
+                    .map_err(|e| PyValueError::new_err(format!("Failed to add task: {}", e)))?;
+
+                Ok(())
+            }
+            _ => match task.bind(py).hasattr("__name__") {
+                Ok(true) => match task.getattr(py, "__name__") {
+                    Ok(name_obj) => match name_obj.extract::<String>(py) {
+                        Ok(func_name) => {
+                            let rt = crate::runtime_scope::current_runtime().ok_or_else(|| {
+                                PyValueError::new_err(
+                                    "WorkflowBuilder.add_task called outside a Runtime scope",
+                                )
+                            })?;
+
+                            let (tenant_id, package_name, workflow_id) =
+                                self.context.as_components();
+                            let task_namespace = cloacina::TaskNamespace::new(
+                                tenant_id,
+                                package_name,
+                                workflow_id,
+                                &func_name,
+                            );
+
+                            let task_instance = rt.get_task(&task_namespace).ok_or_else(|| {
+                                        PyValueError::new_err(format!(
+                                            "Task '{}' not found in registry. Make sure it was decorated with @task.",
+                                            func_name
+                                        ))
+                                    })?;
+
+                            self.inner =
+                                self.inner.clone().add_task(task_instance).map_err(|e| {
+                                    PyValueError::new_err(format!("Failed to add task: {}", e))
+                                })?;
+
+                            Ok(())
+                        }
+                        Err(e) => Err(PyValueError::new_err(format!(
+                            "Function has __name__ but it's not a string: {}",
+                            e
+                        ))),
+                    },
+                    Err(e) => Err(PyValueError::new_err(format!(
+                        "Failed to get __name__ from function: {}",
+                        e
+                    ))),
+                },
+                Ok(false) => Err(PyValueError::new_err(
+                    "Task must be either a string task ID or a function object with __name__ attribute",
+                )),
+                Err(e) => Err(PyValueError::new_err(format!(
+                    "Failed to check if object has __name__ attribute: {}",
+                    e
+                ))),
+            },
+        }
+    }
+
+    /// Build the workflow
+    pub fn build(&self) -> PyResult<PyWorkflow> {
+        let workflow = self
+            .inner
+            .clone()
+            .build()
+            .map_err(|e| PyValueError::new_err(format!("Failed to build workflow: {}", e)))?;
+        Ok(PyWorkflow { inner: workflow })
+    }
+
+    /// Context manager entry - establish workflow context for task decorators
+    pub fn __enter__(slf: PyRef<Self>) -> PyRef<Self> {
+        push_workflow_context(slf.context.clone());
+        slf
+    }
+
+    /// Context manager exit - clean up context and build workflow
+    pub fn __exit__(
+        &mut self,
+        _py: Python,
+        _exc_type: Option<&Bound<PyAny>>,
+        _exc_value: Option<&Bound<PyAny>>,
+        _traceback: Option<&Bound<PyAny>>,
+    ) -> PyResult<bool> {
+        pop_workflow_context();
+
+        let (tenant_id, package_name, workflow_id) = self.context.as_components();
+
+        let mut workflow = cloacina::Workflow::new(workflow_id);
+        workflow.set_tenant(tenant_id);
+        workflow.set_package(package_name);
+
+        // Preserve description and tags set on the builder during the `with` block
+        if let Some(desc) = self.inner.get_description() {
+            workflow.set_description(desc);
+        }
+        for (key, value) in self.inner.get_tags() {
+            workflow.add_tag(key, value);
+        }
+
+        let rt = crate::runtime_scope::current_runtime().ok_or_else(|| {
+            PyValueError::new_err("WorkflowBuilder.__exit__ called outside a Runtime scope")
+        })?;
+        for namespace in rt.task_namespaces() {
+            if namespace.tenant_id == tenant_id
+                && namespace.package_name == package_name
+                && namespace.workflow_id == workflow_id
+            {
+                if let Some(task_instance) = rt.get_task(&namespace) {
+                    workflow
+                        .add_task(task_instance)
+                        .map_err(|e| PyValueError::new_err(format!("Failed to add task: {}", e)))?;
+                }
+            }
+        }
+
+        workflow
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("Workflow validation failed: {}", e)))?;
+        let final_workflow = workflow.finalize();
+
+        let workflow_name = final_workflow.name().to_string();
+        rt.register_workflow(workflow_name, move || final_workflow.clone());
+
+        Ok(false)
+    }
+
+    /// String representation
+    pub fn __repr__(&self) -> String {
+        format!("WorkflowBuilder(name='{}')", self.inner.name())
+    }
+}
+
+/// Python wrapper for Workflow
+#[pyclass(name = "Workflow", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflow {
+    inner: cloacina::Workflow,
+}
+
+#[pymethods]
+impl PyWorkflow {
+    /// Get workflow name
+    #[getter]
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    /// Get workflow description
+    #[getter]
+    pub fn description(&self) -> String {
+        self.inner
+            .metadata()
+            .description
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Get workflow version
+    #[getter]
+    pub fn version(&self) -> &str {
+        &self.inner.metadata().version
+    }
+
+    /// Get topological sort of tasks
+    pub fn topological_sort(&self) -> PyResult<Vec<String>> {
+        self.inner
+            .topological_sort()
+            .map(|namespaces| namespaces.into_iter().map(|ns| ns.to_string()).collect())
+            .map_err(|e| PyValueError::new_err(format!("Failed to sort tasks: {}", e)))
+    }
+
+    /// Get execution levels (tasks that can run in parallel)
+    pub fn get_execution_levels(&self) -> PyResult<Vec<Vec<String>>> {
+        self.inner
+            .get_execution_levels()
+            .map(|levels| {
+                levels
+                    .into_iter()
+                    .map(|level| level.into_iter().map(|ns| ns.to_string()).collect())
+                    .collect()
+            })
+            .map_err(|e| PyValueError::new_err(format!("Failed to get execution levels: {}", e)))
+    }
+
+    /// Get root tasks (no dependencies)
+    pub fn get_roots(&self) -> Vec<String> {
+        self.inner
+            .get_roots()
+            .into_iter()
+            .map(|ns| ns.to_string())
+            .collect()
+    }
+
+    /// Get leaf tasks (no dependents)
+    pub fn get_leaves(&self) -> Vec<String> {
+        self.inner
+            .get_leaves()
+            .into_iter()
+            .map(|ns| ns.to_string())
+            .collect()
+    }
+
+    /// Validate the workflow
+    pub fn validate(&self) -> PyResult<()> {
+        self.inner
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("Workflow validation failed: {}", e)))
+    }
+
+    /// String representation
+    pub fn __repr__(&self) -> String {
+        format!(
+            "Workflow(name='{}', tasks={})",
+            self.inner.name(),
+            self.inner.get_task_ids().len()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_workflow_builder_new_defaults() {
+        Python::initialize();
+        let builder = PyWorkflowBuilder::new("my_workflow", None, None, None);
+        let repr = builder.__repr__();
+        assert_eq!(repr, "WorkflowBuilder(name='my_workflow')");
+    }
+
+    #[test]
+    fn test_workflow_builder_new_with_custom_namespace() {
+        Python::initialize();
+        let builder = PyWorkflowBuilder::new(
+            "wf1",
+            Some("custom_tenant"),
+            Some("custom_pkg"),
+            Some("custom_wf"),
+        );
+        let repr = builder.__repr__();
+        assert!(repr.contains("wf1"));
+    }
+
+    #[test]
+    fn test_workflow_builder_description_and_tag() {
+        Python::initialize();
+        let mut builder = PyWorkflowBuilder::new("wf1", None, None, None);
+        builder.description("A test workflow");
+        builder.tag("env", "test");
+        // Should not panic; verify repr still works
+        let repr = builder.__repr__();
+        assert!(repr.contains("wf1"));
+    }
+
+    #[test]
+    fn test_workflow_builder_build_empty_returns_error() {
+        Python::initialize();
+        let builder = PyWorkflowBuilder::new("empty_wf", None, None, None);
+        let result = builder.build();
+        assert!(result.is_err(), "Empty workflow build should fail");
+    }
+
+    #[test]
+    fn test_workflow_builder_build_with_task() {
+        Python::initialize();
+        Python::attach(|py| {
+            let rt = std::sync::Arc::new(cloacina::Runtime::empty());
+            let _scope =
+                crate::runtime_scope::ScopedRuntime::new(rt).expect("ScopedRuntime install");
+            // Register a task first so the builder has something
+            crate::task::push_workflow_context(crate::workflow_context::PyWorkflowContext::new(
+                "public",
+                "embedded",
+                "build_test_wf",
+            ));
+            let decorator = crate::task::task(
+                py,
+                Some("build_task".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let func = py
+                .eval(pyo3::ffi::c_str!("lambda ctx: ctx"), None, None)
+                .unwrap();
+            decorator.__call__(py, func.into()).unwrap();
+            crate::task::pop_workflow_context();
+
+            // Now build a workflow that references the registered task
+            let builder = PyWorkflowBuilder::new("build_test_wf", None, None, None);
+            // build() may still fail if the task isn't wired through the builder
+            // Just verify it doesn't panic
+            let _ = builder.build();
+        });
+    }
+}
+
+/// Register a workflow constructor function on the thread-local Runtime
+/// scope. Exported to Python as `register_workflow_constructor` for backwards
+/// compatibility; the Rust symbol name is `py_register_workflow` so it does
+/// not collide with the (now deleted) `cloacina::register_workflow_constructor`.
+#[pyfunction(name = "register_workflow_constructor")]
+pub fn py_register_workflow(name: String, constructor: Py<PyAny>) -> PyResult<()> {
+    Python::attach(|py| {
+        let workflow_obj = constructor.call0(py).map_err(|e| {
+            PyValueError::new_err(format!("Failed to call workflow constructor: {}", e))
+        })?;
+
+        let py_workflow: PyWorkflow = workflow_obj.extract(py).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to extract workflow from constructor: {}",
+                e
+            ))
+        })?;
+
+        let workflow = py_workflow.inner.clone();
+        let rt = crate::runtime_scope::current_runtime().ok_or_else(|| {
+            PyValueError::new_err("register_workflow_constructor called outside a Runtime scope")
+        })?;
+        rt.register_workflow(name, move || workflow.clone());
+
+        Ok(())
+    })
+}
+
+/// Pass-through decorator returned by [`workflow_params`]. CLOACI-T-0760: the
+/// declaration is parsed from source by the compiler at build time, so at
+/// runtime this just returns the decorated object unchanged. It exists only so
+/// that importing a package which uses `@cloaca.workflow_params(...)` doesn't
+/// fail (the reconciler imports the module via PyO3).
+#[pyclass(name = "WorkflowParamsDecorator")]
+pub struct PyWorkflowParamsDecorator;
+
+#[pymethods]
+impl PyWorkflowParamsDecorator {
+    fn __call__(&self, obj: Py<PyAny>) -> Py<PyAny> {
+        obj
+    }
+}
+
+/// `@cloaca.workflow_params(name=type, name=(type, default), ...)` — declares a
+/// packaged Python workflow's typed input params (CLOACI-I-0128 / T-0760).
+///
+/// Parity with Rust's `#[workflow(params(...))]`. The authoritative extraction
+/// happens at build time (the compiler parses this decorator from source into
+/// JSON-Schema-typed `InputSlot`s); at runtime it is a no-op pass-through so the
+/// decorated function/workflow is unaffected. Supported scalar types: `str`,
+/// `int`, `float`, `bool`, `list`, `dict`.
+#[pyfunction]
+#[pyo3(signature = (**_kwargs))]
+pub fn workflow_params(
+    _kwargs: Option<Bound<'_, pyo3::types::PyDict>>,
+) -> PyWorkflowParamsDecorator {
+    PyWorkflowParamsDecorator
+}
+
+/// Pass-through decorator returned by [`workflow_secrets`]. CLOACI-T-0859: like
+/// [`PyWorkflowParamsDecorator`], the declaration is parsed from source by the
+/// compiler at build time into encrypted `InputSlot`s; at runtime it is a no-op
+/// pass-through so importing a package that uses `@cloaca.workflow_secrets(...)`
+/// doesn't fail.
+#[pyclass(name = "WorkflowSecretsDecorator")]
+pub struct PyWorkflowSecretsDecorator;
+
+#[pymethods]
+impl PyWorkflowSecretsDecorator {
+    fn __call__(&self, obj: Py<PyAny>) -> Py<PyAny> {
+        obj
+    }
+}
+
+/// `@cloaca.workflow_secrets("db_prod", "api_token", ...)` — declares the
+/// SECRETS a packaged Python workflow requires (CLOACI-I-0133 / T-0859), the
+/// parity of Rust's `#[workflow(secrets(...))]`. Each name becomes a required
+/// encrypted `InputSlot` (`encrypted: true`) carried in the package manifest
+/// alongside the declared params; a secret is bound per-instance via a
+/// `{"$secret": "name"}` reference and resolved encrypted at fire time (its
+/// value never enters the durable `Context`). The authoritative extraction
+/// happens at build time (the compiler parses this decorator from source); at
+/// runtime it is a no-op pass-through.
+#[pyfunction]
+#[pyo3(signature = (*_args))]
+pub fn workflow_secrets(_args: Bound<'_, pyo3::types::PyTuple>) -> PyWorkflowSecretsDecorator {
+    PyWorkflowSecretsDecorator
+}
+
+/// Pass-through decorator returned by [`boundary_schema`]. CLOACI-T-0770: like
+/// [`PyWorkflowParamsDecorator`], the declaration is parsed from source by the
+/// compiler at build time; at runtime this just returns the decorated object.
+#[pyclass(name = "BoundarySchemaDecorator")]
+pub struct PyBoundarySchemaDecorator;
+
+#[pymethods]
+impl PyBoundarySchemaDecorator {
+    fn __call__(&self, obj: Py<PyAny>) -> Py<PyAny> {
+        obj
+    }
+}
+
+/// `@cloaca.boundary_schema(field=type, ...)` — declares the typed shape of a
+/// Python accumulator's boundary (CLOACI-T-0770), the parity of deriving
+/// `schemars::JsonSchema` on a Rust boundary type. The compiler parses this from
+/// source at build time into the accumulator's declared input-interface slot
+/// (so inject/fire-with render typed forms); at runtime it's a no-op
+/// pass-through. Applied to the accumulator function:
+///
+/// ```python
+/// @cloaca.boundary_schema(bid=float, ask=float)
+/// @cloaca.passthrough_accumulator
+/// def py_alpha(event): ...
+/// ```
+///
+/// Supported scalar types: `str`, `int`, `float`, `bool`, `list`, `dict`.
+#[pyfunction]
+#[pyo3(signature = (**_kwargs))]
+pub fn boundary_schema(
+    _kwargs: Option<Bound<'_, pyo3::types::PyDict>>,
+) -> PyBoundarySchemaDecorator {
+    PyBoundarySchemaDecorator
+}

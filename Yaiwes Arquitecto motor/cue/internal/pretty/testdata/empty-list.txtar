@@ -1,0 +1,10 @@
+-- in --
+{
+x: [  ]
+}
+-- out/relpos --
+{
+	x: []
+}
+-- out/norelpos --
+{x: []}

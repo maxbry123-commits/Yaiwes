@@ -1,0 +1,633 @@
+"""Pulse API：单请求、快照绑定的符号上下文。
+
+query_pulse 在同一保存点内读取身份、关系、修改记录、导入及注释，返回
+PulseResponse；单请求不等于单次 SQL 往返。预算裁剪由 apply_budget 负责。
+
+用法::
+
+    conn = cache.get_conn()
+    response = query_pulse(conn, "tree_sitter_analyzer/api/pulse.py", "query_pulse")
+    budgeted = apply_budget(response, token_budget=600)
+    payload  = serialize(budgeted, format="compact")  # 见 serialization.py
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import sqlite3
+from dataclasses import dataclass as dataclass
+from dataclasses import field as field
+from typing import Any
+
+from ._pulse_models import (
+    BranchContext as BranchContext,
+)
+from ._pulse_models import (
+    CalleeRef as CalleeRef,
+)
+from ._pulse_models import (
+    CallerRef as CallerRef,
+)
+from ._pulse_models import (
+    CommentRef as CommentRef,
+)
+from ._pulse_models import (
+    FieldTruncation as FieldTruncation,
+)
+from ._pulse_models import (
+    GitHeat as GitHeat,
+)
+from ._pulse_models import (
+    ImportRef as ImportRef,
+)
+from ._pulse_models import (
+    PulseResponse as PulseResponse,
+)
+from ._pulse_models import (
+    SiblingRef as SiblingRef,
+)
+from ._pulse_models import (
+    SymbolInfo as SymbolInfo,
+)
+from ._pulse_sql import _PULSE_SQL
+
+logger = logging.getLogger(__name__)
+
+# 尚不支持调用图提取的语言。
+_NO_CALL_GRAPH_LANGUAGES = frozenset(
+    {
+        "bash",
+        "scala",
+        "css",
+        "html",
+        "json",
+        "yaml",
+        "sql",
+        "markdown",
+    }
+)
+
+# 支持反向导入（import 边）的语言；其余语言的 imported_by 恒为空（issue #1444），
+# 用 imports_graph_available=False 显式声明，避免「没人导入」与「不支持」混淆。
+_IMPORT_GRAPH_LANGUAGES = frozenset({"python", "typescript", "javascript"})
+
+
+def _enrich_callees_with_lsp(
+    conn: sqlite3.Connection,
+    callees: tuple[CalleeRef, ...],
+    edge_ids: tuple[int, ...],
+) -> tuple[CalleeRef, ...]:
+    """按原始调用边关联 LSP 缓存，并把零基定义行转换为一基行。"""
+    try:
+        enriched: list[CalleeRef] = []
+        for ce, edge_id in zip(callees, edge_ids, strict=True):
+            if ce.resolution not in ("unknown", "unresolved", "heuristic"):
+                enriched.append(ce)
+                continue
+            try:
+                row = conn.execute(
+                    """
+                    SELECT lrc.resolved_file, lrc.resolved_line, lrc.resolved_type
+                    FROM   lsp_resolution_cache lrc
+                    WHERE  lrc.edge_id = ?
+                    ORDER  BY lrc.cached_at DESC, lrc.lsp_server
+                    LIMIT  1
+                    """,
+                    (edge_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # 旧 schema 可能尚未创建可选 LSP 缓存表。
+                enriched.append(ce)
+                continue
+            if row:
+                resolved_file, resolved_line, _resolved_type = row
+                if not resolved_file or resolved_line is None or resolved_line < 0:
+                    enriched.append(ce)
+                    continue
+                enriched.append(
+                    CalleeRef(
+                        name=ce.name,
+                        file=resolved_file,
+                        line=resolved_line + 1,
+                        resolution="resolved",
+                    )
+                )
+            else:
+                enriched.append(ce)
+        return tuple(enriched)
+    except Exception:
+        # 可选富化失败不能破坏基础上下文。
+        return callees
+
+
+def query_pulse(
+    conn: sqlite3.Connection,
+    file_path: str,
+    symbol_name: str,
+    *,
+    max_callers: int = 10,
+    max_callees: int = 10,
+    max_siblings: int = 15,
+    max_imports: int = 20,
+    max_comments: int = 10,
+) -> PulseResponse | None:
+    """返回符号上下文，缺少符号时返回 None。
+
+    本函数只保证传入数据库连接内的版本一致，不认证当前磁盘源码。
+    项目级查询须由 certified_pulse_connection 绑定源码证据并完成退出验证。
+    Python 反向 import 复用 Synapse resolver。注释必须来自新提取器写入的
+    索引；旧索引或不支持注释的语言需重新索引或显式设置 max_comments=0。
+    存量 activation 消息缺失时保持 NULL，并发出 COMMIT_MESSAGE_MISSING。
+    Python 反向导入富化超资源上限时降级：保留 SQL 侧结果并在
+    truncated_fields 声明 "imported_by"，不再整体报错（issue #1445）。
+    """
+    params: dict[str, Any] = {
+        "file_path": file_path,
+        "symbol_name": symbol_name,
+        "max_callers": max_callers,
+        "max_callees": max_callees,
+        "max_siblings": max_siblings,
+        "max_imports": max_imports,
+        "max_comments": max_comments,
+    }
+    for name in (
+        "max_callers",
+        "max_callees",
+        "max_siblings",
+        "max_imports",
+        "max_comments",
+    ):
+        if type(params[name]) is not int or not 0 <= params[name] <= 1000:
+            raise ValueError(f"{name} must be an integer between 0 and 1000")
+
+    # 保存点把身份、CTE、反向导入和可选 LSP 读取绑定到同一版本，不结束调用者事务。
+    conn.execute("SAVEPOINT tsa_pulse_read")
+    try:
+        return _query_pulse_snapshot(conn, file_path, symbol_name, params)
+    finally:
+        conn.execute("RELEASE SAVEPOINT tsa_pulse_read")
+
+
+def _query_pulse_snapshot(
+    conn: sqlite3.Connection,
+    file_path: str,
+    symbol_name: str,
+    params: dict[str, Any],
+) -> PulseResponse | None:
+    """在公开入口持有的只读保存点内完成全部上下文读取。"""
+    # 先证明唯一身份；同文件同名必须由调用方消歧，不能任意取第一条。
+    targets = conn.execute(
+        "SELECT id FROM ast_symbol_rows WHERE file_path = ? AND name = ? LIMIT 2",
+        (file_path, symbol_name),
+    ).fetchall()
+    if not targets:
+        return None
+    if len(targets) != 1:
+        raise ValueError(f"AMBIGUOUS_SYMBOL: {file_path}:{symbol_name}")
+    params["symbol_id"] = targets[0][0]
+    from ..synapse_resolver._context import _build_module_to_file
+
+    modules = _build_module_to_file([file_path])
+    params["module_node"] = "module:" + next(iter(modules), "")
+    if params["max_comments"]:
+        marker = conn.execute(
+            "SELECT json_type(symbols_json, '$.comments') FROM ast_index WHERE file_path=?",
+            (file_path,),
+        ).fetchone()
+        if marker is not None and marker[0] != "array":
+            raise ValueError(
+                "COMMENTS_NOT_INDEXED: rebuild the index, or set max_comments=0 for unsupported languages"
+            )
+
+    # 主查询失败不是符号缺失；仅可选 LSP 富化允许降级。
+    row = conn.execute(_PULSE_SQL, _probe_params(params)).fetchone()
+
+    # 固定 SELECT 总会返回一行；内置 JSON 聚合生成合法 JSON，对象子查询可为 NULL。
+    # 按固定列序读取，兼容 tuple 与 sqlite3.Row；索引 7 是原始文档文本，不参与解码。
+    target_d, git_heat_d = (
+        json.loads(row[index]) if row[index] is not None else None for index in (0, 5)
+    )
+    if target_d is None:
+        return None
+    (
+        callers_raw,
+        callees_raw,
+        imports_raw,
+        imported_by_raw,
+        siblings_raw,
+        comments_raw,
+    ) = (json.loads(row[index]) for index in (1, 2, 3, 4, 6, 8))
+
+    language = target_d.get("language", "")
+    call_graph_available = language not in _NO_CALL_GRAPH_LANGUAGES
+    call_graph_reason = (
+        f"{language}: call-graph not supported" if not call_graph_available else ""
+    )
+    imports_graph_available = language in _IMPORT_GRAPH_LANGUAGES
+
+    docstring_raw = row[7]
+
+    # SQL 在完整 JSON 中定位定义后才截短文档，避免截断序列化对象。
+    docstring = (
+        docstring_raw if isinstance(docstring_raw, str) and docstring_raw else None
+    )
+
+    sym_info = SymbolInfo(
+        name=target_d.get("name", symbol_name),
+        kind=target_d.get("kind", "unknown"),
+        file=target_d.get("file", file_path),
+        line=target_d.get("line", 0),
+        end_line=target_d.get("end_line", 0),
+        language=language,
+        docstring=docstring,
+    )
+
+    callers_raw, callers_cap = _cap("callers", callers_raw, params, "name")
+    callees_raw, callees_cap = _cap("callees", callees_raw, params, "name")
+    imports_raw, imports_cap = _cap("imports", imports_raw, params, "module")
+    siblings_raw, siblings_cap = _cap("siblings", siblings_raw, params, "name")
+    comments_raw, comments_cap = _cap("comments", comments_raw, params, None)
+
+    callers = tuple(
+        CallerRef(
+            name=c.get("name", ""),
+            file=c.get("file", ""),
+            line=c.get("line", 0) or 0,
+            hot30=c.get("hot30", 0) or 0,
+        )
+        for c in callers_raw
+    )
+
+    callees = tuple(
+        CalleeRef(
+            name=c.get("name", ""),
+            file=c.get("file") or None,
+            line=c.get("line") or None,
+            resolution=c.get("resolution") or "unresolved",
+        )
+        for c in callees_raw
+    )
+
+    git_heat: GitHeat | None = None
+    if git_heat_d:
+        if git_heat_d.get("commit") and not git_heat_d.get("commit_msg"):
+            logger.warning("COMMIT_MESSAGE_MISSING: %s:%s", file_path, symbol_name)
+        git_heat = GitHeat(
+            commit=git_heat_d.get("commit"),
+            commit_msg=git_heat_d.get("commit_msg") or None,
+            at=git_heat_d.get("at"),
+            mod_30d=git_heat_d.get("mod_30d", 0) or 0,
+            mod_90d=git_heat_d.get("mod_90d", 0) or 0,
+            mod_all=git_heat_d.get("mod_all", 0) or 0,
+            state=git_heat_d.get("state", "tracked") or "tracked",
+        )
+
+    imports = tuple(
+        ImportRef(module=i.get("module", ""), file=i.get("file")) for i in imports_raw
+    )
+
+    importer_rows = [str(f) for f in imported_by_raw if f]
+    imported_by, imported_by_cap = _cap_rows(
+        "imported_by", importer_rows, len(imported_by_raw), _IMPORTED_BY_CAP
+    )
+    imports_degraded = False
+    if language == "python":
+        # 富化走内容戳缓存（审计 P2-2）：同一索引版本内重复查询不再全量扫描。
+        imports_degraded, importers_map = _python_importers_snapshot(conn)
+        if not imports_degraded:
+            merged = sorted(
+                set(importer_rows) | importers_map.get(file_path, frozenset())
+            )
+            imported_by = tuple(merged[:_IMPORTED_BY_CAP])
+            # SQL 侧已触顶时并集仍可能缺项，总数未知；否则并集即精确总数。
+            sql_capped = imported_by_cap is not None
+            imported_by_cap = (
+                FieldTruncation(
+                    "imported_by",
+                    len(imported_by),
+                    None if sql_capped else len(merged),
+                    len(merged),
+                )
+                if sql_capped or len(merged) > _IMPORTED_BY_CAP
+                else None
+            )
+
+    siblings = tuple(
+        SiblingRef(
+            name=s.get("name", ""),
+            kind=s.get("kind", "unknown"),
+            line=s.get("line", 0) or 0,
+        )
+        for s in siblings_raw
+    )
+
+    comments = tuple(
+        CommentRef(
+            line=c.get("line", 0) or 0,
+            text=c.get("text", ""),
+            kind=c.get("kind", "inline"),
+        )
+        for c in comments_raw
+    )
+
+    # 保留 SQL 返回的边身份，不能按文件和名字重新猜测调用点。
+    callees = _enrich_callees_with_lsp(
+        conn, callees, tuple(c["edge_id"] for c in callees_raw)
+    )
+
+    if not call_graph_available:
+        callers = ()
+        callees = ()
+        callers_cap = callees_cap = None
+    caps = (
+        callers_cap,
+        callees_cap,
+        imports_cap,
+        imported_by_cap,
+        siblings_cap,
+        comments_cap,
+    )
+
+    return PulseResponse(
+        symbol=sym_info,
+        call_graph_available=call_graph_available,
+        call_graph_reason=call_graph_reason,
+        imports_graph_available=imports_graph_available,
+        callers=callers,
+        callees=callees,
+        git_heat=git_heat,
+        imports=imports,
+        imported_by=imported_by,
+        siblings=siblings,
+        comments=comments,
+        # Python 富化降级时向消费者声明该字段被截断（issue #1445）。
+        truncated_fields=(("imported_by",) if imports_degraded else ()),
+        field_truncation=tuple(cap for cap in caps if cap is not None),
+    )
+
+
+# 反向导入的固定上限；SQL 多取一行用于判断是否触顶（审计 P3-2）。
+_IMPORTED_BY_CAP = 20
+
+
+def _probe_params(params: dict[str, Any]) -> dict[str, Any]:
+    """各上限多取一行以证明触顶；上限 0 表示调用方不要该字段，保持不取。"""
+    probes = {
+        name: params[name] + 1 if params[name] else 0
+        for name in (
+            "max_callers",
+            "max_callees",
+            "max_siblings",
+            "max_imports",
+            "max_comments",
+        )
+    }
+    return {**params, **probes, "imported_by_probe": _IMPORTED_BY_CAP + 1}
+
+
+def _cap(
+    field_name: str,
+    rows: list[dict[str, Any]],
+    params: dict[str, Any],
+    required_key: str | None,
+) -> tuple[list[dict[str, Any]], FieldTruncation | None]:
+    """过滤无效行后按请求上限截取 SQL 结果。"""
+    valid = [r for r in rows if required_key is None or r.get(required_key)]
+    kept, cap = _cap_rows(field_name, valid, len(rows), params[f"max_{field_name}"])
+    return list(kept), cap
+
+
+def _cap_rows(
+    field_name: str, valid: list[Any], fetched: int, limit: int
+) -> tuple[tuple[Any, ...], FieldTruncation | None]:
+    """取前 limit 条；SQL 返回行数超过 limit 即触顶，真实总数未知，只报已见下界。"""
+    kept = tuple(valid[:limit])
+    if fetched <= limit:
+        return kept, None
+    return kept, FieldTruncation(field_name, len(kept), None, len(valid))
+
+
+# ---------------------------------------------------------------------------
+# Python 反向导入派生表（审计 P2-2：内容戳缓存，避免每次查询全量扫描）
+# ---------------------------------------------------------------------------
+
+# 键为（数据库文件路径, 文件集内容戳, 绑定集内容戳）；内容戳变化即整体失效。
+# 内存库无稳定标识不缓存；GIL 下的字典读写对单事件循环的 MCP 服务足够。
+_PY_IMPORTERS_CACHE: dict[
+    tuple[str, tuple[object, ...], tuple[object, ...]],
+    tuple[bool, dict[str, frozenset[str]]],
+] = {}
+_PY_IMPORTERS_CACHE_MAX = 32
+
+
+def _python_importers_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[bool, dict[str, frozenset[str]]]:
+    """返回（是否超限降级, 目标文件 → 导入者集合）；文件库带内容戳缓存。"""
+    main_path = ""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main":
+            main_path = (row[2] or "").strip()
+            break
+    if not main_path:
+        # 内存库（测试与一次性连接）没有稳定身份，直接构建、不缓存。
+        return _build_python_importers(conn)
+
+    index_row = conn.execute(
+        "SELECT COUNT(*), IFNULL(MAX(indexed_at),'') FROM ast_index WHERE language='python'"
+    ).fetchone()
+    symbol_row = conn.execute(
+        # ast_symbol_rows 没有 indexed_at 列，用 rowid 上界补充捕捉符号行变化。
+        "SELECT COUNT(*), IFNULL(MAX(rowid),0) FROM ast_symbol_rows WHERE language='python'"
+    ).fetchone()
+    bindings_row = conn.execute(
+        "SELECT COUNT(*), IFNULL(MAX(rowid),0) FROM ast_imports WHERE language='python'"
+    ).fetchone()
+    key = (
+        main_path,
+        (index_row[0], index_row[1], symbol_row[0], symbol_row[1]),
+        (bindings_row[0], bindings_row[1]),
+    )
+    cached = _PY_IMPORTERS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = _build_python_importers(conn)
+    if len(_PY_IMPORTERS_CACHE) >= _PY_IMPORTERS_CACHE_MAX:
+        # 粗粒度上限：正常场景一个仓库只有一条记录，超限说明在测试等临时目录场景。
+        _PY_IMPORTERS_CACHE.clear()
+    _PY_IMPORTERS_CACHE[key] = value
+    return value
+
+
+def _build_python_importers(
+    conn: sqlite3.Connection,
+) -> tuple[bool, dict[str, frozenset[str]]]:
+    """全量构建「目标文件 → 导入者集合」派生表；超资源上限返回 (True, {})。"""
+    from ..synapse_resolver._context import (
+        _build_module_to_file,
+        _local_name_as_submodule,
+        _resolve_module_to_file,
+    )
+
+    files = conn.execute(
+        "SELECT file_path FROM ast_index WHERE language='python' "
+        "UNION SELECT file_path FROM ast_symbol_rows WHERE language='python' LIMIT 10001"
+    ).fetchall()
+    bindings = (
+        conn.execute(
+            "SELECT module_path,is_relative,file_path,local_name,alias_of FROM ast_imports "
+            "WHERE language='python' LIMIT 20001"
+        ).fetchall()
+        if len(files) <= 10000
+        else []
+    )
+    # 超资源上限时降级（issue #1445）：调用方保留 SQL 侧结果并声明截断。
+    if len(files) > 10000 or len(bindings) > 20000:
+        return True, {}
+    module_to_file = _build_module_to_file([r[0] for r in files])
+    importers_map: dict[str, set[str]] = {}
+    for module, relative, caller, local_name, alias_of in bindings:
+        resolved = _resolve_module_to_file(
+            module, bool(relative), caller, module_to_file
+        )
+        submodule = (
+            _local_name_as_submodule(
+                local_name, alias_of, module, caller, module_to_file
+            )
+            if relative
+            else ""
+        )
+        for target in (resolved, submodule):
+            if target:
+                importers_map.setdefault(target, set()).add(caller)
+    return False, {
+        target: frozenset(importers) for target, importers in importers_map.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# token 数量估算
+# ---------------------------------------------------------------------------
+
+
+def _estimate_tokens(value: Any) -> int:
+    """估算 JSON 序列化后的 token 数量。"""
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(json.dumps(value, ensure_ascii=False, default=str)))
+    except Exception:
+        # 有意兜底：tiktoken 未安装（ImportError）、已安装但离线冷缓存导致
+        # 初始化抛网络异常等，都退回字符数估算，不让 pulse 整体失败。
+        return len(json.dumps(value, ensure_ascii=False, default=str)) // 4
+
+
+# ---------------------------------------------------------------------------
+# apply_budget：按 token 预算裁剪
+# ---------------------------------------------------------------------------
+
+# 字段按优先级从高到低排列，裁剪时逆序遍历。
+_PRIORITY_ORDER = [
+    "callers",
+    "callees",
+    "git_heat",
+    "imports",
+    "imported_by",
+    "siblings",
+    "comments",
+]
+
+_FIELD_TOP_N = {
+    "callers": 5,
+    "callees": 10,
+    "imports": 10,
+    "imported_by": 5,
+    "siblings": 10,
+    "comments": 10,
+}
+
+
+def apply_budget(pulse: PulseResponse, token_budget: int) -> PulseResponse:
+    """按估算 token 预算裁剪，始终保留 symbol，其他字段从低优先级开始删除。
+
+    返回新的 PulseResponse，不修改输入；仅保留 symbol 时也可能超过预算。
+    """
+    # 符号身份始终保留。
+    sym_tokens = _estimate_tokens(dataclasses.asdict(pulse.symbol))
+    truncated: list[str] = []
+
+    # 收集当前字段值；SQL LIMIT 可能已经做过数量裁剪。
+    field_values: dict[str, Any] = {
+        "callers": tuple(pulse.callers[: _FIELD_TOP_N.get("callers", 100)]),
+        "callees": tuple(pulse.callees[: _FIELD_TOP_N.get("callees", 100)]),
+        "git_heat": pulse.git_heat,
+        "imports": tuple(pulse.imports[: _FIELD_TOP_N.get("imports", 100)]),
+        "imported_by": tuple(pulse.imported_by[: _FIELD_TOP_N.get("imported_by", 100)]),
+        "siblings": tuple(pulse.siblings[: _FIELD_TOP_N.get("siblings", 100)]),
+        "comments": tuple(pulse.comments[: _FIELD_TOP_N.get("comments", 100)]),
+    }
+
+    # 从低优先级开始删减，不因某个高优先字段太大就跳过它保留低优先字段。
+    total_estimate = sym_tokens + sum(
+        _estimate_tokens(v) for v in field_values.values()
+    )
+    for field_name in reversed(_PRIORITY_ORDER):
+        if total_estimate <= token_budget:
+            break
+        val = field_values[field_name]
+        if val is None or val == ():
+            continue
+        truncated.append(field_name)
+        field_values[field_name] = () if isinstance(val, tuple) else None
+        total_estimate += _estimate_tokens(field_values[field_name]) - _estimate_tokens(
+            val
+        )
+
+    total_estimate = sym_tokens + sum(
+        _estimate_tokens(v) for v in field_values.values()
+    )
+
+    # 合并 query_pulse 已声明的截断（如 Python 富化降级）与预算裁剪产生的截断，
+    # 去重保序；直接覆盖会丢掉查询侧的降级声明。
+    merged_truncated = list(pulse.truncated_fields)
+    for field_name in truncated:
+        if field_name not in merged_truncated:
+            merged_truncated.append(field_name)
+
+    return dataclasses.replace(
+        pulse,
+        callers=field_values["callers"],
+        callees=field_values["callees"],
+        git_heat=field_values["git_heat"],
+        imports=field_values["imports"],
+        imported_by=field_values["imported_by"],
+        siblings=field_values["siblings"],
+        comments=field_values["comments"],
+        token_estimate=total_estimate,
+        truncated_fields=tuple(merged_truncated),
+        field_truncation=_budget_field_truncation(pulse, field_values, truncated),
+    )
+
+
+def _budget_field_truncation(
+    pulse: PulseResponse, field_values: dict[str, Any], dropped: list[str]
+) -> tuple[FieldTruncation, ...]:
+    """合并查询侧触顶声明与 top-N 裁剪；整字段删除只记入 truncated_fields。
+
+    源已触顶时沿用其未知总数与下界，绝不把截断后的条数当作精确总数。
+    """
+    prior = {t.field: t for t in pulse.field_truncation}
+    result: list[FieldTruncation] = []
+    for name in _FIELD_TOP_N:
+        source = getattr(pulse, name)
+        kept = len(field_values[name])
+        if name in dropped or (name not in prior and kept == len(source)):
+            continue
+        known = prior.get(name)
+        total = known.total if known else len(source)
+        at_least = known.at_least if known else len(source)
+        result.append(FieldTruncation(name, kept, total, at_least))
+    return tuple(result)

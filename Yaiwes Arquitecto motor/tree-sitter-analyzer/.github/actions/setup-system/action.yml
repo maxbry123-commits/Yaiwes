@@ -1,0 +1,12 @@
+name: Setup System Dependencies
+description: Verify Git required for project history and change analysis
+inputs:
+  os:
+    description: Runner operating system
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Verify Git
+      shell: bash
+      run: git --version

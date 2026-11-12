@@ -1,0 +1,469 @@
+---
+name: Cloacina Tests
+
+on:
+  workflow_call:
+
+concurrency:
+  group: cloacina-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Force HTTP/1.1 for crates.io fetches — HTTP/2 multiplexing intermittently
+# fails with "[16] Error in the HTTP2 framing layer" (exit 56) on dependency
+# downloads in the integration/package-build steps. (CLOACI v0.9.0 recovery)
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+# Lane layout (CI-perf pass, 2026-09): the account runs at most 20 jobs at
+# once and a PR fanned out to ~80, so wall-clock was queue time, not test
+# time. Every lane here now does one thing once:
+#   * feature-builds   — compile-time backend isolation only (the per-backend
+#                        integration suite it also ran duplicated the
+#                        integration-tests lane below, minute for minute).
+#   * unit-tests       — ubuntu + macOS. macOS is a library/daemon platform
+#                        (embedded cloacina, cloacina-agent, the CLI), never
+#                        a server host, so it gets the library unit tests
+#                        here and a sqlite integration pass in nightly.yml
+#                        (macos-library-daemon) — no server suites, no
+#                        Postgres cluster.
+#   * integration-tests— ubuntu only, and the Rust and Python layers are
+#                        separate parallel jobs (they share nothing but the
+#                        DB; serialized they were the longest lane at ~20m).
+#   * nothing waits on unit-tests any more: the gate saved runner-minutes
+#                        only when unit failed, and cost ~8 min of critical
+#                        path on every green run.
+
+jobs:
+  # Feature builds — verify compile-time database backend selection works.
+  # The sqlite-only leg removes libpq from the runner first, so a stray
+  # postgres dependency fails to link rather than silently leaking in
+  # (CLOACI-I-0134). The cloaca extension build repeats that proof for the
+  # Python bindings, which link separately from the cloacina test binary.
+  feature-builds:
+    name: Feature Build (${{ matrix.features.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: postgres-only
+            flags: --no-default-features --features postgres,macros
+            backend: postgres
+          - name: sqlite-only
+            flags: --no-default-features --features sqlite,macros
+            backend: sqlite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Remove PostgreSQL libraries (sqlite-only verification)
+        if: matrix.features.backend == 'sqlite'
+        run: |
+          # Remove libpq to verify sqlite-only build doesn't require it
+          sudo apt-get remove -y libpq-dev libpq5 || true
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libpq* || true
+
+      - name: Install PostgreSQL dev libraries
+        if: matrix.features.backend == 'postgres'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cloacina-feature-${{ matrix.features.name }}"
+
+      - name: Build cloacina (${{ matrix.features.name }})
+        run: cargo build -p cloacina ${{ matrix.features.flags }}
+
+      - name: Run unit tests (${{ matrix.features.name }})
+        run: cargo test -p cloacina --lib ${{ matrix.features.flags }}
+
+      - name: Build cloaca extension without libpq (sqlite-only)
+        if: matrix.features.backend == 'sqlite'
+        run: cargo build -p cloacina-python --no-default-features --features sqlite,macros,extension-module
+
+  # Unit tests - fast, fail-fast enabled, cross-platform
+  unit-tests:
+    name: Unit Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      # libpq only — cloacina's default features link it. No Postgres
+      # cluster: macOS never runs the server, and the unit tests need no DB.
+      - name: Install libpq (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install libpq
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$(brew --prefix libpq)/lib" >> $GITHUB_ENV
+
+      - name: Install PostgreSQL dev libraries (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cloacina -> target"
+          shared-key: "cloacina-${{ matrix.os }}"
+
+      - name: Run unit tests (postgres)
+        run: angreal test unit --backend postgres
+
+      - name: Run unit tests (sqlite)
+        run: angreal test unit --backend sqlite
+
+  # Integration tests — one job per (backend, layer). `rust` is the cargo
+  # `--test integration` target (+ the cloacina-server lib tests and the
+  # auth/OIDC server suites on postgres); `python` is the pytest scenario
+  # files under tests/python against a freshly built cloaca wheel. fail-fast
+  # disabled to catch multi-backend issues.
+  integration-tests:
+    name: Integration Tests (${{ matrix.layer }}, ${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [postgres, sqlite]
+        layer: [rust, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cloacina -> target"
+          shared-key: "cloacina-ubuntu-latest"
+
+      - name: Start PostgreSQL services
+        if: matrix.backend == 'postgres'
+        uses: hoverkraft-tech/compose-action@v2.0.1
+        with:
+          compose-file: ".angreal/docker-compose.yaml"
+
+      - name: Install debugging tools
+        # CLOACI-I-0140: all legs, not just postgres — the segfault class
+        # historically rotated across BOTH backends' lanes.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdb libpq-dev
+
+      - name: Enable core dumps
+        run: |
+          ulimit -c unlimited
+          # Set core pattern to a predictable location
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p.%t
+          # Verify settings
+          echo "Core pattern: $(cat /proc/sys/kernel/core_pattern)"
+          echo "Core limit: $(ulimit -c)"
+
+      - name: Run integration tests (${{ matrix.layer }}, ${{ matrix.backend }})
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          # CLOACI-I-0140: disable ASLR for consistent crash addresses; ulimit
+          # must be re-set here — the earlier step's ulimit does not persist
+          # across workflow steps.
+          ulimit -c unlimited
+          if [ "${{ matrix.layer }}" = "rust" ]; then
+            setarch $(uname -m) -R angreal test integration --backend ${{ matrix.backend }} --skip-python
+          else
+            setarch $(uname -m) -R angreal test integration --backend ${{ matrix.backend }} --skip-rust
+          fi
+
+      # CLOACI-T-0804: full-server auth integration suite (postgres-only — the
+      # auth tables, local accounts, OIDC mapping, and the cross-tenant
+      # key-management leak fix all require Postgres). Boots a real server and
+      # exercises roles, isolation, whoami, local login, and the leak-fix
+      # regression end-to-end. Lives in the rust/postgres leg because that leg
+      # already compiled cloacina-server for its lib tests.
+      - name: Run auth integration tests (postgres)
+        if: matrix.layer == 'rust' && matrix.backend == 'postgres'
+        run: angreal test auth
+
+      # CLOACI-T-0804: OIDC relying-party tests against a real Dex issuer
+      # (discovery, JWKS, authorization-URL with PKCE/state/nonce). The OIDC
+      # tests are #[ignore]'d by default since they need a live issuer; this
+      # brings up the dex sidecar (localhost issuer — the runner is the host)
+      # and runs them. The integration harness tears the stack down when it
+      # finishes, so dex is started here explicitly.
+      - name: Run OIDC relying-party tests (postgres)
+        if: matrix.layer == 'rust' && matrix.backend == 'postgres'
+        run: |
+          docker compose -f .angreal/docker-compose.yaml up -d dex
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:5556/dex/.well-known/openid-configuration >/dev/null 2>&1 && break
+            sleep 2
+          done
+          cargo test -p cloacina-server --lib oidc -- --ignored
+
+      - name: Analyze core dump on failure
+        if: failure()
+        run: |
+          echo "=== Checking for core dumps ==="
+          ls -la /tmp/core.* 2>/dev/null || echo "No core dumps found in /tmp"
+
+          # CLOACI-I-0140: cores come from DIFFERENT executables — the rust
+          # `integration-*` test binary AND the venv python running scenario
+          # tests (the rotating-segfault class). The old version hardcoded the
+          # rust binary, producing garbage backtraces for python cores. Detect
+          # the crashing executable per-core from the core file itself; the
+          # unstripped cloaca wheel (pyproject strip=false) makes the frames
+          # inside the extension resolve.
+          # Lessons from the 2026-07-29 v0.10.0 release-gate core (the first
+          # capture with the venv intact): `execfn` records the exec'd FILE,
+          # which for pytest is a python SCRIPT (not ELF — gdb rejects it and
+          # then loads no symbol tables at all); and `%e` in the core pattern
+          # is the crashing THREAD's name (e.g. `tokio-rt-worker`), not the
+          # binary. So: resolve execfn, then if it isn't a real ELF, follow a
+          # script's shebang / fall back to the venv's REAL python binary
+          # (readlink through the symlink chain), then the rust test binary.
+          resolve_elf() {
+            local cand="$1"
+            [ -n "$cand" ] && [ -f "$cand" ] || return 1
+            cand=$(readlink -f "$cand")
+            if file "$cand" | grep -q ELF; then echo "$cand"; return 0; fi
+            # Script: try its shebang interpreter.
+            local interp
+            interp=$(head -1 "$cand" | grep -oP '^#!\K\S+' || true)
+            if [ -n "$interp" ] && [ -f "$interp" ]; then
+              interp=$(readlink -f "$interp")
+              file "$interp" | grep -q ELF && echo "$interp" && return 0
+            fi
+            return 1
+          }
+          for core in /tmp/core.*; do
+            [ -f "$core" ] || continue
+            echo "=== Analyzing core dump: $core ==="
+            EXE=$(resolve_elf "$(file "$core" | grep -oP "execfn: '\K[^']+" || true)" || true)
+            if [ -z "$EXE" ]; then
+              EXE=$(resolve_elf "$PWD/test-env-unified/bin/python" || true)
+            fi
+            if [ -z "$EXE" ]; then
+              echo "Could not resolve a python ELF; trying rust test binary"
+              EXE=$(find target/debug/deps -name 'integration-*' -type f -executable 2>/dev/null | head -1)
+            fi
+            echo "=== Executable: ${EXE:-unknown} ==="
+            [ -n "$EXE" ] || continue
+            gdb -batch \
+              -ex "set pagination off" \
+              -ex "info sharedlibrary" \
+              -ex "thread apply all bt" \
+              -ex "bt full" \
+              -ex "info registers" \
+              "$EXE" "$core" 2>&1 | head -400
+          done
+
+      - name: Report compiled workflow sizes
+        if: always() && matrix.layer == 'rust'
+        run: |
+          echo "=== Compiled Workflow Library Sizes ==="
+          echo "Platform: ubuntu-latest"
+          echo "Architecture: $(uname -m)"
+          echo ""
+
+          # Function to format size in human-readable format
+          format_size() {
+            local size=$1
+            if [ $size -ge 1048576 ]; then
+              echo "$(echo "scale=2; $size / 1048576" | bc) MB"
+            elif [ $size -ge 1024 ]; then
+              echo "$(echo "scale=2; $size / 1024" | bc) KB"
+            else
+              echo "$size bytes"
+            fi
+          }
+
+          echo "| Workflow | Size (bytes) | Size |"
+          echo "|----------|--------------|------|"
+
+          # Find and report packaged workflow example
+          for ext in dylib so; do
+            lib="examples/features/workflows/packaged-workflows/target/release/libpackaged_workflow_example.$ext"
+            if [ -f "$lib" ]; then
+              size=$(stat -f%z "$lib" 2>/dev/null || stat -c%s "$lib" 2>/dev/null)
+              echo "| packaged-workflow-example | $size | $(format_size $size) |"
+              break
+            fi
+          done
+
+          # Find and report simple packaged demo
+          for ext in dylib so; do
+            lib="examples/features/workflows/simple-packaged/target/release/libsimple_packaged_demo.$ext"
+            if [ -f "$lib" ]; then
+              size=$(stat -f%z "$lib" 2>/dev/null || stat -c%s "$lib" 2>/dev/null)
+              echo "| simple-packaged-demo | $size | $(format_size $size) |"
+              break
+            fi
+          done
+
+          echo ""
+          echo "=== Detailed file info ==="
+          find examples/features/workflows/*/target/release examples/features/computation-graphs/*/target/release -name "*.dylib" -o -name "*.so" 2>/dev/null | while read f; do
+            if [ -f "$f" ]; then
+              ls -lh "$f"
+            fi
+          done
+
+  # Macro tests - only need to run once per backend (ubuntu only)
+  macro-tests:
+    name: Macro Tests (${{ matrix.backend }})
+    strategy:
+      fail-fast: true
+      matrix:
+        backend: [postgres, sqlite]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cloacina -> target"
+          shared-key: "cloacina-ubuntu-latest"
+
+      - name: Install PostgreSQL dev libraries
+        if: matrix.backend == 'postgres'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: Start PostgreSQL services
+        if: matrix.backend == 'postgres'
+        uses: hoverkraft-tech/compose-action@v2.0.1
+        with:
+          compose-file: ".angreal/docker-compose.yaml"
+          services: postgres
+
+      - name: Run macro tests (${{ matrix.backend }})
+        run: angreal test macros --backend ${{ matrix.backend }}
+
+  # promtool /metrics exposition-format check (T-0536)
+  metrics-format:
+    name: Metrics Format (promtool)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cloacina -> target"
+          shared-key: "cloacina-ubuntu-latest"
+
+      - name: Install PostgreSQL dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: Start PostgreSQL services
+        uses: hoverkraft-tech/compose-action@v2.0.1
+        with:
+          compose-file: ".angreal/docker-compose.yaml"
+
+      - name: Install promtool
+        run: |
+          PROM_VERSION=2.54.1
+          curl -sSL \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 "prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: Validate /metrics exposition format
+        run: angreal test metrics-format

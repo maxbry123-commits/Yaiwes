@@ -1,0 +1,30 @@
+# The replaceWith field is not allowed in cue.mod/module.cue; it belongs in
+# cue.mod/local-module.cue (the two-file approach). A replaceWith field in
+# module.cue must be a hard error pointing the user at local-module.cue.
+
+! exec cue export .
+stderr 'module replace for "example.com/dep@v0" is not allowed in module.cue; move it to cue.mod/local-module.cue'
+
+-- cue.mod/module.cue --
+module: "example.com/main@v0"
+language: version: "v0.17.0"
+
+deps: {
+	"example.com/dep@v0": {
+		v: "v0.1.0"
+		replaceWith: "./local_dep"
+	}
+}
+-- main.cue --
+package main
+
+import "example.com/dep@v0:lib"
+
+output: lib.value
+-- local_dep/cue.mod/module.cue --
+module: "example.com/dep@v0"
+language: version: "v0.9.0"
+-- local_dep/lib.cue --
+package lib
+
+value: "from local directory"

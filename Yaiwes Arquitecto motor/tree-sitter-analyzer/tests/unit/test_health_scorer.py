@@ -1,0 +1,1438 @@
+"""Unit tests for health_scorer.py — file-level code health scoring."""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "project_graph"
+HEALTH_PROJECT = FIXTURES_DIR / "health_project"
+
+
+# ============================================================
+# HealthScorer tests
+# ============================================================
+
+
+class TestHealthScorer:
+    """Test file health scoring."""
+
+    @pytest.fixture
+    def scorer(self):
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        return HealthScorer()
+
+    def test_healthy_file_scores_higher(self, scorer):
+        """healthy.py should score higher than unhealthy.py."""
+        healthy_score = scorer.score_file(str(HEALTH_PROJECT / "healthy.py"))
+        unhealthy_score = scorer.score_file(str(HEALTH_PROJECT / "unhealthy.py"))
+        assert healthy_score.total > unhealthy_score.total, (
+            f"Expected healthy ({healthy_score.total}) > unhealthy ({unhealthy_score.total})"
+        )
+
+    def test_score_is_between_0_and_100(self, scorer):
+        """All scores should be in the 0-100 range."""
+        for fname in ["healthy.py", "unhealthy.py"]:
+            result = scorer.score_file(str(HEALTH_PROJECT / fname))
+            assert 0 <= result.total <= 100, (
+                f"Score for {fname} out of range: {result.total}"
+            )
+
+    def test_score_has_breakdown(self, scorer):
+        """Score should include per-dimension breakdown."""
+        result = scorer.score_file(str(HEALTH_PROJECT / "healthy.py"))
+        breakdown = result.to_dict()
+        assert "total" in breakdown
+        assert "dimensions" in breakdown
+        dims = breakdown["dimensions"]
+        for key in ("size", "complexity", "dependencies", "structure"):
+            assert key in dims, f"Missing dimension: {key}"
+
+    def test_score_empty_file(self, scorer, tmp_path):
+        """Empty file gets a baseline score."""
+        empty = tmp_path / "empty.py"
+        empty.write_text("")
+        result = scorer.score_file(str(empty))
+        assert result.total == 87.5
+
+    def test_score_nonexistent_file(self, scorer):
+        """Nonexistent file returns 0 score."""
+        result = scorer.score_file("/nonexistent/file.py")
+        assert result.total == 0
+
+    def test_score_project(self, scorer):
+        """Can score an entire project directory."""
+        results = scorer.score_project(str(HEALTH_PROJECT))
+        assert len(results) == 2
+        for r in results:
+            assert 0 <= r.total <= 100
+
+    def test_certified_score_omits_coverage_and_git_dimensions(
+        self, scorer, tmp_path, monkeypatch
+    ):
+        # Codex P1 (#1299 round-4): coverage.json and git history are outside
+        # the snapshot source generation — certified reads must not report
+        # dimensions that can drift for the same snapshot identity, even when
+        # those inputs are present.
+        import tree_sitter_analyzer.health_scorer as health_scorer
+
+        monkeypatch.setattr(health_scorer, "score_git_hotspot", lambda file_path: 80.0)
+        monkeypatch.setattr(
+            health_scorer.HealthScorer,
+            "_score_coverage",
+            lambda self, file_path: 90.0,
+        )
+        target = tmp_path / "app.py"
+        target.write_text("def run():\n    return 1\n", encoding="utf-8")
+
+        live = scorer.score_file(str(target), fast_dependencies=True)
+        assert "coverage" in live.dimensions
+        assert "git_hotspot" in live.dimensions
+
+        certified = scorer.score_file(
+            str(target), fast_dependencies=True, certified=True
+        )
+        assert "coverage" not in certified.dimensions
+        assert "git_hotspot" not in certified.dimensions
+        assert certified.total > 0.0
+
+    def test_invalidate_stat_cache_drops_only_stat_fast_path(self) -> None:
+        from tree_sitter_analyzer.core.parser import Parser
+
+        Parser.invalidate_stat_cache()
+        assert Parser._stat_cache == {}
+        # The content-addressed cache is untouched.
+        assert isinstance(Parser._cache, object)
+
+    def test_certified_score_never_touches_coverage_or_git(
+        self, scorer, tmp_path, monkeypatch
+    ):
+        # Codex P2 round-5 (C23): the certified branch must not EVALUATE the
+        # omitted dimensions — a corrupt coverage.json must not flip a
+        # certified request into a failure.
+        import tree_sitter_analyzer.health_scorer as health_scorer
+
+        def boom_coverage(self, file_path):
+            raise ValueError("corrupt coverage.json")
+
+        monkeypatch.setattr(
+            health_scorer.HealthScorer, "_score_coverage", boom_coverage
+        )
+        monkeypatch.setattr(health_scorer, "score_git_hotspot", lambda file_path: 1 / 0)
+        target = tmp_path / "app.py"
+        target.write_text("def run():\n    return 1\n", encoding="utf-8")
+
+        certified = scorer.score_file(
+            str(target), fast_dependencies=True, certified=True
+        )
+        assert certified.total > 0.0
+        assert "coverage" not in certified.dimensions
+
+    def test_score_project_includes_reported_source_extensions(self, scorer, tmp_path):
+        """Project scoring should include all configured reportable extensions."""
+        from tree_sitter_analyzer.health_scorer import PROJECT_HEALTH_SOURCE_EXTS
+
+        for idx, ext in enumerate(sorted(PROJECT_HEALTH_SOURCE_EXTS)):
+            path = tmp_path / f"sample{idx}{ext}"
+            path.write_text("x = 1\n")
+
+        unknown = tmp_path / "ignored.log"
+        unknown.write_text("x = 1\n")
+
+        results = scorer.score_project(str(tmp_path))
+        names = {Path(result.file_path).name for result in results}
+        included = {
+            f"sample{idx}{ext}"
+            for idx, ext in enumerate(sorted(PROJECT_HEALTH_SOURCE_EXTS))
+        }
+
+        assert names >= included
+        assert "ignored.log" not in names
+
+    def test_score_project_respects_custom_source_extensions(self, tmp_path):
+        """Health scorer should limit scan scope to caller-provided extensions."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        py_file = tmp_path / "main.py"
+        cfg_file = tmp_path / "project.cfg"
+        py_file.write_text("x = 1\n")
+        cfg_file.write_text("x = 1\n")
+
+        scorer = HealthScorer(source_extensions={".cfg"})
+        results = scorer.score_project(str(tmp_path))
+        names = {Path(result.file_path).name for result in results}
+
+        assert names == {"project.cfg"}
+
+    def test_score_file_fast_dependencies_uses_fallback(self, monkeypatch, tmp_path):
+        """Latency-sensitive callers can bypass whole-project dependency graphing."""
+        from tree_sitter_analyzer import health_scorer
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        source = tmp_path / "main.py"
+        source.write_text("import app.service\n")
+
+        def fail_full_graph(_file_path):
+            raise AssertionError("full dependency graph should not be used")
+
+        monkeypatch.setattr(health_scorer, "score_dependencies", fail_full_graph)
+        monkeypatch.setattr(
+            health_scorer,
+            "_score_deps_fallback",
+            lambda _file_path: 42.0,
+        )
+
+        result = HealthScorer().score_file(str(source), fast_dependencies=True)
+
+        assert result.dimensions["dependencies"] == 42.0
+
+    def test_score_file_default_dependencies_uses_full_graph_score(
+        self, monkeypatch, tmp_path
+    ):
+        """Default scoring keeps the full dependency graph dimension."""
+        from tree_sitter_analyzer import health_scorer
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        source = tmp_path / "main.py"
+        source.write_text("import app.service\n")
+
+        monkeypatch.setattr(
+            health_scorer,
+            "score_dependencies",
+            lambda _file_path: 77.0,
+        )
+
+        result = HealthScorer().score_file(str(source))
+
+        assert result.dimensions["dependencies"] == 77.0
+
+    def test_is_excluded_falls_back_to_absolute_parts(self, tmp_path):
+        """Paths outside root still honor generated/hidden path parts."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        scorer = HealthScorer()
+
+        assert scorer._is_excluded(tmp_path / ".hidden" / "file.py", Path("/outside"))
+
+    def test_iter_source_files_skips_hidden_filenames(self, tmp_path):
+        """Hidden filenames are not counted as project source files."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        visible = tmp_path / "src" / "main.py"
+        hidden = tmp_path / "src" / ".ignored.py"
+        visible.parent.mkdir(parents=True)
+        visible.write_text("x = 1\n")
+        hidden.write_text("x = 1\n")
+
+        files, pruned = HealthScorer(source_extensions={".py"})._iter_source_files(
+            tmp_path
+        )
+
+        assert [path.name for path in files] == ["main.py"]
+        assert pruned == 0
+
+    def test_score_project_counts_scoring_failures(self, monkeypatch, tmp_path):
+        """Stats should record files that were discovered but failed scoring."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        source = tmp_path / "main.py"
+        source.write_text("x = 1\n")
+        scorer = HealthScorer(source_extensions={".py"})
+        monkeypatch.setattr(scorer, "_score_file_with_cache", lambda *_args: None)
+
+        scores, stats = scorer.score_project_with_stats(str(tmp_path), use_cache=False)
+
+        assert scores == []
+        assert stats == {
+            "total_files_scanned": 1,
+            "total_files_scored": 0,
+            "total_files_skipped": 1,
+            "pruned_directories": 0,
+            "skip_reasons": {
+                "excluded_dir": 0,
+                "scoring_failed": 1,
+            },
+        }
+
+    def test_score_project_counts_defensive_excluded_file(self, monkeypatch, tmp_path):
+        """A defensive _is_excluded hit is still reported in project stats."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        hidden = tmp_path / ".hidden" / "main.py"
+        hidden.parent.mkdir()
+        hidden.write_text("x = 1\n")
+        scorer = HealthScorer(source_extensions={".py"})
+        monkeypatch.setattr(scorer, "_iter_source_files", lambda _root: ([hidden], 0))
+        monkeypatch.setattr(
+            scorer,
+            "_score_file_with_cache",
+            lambda *_args: pytest.fail("excluded files must not be scored"),
+        )
+
+        scores, stats = scorer.score_project_with_stats(str(tmp_path), use_cache=False)
+
+        assert scores == []
+        assert stats == {
+            "total_files_scanned": 1,
+            "total_files_scored": 0,
+            "total_files_skipped": 1,
+            "pruned_directories": 0,
+            "skip_reasons": {
+                "excluded_dir": 1,
+                "scoring_failed": 0,
+            },
+        }
+
+    def test_score_empty_project_has_zeroed_stats(self, tmp_path):
+        """An empty project should report an exact zero-valued partition."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        scores, stats = HealthScorer(
+            source_extensions={".py"}
+        ).score_project_with_stats(
+            str(tmp_path),
+            use_cache=False,
+        )
+
+        assert scores == []
+        assert stats == {
+            "total_files_scanned": 0,
+            "total_files_scored": 0,
+            "total_files_skipped": 0,
+            "pruned_directories": 0,
+            "skip_reasons": {
+                "excluded_dir": 0,
+                "scoring_failed": 0,
+            },
+        }
+
+    def test_score_project_prunes_hidden_and_generated_dirs(self, tmp_path):
+        """Project scoring should not descend into hidden/generated directories."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        visible = tmp_path / "src" / "main.py"
+        hidden = tmp_path / ".hidden" / "ignored.py"
+        generated = tmp_path / "build" / "ignored.py"
+        visible.parent.mkdir(parents=True)
+        hidden.parent.mkdir(parents=True)
+        generated.parent.mkdir(parents=True)
+        visible.write_text("x = 1\n")
+        hidden.write_text("x = 1\n")
+        generated.write_text("x = 1\n")
+
+        scores, stats = HealthScorer(
+            source_extensions={".py"}
+        ).score_project_with_stats(
+            str(tmp_path),
+            use_cache=False,
+        )
+
+        assert {Path(score.file_path).name for score in scores} == {"main.py"}
+        assert stats["total_files_scanned"] == 1
+        assert stats["total_files_scored"] == 1
+        assert stats["total_files_skipped"] == 0
+        assert stats["skip_reasons"] == {
+            "excluded_dir": 0,
+            "scoring_failed": 0,
+        }
+        assert stats["pruned_directories"] == 2
+
+    def test_large_file_gets_penalized(self, scorer, tmp_path):
+        """Files over 500 lines should have lower size score."""
+        big = tmp_path / "big.py"
+        big.write_text("\n".join([f"x{i} = {i}" for i in range(600)]))
+        result = scorer.score_file(str(big))
+        dims = result.to_dict()["dimensions"]
+        assert dims["size"] < 85, (
+            f"Large file should have low size score, got {dims['size']}"
+        )
+
+    def test_cc_penalizes_branches(self, scorer, tmp_path):
+        """Code with many branches should have lower complexity score."""
+        # High CC: 20 if-statements → CC = 21
+        high_cc = tmp_path / "high_cc.py"
+        lines = ["def f(x):"]
+        for i in range(20):
+            lines.append(f"    if x > {i}:")
+            lines.append("        pass")
+        high_cc.write_text("\n".join(lines))
+
+        # Low CC: single return → CC = 1
+        low_cc = tmp_path / "low_cc.py"
+        low_cc.write_text("def f(x):\n    return x\n")
+
+        high_result = scorer.score_file(str(high_cc))
+        low_result = scorer.score_file(str(low_cc))
+        assert (
+            high_result.to_dict()["dimensions"]["complexity"]
+            < low_result.to_dict()["dimensions"]["complexity"]
+        ), "High CC code should have lower complexity score"
+
+    def test_deeply_nested_code_penalized(self, scorer, tmp_path):
+        """Deeply nested code should have lower structure score."""
+        deep = tmp_path / "deep.py"
+        deep.write_text(
+            "def f(x):\n    if x:\n        if x:\n            if x:\n"
+            "                if x:\n                    if x:\n"
+            "                        if x:\n                            pass\n"
+        )
+        flat = tmp_path / "flat.py"
+        flat.write_text("def f(x):\n    return x\n")
+        deep_result = scorer.score_file(str(deep))
+        flat_result = scorer.score_file(str(flat))
+        assert (
+            deep_result.to_dict()["dimensions"]["structure"]
+            < flat_result.to_dict()["dimensions"]["structure"]
+        ), "Deep nesting should have lower structure score"
+
+    def test_coverage_none_without_data(self, scorer, tmp_path):
+        """Coverage should be None (excluded from total) when no coverage.json exists."""
+        f = tmp_path / "test.py"
+        f.write_text("x = 1\n")
+        result = scorer.score_file(str(f))
+        dims = result.to_dict()["dimensions"]
+        assert "coverage" not in dims, (
+            f"Coverage should be absent when no data, got {dims}"
+        )
+
+    def test_stale_coverage_json_is_ignored(self, monkeypatch, tmp_path):
+        """Do not use stale JSON coverage when pytest-cov has newer raw data."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        source = tmp_path / "pkg" / "module.py"
+        source.parent.mkdir()
+        source.write_text("x = 1\n")
+        coverage_json = tmp_path / "coverage.json"
+        coverage_json.write_text(
+            json.dumps(
+                {
+                    "files": {"pkg/module.py": {"summary": {"percent_covered": 12.5}}},
+                    "totals": {"percent_covered": 12.5},
+                }
+            ),
+            encoding="utf-8",
+        )
+        coverage_db = tmp_path / ".coverage"
+        coverage_db.write_text("newer raw coverage", encoding="utf-8")
+        os.utime(coverage_json, (1000, 1000))
+        os.utime(coverage_db, (2000, 2000))
+        monkeypatch.chdir(tmp_path)
+
+        result = HealthScorer().score_file(str(source))
+
+        assert "coverage" not in result.to_dict()["dimensions"]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Windows path drift — tracked separately"
+    )
+    def test_current_coverage_json_is_used(self, monkeypatch, tmp_path):
+        """Use JSON coverage when it is as current as the raw coverage data."""
+        from tree_sitter_analyzer.health_scorer import HealthScorer
+
+        source = tmp_path / "pkg" / "module.py"
+        source.parent.mkdir()
+        source.write_text("x = 1\n")
+        coverage_json = tmp_path / "coverage.json"
+        coverage_json.write_text(
+            json.dumps(
+                {
+                    "files": {"pkg/module.py": {"summary": {"percent_covered": 87.5}}},
+                    "totals": {"percent_covered": 87.5},
+                }
+            ),
+            encoding="utf-8",
+        )
+        coverage_db = tmp_path / ".coverage"
+        coverage_db.write_text("older raw coverage", encoding="utf-8")
+        os.utime(coverage_db, (1000, 1000))
+        os.utime(coverage_json, (2000, 2000))
+        monkeypatch.chdir(tmp_path)
+
+        result = HealthScorer().score_file(str(source))
+
+        assert result.to_dict()["dimensions"]["coverage"] == 87.5
+
+    def test_weights_sum_to_100(self):
+        """Default dimension weights must sum to 100."""
+        from tree_sitter_analyzer.health_scorer import DIMENSION_WEIGHTS
+
+        assert sum(DIMENSION_WEIGHTS.values()) == 100, (
+            f"Weights sum to {sum(DIMENSION_WEIGHTS.values())}"
+        )
+
+    def test_bash_complexity_counts_decision_nodes(self, scorer, tmp_path):
+        """A bash function with 4 if + 2 while + 2 for + 1 case + 1 elif
+        must yield CC=11 from the extractor (single source of truth).
+
+        The extractor counts the whole case statement as 1 branch (not
+        per-arm), and counts the elif within its parent if-statement, so
+        the result is 10 decision nodes + base 1 = CC=11.
+        """
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+
+        sh = tmp_path / "branchy.sh"
+        sh.write_text(
+            "#!/bin/bash\n"
+            "mega() {\n"
+            "  if true; then echo 1; fi\n"
+            "  if true; then echo 2; fi\n"
+            "  if true; then echo 3; fi\n"
+            "  while true; do break; done\n"
+            "  while true; do break; done\n"
+            "  for i in 1 2 3; do echo $i; done\n"
+            "  for j in a b c; do echo $j; done\n"
+            '  case "$x" in 1) echo a;; 2) echo b;; esac\n'
+            "  if true; then echo 4; elif false; then echo 5; fi\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        funcs = analyze_file_complexity(str(sh), "bash")
+        assert len(funcs) == 1
+        assert funcs[0].complexity == 11
+
+    def test_dependencies_neutral_for_unanalyzable_languages(self, tmp_path):
+        """Languages DependencyGraph cannot resolve (bash/scala/swift) must
+        get a NEUTRAL dependency score, not a false-perfect 100."""
+        from tree_sitter_analyzer.health_scorer import score_dependencies
+
+        for name, body in (
+            ("a.sh", "#!/bin/bash\necho hi\n"),
+            ("b.scala", "object M { def f(): Int = 1 }\n"),
+            ("c.swift", "func f() {}\n"),
+        ):
+            f = tmp_path / name
+            f.write_text(body, encoding="utf-8")
+            assert score_dependencies(str(f)) == 50.0
+
+    def test_fast_dependencies_neutral_for_unanalyzable_language(self, tmp_path):
+        """The ``fast_dependencies=True`` path (``_score_deps_fallback``) must
+        apply the SAME neutral-language guard as ``score_dependencies`` — a
+        ``.sh`` file gets 50, not a false-perfect 100."""
+        from tree_sitter_analyzer.health_scorer import _score_deps_fallback
+
+        sh = tmp_path / "tool.sh"
+        sh.write_text("#!/bin/bash\necho hi\n", encoding="utf-8")
+        assert _score_deps_fallback(str(sh)) == 50.0
+
+    def test_bash_case_scores_decision_per_case(self, tmp_path):
+        """A K-arm bash ``case`` dispatch: the extractor (single source of
+        truth) reports CC=2 for a 10-arm case (base 1 + 1 case_statement
+        branch). The extractor does not count per-arm items for bash case."""
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+
+        arms = "\n".join(f"    {i}) echo {i} ;;" for i in range(1, 11))
+        sh = tmp_path / "dispatch.sh"
+        sh.write_text(
+            '#!/bin/bash\ndispatch() {\n  case "$1" in\n' + arms + "\n  esac\n}\n",
+            encoding="utf-8",
+        )
+        funcs = analyze_file_complexity(str(sh), "bash")
+        assert len(funcs) == 1
+        assert funcs[0].complexity == 2
+
+    def test_scala_avg_cc_includes_all_methods(self, tmp_path):
+        """A Scala trait with abstract + concrete methods: the extractor
+        reports all of them (abstract methods get CC=1 base). score_complexity
+        averages over all 5 functions → avg_cc = (1+1+2+2+2)/5 = 1.6 → 100.0
+        (still in the ideal range)."""
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+        from tree_sitter_analyzer.health_scorer import score_complexity
+
+        scala = tmp_path / "T.scala"
+        scala.write_text(
+            "trait T {\n"
+            "  def a1(x: Int): Int\n"
+            "  def a2(x: Int): Int\n"
+            "  def c1(x: Int): Int = { if (x > 0) x else -x }\n"
+            "  def c2(x: Int): Int = { if (x > 0) x else -x }\n"
+            "  def c3(x: Int): Int = { if (x > 0) x else -x }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        funcs = analyze_file_complexity(str(scala), "scala")
+        assert len(funcs) == 5
+        total_cc = sum(fn.complexity for fn in funcs)
+        assert total_cc == 8  # 1+1+2+2+2
+        avg_cc = total_cc / len(funcs)
+        assert avg_cc == 1.6
+
+        src = scala.read_text(encoding="utf-8")
+        score = score_complexity(str(scala), src, "scala")
+        assert score == 100.0
+
+    def test_duplication_penalizes_repeated_code(self, scorer, tmp_path):
+        """Files with repeated code blocks should have lower duplication score."""
+        # High duplication: same block repeated 10 times
+        repeated = tmp_path / "dup.py"
+        block = "x = 1\ny = 2\nz = 3\n"
+        repeated.write_text(block * 10)
+
+        # No duplication: unique lines
+        unique = tmp_path / "unique.py"
+        unique.write_text("\n".join([f"x{i} = {i}" for i in range(30)]))
+
+        dup_result = scorer.score_file(str(repeated))
+        unique_result = scorer.score_file(str(unique))
+        assert (
+            dup_result.to_dict()["dimensions"]["duplication"]
+            < unique_result.to_dict()["dimensions"]["duplication"]
+        ), "Repeated code should have lower duplication score"
+
+    def test_git_hotspot_none_outside_git(self, scorer, tmp_path):
+        """Git hotspot should be None for files outside git repo."""
+        f = tmp_path / "test.py"
+        f.write_text("x = 1\n")
+        result = scorer.score_file(str(f))
+        # Single-line file with no complexity/deps/duplication → all dims score 100.0
+        assert result.total == 100.0
+
+    def test_git_hotspot_uses_repo_relative_pathspec(self, monkeypatch, tmp_path):
+        """Git hotspot should query from repo root with a repo-relative path."""
+        import subprocess
+        from types import SimpleNamespace
+
+        from tree_sitter_analyzer.health_scorer import score_git_hotspot
+
+        repo = tmp_path / "repo"
+        file_path = repo / "tree_sitter_analyzer" / "cli_main.py"
+        file_path.parent.mkdir(parents=True)
+        file_path.write_text("x = 1\n")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return SimpleNamespace(returncode=0, stdout=f"{repo}\n")
+            if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
+                return SimpleNamespace(returncode=0, stdout="false\n")
+            return SimpleNamespace(returncode=0, stdout="\n".join(["abc"] * 10))
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        score = score_git_hotspot(str(file_path))
+
+        assert score == pytest.approx(88.9, abs=0.1)
+        assert calls[2][0][-1] == "tree_sitter_analyzer/cli_main.py"
+        assert calls[2][1]["cwd"] == str(repo)
+
+    def test_seven_dimensions_in_weights(self):
+        """All 7 dimensions should be in DIMENSION_WEIGHTS."""
+        from tree_sitter_analyzer.health_scorer import DIMENSION_WEIGHTS
+
+        expected = {
+            "size",
+            "complexity",
+            "dependencies",
+            "coverage",
+            "duplication",
+            "structure",
+            "git_hotspot",
+        }
+        assert set(DIMENSION_WEIGHTS.keys()) == expected
+
+
+# ============================================================
+# HealthScore data class tests
+# ============================================================
+
+
+class TestHealthScore:
+    """Test the HealthScore data class."""
+
+    def test_health_score_creation(self):
+        from tree_sitter_analyzer.health_scorer import HealthScore
+
+        score = HealthScore(
+            file_path="test.py",
+            total=75.0,
+            dimensions={
+                "size": 80,
+                "complexity": 60,
+                "dependencies": 90,
+                "structure": 70,
+            },
+        )
+        assert score.file_path == "test.py"
+        assert score.total == 75.0
+        assert len(score.dimensions) == 4
+
+    def test_health_score_to_dict(self):
+        from tree_sitter_analyzer.health_scorer import HealthScore
+
+        score = HealthScore(
+            file_path="test.py",
+            total=75.0,
+            dimensions={"size": 80, "complexity": 60, "dependencies": 90},
+        )
+        d = score.to_dict()
+        assert d["file"] == "test.py"
+        assert d["total"] == 75.0
+        assert d["dimensions"]["size"] == 80
+
+    def test_health_score_grade(self):
+        from tree_sitter_analyzer.health_scorer import HealthScore
+
+        assert HealthScore("f", 95, {}).grade == "A"
+        assert HealthScore("f", 85, {}).grade == "B"
+        assert HealthScore("f", 72, {}).grade == "C"
+        assert HealthScore("f", 55, {}).grade == "D"
+        assert HealthScore("f", 30, {}).grade == "F"
+
+
+# ============================================================
+# score_complexity extractor-path tests (RFC-0019 / #1094)
+# ============================================================
+
+
+class TestScoreComplexityExtractorPath:
+    """Verify score_complexity derives CC from the extractor (single
+    source of truth) rather than the stale DECISION_NODE_TYPES table.
+
+    The key regression: Java with a 3-case switch + ternary + do-while
+    was silently scored CC=1 (all missed) by the old AST-walk using
+    DECISION_NODE_TYPES which mapped ``switch_statement`` (old grammar)
+    and ``conditional_expression`` (wrong name) while tree-sitter-java
+    emits ``switch_expression``, ``ternary_expression``, and
+    ``do_statement``. The extractor (via complexity_heatmap) uses the
+    correct node types and yields CC=6 for this method.
+    """
+
+    def _write(self, tmp_path, name: str, content: str):
+        p = tmp_path / name
+        p.write_text(content, encoding="utf-8")
+        return str(p)
+
+    def test_java_switch_ternary_do_while_matches_extractor(self, tmp_path):
+        """Java method with 3-case switch + ternary + do-while must yield
+        the same aggregate CC the extractor computes (CC=4 for this method).
+
+        Construct-once (#1094): base 1 + switch 1 + ternary 1 + do-while 1 = 4.
+        The switch counts ONCE regardless of arm count, not per-arm.
+
+        Old scorer returned 100.0 (CC=1, all branches missed because
+        DECISION_NODE_TYPES had switch_statement/conditional_expression/
+        no do_statement while tree-sitter-java emits switch_expression/
+        ternary_expression/do_statement).
+
+        Both CC=1 and CC=4 fall in the ideal range (≤15) so both give
+        score=100. The switch-specific invariant is locked in
+        test_java_switch_counts_construct_once_via_extractor below.
+        """
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+        from tree_sitter_analyzer.health_scorer import score_complexity
+
+        java_src = (
+            "public class Foo {\n"
+            "    public int compute(int x) {\n"
+            "        int result = 0;\n"
+            "        switch (x) {\n"
+            "            case 1: result = 1; break;\n"
+            "            case 2: result = 2; break;\n"
+            "            case 3: result = 3; break;\n"
+            "        }\n"
+            "        result = (x > 0) ? result : -result;\n"
+            "        do {\n"
+            "            result--;\n"
+            "        } while (result > 0);\n"
+            "        return result;\n"
+            "    }\n"
+            "}\n"
+        )
+        f = self._write(tmp_path, "Foo.java", java_src)
+
+        # Ground truth from the extractor (single source of truth)
+        funcs = analyze_file_complexity(f, "java")
+        assert len(funcs) == 1, f"Expected 1 function, got {len(funcs)}"
+        extractor_cx = funcs[0].complexity
+        assert extractor_cx == 4, (
+            f"Extractor CC for switch(3)+ternary+do-while should be 4, got {extractor_cx}"
+        )
+
+        # health scorer must now delegate to the extractor (CC=4)
+        scorer_score = score_complexity(f, java_src, "java")
+        # CC=4, n_funcs=1 (<3) → absolute path: 4 <= CC_IDEAL=15 → 100.0
+        assert scorer_score == 100.0, (
+            f"score_complexity returned {scorer_score}, expected 100.0 "
+            f"(CC=4 via extractor, still in ideal range)"
+        )
+
+    def test_java_switch_counts_construct_once_via_extractor(self, tmp_path):
+        """A Java ``switch`` contributes exactly ONE decision to cyclomatic
+        complexity no matter how many arms — the construct-once convention
+        (#1094). A 19-arm switch method therefore has CC = base 1 + switch 1
+        = 2, NOT 20: switch breadth must not inflate the health score.
+
+        This locks the switch-specific invariant. The old DECISION_NODE_TYPES
+        missed switches entirely (wrong node names → CC=1); the extractor
+        counts the construct once. The "high CC ⇒ penalised" behaviour is
+        covered separately by test_java_high_complexity_method_scored_correctly
+        (15 sequential ``if`` branches → CC=16 → penalised).
+        """
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+        from tree_sitter_analyzer.health_scorer import CC_IDEAL, score_complexity
+
+        switch_cases = "\n".join(
+            f"            case {i}: result = {i}; break;" for i in range(1, 20)
+        )
+        java_src = (
+            "public class Foo {\n"
+            "    public int compute(int x) {\n"
+            "        int result = 0;\n"
+            "        switch (x) {\n"
+            f"{switch_cases}\n"
+            "        }\n"
+            "        return result;\n"
+            "    }\n"
+            "}\n"
+        )
+        f = self._write(tmp_path, "Foo.java", java_src)
+
+        # Extractor ground truth: construct-once → CC = base 1 + switch 1 = 2
+        funcs = analyze_file_complexity(f, "java")
+        assert len(funcs) == 1
+        extractor_cx = funcs[0].complexity
+        assert extractor_cx == 2, (
+            f"19-arm switch is construct-once: CC == base 1 + switch 1 == 2, "
+            f"got {extractor_cx}"
+        )
+        assert extractor_cx <= CC_IDEAL, "A wide switch stays within the ideal CC band"
+
+        # CC=2 ≤ CC_IDEAL=15 → switch breadth alone must NOT penalise the score
+        score = score_complexity(f, java_src, "java")
+        assert score == 100.0, (
+            f"A wide switch (CC=2 construct-once) must not be penalised, "
+            f"got score={score}"
+        )
+
+    def test_java_high_complexity_method_scored_correctly(self, tmp_path):
+        """A single Java method with CC > 15 must be penalised.
+
+        Old scorer would return 100.0 (CC=1 due to wrong node names).
+        New scorer (via extractor) correctly counts the branches.
+        """
+        from tree_sitter_analyzer.health_scorer import score_complexity
+
+        # Build a Java method with many if statements (15 → CC≈16 from extractor)
+        branches = "\n".join(f"        if (x > {i}) result += {i};" for i in range(15))
+        java_src = (
+            "public class Bar {\n"
+            "    public int f(int x) {\n"
+            "        int result = 0;\n"
+            f"{branches}\n"
+            "        return result;\n"
+            "    }\n"
+            "}\n"
+        )
+        f = self._write(tmp_path, "Bar.java", java_src)
+
+        score = score_complexity(f, java_src, "java")
+
+        # Old scorer: CC=1 (all if_statement matched? Let us check):
+        # Actually if_statement IS in old DECISION_NODE_TYPES for java, so it
+        # scored correctly for if. The regression is specifically for switch /
+        # ternary / do-while. This test verifies if-based CC still works.
+        # CC = 1 + 15 = 16 > CC_IDEAL=15 → penalty starts.
+        # n_funcs=1 < 3 → absolute path: cc=16 > CC_IDEAL → penalised.
+        assert score < 100.0, (
+            f"Java method with 15 if-branches must be penalised, got score={score}"
+        )
+        # Verify the range is plausible (16 should fall into moderate zone)
+        assert score >= 30.0, f"Score {score} is too low for CC=16"
+
+    def test_javascript_ternary_scored_correctly(self, tmp_path):
+        """JavaScript ternary_expression was mapped to ``conditional_expression``
+        in DECISION_NODE_TYPES (wrong node name). Extractor uses the correct
+        name and counts it.
+
+        A JS function with a ternary must yield CC > 1 from the extractor.
+        """
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+        from tree_sitter_analyzer.health_scorer import score_complexity
+
+        js_src = "function compute(x) {\n  return x > 0 ? x : -x;\n}\n"
+        f = self._write(tmp_path, "compute.js", js_src)
+
+        funcs = analyze_file_complexity(f, "javascript")
+        assert len(funcs) == 1
+        extractor_cx = funcs[0].complexity
+        # extractor sees ternary_expression -> base 1 + 1 ternary = exactly 2
+        assert extractor_cx == 2, f"JS ternary should give CC == 2, got {extractor_cx}"
+
+        score = score_complexity(f, js_src, "javascript")
+        # CC=2, n_funcs=1 (<3) → absolute path → CC=2 <= CC_IDEAL=15 → 100.0
+        assert score == 100.0, f"Expected 100.0 for low-CC JS, got {score}"
+
+    def test_no_plugin_language_returns_neutral(self, tmp_path):
+        """When language is None, score_complexity returns 50.0 (neutral)."""
+        from tree_sitter_analyzer.health_scorer import score_complexity
+
+        f = self._write(tmp_path, "x.txt", "hello world\n")
+        assert score_complexity(f, "hello world\n", None) == 50.0
+
+    def test_extractor_aggregate_matches_scorer_for_multi_function_file(self, tmp_path):
+        """For a Python file with >= 3 functions, score_complexity must use
+        the average extractor CC (not a raw AST walk with stale node types).
+        Both paths must agree on the average when using the extractor as source.
+        """
+        from tree_sitter_analyzer.complexity_heatmap import analyze_file_complexity
+        from tree_sitter_analyzer.health_scorer import score_complexity
+
+        # 4 identical simple functions → avg_cc should be 1.0 → score 100.0
+        py_src = "\n".join([f"def f{i}(x):\n    return x\n" for i in range(4)])
+        f = self._write(tmp_path, "multi.py", py_src)
+
+        funcs = analyze_file_complexity(f, "python")
+        assert len(funcs) == 4, f"Expected 4 functions, got {len(funcs)}"
+        avg_cx = sum(fn.complexity for fn in funcs) / len(funcs)
+        assert avg_cx == 1.0
+
+        score = score_complexity(f, py_src, "python")
+        assert score == 100.0, (
+            f"4 simple Python functions must score 100.0 (avg_cc=1.0), got {score}"
+        )
+
+
+def test_project_health_reuses_graph_only_within_one_call(tmp_path, monkeypatch):
+    """每次项目评分只校验一次依赖图，下次调用必须发现内容变化。"""
+    import os
+
+    from tree_sitter_analyzer.health_scorer import HealthScorer
+    from tree_sitter_analyzer.project_graph import DependencyGraph
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="probe"\n', encoding="utf-8"
+    )
+    for name in ("b", "c"):
+        (tmp_path / f"{name}.py").write_text("value = 1\n", encoding="utf-8")
+    for index in range(6):
+        (tmp_path / f"a{index}.py").write_text("import b\n", encoding="utf-8")
+    original = DependencyGraph._cache_key_for
+    calls = []
+
+    def measured(root):
+        calls.append(root)
+        return original(root)
+
+    monkeypatch.setattr(DependencyGraph, "_cache_key_for", staticmethod(measured))
+    scorer = HealthScorer()
+    first, _ = scorer.score_project_with_stats(str(tmp_path), use_cache=False)
+    for index in range(6):
+        path = tmp_path / f"a{index}.py"
+        before = path.stat()
+        path.write_text("import c\n", encoding="utf-8")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    second, _ = scorer.score_project_with_stats(str(tmp_path), use_cache=False)
+    assert len(calls) == 2
+
+    def by_name(scores):
+        return {
+            Path(score.file_path).name: score.dimensions["dependencies"]
+            for score in scores
+        }
+
+    assert by_name(first)["b.py"] == 99.1
+    assert by_name(second)["b.py"] == 100.0
+    assert by_name(second)["c.py"] == 99.1
+
+
+@pytest.mark.parametrize("failure_phase", ["enumeration", "prefetch"])
+def test_project_health_restores_graph_scope_after_failure(
+    tmp_path, monkeypatch, failure_phase
+):
+    """枚举或预取异常后，恢复调用方的依赖图与 Git 预取上下文。"""
+    from tree_sitter_analyzer import health_scorer as health
+
+    scorer = health.HealthScorer()
+    outer = {"outer": object()}
+    outer_hotspots = {"outer": 17.0}
+    token = health._PROJECT_DEPENDENCY_GRAPHS.set(outer)
+    hotspot_token = health._PROJECT_HOTSPOT_SCORES.set(outer_hotspots)
+    (tmp_path / "probe.py").write_text("value=1\n", encoding="utf-8")
+
+    def fail(_path, context=None):
+        raise RuntimeError("operation failed")
+
+    if failure_phase == "enumeration":
+        monkeypatch.setattr(scorer, "_iter_source_files", fail)
+    else:
+        monkeypatch.setattr(health, "score_git_hotspot", fail)
+    try:
+        with pytest.raises(RuntimeError, match="operation failed"):
+            scorer.score_project_with_stats(str(tmp_path), use_cache=False)
+        assert health._PROJECT_DEPENDENCY_GRAPHS.get() is outer
+        assert health._PROJECT_HOTSPOT_SCORES.get() is outer_hotspots
+    finally:
+        health._PROJECT_HOTSPOT_SCORES.reset(hotspot_token)
+        health._PROJECT_DEPENDENCY_GRAPHS.reset(token)
+
+
+def test_project_graph_timeout_does_not_populate_scope(tmp_path, monkeypatch):
+    """超时回退不能把未完成的图当作本次评分可复用的结果。"""
+    import time
+
+    import tree_sitter_analyzer.health_scorer as health
+
+    path = tmp_path / "a.py"
+    path.write_text("import os\n", encoding="utf-8")
+    graphs = {}
+    token = health._PROJECT_DEPENDENCY_GRAPHS.set(graphs)
+
+    def delayed(_root):
+        time.sleep(0.03)
+        return object()
+
+    monkeypatch.setattr(health, "_build_dep_graph", delayed)
+    monkeypatch.setattr(health, "_DEP_GRAPH_TIMEOUT_S", 0.001)
+    try:
+        assert health.score_dependencies(str(path)) == 100.0
+        assert graphs == {}
+    finally:
+        health._PROJECT_DEPENDENCY_GRAPHS.reset(token)
+
+
+def test_project_health_cache_tracks_changed_incoming_dependencies(tmp_path):
+    """默认磁盘缓存必须更新未改动文件的入向依赖评分。"""
+    # 2026-09-08 事件：保留时间戳的导入改写留下旧健康评分。
+    import os
+
+    from tree_sitter_analyzer.health_scorer import HealthScorer
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="probe"\n', encoding="utf-8"
+    )
+    for name in ("b", "c"):
+        (tmp_path / f"{name}.py").write_text("value = 1\n", encoding="utf-8")
+    for index in range(6):
+        (tmp_path / f"a{index}.py").write_text("import b\n", encoding="utf-8")
+    scorer = HealthScorer()
+    scorer.score_project_with_stats(str(tmp_path))
+    for index in range(6):
+        path = tmp_path / f"a{index}.py"
+        before = path.stat()
+        path.write_text("import c\n", encoding="utf-8")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    cached, _ = scorer.score_project_with_stats(str(tmp_path))
+    fresh, _ = scorer.score_project_with_stats(str(tmp_path), use_cache=False)
+
+    def dependencies(scores):
+        return {
+            Path(score.file_path).name: score.dimensions["dependencies"]
+            for score in scores
+            if Path(score.file_path).name in {"b.py", "c.py"}
+        }
+
+    assert dependencies(fresh) == {"b.py": 100.0, "c.py": 99.1}
+    assert dependencies(cached) == dependencies(fresh)
+
+
+@pytest.mark.parametrize("mutation_phase", ["scoring", "publication", "reuse"])
+def test_health_cache_does_not_publish_scores_for_changed_source(
+    tmp_path, monkeypatch, mutation_phase
+):
+    """评分或发布期间改写文件，不得把旧分数绑定到新内容。"""
+    # 2026-09-08 事件：保存时单独读取指纹会给旧评分贴上新内容标记。
+    import os
+
+    from tree_sitter_analyzer.health_scorer import HealthScorer
+    from tree_sitter_analyzer.registry.health_score_cache import HealthScoreCache
+
+    target = tmp_path / "probe.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    scorer = HealthScorer()
+    cache = HealthScoreCache(str(tmp_path))
+    owner, method = (
+        (scorer, "score_file") if mutation_phase == "scoring" else (cache, "store")
+    )
+    if mutation_phase == "reuse":
+        from tree_sitter_analyzer import health_scorer
+
+        scorer._score_file_with_cache(str(target), cache)
+        owner, method = health_scorer, "score_dependencies"
+    original = getattr(owner, method)
+
+    def mutate(*args, **kwargs):
+        result = original(*args, **kwargs) if mutation_phase != "publication" else None
+        before = target.stat()
+        target.write_text("value = 2\n", encoding="utf-8")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return result if mutation_phase != "publication" else original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, mutate)
+    try:
+        result = scorer._score_file_with_cache(str(target), cache)
+        if mutation_phase != "publication":
+            assert result is None
+        assert cache.lookup(str(target)) is None
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("condition", ["special", "oversized", "changed"])
+def test_health_source_fingerprint_rejects_unstable_reads(
+    tmp_path, monkeypatch, condition
+):
+    """特殊文件、超限内容和读取中变化均不能形成缓存准入证据。"""
+    import os
+
+    from tree_sitter_analyzer.registry.health_score_cache import _Fingerprint
+
+    target = tmp_path / "probe.py"
+    target.write_bytes(b"value=1\n")
+    original = os.fstat
+    calls = 0
+
+    def observed(fd):
+        nonlocal calls
+        calls += 1
+        if condition == "changed" and calls == 2:
+            target.write_bytes(b"value=22\n")
+        if condition == "special":
+            return os.stat(tmp_path)
+        return original(fd)
+
+    if condition == "oversized":
+        with target.open("wb") as stream:
+            stream.truncate(64 * 1024 * 1024 + 1)
+    monkeypatch.setattr(os, "fstat", observed)
+    assert _Fingerprint.from_path(str(target)) is None
+
+
+@pytest.mark.parametrize("restore_mode", ["rewrite", "replace"])
+def test_health_cache_rejects_source_changed_then_restored(
+    tmp_path, monkeypatch, restore_mode
+):
+    """内容和时间戳恢复后，仍拒绝评分期间的中间版本。"""
+    # 2026-09-08 事件：中间版本 75.4 分被发布给实际应为 100 分的文件。
+    import os
+
+    from tree_sitter_analyzer.health_scorer import HealthScorer
+    from tree_sitter_analyzer.registry.health_score_cache import HealthScoreCache
+
+    target = tmp_path / "probe.py"
+    initial = "def f(x):\n    return x\n"
+    target.write_text(initial, encoding="utf-8")
+    scorer = HealthScorer()
+    cache = HealthScoreCache(str(tmp_path))
+    original = scorer.score_file
+
+    def intermediate(path):
+        before = target.stat()
+        target.write_text(
+            "def f(x):\n"
+            + "".join(f"    if x == {i}: return {i}\n" for i in range(60)),
+            encoding="utf-8",
+        )
+        score = original(path)
+        restored = target if restore_mode == "rewrite" else tmp_path / "restored.py"
+        restored.write_text(initial, encoding="utf-8")
+        if restore_mode == "replace":
+            restored.replace(target)
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return score
+
+    monkeypatch.setattr(scorer, "score_file", intermediate)
+    try:
+        result = scorer._score_file_with_cache(str(target), cache)
+        assert original(str(target)).total == 100.0
+        assert result is None
+        assert cache.lookup(str(target)) is None
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_health_fingerprint_windows_change_time_binding(tmp_path, monkeypatch, success):
+    """原生查询使用真实变更时间字段，失败时不回退为创建时间。"""
+    import ctypes
+    import sys
+    from types import SimpleNamespace
+
+    from tree_sitter_analyzer.registry import health_score_fingerprint as fingerprint
+
+    def query(handle, selector, pointer, size):
+        assert (handle, selector, size) == (123, 0, 40)
+        info = ctypes.cast(pointer, ctypes.POINTER(fingerprint._FileBasicInfo)).contents
+        info.creation, info.change = 11, 987654321
+        return int(success)
+
+    def library(name, *, use_last_error):
+        assert (name, use_last_error) == ("kernel32", True)
+        return SimpleNamespace(GetFileInformationByHandleEx=query)
+
+    monkeypatch.setattr(fingerprint, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ctypes, "WinDLL", library, raising=False)
+    monkeypatch.setitem(
+        sys.modules, "msvcrt", SimpleNamespace(get_osfhandle=lambda fd: fd + 100)
+    )
+    fingerprint._windows_file_info.cache_clear()
+    try:
+        if success:
+            assert fingerprint._change_time(23, tmp_path.stat()) == 987654321
+        else:
+            with pytest.raises(OSError, match="change time unavailable"):
+                fingerprint._change_time(23, tmp_path.stat())
+    finally:
+        fingerprint._windows_file_info.cache_clear()
+
+
+def test_project_health_prefetches_git_scores_with_four_workers(tmp_path, monkeypatch):
+    """冷评分最多并发四路 Git 查询，并按文件保留各自结果。"""
+    import threading
+
+    from tree_sitter_analyzer import health_scorer as health
+
+    barrier = threading.Barrier(4, timeout=2)
+    lock = threading.Lock()
+    active = maximum = 0
+
+    def git_score(path, low, high, *, context=None):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            barrier.wait()
+            return float(Path(path).stem[1:]) * 10
+        finally:
+            with lock:
+                active -= 1
+
+    for index in range(4):
+        (tmp_path / f"f{index}.py").write_text("value=1\n", encoding="utf-8")
+    monkeypatch.setattr(health, "calculate_git_hotspot", git_score)
+    scores, _ = health.HealthScorer().score_project_with_stats(
+        str(tmp_path), use_cache=False
+    )
+    assert maximum == 4
+    assert {
+        Path(s.file_path).name: s.dimensions.get("git_hotspot") for s in scores
+    } == {
+        "f0.py": 0.0,
+        "f1.py": 10.0,
+        "f2.py": 20.0,
+        "f3.py": 30.0,
+    }
+
+
+def test_project_git_prefetch_preserves_warm_hits_and_resets_scope(
+    tmp_path, monkeypatch
+):
+    """暖缓存不查询历史；后续冷调用与单文件调用不继承旧预取结果。"""
+    from tree_sitter_analyzer import health_scorer as health
+
+    target = tmp_path / "probe.py"
+    target.write_text("value=1\n", encoding="utf-8")
+    calls = []
+    value = [90.0]
+
+    def git_score(path, low, high, *, context=None):
+        calls.append(path)
+        return value[0]
+
+    monkeypatch.setattr(health, "calculate_git_hotspot", git_score)
+    scorer = health.HealthScorer()
+    cold, _ = scorer.score_project_with_stats(str(tmp_path))
+    warm, _ = scorer.score_project_with_stats(str(tmp_path))
+    assert calls == [str(target)]
+    assert (
+        cold[0].dimensions["git_hotspot"] == warm[0].dimensions["git_hotspot"] == 90.0
+    )
+    value[0] = 80.0
+    target.write_text("value=2\n", encoding="utf-8")
+    changed, _ = scorer.score_project_with_stats(str(tmp_path))
+    assert changed[0].dimensions["git_hotspot"] == 80.0
+    value[0] = 70.0
+    assert health.score_git_hotspot(str(target)) == 70.0
+    assert calls == [str(target)] * 3
+
+
+@pytest.mark.parametrize("interrupt_at", ["query", "submit"])
+def test_project_git_prefetch_cancels_queued_queries_on_interrupt(
+    tmp_path, monkeypatch, interrupt_at
+):
+    """查询或提交中断后取消排队任务，并回收已启动工作及恢复上下文。"""
+    # 2026-09-09：submit 已入队但未返回时，中断也必须取消未登记任务。
+    import concurrent.futures
+    import threading
+
+    from tree_sitter_analyzer import health_scorer as health
+
+    futures = []
+    release = threading.Event()
+    started = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+    outer_graphs = health._PROJECT_DEPENDENCY_GRAPHS.get()
+    outer_hotspots = health._PROJECT_HOTSPOT_SCORES.get()
+
+    class ObservedPool(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            future = super().submit(*args, **kwargs)
+            futures.append(future)
+            if interrupt_at == "submit" and len(futures) == 9:
+                assert started.wait(timeout=3)
+                # 第九个任务已入队，但调用方尚未收到并登记它的 future。
+                raise KeyboardInterrupt("cancel prefetch")
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            # 先执行真实取消，再释放工作线程，避免用休眠制造调度竞态。
+            super().shutdown(wait=False, cancel_futures=cancel_futures)
+            release.set()
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def query(*args, **kwargs):
+        nonlocal calls
+        with lock:
+            calls += 1
+            first = calls == 1
+            if calls == 4:
+                started.set()
+        if interrupt_at == "query" and first:
+            raise KeyboardInterrupt("cancel prefetch")
+        assert release.wait(timeout=3)
+        return 100.0
+
+    for index in range(40):
+        (tmp_path / f"f{index}.py").write_text("x=1\n", encoding="utf-8")
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", ObservedPool)
+    monkeypatch.setattr(health, "calculate_git_hotspot", query)
+    with pytest.raises(KeyboardInterrupt, match="cancel prefetch"):
+        health.HealthScorer().score_project_with_stats(str(tmp_path), use_cache=False)
+    assert len(futures) == (9 if interrupt_at == "submit" else 40)
+    # 调度顺序决定取消数量；不变量是存在取消且没有未结束的任务。
+    assert any(f.cancelled() for f in futures)
+    assert all(f.done() for f in futures)
+    if interrupt_at == "submit":
+        assert calls == 4
+        assert sum(f.cancelled() for f in futures) == 5
+        assert futures[-1].cancelled()
+    assert health._PROJECT_DEPENDENCY_GRAPHS.get() is outer_graphs
+    assert health._PROJECT_HOTSPOT_SCORES.get() is outer_hotspots
+
+
+@pytest.mark.parametrize("ready_index", [0, 3])
+def test_project_health_stores_ready_scores_before_remaining_git_queries_finish(
+    tmp_path, monkeypatch, ready_index
+):
+    """2026-09-09：慢历史查询不能阻止已就绪文件评分与发布缓存。"""
+    import threading
+
+    from tree_sitter_analyzer import health_scorer as health
+    from tree_sitter_analyzer.registry.health_score_cache import HealthScoreCache
+
+    files = [tmp_path / f"f{index}.py" for index in range(4)]
+    for path in files:
+        path.write_text("value=1\n", encoding="utf-8")
+    stored = threading.Event()
+    observed = []
+    original_store = HealthScoreCache.store
+
+    def store(self, score, **kwargs):
+        result = original_store(self, score, **kwargs)
+        if score.file_path == str(files[ready_index]):
+            stored.set()
+        return result
+
+    def query(path, low, high, *, context=None):
+        if path != str(files[ready_index]):
+            observed.append(stored.wait(timeout=3))
+        return 100.0
+
+    monkeypatch.setattr(HealthScoreCache, "store", store)
+    monkeypatch.setattr(health, "calculate_git_hotspot", query)
+    monkeypatch.setattr(
+        health.HealthScorer, "_iter_source_files", lambda *_: (files, 0)
+    )
+    scores, stats = health.HealthScorer().score_project_with_stats(str(tmp_path))
+    assert observed == [True, True, True]
+    assert len(scores) == stats["total_files_scored"] == 4
+    assert [score.file_path for score in scores] == [str(path) for path in files]
+
+
+def test_project_git_fallback_shares_four_workers_after_dependency_invalidation(
+    tmp_path, monkeypatch
+):
+    """#1437：依赖失效的暖文件与冷文件共用四路历史查询预算。"""
+    import concurrent.futures
+    import threading
+
+    from tree_sitter_analyzer import health_scorer as health
+    from tree_sitter_analyzer.registry.health_score_cache import HealthScoreCache
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="probe"\n', encoding="utf-8"
+    )
+    warm = tmp_path / "warm.py"
+    warm.write_text("value=1\n", encoding="utf-8")
+    monkeypatch.setattr(health, "calculate_git_hotspot", lambda *_, **__: 90.0)
+    for index in range(2):
+        (tmp_path / f"existing{index}.py").write_text("import warm\n", encoding="utf-8")
+    scorer = health.HealthScorer()
+    monkeypatch.setattr(scorer, "_iter_source_files", lambda *_: ([warm], 0))
+    initial = scorer.score_project(str(tmp_path))
+    assert initial[0].dimensions["dependencies"] == 100.0
+    cold = [tmp_path / f"cold{index}.py" for index in range(4)]
+    for path in cold:
+        path.write_text("import warm\n", encoding="utf-8")
+    all_started = threading.Event()
+    release = threading.Event()
+    stored = threading.Event()
+    original_store = HealthScoreCache.store
+
+    def store(self, score, **kwargs):
+        result = original_store(self, score, **kwargs)
+        if score.file_path == str(cold[0]):
+            stored.set()
+        return result
+
+    lock = threading.Lock()
+    active = maximum = 0
+    queried = []
+
+    class ObservedPool(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, fn, path, *args, **kwargs):
+            future = super().submit(fn, path, *args, **kwargs)
+            if path == str(warm):
+                # 暖文件入队后释放四个冷任务，不依赖线程调度或休眠。
+                assert all_started.wait(timeout=3)
+                release.set()
+            return future
+
+    def query(path, low, high, *, context=None):
+        nonlocal active, maximum
+        if path == str(warm):
+            assert all_started.wait(timeout=3)
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            queried.append(path)
+            if len(queried) == 4:
+                all_started.set()
+        try:
+            if path == str(warm):
+                # 旧实现直接在主线程调用，能在四个冷任务阻塞时暴露峰值五。
+                release.set()
+                # 暖查询尚未完成时，已就绪冷文件必须能够发布缓存。
+                assert stored.wait(timeout=3)
+            assert release.wait(timeout=3)
+            return 80.0
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", ObservedPool)
+    monkeypatch.setattr(health, "calculate_git_hotspot", query)
+    monkeypatch.setattr(HealthScoreCache, "store", store)
+    monkeypatch.setattr(scorer, "_iter_source_files", lambda *_: ([warm, *cold], 0))
+    scores, stats = scorer.score_project_with_stats(str(tmp_path))
+    assert stats["total_files_scored"] == 5
+    assert stats["total_files_skipped"] == 0
+    assert maximum == 4
+    assert sorted(queried) == sorted(str(path) for path in [warm, *cold])
+    by_path = {score.file_path: score for score in scores}
+    assert by_path[str(warm)].dimensions["dependencies"] == 99.1
+    assert by_path[str(warm)].dimensions["git_hotspot"] == 80.0

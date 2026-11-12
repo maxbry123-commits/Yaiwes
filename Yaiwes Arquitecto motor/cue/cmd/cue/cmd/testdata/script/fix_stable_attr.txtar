@@ -1,0 +1,57 @@
+# An @experiment attribute is redundant once the experiments it names are
+# stable at the file's language version, so cue fix drops those names and
+# leaves the rest of the attribute alone.
+exec cue fix .
+cmp stable.cue expect/stable
+cmp mixed.cue expect/mixed
+cmp preview.cue expect/preview
+cmp both.cue expect/both
+
+-- cue.mod/module.cue --
+module: "mod.test"
+
+language: version: "v0.18.0"
+-- stable.cue --
+@experiment(aliasv2)
+
+package p
+
+a: 1
+-- mixed.cue --
+@experiment(aliasv2,try)
+
+package p
+
+b: 2
+-- preview.cue --
+@experiment(try)
+
+package p
+
+c: 3
+-- both.cue --
+@experiment(aliasv2,explicitopen)
+
+package p
+
+d: 4
+-- expect/stable --
+package p
+
+a: 1
+-- expect/mixed --
+@experiment(try)
+
+package p
+
+b: 2
+-- expect/preview --
+@experiment(try)
+
+package p
+
+c: 3
+-- expect/both --
+package p
+
+d: 4

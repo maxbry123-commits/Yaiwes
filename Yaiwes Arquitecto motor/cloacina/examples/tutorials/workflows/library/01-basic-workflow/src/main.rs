@@ -1,0 +1,88 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Simple Cloacina Example
+//!
+//! This example demonstrates the most basic usage of Cloacina with a single task.
+
+use cloacina::executor::WorkflowExecutor;
+
+use cloacina::runner::{DefaultRunner, DefaultRunnerConfig};
+use cloacina::{Context, TaskError, task, workflow};
+use serde_json::json;
+use tracing::info;
+
+#[workflow(
+    name = "simple_workflow",
+    description = "A simple workflow with one task"
+)]
+pub mod simple_workflow {
+    use super::*;
+
+    /// A simple task that just logs a message
+    #[task]
+    pub async fn hello_world(context: &mut Context<serde_json::Value>) -> Result<(), TaskError> {
+        info!("Hello from Cloacina!");
+
+        // Add some data to context for demonstration
+        context.insert("message", json!("Hello World!"))?;
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter("tutorial_01=info,cloacina=debug")
+        .init();
+
+    info!("Starting Simple Cloacina Example");
+
+    // Initialize runner with SQLite database using WAL mode for better concurrency
+    // Clean up stale database from previous runs
+    let _ = std::fs::remove_file("tutorial-01.db");
+
+    let runner =
+        DefaultRunner::with_config("sqlite://tutorial-01.db", DefaultRunnerConfig::default())
+            .await?;
+
+    // Create input context
+    let input_context = Context::new();
+
+    info!("Executing workflow");
+
+    // Execute the workflow (scheduler and executor managed automatically)
+    let result = runner.execute("simple_workflow", input_context).await?;
+
+    info!("*** EXECUTION COMPLETED ***");
+    info!("Status: {:?}", result.status);
+    info!("Result type: {}", std::any::type_name_of_val(&result));
+
+    // Check if our task actually set the message
+    if let Some(message) = result.final_context.get("message") {
+        info!("Message found in final context: {}", message);
+    } else {
+        info!("No message found in final context!");
+    }
+
+    // Shutdown the runner
+    runner.shutdown().await?;
+
+    info!("Simple example completed!");
+
+    Ok(())
+}

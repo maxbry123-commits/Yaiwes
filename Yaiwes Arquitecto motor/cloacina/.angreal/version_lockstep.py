@@ -1,0 +1,260 @@
+"""
+Single source of version truth for Cloacina CORE (CLOACI-I-0134).
+
+Standalone (no `angreal` import) so the pre-commit hook / CI can run it directly
+with `python .angreal/version_lockstep.py check` and get readable output — the
+angreal task runner swallows task stdout, so the guard lives here and
+`task_release.py` is a thin wrapper.
+
+Canonical version = `[workspace.package] version` in the root Cargo.toml.
+Every other CORE touchpoint inherits it (Rust `{ workspace = true }`) or is
+rewritten from it. Providers under `examples/` are independently versioned by
+design (ADR A-0010 / I-0134 D-6) and are deliberately NOT touched or checked.
+"""
+
+import re
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+_SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+
+_JSON_FILES = [
+    ("npm · typescript client", "clients/typescript/package.json"),
+    ("npm · ui", "ui/package.json"),
+    ("npm · ui harness", "ui/harness/package.json"),
+    # info.version is the first `"version":` key in the emitted spec; the
+    # count=1 substitution below relies on that. Missed at 0.11.0 AND 0.11.1
+    # (spec-drift + sdk-version gates both failed on it) — hence a touchpoint.
+    ("openapi · spec info.version", "docs/public/openapi.json"),
+]
+_PY_PYPROJECT = ("python · client pyproject", "clients/python/pyproject.toml")
+_PY_INIT = ("python · client __init__", "clients/python/src/cloacina_client/__init__.py")
+_SCAFFOLD = ("scaffold · CLOACINA_CRATE_VERSION", "crates/cloacinactl/src/nouns/package/new.rs")
+# The Leptos UI crate (CLOACI-I-0141) — detached from the workspace, so it
+# does not inherit [workspace.package] and needs its own pin.
+_UI_CRATE = ("cargo · cloacina-ui crate", "ui/Cargo.toml")
+
+def _example_manifests():
+    """Every example Cargo.toml pinning a cloacina crate by MINOR version.
+    Packaged examples ship crates.io VERSION deps (the I-0138 standard); at a
+    minor bump every host-side crate moves together, so a stale example pin
+    resolves the OLD crates.io release against the NEW host and fails the
+    plugin-ABI handshake (seen as `bincode wire error` at load, 0.10→0.11)."""
+    import pathlib
+    return sorted(
+        str(pp.relative_to(PROJECT_ROOT))
+        for pp in pathlib.Path(PROJECT_ROOT, "examples").rglob("Cargo.toml")
+        if "target" not in pp.parts
+        and re.search(r'^cloacina[\w-]*\s*=\s*(?:"|\{[^}]*version\s*=\s*")', pp.read_text(), re.MULTILINE)
+    )
+
+# `(?!-provider)`: provider crates release on their own cadence (T-0872) and
+# their pins must NOT track the core version.
+_EXAMPLE_PIN = re.compile(r'^(cloacina(?!-provider)[\w-]*\s*=\s*(?:"|\{[^}]*?version\s*=\s*"))(\d+\.\d+)(")', re.MULTILINE)
+# Helm chart appVersion = which app image tag `helm install` runs by default.
+# These drifted four minors behind before being added here (found during 0.10.0
+# release prep: server/agent said 0.6.1, ui 0.7.0 — a fresh chart install would
+# have deployed the wrong image). The chart's own `version:` is deliberately
+# independent semver and NOT checked.
+_HELM_CHARTS = [
+    ("helm · cloacina-server appVersion", "charts/cloacina-server/Chart.yaml"),
+    ("helm · cloacina-agent appVersion", "charts/cloacina-agent/Chart.yaml"),
+    # (charts/cloacina-ui retired in T-0940 — UI ships embedded in the server.)
+]
+
+# Docs carry user-facing pins too (T-0940: every doc pin sat at 0.10 straight
+# through the 0.11 release because nothing swept them). Three shapes tracked
+# across docs/src/content/docs (reference/api is generated and excluded):
+# minor-form crate pins (`cloacina = "0.11"`), server image tags, and the
+# installer's `--version vX.Y.Z` example.
+def _doc_files():
+    import pathlib
+    root = pathlib.Path(PROJECT_ROOT, "docs", "src", "content", "docs")
+    return sorted(
+        str(pp.relative_to(PROJECT_ROOT))
+        for pp in root.rglob("*.md*")
+        if pp.suffix in (".md", ".mdx")
+        and pp.relative_to(root).parts[:2] != ("reference", "api")
+    )
+
+_DOC_CRATE_PIN = re.compile(r'(cloacina(?!-provider)[\w-]*\s*=\s*(?:"|\{[^}\n]*?version\s*=\s*"))(\d+\.\d+)(")')
+_DOC_IMAGE_TAG = re.compile(r'(ghcr\.io/[\w./-]*cloacina-server:)(\d+\.\d+\.\d+)')
+_DOC_INSTALLER = re.compile(r'(--version v)(\d+\.\d+\.\d+)')
+
+
+def _read(rel: str) -> str:
+    return (PROJECT_ROOT / rel).read_text()
+
+
+def _write(rel: str, text: str) -> None:
+    (PROJECT_ROOT / rel).write_text(text)
+
+
+def _minor(v: str) -> str:
+    p = v.split(".")
+    return f"{p[0]}.{p[1]}"
+
+
+def source_version() -> str:
+    """The canonical version: `version` under `[workspace.package]`."""
+    text = _read("Cargo.toml")
+    m = re.search(r"\[workspace\.package\][^\[]*?\bversion\s*=\s*\"([^\"]+)\"", text, re.DOTALL)
+    if not m:
+        raise SystemExit("version-lockstep: no [workspace.package] version in root Cargo.toml")
+    return m.group(1)
+
+
+def found_versions(source: str):
+    """(label, found, expected) for every core touchpoint."""
+    out = []
+    cargo = _read("Cargo.toml")
+    for m in re.finditer(
+        r"^(cloacina[\w-]*)\s*=\s*\{\s*version\s*=\s*\"([^\"]+)\"[^}]*path\s*=\s*\"crates/",
+        cargo,
+        re.MULTILINE,
+    ):
+        out.append((f"Cargo · {m.group(1)} dep pin", m.group(2), source))
+    for label, rel in _JSON_FILES:
+        m = re.search(r'"version"\s*:\s*"([^"]+)"', _read(rel))
+        out.append((label, m.group(1) if m else "<missing>", source))
+    m = re.search(r'^version\s*=\s*"([^"]+)"', _read(_PY_PYPROJECT[1]), re.MULTILINE)
+    out.append((_PY_PYPROJECT[0], m.group(1) if m else "<missing>", source))
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', _read(_PY_INIT[1]))
+    out.append((_PY_INIT[0], m.group(1) if m else "<missing>", source))
+    m = re.search(r'CLOACINA_CRATE_VERSION:\s*&str\s*=\s*"([^"]+)"', _read(_SCAFFOLD[1]))
+    out.append((_SCAFFOLD[0], m.group(1) if m else "<missing>", _minor(source)))
+    m = re.search(r'^version\s*=\s*"([^"]+)"', _read(_UI_CRATE[1]), re.MULTILINE)
+    out.append((_UI_CRATE[0], m.group(1) if m else "<missing>", source))
+    minor = _minor(source)
+    for rel in _example_manifests():
+        for mm in _EXAMPLE_PIN.finditer(_read(rel)):
+            out.append((f"example pin · {rel}", mm.group(2), minor))
+    for label, rel in _HELM_CHARTS:
+        m = re.search(r'^appVersion:\s*"([^"]+)"', _read(rel), re.MULTILINE)
+        out.append((label, m.group(1) if m else "<missing>", source))
+    for rel in _doc_files():
+        text = _read(rel)
+        for mm in _DOC_CRATE_PIN.finditer(text):
+            out.append((f"docs pin · {rel}", mm.group(2), minor))
+        for mm in _DOC_IMAGE_TAG.finditer(text):
+            out.append((f"docs image tag · {rel}", mm.group(2), source))
+        for mm in _DOC_INSTALLER.finditer(text):
+            out.append((f"docs installer · {rel}", mm.group(2), source))
+    return out
+
+
+def mismatches():
+    source = source_version()
+    return source, [(lbl, got, exp) for (lbl, got, exp) in found_versions(source) if got != exp]
+
+
+def set_version(new: str) -> None:
+    source_minor = _minor(new)
+    cargo = _read("Cargo.toml")
+    cargo = re.sub(
+        r"(\[workspace\.package\][^\[]*?\bversion\s*=\s*\")[^\"]+(\")",
+        lambda mm: mm.group(1) + new + mm.group(2),
+        cargo,
+        count=1,
+        flags=re.DOTALL,
+    )
+    cargo = re.sub(
+        r"^(cloacina[\w-]*\s*=\s*\{\s*version\s*=\s*\")[^\"]+(\"[^}]*path\s*=\s*\"crates/)",
+        lambda mm: mm.group(1) + new + mm.group(2),
+        cargo,
+        flags=re.MULTILINE,
+    )
+    _write("Cargo.toml", cargo)
+    for _, rel in _JSON_FILES:
+        t = _read(rel)
+        t = re.sub(r'("version"\s*:\s*")[^"]+(")', r"\g<1>" + new + r"\g<2>", t, count=1)
+        _write(rel, t)
+    t = _read(_PY_PYPROJECT[1])
+    t = re.sub(r'^(version\s*=\s*")[^"]+(")', r"\g<1>" + new + r"\g<2>", t, count=1, flags=re.MULTILINE)
+    _write(_PY_PYPROJECT[1], t)
+    t = _read(_PY_INIT[1])
+    t = re.sub(r'(__version__\s*=\s*")[^"]+(")', r"\g<1>" + new + r"\g<2>", t, count=1)
+    _write(_PY_INIT[1], t)
+    t = _read(_SCAFFOLD[1])
+    t = re.sub(r'(CLOACINA_CRATE_VERSION:\s*&str\s*=\s*")[^"]+(")', r"\g<1>" + source_minor + r"\g<2>", t, count=1)
+    _write(_SCAFFOLD[1], t)
+    t = _read(_UI_CRATE[1])
+    t = re.sub(r'^(version\s*=\s*")[^"]+(")', r"\g<1>" + new + r"\g<2>", t, count=1, flags=re.MULTILINE)
+    _write(_UI_CRATE[1], t)
+    for rel in _example_manifests():
+        t = _read(rel)
+        t2 = _EXAMPLE_PIN.sub(lambda mm: mm.group(1) + source_minor + mm.group(3), t)
+        if t2 != t:
+            _write(rel, t2)
+    for _, rel in _HELM_CHARTS:
+        t = _read(rel)
+        t = re.sub(r'^(appVersion:\s*")[^"]+(")', r"\g<1>" + new + r"\g<2>", t, count=1, flags=re.MULTILINE)
+        _write(rel, t)
+    for rel in _doc_files():
+        t = _read(rel)
+        t2 = _DOC_CRATE_PIN.sub(lambda mm: mm.group(1) + source_minor + mm.group(3), t)
+        t2 = _DOC_IMAGE_TAG.sub(lambda mm: mm.group(1) + new, t2)
+        t2 = _DOC_INSTALLER.sub(lambda mm: mm.group(1) + new, t2)
+        if t2 != t:
+            _write(rel, t2)
+
+
+def changelog_stub(new: str) -> None:
+    cl = PROJECT_ROOT / "CHANGELOG.md"
+    if not cl.exists():
+        return
+    text = cl.read_text()
+    if re.search(rf"^##\s*\[{re.escape(new)}\]", text, re.MULTILINE):
+        return
+    stub = f"## [{new}] - UNRELEASED\n\n### Added\n\n### Changed\n\n### Fixed\n\n"
+    m = re.search(r"^##\s*\[", text, re.MULTILINE)
+    text = (text[: m.start()] + stub + text[m.start():]) if m else (text.rstrip() + "\n\n" + stub)
+    cl.write_text(text)
+
+
+def run_check() -> int:
+    source, bad = mismatches()
+    if not bad:
+        print(f"version-lockstep OK — {len(found_versions(source))} touchpoints all at {source}")
+        return 0
+    print(f"version DRIFT — canonical [workspace.package] version is {source}:", file=sys.stderr)
+    for lbl, got, exp in bad:
+        print(f"  ✗ {lbl}: found {got!r}, expected {exp!r}", file=sys.stderr)
+    print("\nRun `angreal release bump <version>` to set every touchpoint from one input.", file=sys.stderr)
+    return 1
+
+
+def run_bump(new: str) -> int:
+    if not _SEMVER.match(new):
+        print(f"release bump: {new!r} is not MAJOR.MINOR.PATCH semver", file=sys.stderr)
+        return 1
+    old = source_version()
+    set_version(new)
+    changelog_stub(new)
+    _, bad = mismatches()
+    if bad:
+        print("WARNING: touchpoints still drifted after bump:", file=sys.stderr)
+        for lbl, got, exp in bad:
+            print(f"  ✗ {lbl}: {got!r} != {exp!r}", file=sys.stderr)
+        return 1
+    print(f"bumped {old} -> {new} across all core touchpoints + CHANGELOG stub; version-lockstep verified.")
+    print(f"Next: review, commit, then `git tag v{new}` when ready.")
+    return 0
+
+
+def main(argv) -> int:
+    if not argv or argv[0] == "check":
+        return run_check()
+    if argv[0] == "bump":
+        if len(argv) < 2:
+            print("usage: version_lockstep.py bump <version>", file=sys.stderr)
+            return 2
+        return run_bump(argv[1])
+    print(f"unknown command {argv[0]!r} (expected: check | bump <version>)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

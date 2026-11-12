@@ -1,0 +1,1261 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+use super::workflow_context::PyWorkflowContext;
+use async_trait::async_trait;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// Python wrapper for TaskHandle providing defer_until capability.
+#[pyclass(name = "TaskHandle")]
+pub struct PyTaskHandle {
+    inner: Option<cloacina::TaskHandle>,
+}
+
+#[pymethods]
+impl PyTaskHandle {
+    /// Release the concurrency slot while polling an external condition.
+    #[pyo3(signature = (condition, poll_interval_ms = 1000))]
+    pub fn defer_until(
+        &mut self,
+        py: Python,
+        condition: Py<PyAny>,
+        poll_interval_ms: u64,
+    ) -> PyResult<()> {
+        let handle = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("TaskHandle has already been consumed"))?;
+
+        let poll_interval = Duration::from_millis(poll_interval_ms);
+
+        // CLOACI-I-0136: one GIL-safe async→sync bridge (was a hand-inlined
+        // allow_threads + Handle::current().block_on).
+        crate::gil::py_block_on(py, async {
+            handle
+                .defer_until(
+                    move || {
+                        let result = Python::attach(|py| match condition.call0(py) {
+                            Ok(r) => r.extract::<bool>(py).unwrap_or(false),
+                            Err(e) => {
+                                eprintln!("[cloaca] defer_until condition error: {}", e);
+                                false
+                            }
+                        });
+                        async move { result }
+                    },
+                    poll_interval,
+                )
+                .await
+        })
+        .map_err(|e| PyValueError::new_err(format!("defer_until failed: {}", e)))
+    }
+
+    /// Returns whether the handle currently holds a concurrency slot.
+    pub fn is_slot_held(&self) -> PyResult<bool> {
+        let handle = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("TaskHandle has already been consumed"))?;
+        Ok(handle.is_slot_held())
+    }
+}
+
+/// Workflow builder reference for automatic task registration
+#[derive(Clone)]
+pub struct WorkflowBuilderRef {
+    pub context: PyWorkflowContext,
+}
+
+// ---------------------------------------------------------------------------
+// Workflow context stack (CLOACI-T-0919)
+// ---------------------------------------------------------------------------
+//
+// This stack is the NAMESPACE SOURCE for `@task` / `@cloaca.constructor`: the
+// tenant/package/workflow triple a decorator registers under. It used to be a
+// process-global `Mutex<Vec<_>>`, which was only safe because the reconciler
+// happens to serialize package loads — two concurrent imports would have
+// interleaved pushes and silently mis-namespaced each other's tasks (a task
+// landing in the wrong tenant, not an error).
+//
+// It is now thread-local, matching the registration TARGET seam
+// (`runtime_scope::ScopedRuntime`), so a namespace can never leak across
+// threads. Every producer/consumer is import-time and single-threaded
+// (`WorkflowBuilder.__enter__`/`__exit__`, the loader's push around
+// `py.import`, `TaskDecorator::__call__`, `constructor()`), so this is a
+// tightening, not a behavior change — except that concurrent loads are now
+// correct instead of accidentally correct.
+
+/// Per-thread stack. The `Drop` impl exists so an import thread that dies
+/// mid-scope (e.g. the T-0919 timeout interrupt unwinding a hung import) does
+/// not leave `ACTIVE_CONTEXT_PUSHES` permanently inflated, which would make
+/// every later "no context" error claim a cross-thread problem that isn't one.
+struct ContextStack(RefCell<Vec<WorkflowBuilderRef>>);
+
+impl Drop for ContextStack {
+    fn drop(&mut self) {
+        let remaining = self.0.borrow().len();
+        if remaining > 0 {
+            ACTIVE_CONTEXT_PUSHES.fetch_sub(remaining, Ordering::SeqCst);
+        }
+    }
+}
+
+thread_local! {
+    static WORKFLOW_CONTEXT_STACK: ContextStack =
+        const { ContextStack(RefCell::new(Vec::new())) };
+}
+
+/// Number of contexts pushed process-wide, across all threads. Used ONLY to
+/// turn the "no context on this thread" error into a specific, actionable
+/// cross-thread diagnosis instead of the generic "you forgot the context
+/// manager" message.
+static ACTIVE_CONTEXT_PUSHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Push a workflow context onto this THREAD's stack (called when entering
+/// workflow scope). The matching [`pop_workflow_context`] must run on the same
+/// thread — decorated modules are imported on one thread by construction.
+pub fn push_workflow_context(context: PyWorkflowContext) {
+    ACTIVE_CONTEXT_PUSHES.fetch_add(1, Ordering::SeqCst);
+    WORKFLOW_CONTEXT_STACK.with(|stack| stack.0.borrow_mut().push(WorkflowBuilderRef { context }));
+}
+
+/// Pop a workflow context from this thread's stack (called when exiting
+/// workflow scope).
+pub fn pop_workflow_context() -> Option<WorkflowBuilderRef> {
+    let popped = WORKFLOW_CONTEXT_STACK.with(|stack| stack.0.borrow_mut().pop());
+    if popped.is_some() {
+        ACTIVE_CONTEXT_PUSHES.fetch_sub(1, Ordering::SeqCst);
+    } else {
+        // A pop with nothing to pop is either unbalanced `__exit__` handling
+        // or a pop on the wrong thread. Neither is recoverable state, but it
+        // is not worth aborting a load over — say so loudly instead.
+        debug_assert!(
+            false,
+            "pop_workflow_context() on a thread with no workflow context — \
+             unbalanced push/pop, or the pop ran on a different thread than \
+             the push (CLOACI-T-0919)"
+        );
+        tracing::warn!(
+            "pop_workflow_context() called with no context on this thread \
+             (unbalanced push/pop, or cross-thread use)"
+        );
+    }
+    popped
+}
+
+/// Get the current workflow context (used by the task decorator).
+///
+/// Errors when this thread has no context. If some OTHER thread does, the
+/// error says so explicitly — that is the cross-thread misuse the global stack
+/// used to paper over by handing back a foreign namespace.
+pub fn current_workflow_context() -> PyResult<PyWorkflowContext> {
+    let local =
+        WORKFLOW_CONTEXT_STACK.with(|stack| stack.0.borrow().last().map(|r| r.context.clone()));
+    if let Some(context) = local {
+        return Ok(context);
+    }
+
+    if ACTIVE_CONTEXT_PUSHES.load(Ordering::SeqCst) > 0 {
+        // Deliberately a hard error in EVERY build rather than a
+        // `debug_assert!` panic: this is reachable from user Python code
+        // (a module that spawns a thread and decorates from it), and a
+        // panic across the pyo3 boundary is strictly worse than a raised
+        // exception. The debug assertion for genuine internal misuse lives
+        // on the pop path, which user code cannot reach.
+        tracing::error!(
+            "cross-thread workflow-context use — a @task/constructor decorator ran on a \
+             thread with no workflow context while another thread holds one (CLOACI-T-0919)"
+        );
+        return Err(PyValueError::new_err(
+            "No workflow context on this thread, but one is active on a DIFFERENT thread. \
+             The workflow context is thread-local: `@task`/`cloaca.constructor` must be \
+             evaluated on the same thread that entered the WorkflowBuilder scope (i.e. at \
+             module scope during import), never from a thread spawned by the module. \
+             Registering from another thread would silently namespace the task under the \
+             wrong tenant/package.",
+        ));
+    }
+
+    Err(PyValueError::new_err(
+        "No workflow context available. Tasks must be defined within a WorkflowBuilder context manager.",
+    ))
+}
+
+/// Optional `@cloaca.task(invokes=..., post_invocation=...)` plumbing.
+///
+/// When set, the task's `execute()` runs the user body first, then calls
+/// the named (trigger-less) computation graph with the task context, routes
+/// each terminal output back into the context under its terminal node name,
+/// and finally invokes the optional `post_invocation` callback. Mirrors
+/// Rust's `#[task(invokes = computation_graph(...))]` (T-0540 M3+M5).
+pub struct CGInvocation {
+    pub graph_name: String,
+    pub post_invocation: Option<Py<PyAny>>,
+}
+
+/// Python task wrapper implementing Rust Task trait
+pub struct PythonTaskWrapper {
+    id: String,
+    dependencies: Vec<cloacina::TaskNamespace>,
+    retry_policy: cloacina::retry::RetryPolicy,
+    python_function: Py<PyAny>,
+    on_success_callback: Option<Py<PyAny>>,
+    on_failure_callback: Option<Py<PyAny>>,
+    requires_handle: bool,
+    cg_invocation: Option<CGInvocation>,
+    /// Authored trigger rule as canonical TriggerRule JSON (CLOACI-T-0763).
+    /// `{"type":"Always"}` when the task declares no rule.
+    trigger_rules: serde_json::Value,
+}
+
+impl PythonTaskWrapper {
+    /// Helper: invoke an `on_failure` callback (if any) with a fresh
+    /// `PyContext` built from the current task context. Errors from the
+    /// callback are logged and swallowed — the task already has its own
+    /// terminal error to surface.
+    /// CLOACI-T-0622 follow-up: runs the callback on the blocking pool, NOT a
+    /// direct `Python::with_gil` on the async executor worker (the PyO3↔tokio
+    /// deadlock that hung scenario_30, and via the CG path, scenario_32). `async`
+    /// so callers `.await` it; the GIL is acquired only inside `spawn_blocking`.
+    async fn fire_on_failure(
+        &self,
+        task_id: &str,
+        message: &str,
+        context: &cloacina::Context<serde_json::Value>,
+        on_failure: Option<&Py<PyAny>>,
+    ) {
+        let Some(callback) = on_failure else {
+            return;
+        };
+        let callback = Python::attach(|py| callback.clone_ref(py));
+        let task_id = task_id.to_string();
+        let message = message.to_string();
+        let data: Vec<(String, serde_json::Value)> = context
+            .data()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let _ = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let mut ctx = cloacina::Context::new();
+                for (k, v) in data {
+                    ctx.insert(k, v).ok();
+                }
+                let py_ctx = super::context::PyContext::from_rust_context(ctx);
+                if let Err(e) = callback.call1(py, (&task_id, &message, py_ctx)) {
+                    eprintln!(
+                        "[cloaca] on_failure callback failed for task '{}': {}",
+                        task_id, e
+                    );
+                }
+            })
+        })
+        .await;
+    }
+}
+
+// SAFETY: PythonTaskWrapper holds PyObject fields which are not Send/Sync.
+// This is safe because ALL access to PyObject fields goes through Python::with_gil()
+// or tokio::task::spawn_blocking + Python::with_gil(), ensuring the GIL is held
+// before any PyObject is touched. The execute() method clones PyObjects inside
+// with_gil and runs Python calls inside spawn_blocking(with_gil(...)). No code
+// path accesses PyObject fields without the GIL.
+unsafe impl Send for PythonTaskWrapper {}
+unsafe impl Sync for PythonTaskWrapper {}
+
+#[async_trait]
+impl cloacina::Task for PythonTaskWrapper {
+    async fn execute(
+        &self,
+        context: cloacina::Context<serde_json::Value>,
+    ) -> Result<cloacina::Context<serde_json::Value>, cloacina::TaskError> {
+        use super::context::PyContext;
+
+        let function = Python::attach(|py| self.python_function.clone_ref(py));
+        let on_success =
+            Python::attach(|py| self.on_success_callback.as_ref().map(|f| f.clone_ref(py)));
+        let on_failure =
+            Python::attach(|py| self.on_failure_callback.as_ref().map(|f| f.clone_ref(py)));
+        let task_id = self.id.clone();
+        let task_id_for_error = self.id.clone();
+        let needs_handle = self.requires_handle;
+
+        let task_handle = if needs_handle {
+            Some(cloacina::take_task_handle())
+        } else {
+            None
+        };
+
+        // 1. Run the user body (sync, on the spawn_blocking pool, under the
+        //    GIL). on_success / post_invocation / CG invocation all happen
+        //    later in the async caller so the graph can be `.await`ed.
+        let task_id_for_body = task_id.clone();
+        let on_failure_for_body = Python::attach(|py| on_failure.as_ref().map(|f| f.clone_ref(py)));
+        let (mut final_context, returned_handle) = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let original_data = context.data().clone();
+                let py_context = PyContext::from_rust_context(context);
+
+                let (result, recovered_handle) = if let Some(handle) = task_handle {
+                    let py_handle = Py::new(
+                        py,
+                        PyTaskHandle {
+                            inner: Some(handle),
+                        },
+                    )
+                    .map_err(|e| cloacina::TaskError::ExecutionFailed {
+                        message: format!("Failed to create PyTaskHandle: {}", e),
+                        task_id: task_id_for_body.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })?;
+                    let call_result =
+                        function.call1(py, (py_context.clone(), py_handle.clone_ref(py)));
+                    let recovered = py_handle.borrow_mut(py).inner.take();
+                    (call_result, recovered)
+                } else {
+                    let call_result = function.call1(py, (py_context.clone(),));
+                    (call_result, None)
+                };
+
+                match result {
+                    Ok(returned) => {
+                        let final_context = if returned.is_none(py) {
+                            let mut new_context = cloacina::Context::new();
+                            for (key, value) in original_data.iter() {
+                                new_context.insert(key.clone(), value.clone()).unwrap();
+                            }
+                            new_context
+                        } else {
+                            let returned_context: PyContext =
+                                returned.extract(py).map_err(|e| {
+                                    cloacina::TaskError::ExecutionFailed {
+                                        message: format!("Python task execution failed: {}", e),
+                                        task_id: task_id_for_body.clone(),
+                                        timestamp: chrono::Utc::now(),
+                                    }
+                                })?;
+                            returned_context.into_inner()
+                        };
+                        Ok::<_, cloacina::TaskError>((final_context, recovered_handle))
+                    }
+                    Err(e) => {
+                        let error_message = format!("Python task execution failed: {}", e);
+                        if let Some(callback) = on_failure_for_body {
+                            if let Err(callback_err) =
+                                callback.call1(py, (&task_id_for_body, &error_message, py_context))
+                            {
+                                eprintln!(
+                                    "[cloaca] on_failure callback failed for task '{}': {}",
+                                    task_id_for_body, callback_err
+                                );
+                            }
+                        }
+                        Err(cloacina::TaskError::ExecutionFailed {
+                            message: error_message,
+                            task_id: task_id_for_body.clone(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                    }
+                }
+            })
+        })
+        .await
+        .map_err(|e| cloacina::TaskError::ExecutionFailed {
+            message: format!("Task execution panicked: {}", e),
+            task_id: task_id_for_error.clone(),
+            timestamp: chrono::Utc::now(),
+        })??;
+
+        // 2. Optional CG invocation (mirrors Rust T-0540 M3): run the graph
+        //    with the task context, route each terminal back under its node
+        //    name, error out on graph failure (after firing on_failure).
+        if let Some(invocation) = self.cg_invocation.as_ref() {
+            let executor =
+                match crate::computation_graph::get_graph_executor(&invocation.graph_name) {
+                    Some(e) => e,
+                    None => {
+                        let msg = format!(
+                            "task '{}' invokes computation graph '{}' which is not registered",
+                            task_id, invocation.graph_name
+                        );
+                        self.fire_on_failure(&task_id, &msg, &final_context, on_failure.as_ref())
+                            .await;
+                        return Err(cloacina::TaskError::ExecutionFailed {
+                            message: msg,
+                            task_id: task_id.clone(),
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                };
+
+            // CLOACI-T-0622 follow-up: materialize the PyContext on the blocking
+            // pool, not a direct `Python::with_gil` on the async worker (the
+            // deadlock that hung scenario_32 — a task that invokes a CG).
+            let cg_data: Vec<(String, serde_json::Value)> = final_context
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let py_ctx_obj = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let mut ctx = cloacina::Context::new();
+                    for (k, v) in cg_data {
+                        ctx.insert(k, v).ok();
+                    }
+                    Py::new(py, PyContext::from_rust_context(ctx)).map(|p| p.into_any())
+                })
+            })
+            .await
+            .map_err(|e| cloacina::TaskError::ExecutionFailed {
+                message: format!("CG context materialization panicked: {}", e),
+                task_id: task_id.clone(),
+                timestamp: chrono::Utc::now(),
+            })?
+            .map_err(|e| {
+                let msg = format!("failed to materialize PyContext for CG invocation: {}", e);
+                cloacina::TaskError::ExecutionFailed {
+                    message: msg,
+                    task_id: task_id.clone(),
+                    timestamp: chrono::Utc::now(),
+                }
+            })?;
+
+            match executor.execute_trigger_less(py_ctx_obj).await {
+                Ok(pairs) => {
+                    for (name, value) in pairs {
+                        if final_context.get(&name).is_some() {
+                            let _ = final_context.update(&name, value);
+                        } else {
+                            let _ = final_context.insert(name, value);
+                        }
+                    }
+                }
+                Err(graph_err) => {
+                    let msg = format!(
+                        "computation graph '{}' invocation failed: {}",
+                        invocation.graph_name, graph_err
+                    );
+                    self.fire_on_failure(&task_id, &msg, &final_context, on_failure.as_ref())
+                        .await;
+                    return Err(cloacina::TaskError::ExecutionFailed {
+                        message: msg,
+                        task_id: task_id.clone(),
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
+            }
+
+            // 3. Optional post_invocation hook (mirrors Rust T-0540 M5).
+            //    CLOACI-T-0622 follow-up: run on the blocking pool, not a direct
+            //    `Python::with_gil` on the async worker. Returns the (optionally)
+            //    updated context so the mutation survives the spawn_blocking hop.
+            if let Some(post) = invocation.post_invocation.as_ref() {
+                let post = Python::attach(|py| post.clone_ref(py));
+                let post_data: Vec<(String, serde_json::Value)> = final_context
+                    .data()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let post_result = tokio::task::spawn_blocking(move || {
+                    Python::attach(
+                        |py| -> PyResult<Option<cloacina::Context<serde_json::Value>>> {
+                            let mut ctx = cloacina::Context::new();
+                            for (k, v) in post_data {
+                                ctx.insert(k, v).ok();
+                            }
+                            let py_ctx = PyContext::from_rust_context(ctx);
+                            let returned = post.call1(py, (py_ctx,))?;
+                            if !returned.is_none(py) {
+                                if let Ok(updated) = returned.extract::<PyContext>(py) {
+                                    return Ok(Some(updated.into_inner()));
+                                }
+                            }
+                            Ok(None)
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| cloacina::TaskError::ExecutionFailed {
+                    message: format!("post_invocation callback panicked: {}", e),
+                    task_id: task_id.clone(),
+                    timestamp: chrono::Utc::now(),
+                })?;
+                match post_result {
+                    Ok(Some(updated)) => final_context = updated,
+                    Ok(None) => {}
+                    Err(e) => {
+                        let msg = format!("post_invocation callback failed: {}", e);
+                        self.fire_on_failure(&task_id, &msg, &final_context, on_failure.as_ref())
+                            .await;
+                        return Err(cloacina::TaskError::ExecutionFailed {
+                            message: msg,
+                            task_id: task_id.clone(),
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 4. on_success runs last, after CG invocation + post_invocation.
+        //    CLOACI-T-0622 follow-up: run it on the blocking pool (like the task
+        //    body at step 1), NOT a direct `Python::with_gil` on the async
+        //    executor worker. Blocking on the GIL inside an async task is a
+        //    PyO3↔tokio deadlock — it intermittently hung scenario_30 (the only
+        //    scenario with callbacks) on the sqlite nightly. Awaiting preserves
+        //    the "callback fires before the task completes" ordering.
+        if let Some(callback) = on_success {
+            let data: Vec<(String, serde_json::Value)> = final_context
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let tid = task_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let mut callback_ctx = cloacina::Context::new();
+                    for (k, v) in data {
+                        callback_ctx.insert(k, v).ok();
+                    }
+                    let callback_context = PyContext::from_rust_context(callback_ctx);
+                    if let Err(e) = callback.call1(py, (&tid, callback_context)) {
+                        eprintln!(
+                            "[cloaca] on_success callback failed for task '{}': {}",
+                            tid, e
+                        );
+                    }
+                })
+            })
+            .await;
+        }
+
+        if let Some(handle) = returned_handle {
+            cloacina::return_task_handle(handle);
+        }
+
+        Ok(final_context)
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn dependencies(&self) -> &[cloacina::TaskNamespace] {
+        &self.dependencies
+    }
+
+    fn retry_policy(&self) -> cloacina::retry::RetryPolicy {
+        self.retry_policy.clone()
+    }
+
+    fn requires_handle(&self) -> bool {
+        self.requires_handle
+    }
+
+    fn checkpoint(
+        &self,
+        _context: &cloacina::Context<serde_json::Value>,
+    ) -> Result<(), cloacina::CheckpointError> {
+        Ok(())
+    }
+
+    fn trigger_rules(&self) -> serde_json::Value {
+        // CLOACI-T-0763: return the task's authored rule (Always by default) so a
+        // gated Python task is evaluated by the same planner as Rust → Skipped.
+        self.trigger_rules.clone()
+    }
+
+    fn code_fingerprint(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Build retry policy from Python decorator parameters.
+///
+/// CLOACI-T-0930: unrecognized `retry_backoff` / `retry_condition` strings are
+/// ERRORS, not silent defaults. The old `_ =>` fallthroughs meant
+/// `retry_backoff="exponentail"` (typo) quietly configured Fixed backoff and an
+/// unknown condition quietly retried ALL errors — the workflow ran with retry
+/// semantics its author never asked for, invisibly. Failing loudly here is a
+/// deliberate behavior change: the population currently hitting the fallback
+/// is exactly the misconfigured one.
+fn build_retry_policy(
+    retry_attempts: Option<usize>,
+    retry_backoff: Option<String>,
+    retry_delay_ms: Option<u64>,
+    retry_max_delay_ms: Option<u64>,
+    retry_condition: Option<String>,
+    retry_jitter: Option<bool>,
+) -> PyResult<cloacina::retry::RetryPolicy> {
+    use cloacina::retry::*;
+    use std::time::Duration;
+
+    let mut builder = RetryPolicy::builder();
+
+    if let Some(attempts) = retry_attempts {
+        builder = builder.max_attempts(attempts as i32);
+    }
+
+    if let Some(backoff) = retry_backoff {
+        let strategy = match backoff.as_str() {
+            "fixed" => BackoffStrategy::Fixed,
+            "linear" => BackoffStrategy::Linear { multiplier: 1.0 },
+            "exponential" => BackoffStrategy::Exponential {
+                base: 2.0,
+                multiplier: 1.0,
+            },
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown retry_backoff {other:?}: expected one of \
+                     \"fixed\", \"linear\", \"exponential\""
+                )));
+            }
+        };
+        builder = builder.backoff_strategy(strategy);
+    }
+
+    if let Some(delay) = retry_delay_ms {
+        builder = builder.initial_delay(Duration::from_millis(delay));
+    }
+
+    if let Some(max_delay) = retry_max_delay_ms {
+        builder = builder.max_delay(Duration::from_millis(max_delay));
+    }
+
+    if let Some(condition) = retry_condition {
+        let retry_cond = match condition.as_str() {
+            "never" => RetryCondition::Never,
+            "transient" => RetryCondition::TransientOnly,
+            "all" => RetryCondition::AllErrors,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown retry_condition {other:?}: expected one of \
+                     \"never\", \"transient\", \"all\""
+                )));
+            }
+        };
+        builder = builder.retry_condition(retry_cond);
+    }
+
+    if let Some(jitter) = retry_jitter {
+        builder = builder.with_jitter(jitter);
+    }
+
+    Ok(builder.build())
+}
+
+/// Decorator class that holds task configuration
+#[pyclass]
+pub struct TaskDecorator {
+    id: Option<String>,
+    dependencies: Vec<Py<PyAny>>,
+    retry_policy: cloacina::retry::RetryPolicy,
+    on_success: Option<Py<PyAny>>,
+    on_failure: Option<Py<PyAny>>,
+    /// `invokes=GraphHandle` — an instance of `ComputationGraphBuilder`
+    /// (or any object exposing `NAME`) that names a trigger-less graph.
+    invokes: Option<Py<PyAny>>,
+    /// `post_invocation=fn` — only meaningful when `invokes` is set.
+    post_invocation: Option<Py<PyAny>>,
+    /// `trigger_rules=...` — canonical TriggerRule JSON (CLOACI-T-0763).
+    trigger_rules: serde_json::Value,
+}
+
+#[pymethods]
+impl TaskDecorator {
+    pub fn __call__(&self, py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let context = current_workflow_context()?;
+
+        let task_id = if let Some(id) = &self.id {
+            id.clone()
+        } else {
+            func.getattr(py, "__name__")?.extract::<String>(py)?
+        };
+
+        let has_handle = {
+            let code = func.getattr(py, "__code__")?;
+            let argcount: usize = code.getattr(py, "co_argcount")?.extract(py)?;
+            if argcount >= 2 {
+                let varnames: Vec<String> = code.getattr(py, "co_varnames")?.extract(py)?;
+                matches!(
+                    varnames.get(1).map(|s| s.as_str()),
+                    Some("handle" | "task_handle")
+                )
+            } else {
+                false
+            }
+        };
+
+        let deps = match self.convert_dependencies_to_namespaces(py, &context) {
+            Ok(deps) => deps,
+            Err(e) => {
+                eprintln!("Error converting dependencies: {}", e);
+                return Err(e);
+            }
+        };
+        let policy = self.retry_policy.clone();
+        let trigger_rules = self.trigger_rules.clone();
+        let function = func.clone_ref(py);
+        let on_success_cb = self.on_success.as_ref().map(|f| f.clone_ref(py));
+        let on_failure_cb = self.on_failure.as_ref().map(|f| f.clone_ref(py));
+
+        // Validate `invokes` / `post_invocation` at decoration time. The
+        // referenced graph must already be registered (the ComputationGraphBuilder's
+        // `with` block must precede the @task that invokes it) and must be
+        // trigger-less. Mirrors Rust T-0540 M3 / M5.
+        if self.post_invocation.is_some() && self.invokes.is_none() {
+            return Err(PyValueError::new_err(
+                "@cloaca.task: `post_invocation` requires `invokes=...` to be set",
+            ));
+        }
+        let cg_invocation = match self.invokes.as_ref() {
+            None => None,
+            Some(handle) => {
+                let bound = handle.bind(py);
+                if !bound.hasattr("NAME")? {
+                    return Err(PyValueError::new_err(
+                        "@cloaca.task(invokes=...): expected a ComputationGraphBuilder \
+                         instance (must expose a `NAME` attribute)",
+                    ));
+                }
+                let graph_name: String = bound.getattr("NAME")?.extract()?;
+                let executor = crate::computation_graph::get_graph_executor(&graph_name)
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "@cloaca.task(invokes=...): graph '{}' is not registered. \
+                             The `with ComputationGraphBuilder(...)` block must run before \
+                             the @cloaca.task decorator that references it.",
+                            graph_name
+                        ))
+                    })?;
+                if executor.has_reactor {
+                    return Err(PyValueError::new_err(format!(
+                        "@cloaca.task(invokes=...): graph '{}' is reactor-triggered. \
+                         Tasks may only invoke trigger-less graphs (omit `reactor=...` \
+                         on the ComputationGraphBuilder).",
+                        graph_name
+                    )));
+                }
+                let _ = executor; // existence verified above; runtime lookup happens at exec
+                let post_invocation = self.post_invocation.as_ref().map(|f| f.clone_ref(py));
+                Some(CGInvocation {
+                    graph_name,
+                    post_invocation,
+                })
+            }
+        };
+        let cg_invocation_arc = cg_invocation.map(Arc::new);
+
+        let shared_function = Arc::new(function);
+        let shared_on_success = on_success_cb.map(Arc::new);
+        let shared_on_failure = on_failure_cb.map(Arc::new);
+        let (tenant_id, package_name, workflow_id) = context.as_components();
+        let namespace =
+            cloacina::TaskNamespace::new(tenant_id, package_name, workflow_id, &task_id);
+
+        let rt = crate::runtime_scope::current_runtime().ok_or_else(|| {
+            PyValueError::new_err(
+                "@task decorator called outside a Runtime scope — install a ScopedRuntime \
+                 before importing Python workflow modules",
+            )
+        })?;
+        py.detach(|| {
+            rt.register_task(namespace.clone(), {
+                let task_id_clone = task_id.clone();
+                let deps_clone = deps.clone();
+                let policy_clone = policy.clone();
+                let function_arc = shared_function.clone();
+                let on_success_arc = shared_on_success.clone();
+                let on_failure_arc = shared_on_failure.clone();
+                let cg_invocation_arc_inner = cg_invocation_arc.clone();
+                let trigger_rules_clone = trigger_rules.clone();
+                move || {
+                    let function_clone = Python::attach(|py| function_arc.clone_ref(py));
+                    let on_success_clone =
+                        Python::attach(|py| on_success_arc.as_ref().map(|f| f.clone_ref(py)));
+                    let on_failure_clone =
+                        Python::attach(|py| on_failure_arc.as_ref().map(|f| f.clone_ref(py)));
+                    let cg_invocation_clone = cg_invocation_arc_inner.as_ref().map(|cg| {
+                        Python::attach(|py| CGInvocation {
+                            graph_name: cg.graph_name.clone(),
+                            post_invocation: cg.post_invocation.as_ref().map(|f| f.clone_ref(py)),
+                        })
+                    });
+                    Arc::new(PythonTaskWrapper {
+                        id: task_id_clone.clone(),
+                        dependencies: deps_clone.clone(),
+                        retry_policy: policy_clone.clone(),
+                        python_function: function_clone,
+                        on_success_callback: on_success_clone,
+                        on_failure_callback: on_failure_clone,
+                        requires_handle: has_handle,
+                        cg_invocation: cg_invocation_clone,
+                        trigger_rules: trigger_rules_clone.clone(),
+                    }) as Arc<dyn cloacina::Task>
+                }
+            });
+        });
+
+        Ok(func)
+    }
+}
+
+impl TaskDecorator {
+    /// Convert mixed dependencies (strings and function objects) to TaskNamespace objects
+    fn convert_dependencies_to_namespaces(
+        &self,
+        py: Python,
+        context: &PyWorkflowContext,
+    ) -> PyResult<Vec<cloacina::TaskNamespace>> {
+        let mut namespace_deps = Vec::new();
+
+        for (i, dep) in self.dependencies.iter().enumerate() {
+            let task_name = match dep.extract::<String>(py) {
+                Ok(string_dep) => string_dep,
+                _ => match dep.bind(py).hasattr("__name__") {
+                    Ok(true) => match dep.getattr(py, "__name__") {
+                        Ok(name_obj) => match name_obj.extract::<String>(py) {
+                            Ok(func_name) => func_name,
+                            Err(e) => {
+                                return Err(PyValueError::new_err(format!(
+                                    "Dependency {} has __name__ but it's not a string: {}",
+                                    i, e
+                                )));
+                            }
+                        },
+                        Err(e) => {
+                            return Err(PyValueError::new_err(format!(
+                                "Failed to get __name__ from dependency {}: {}",
+                                i, e
+                            )));
+                        }
+                    },
+                    Ok(false) => {
+                        return Err(PyValueError::new_err(format!(
+                            "Dependency {} must be either a string or a function object with __name__ attribute",
+                            i
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(PyValueError::new_err(format!(
+                            "Failed to check if dependency {} has __name__ attribute: {}",
+                            i, e
+                        )));
+                    }
+                },
+            };
+
+            let (tenant_id, package_name, workflow_id) = context.as_components();
+            namespace_deps.push(cloacina::TaskNamespace::new(
+                tenant_id,
+                package_name,
+                workflow_id,
+                &task_name,
+            ));
+        }
+
+        Ok(namespace_deps)
+    }
+}
+
+/// Python @task decorator function
+#[pyfunction]
+#[pyo3(signature = (
+    *,
+    id = None,
+    dependencies = None,
+    retry = None,
+    retry_attempts = None,
+    retry_backoff = None,
+    retry_delay_ms = None,
+    retry_max_delay_ms = None,
+    retry_condition = None,
+    retry_jitter = None,
+    on_success = None,
+    on_failure = None,
+    invokes = None,
+    post_invocation = None,
+    trigger_rules = None
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn task(
+    py: Python,
+    id: Option<String>,
+    dependencies: Option<Vec<Py<PyAny>>>,
+    retry: Option<crate::bindings::PyRetryPolicy>,
+    retry_attempts: Option<usize>,
+    retry_backoff: Option<String>,
+    retry_delay_ms: Option<u64>,
+    retry_max_delay_ms: Option<u64>,
+    retry_condition: Option<String>,
+    retry_jitter: Option<bool>,
+    on_success: Option<Py<PyAny>>,
+    on_failure: Option<Py<PyAny>>,
+    invokes: Option<Py<PyAny>>,
+    post_invocation: Option<Py<PyAny>>,
+    trigger_rules: Option<Py<PyAny>>,
+) -> PyResult<TaskDecorator> {
+    // CLOACI-T-0882: two retry-authoring surfaces exist — the `retry_*` kwargs
+    // and a `RetryPolicy` value object. Accept either, never both: silently
+    // preferring one would make the ignored surface look effective, which is
+    // exactly the "exposed but does nothing" failure this ticket was filed for.
+    let kwargs_used: &[(&str, bool)] = &[
+        ("retry_attempts", retry_attempts.is_some()),
+        ("retry_backoff", retry_backoff.is_some()),
+        ("retry_delay_ms", retry_delay_ms.is_some()),
+        ("retry_max_delay_ms", retry_max_delay_ms.is_some()),
+        ("retry_condition", retry_condition.is_some()),
+        ("retry_jitter", retry_jitter.is_some()),
+    ];
+    let conflicting: Vec<&str> = kwargs_used
+        .iter()
+        .filter(|(_, used)| *used)
+        .map(|(name, _)| *name)
+        .collect();
+
+    let retry_policy = match retry {
+        Some(policy) => {
+            if !conflicting.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "@task(retry=RetryPolicy(...)) cannot be combined with the \
+                     retry_* keyword arguments (got: {}). Use the RetryPolicy \
+                     object OR the keywords, not both.",
+                    conflicting.join(", ")
+                )));
+            }
+            policy.to_rust()
+        }
+        None => build_retry_policy(
+            retry_attempts,
+            retry_backoff,
+            retry_delay_ms,
+            retry_max_delay_ms,
+            retry_condition,
+            retry_jitter,
+        )?,
+    };
+
+    // CLOACI-T-0763: parse + validate the trigger rule (default = Always).
+    let trigger_rules = match trigger_rules {
+        Some(obj) => crate::trigger_rules::parse_trigger_rules(py, &obj)?,
+        None => serde_json::json!({ "type": "Always" }),
+    };
+
+    Ok(TaskDecorator {
+        id,
+        dependencies: dependencies.unwrap_or_default(),
+        retry_policy,
+        on_success,
+        on_failure,
+        invokes,
+        post_invocation,
+        trigger_rules,
+    })
+}
+
+#[cfg(test)]
+mod m3_tests {
+    use super::*;
+    use crate::computation_graph;
+    use crate::reactor;
+    use crate::runtime_scope::ScopedRuntime;
+    use pyo3::ffi::c_str;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    /// Inject the cloaca decorators a Python `with`/decorator block needs.
+    fn build_locals(py: Python<'_>) -> Bound<'_, pyo3::types::PyDict> {
+        let locals = pyo3::types::PyDict::new(py);
+        locals
+            .set_item(
+                "node",
+                pyo3::wrap_pyfunction!(computation_graph::node, py).unwrap(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "ComputationGraphBuilder",
+                py.get_type::<computation_graph::PyComputationGraphBuilder>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "reactor",
+                pyo3::wrap_pyfunction!(reactor::reactor, py).unwrap(),
+            )
+            .unwrap();
+        locals
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_task_invokes_trigger_less_routes_terminal_into_context() {
+        Python::initialize();
+
+        let rt = Arc::new(cloacina::Runtime::empty());
+        let _scope = ScopedRuntime::new(rt.clone()).unwrap();
+
+        // Build a trigger-less graph and a task that invokes it.
+        Python::attach(|py| {
+            super::push_workflow_context(super::PyWorkflowContext::new(
+                "public",
+                "embedded",
+                "m3_test_wf",
+            ));
+            let globals = py.import("builtins").unwrap().dict();
+            let locals = build_locals(py);
+
+            py.run(
+                c_str!(
+                    r#"
+score_graph = ComputationGraphBuilder("score_graph", graph={"score": {}})
+with score_graph:
+    @node
+    def score(ctx):
+        return {"score": 99}
+"#
+                ),
+                Some(&globals),
+                Some(&locals),
+            )
+            .unwrap();
+
+            // Pull the live builder back out for the @task decorator below.
+            let score_graph = locals.get_item("score_graph").unwrap().unwrap();
+
+            let decorator = task(
+                py,
+                Some("scorer".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(score_graph.unbind()),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let user_fn = py
+                .eval(c_str!("lambda ctx: ctx"), Some(&globals), Some(&locals))
+                .unwrap();
+            decorator.__call__(py, user_fn.into()).unwrap();
+            super::pop_workflow_context();
+        });
+
+        let ns = cloacina::TaskNamespace::new("public", "embedded", "m3_test_wf", "scorer");
+        let task = rt.get_task(&ns).expect("scorer task registered");
+
+        let ctx = cloacina::Context::new();
+        let out_ctx = task.execute(ctx).await.unwrap();
+
+        let score_value = out_ctx
+            .get("score")
+            .expect("terminal 'score' should be routed into the context");
+        assert_eq!(score_value, &serde_json::json!({"score": 99}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_task_post_invocation_runs_after_graph() {
+        Python::initialize();
+
+        let rt = Arc::new(cloacina::Runtime::empty());
+        let _scope = ScopedRuntime::new(rt.clone()).unwrap();
+
+        Python::attach(|py| {
+            super::push_workflow_context(super::PyWorkflowContext::new(
+                "public",
+                "embedded",
+                "m3_post_wf",
+            ));
+            let globals = py.import("builtins").unwrap().dict();
+            let locals = build_locals(py);
+
+            py.run(
+                c_str!(
+                    r#"
+g = ComputationGraphBuilder("post_graph", graph={"emit": {}})
+with g:
+    @node
+    def emit(ctx):
+        return {"emitted": True}
+
+def post(ctx):
+    ctx.set("post_ran", True)
+    return ctx
+"#
+                ),
+                Some(&globals),
+                Some(&locals),
+            )
+            .unwrap();
+
+            let g = locals.get_item("g").unwrap().unwrap();
+            let post = locals.get_item("post").unwrap().unwrap();
+
+            let decorator = task(
+                py,
+                Some("post_task".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(g.unbind()),
+                Some(post.unbind()),
+                None,
+            )
+            .unwrap();
+
+            let user_fn = py
+                .eval(c_str!("lambda ctx: ctx"), Some(&globals), Some(&locals))
+                .unwrap();
+            decorator.__call__(py, user_fn.into()).unwrap();
+            super::pop_workflow_context();
+        });
+
+        let ns = cloacina::TaskNamespace::new("public", "embedded", "m3_post_wf", "post_task");
+        let task = rt.get_task(&ns).expect("post_task registered");
+        let out_ctx = task.execute(cloacina::Context::new()).await.unwrap();
+
+        assert_eq!(
+            out_ctx.get("emit").expect("terminal routed"),
+            &serde_json::json!({"emitted": true})
+        );
+        assert_eq!(
+            out_ctx.get("post_ran").expect("post_invocation ran"),
+            &serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_task_post_invocation_without_invokes_errors() {
+        Python::initialize();
+        let rt = Arc::new(cloacina::Runtime::empty());
+        let _scope = ScopedRuntime::new(rt).unwrap();
+
+        Python::attach(|py| {
+            super::push_workflow_context(super::PyWorkflowContext::new(
+                "public",
+                "embedded",
+                "m3_no_invokes",
+            ));
+            let post = py.eval(c_str!("lambda ctx: ctx"), None, None).unwrap();
+            let decorator = task(
+                py,
+                Some("bad".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(post.unbind()),
+                None,
+            )
+            .unwrap();
+
+            let user_fn = py.eval(c_str!("lambda ctx: ctx"), None, None).unwrap();
+            let err = decorator.__call__(py, user_fn.into()).unwrap_err();
+            assert!(err.to_string().contains("post_invocation"));
+            super::pop_workflow_context();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_task_invokes_reactor_triggered_graph_rejected() {
+        Python::initialize();
+        let rt = Arc::new(cloacina::Runtime::empty());
+        let _scope = ScopedRuntime::new(rt).unwrap();
+
+        Python::attach(|py| {
+            super::push_workflow_context(super::PyWorkflowContext::new(
+                "public",
+                "embedded",
+                "m3_reactor_target",
+            ));
+            let globals = py.import("builtins").unwrap().dict();
+            let locals = build_locals(py);
+
+            py.run(
+                c_str!(
+                    r#"
+@reactor(name="rx_for_invokes", accumulators=["a"], mode="when_any")
+class RxForInvokes: pass
+
+g = ComputationGraphBuilder("reactor_graph", reactor=RxForInvokes,
+                            graph={"e": {"inputs": ["a"]}})
+with g:
+    @node
+    def e(a):
+        return {"x": 1}
+"#
+                ),
+                Some(&globals),
+                Some(&locals),
+            )
+            .unwrap();
+
+            let g = locals.get_item("g").unwrap().unwrap();
+            let user_fn = py.eval(c_str!("lambda ctx: ctx"), None, None).unwrap();
+            let decorator = task(
+                py,
+                Some("rx_invoker".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(g.unbind()),
+                None,
+                None,
+            )
+            .unwrap();
+            let err = decorator.__call__(py, user_fn.into()).unwrap_err();
+            assert!(err.to_string().contains("reactor-triggered"));
+            super::pop_workflow_context();
+        });
+    }
+}

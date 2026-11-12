@@ -1,0 +1,490 @@
+"""Cold-start fast path: ensure_indexed must not re-run a converged resolve.
+
+A fully-indexed, unchanged cache is already queryable. The cross-file resolve
+pass converges in one pass and is re-run by the indexing path on every file
+change, so re-running it on a cold ``ensure_indexed`` when the index is
+unchanged is a ~40 s no-op that blocks the first retrieval. These tests pin the
+convergence fingerprint + skip behaviour.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.unit._ast_cache_helpers import engine_cache, write_legacy_index
+from tree_sitter_analyzer.ast_cache import ASTCache
+from tree_sitter_analyzer.cache.unresolved import (
+    index_resolution_fingerprint,
+    mark_resolution_converged,
+    resolution_converged,
+)
+from tree_sitter_analyzer.mcp.utils import auto_index_guard
+
+
+def test_resolution_helpers_degrade_on_missing_tables() -> None:
+    """No ast_index / ast_resolve_state → helpers return safe defaults, no raise."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        # ast_index absent → empty fingerprint, not converged, mark is a no-op.
+        assert index_resolution_fingerprint(conn) == ""
+        assert resolution_converged(conn) is False
+        mark_resolution_converged(conn)  # must not raise
+
+        # ast_index present but ast_resolve_state absent → converged False, then
+        # mark creates the table and persists; a second call reports converged.
+        conn.execute("CREATE TABLE ast_index (file_path TEXT, indexed_at TEXT)")
+        conn.execute("INSERT INTO ast_index VALUES ('a.py', '2026-01-01T00:00:00Z')")
+        conn.commit()
+        assert index_resolution_fingerprint(conn) == "1:2026-01-01T00:00:00Z"
+        assert resolution_converged(conn) is False
+        mark_resolution_converged(conn)
+        assert resolution_converged(conn) is True
+    finally:
+        conn.close()
+
+
+def _project(root: Path) -> None:
+    (root / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (root / "b.py").write_text(
+        "from a import f\n\ndef g():\n    return f()\n", encoding="utf-8"
+    )
+    # A class extending an EXTERNAL base keeps pending_unresolved_count > 0
+    # (it never resolves — base not in the project), so the OLD cold-start path
+    # would re-run the resolve-only pass on every ensure_indexed. This is what
+    # the convergence skip must short-circuit.
+    (root / "c.py").write_text("class C(Exception):\n    pass\n", encoding="utf-8")
+
+
+def test_index_project_marks_resolution_converged(tmp_path: Path) -> None:
+    _project(tmp_path)
+    cache = ASTCache(str(tmp_path))
+    try:
+        cache.index_project(max_files=10, workers=0)
+        # _post_index_backfill records the convergence fingerprint.
+        assert resolution_converged(cache.get_conn()) is True
+        assert index_resolution_fingerprint(cache.get_conn())
+    finally:
+        cache.close()
+
+
+def test_converged_false_after_a_file_is_reindexed(tmp_path: Path) -> None:
+    _project(tmp_path)
+    cache = ASTCache(str(tmp_path))
+    try:
+        cache.index_project(max_files=10, workers=0)
+        assert resolution_converged(cache.get_conn()) is True
+        # Re-index one file → indexed_at moves → fingerprint differs → the stored
+        # convergence marker no longer matches, so a resolve is warranted again.
+        time.sleep(0.01)
+        (tmp_path / "a.py").write_text(
+            "def f():\n    return 2\n\ndef h():\n    return 3\n", encoding="utf-8"
+        )
+        cache.index_file(str(tmp_path / "a.py"))
+        assert resolution_converged(cache.get_conn()) is False
+    finally:
+        cache.close()
+
+
+def test_ensure_indexed_skips_resolve_when_converged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _project(tmp_path)
+    cache = ASTCache(str(tmp_path))
+    try:
+        cache.index_project(max_files=10, workers=0)
+    finally:
+        cache.close()
+
+    auto_index_guard.reset()
+    resolve_only_calls: list[int] = []
+    real_index_project = ASTCache.index_project
+
+    def spy(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("resolve_only"):
+            resolve_only_calls.append(1)
+        return real_index_project(self, *args, **kwargs)
+
+    monkeypatch.setattr(ASTCache, "index_project", spy)
+    try:
+        cache = auto_index_guard.ensure_indexed(str(tmp_path), max_files=20)
+        assert cache is not None
+        # Converged → the cold path must NOT run a resolve-only pass.
+        assert resolve_only_calls == []
+    finally:
+        auto_index_guard.reset()
+
+
+def test_ensure_indexed_resolves_when_not_converged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _project(tmp_path)
+    # #1554：默认库已只读发布，旧缓存状态改由引擎库复制到旧位置构造。
+    cache = engine_cache(tmp_path)
+    try:
+        cache.index_project(max_files=10, workers=0)
+        # Wipe the convergence marker to simulate an index built without the
+        # final mark (legacy cache / partial build).
+        cache.get_conn().execute("DROP TABLE IF EXISTS ast_resolve_state")
+        cache.get_conn().commit()
+        assert resolution_converged(cache.get_conn()) is False
+        write_legacy_index(cache)
+    finally:
+        cache.close()
+
+    auto_index_guard.reset()
+    resolve_only_calls: list[int] = []
+    real_index_project = ASTCache.index_project
+
+    def spy(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("resolve_only"):
+            resolve_only_calls.append(1)
+        return real_index_project(self, *args, **kwargs)
+
+    monkeypatch.setattr(ASTCache, "index_project", spy)
+    try:
+        cache = auto_index_guard.ensure_indexed(str(tmp_path), max_files=20)
+        assert cache is not None
+        # Not converged → resolve runs once, and the marker is then persisted.
+        assert resolution_converged(cache.get_conn()) is True
+    finally:
+        auto_index_guard.reset()
+
+
+def test_resolution_converged_false_when_state_table_empty() -> None:
+    """ast_resolve_state exists but has no rows → resolution_converged returns False (row is None)."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("CREATE TABLE ast_index (file_path TEXT, indexed_at TEXT)")
+        conn.execute("INSERT INTO ast_index VALUES ('a.py', '2026-01-01T00:00:00Z')")
+        conn.execute(
+            "CREATE TABLE ast_resolve_state "
+            "(id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL)"
+        )
+        conn.commit()
+        assert resolution_converged(conn) is False
+    finally:
+        conn.close()
+
+
+def test_mark_resolution_converged_handles_operational_error(tmp_path: Path) -> None:
+    """Read-only connection → mark_resolution_converged hits OperationalError handler without raising."""
+    dbfile = tmp_path / "test.db"
+    conn = sqlite3.connect(str(dbfile))
+    conn.execute("CREATE TABLE ast_index (file_path TEXT, indexed_at TEXT)")
+    conn.execute("INSERT INTO ast_index VALUES ('a.py', '2026-01-01T00:00:00Z')")
+    conn.commit()
+    conn.close()
+    ro_conn = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
+    ro_conn.row_factory = sqlite3.Row
+    try:
+        mark_resolution_converged(ro_conn)  # must not raise
+    finally:
+        ro_conn.close()
+
+
+def test_resolution_converged_helpers_degrade_on_broken_cache() -> None:
+    """_resolution_converged/_mark_resolution_converged swallow exceptions from a broken cache."""
+    from tree_sitter_analyzer.mcp.utils.auto_index_guard import (
+        _mark_resolution_converged,
+        _resolution_converged,
+        _resolve_pending_unresolved_refs,
+    )
+
+    class BrokenCache:
+        def get_conn(self) -> None:
+            raise RuntimeError("broken")
+
+    assert _resolution_converged(BrokenCache()) is False
+    assert _resolve_pending_unresolved_refs(BrokenCache()) is False
+    _mark_resolution_converged(BrokenCache())  # must not raise
+
+
+def test_ensure_indexed_does_not_mark_converged_on_resolve_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If _resolve_pending_unresolved_refs fails, convergence must NOT be persisted."""
+    _project(tmp_path)
+    # #1554：默认库已只读发布，旧缓存状态改由引擎库复制到旧位置构造。
+    cache = engine_cache(tmp_path)
+    try:
+        cache.index_project(max_files=10, workers=0)
+        cache.get_conn().execute("DROP TABLE IF EXISTS ast_resolve_state")
+        cache.get_conn().commit()
+        write_legacy_index(cache)
+    finally:
+        cache.close()
+
+    auto_index_guard.reset()
+
+    def broken_index_project(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("resolve_only"):
+            raise RuntimeError("disk full, resolve aborted")
+        raise RuntimeError("unexpected call")
+
+    monkeypatch.setattr(ASTCache, "index_project", broken_index_project)
+    try:
+        result = auto_index_guard.ensure_indexed(str(tmp_path), max_files=20)
+        # Cache is pre-indexed so ensure_indexed still returns it.
+        assert result is not None
+        # Resolve failed → convergence must NOT have been marked.
+        assert resolution_converged(result.get_conn()) is False
+    finally:
+        auto_index_guard.reset()
+
+
+def test_legacy_call_graph_marker_runs_full_cached_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR #1253 review 3757950794: upgraded populated caches need all backfills.
+    class Cache:
+        calls: list[dict[str, Any]] = []
+
+        def get_stats(self) -> dict[str, int]:
+            return {"total_files": 2}
+
+        def index_project(self, **kwargs: Any) -> None:
+            self.calls.append(kwargs)
+
+    cache = Cache()
+    marker_results = iter((False, True))
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+    monkeypatch.setattr(
+        auto_index_guard,
+        "_call_graph_marker_is_current",
+        lambda _cache: next(marker_results),
+    )
+    auto_index_guard.reset()
+
+    result = auto_index_guard.ensure_indexed("/legacy", max_files=17)
+
+    assert result is cache
+    assert cache.calls == [{"max_files": 17}]
+    assert auto_index_guard.is_indexed("/legacy") is True
+    auto_index_guard.reset()
+
+
+def test_failed_marker_repair_does_not_enable_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR #1253 review 3757950794: a failed repair remains fallback-only.
+    class Cache:
+        def get_stats(self) -> dict[str, int]:
+            return {"total_files": 1}
+
+        def index_project(self, **_kwargs: Any) -> None:
+            raise RuntimeError("repair failed")
+
+    cache = Cache()
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+    monkeypatch.setattr(
+        auto_index_guard, "_call_graph_marker_is_current", lambda _cache: False
+    )
+    auto_index_guard.reset()
+
+    result = auto_index_guard.ensure_indexed("/broken")
+
+    assert result is cache
+    assert auto_index_guard.is_indexed("/broken") is False
+    auto_index_guard.reset()
+
+
+def test_read_only_populated_cache_never_repairs_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR #1253 review 3757950794: auto_build=False must not mutate legacy state.
+    class Cache:
+        def get_stats(self) -> dict[str, int]:
+            return {"total_files": 1}
+
+        def index_project(self, **_kwargs: Any) -> None:
+            raise AssertionError("read-only lookup attempted a write")
+
+    cache = Cache()
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+    auto_index_guard.reset()
+
+    result = auto_index_guard.ensure_indexed("/readonly", auto_build=False)
+
+    assert result is cache
+    assert auto_index_guard.is_indexed("/readonly") is False
+    auto_index_guard.reset()
+
+
+def test_process_fast_path_is_read_only_when_auto_build_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = object()
+    auto_index_guard.reset()
+    auto_index_guard._indexed_roots["/ready"] = True
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+
+    result = auto_index_guard.ensure_indexed("/ready", auto_build=False)
+
+    assert result is cache
+    auto_index_guard.reset()
+
+
+def test_stale_process_fast_path_runs_warmup_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cache:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self.close_calls = 0
+
+        def get_stats(self) -> dict[str, int]:
+            return {"total_files": 1}
+
+        def index_project(self, **kwargs: Any) -> None:
+            self.calls.append(kwargs)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    cache = Cache()
+    markers = iter((False, False, True))
+    auto_index_guard.reset()
+    auto_index_guard._indexed_roots["/stale"] = True
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+    monkeypatch.setattr(
+        auto_index_guard,
+        "_call_graph_marker_is_current",
+        lambda _cache: next(markers),
+    )
+
+    result = auto_index_guard.ensure_indexed("/stale", max_files=23)
+
+    assert (
+        result,
+        cache.calls,
+        cache.close_calls,
+        auto_index_guard.is_indexed("/stale"),
+    ) == (
+        cache,
+        [{"max_files": 23}],
+        1,
+        True,
+    )
+    auto_index_guard.reset()
+
+
+def test_lock_recheck_returns_cache_warmed_by_other_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = "/concurrent"
+    cache = object()
+
+    class WarmupLock:
+        def __enter__(self):
+            auto_index_guard._indexed_roots[root] = True
+
+        def __exit__(self, *_args):
+            return None
+
+    auto_index_guard.reset()
+    monkeypatch.setattr(auto_index_guard, "_lock", WarmupLock())
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+
+    result = auto_index_guard.ensure_indexed(root, auto_build=False)
+
+    assert result is cache
+    auto_index_guard._indexed_roots.clear()
+
+
+def test_lock_recheck_discards_stale_marker_before_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = "/concurrent-stale"
+
+    class Cache:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self.close_calls = 0
+
+        def get_stats(self) -> dict[str, int]:
+            return {"total_files": 1}
+
+        def index_project(self, **kwargs: Any) -> None:
+            self.calls.append(kwargs)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class StaleLock:
+        def __enter__(self):
+            auto_index_guard._indexed_roots[root] = True
+
+        def __exit__(self, *_args):
+            return None
+
+    cache = Cache()
+    markers = iter((False, False, True))
+    auto_index_guard.reset()
+    monkeypatch.setattr(auto_index_guard, "_lock", StaleLock())
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+    monkeypatch.setattr(
+        auto_index_guard,
+        "_call_graph_marker_is_current",
+        lambda _cache: next(markers),
+    )
+
+    result = auto_index_guard.ensure_indexed(root, max_files=29)
+
+    assert (
+        result,
+        cache.calls,
+        cache.close_calls,
+        auto_index_guard.is_indexed(root),
+    ) == (
+        cache,
+        [{"max_files": 29}],
+        1,
+        True,
+    )
+    auto_index_guard._indexed_roots.clear()
+
+
+def test_successful_warmup_without_current_marker_remains_uncertified(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    caplog.set_level(
+        logging.WARNING, logger="tree_sitter_analyzer.mcp.utils.auto_index_guard"
+    )
+
+    class Cache:
+        def get_stats(self) -> dict[str, int]:
+            return {"total_files": 0}
+
+        def index_project(self, **_kwargs: Any) -> None:
+            return None
+
+    cache = Cache()
+    auto_index_guard.reset()
+    monkeypatch.setattr(auto_index_guard, "_open_cache", lambda _root: cache)
+    monkeypatch.setattr(
+        auto_index_guard, "_call_graph_marker_is_current", lambda _cache: False
+    )
+
+    result = auto_index_guard.ensure_indexed("/uncertified")
+
+    assert result is cache
+    assert auto_index_guard.is_indexed("/uncertified") is False
+    assert "pipeline marker remains non-current for /uncertified" in caplog.text
+    auto_index_guard.reset()
+
+
+def test_call_graph_marker_probe_failure_is_not_current() -> None:
+    class BrokenCache:
+        def get_conn(self) -> None:
+            raise RuntimeError("database unavailable")
+
+    assert auto_index_guard._call_graph_marker_is_current(BrokenCache()) is False

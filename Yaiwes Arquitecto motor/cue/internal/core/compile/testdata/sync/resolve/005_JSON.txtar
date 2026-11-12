@@ -1,0 +1,15 @@
+-- in.cue --
+"a"~(a): 3
+b: a
+o: {"a\nb": 2}
+c: o["a\nb"]
+-- out/compile --
+--- in.cue
+{
+  a: 3
+  b: 〈0;a〉
+  o: {
+    "a\nb": 2
+  }
+  c: 〈0;o〉["a\nb"]
+}

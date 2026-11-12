@@ -1,0 +1,318 @@
+-- in.cue --
+@experiment(try)
+
+// if-else: condition true - no else
+ifTrue: {
+	if true { a: 1 } else { b: 2 }
+	@test(eq, {a: 1})
+}
+
+// if-else: condition false - else yields
+ifFalse: {
+	if false { a: 1 } else { b: 2 }
+	@test(eq, {b: 2})
+}
+
+// for-else: non-empty source - no else
+forNonEmpty: {
+	for x in [1, 2] { "\(x)": x } fallback { empty: true }
+	@test(eq, {"1": 1, "2": 2})
+}
+
+// for-else: empty source - else yields
+forEmpty: {
+	for x in [] { "\(x)": x } fallback { empty: true }
+	@test(eq, {empty: true})
+}
+
+// for-else with filter: filter removes all - else yields
+forFilteredAll: {
+	for x in [1, 2, 3] if x > 10 { "\(x)": x } fallback { empty: true }
+	@test(eq, {empty: true})
+}
+
+// for-else with filter: filter keeps some - no else
+forFilteredSome: {
+	for x in [1, 2, 3] if x > 1 { "\(x)": x } fallback { empty: true }
+	@test(eq, {"2": 2, "3": 3})
+}
+
+// if-for-fallback: if true, for empty - fallback yields
+ifTrueForEmpty: {
+	if true for x in [] { "\(x)": x } fallback { empty: true }
+	@test(eq, {empty: true})
+}
+
+// if-for-fallback: if false, for non-empty - fallback yields (if blocks iteration)
+ifFalseForNonEmpty: {
+	if false for x in [1, 2] { "\(x)": x } fallback { empty: true }
+	@test(eq, {empty: true})
+}
+
+// if-for-fallback: if true, for non-empty - no fallback
+ifTrueForNonEmpty: {
+	if true for x in [1, 2] { "\(x)": x } fallback { empty: true }
+	@test(eq, {"1": 1, "2": 2})
+}
+
+// if-if-fallback: both true - no fallback
+ifIfBothTrue: {
+	if true if true { a: 1 } fallback { b: 2 }
+	@test(eq, {a: 1})
+}
+
+// if-if-fallback: first false - fallback yields
+ifIfFirstFalse: {
+	if false if true { a: 1 } fallback { b: 2 }
+	@test(eq, {b: 2})
+}
+
+// if-if-fallback: second false - fallback yields
+ifIfSecondFalse: {
+	if true if false { a: 1 } fallback { b: 2 }
+	@test(eq, {b: 2})
+}
+
+// try-try-fallback: both succeed - no fallback
+tryTryBothSucceed: {
+	a: 1
+	b: 2
+	try x = a? try y = b? { result: x + y } fallback { default: 0 }
+	@test(eq, {a: 1, b: 2, result: 3})
+}
+
+missing?: int
+
+// try-try-fallback: first fails - fallback yields
+tryTryFirstFails: {
+	b: 2
+	try x = missing? try y = b? { result: x + y } fallback { default: -1 }
+	@test(eq, {b: 2, default: -1})
+}
+
+// try-try-fallback: second fails - fallback yields
+tryTrySecondFails: {
+	a: 1
+	try x = a? try y = missing? { result: x + y } fallback { default: -2 }
+	@test(eq, {a: 1, default: -2})
+}
+
+// list if-else: true
+listIfTrue: [
+	if true { 1 } else { 2 }
+] @test(eq, [1])
+
+// list if-else: false
+listIfFalse: [
+	if false { 1 } else { 2 }
+] @test(eq, [2])
+
+// list for-else: empty
+listForEmpty: [
+	for x in [] { x } fallback { 0 }
+] @test(eq, [0])
+
+// list for-else: non-empty
+listForNonEmpty: [
+	for x in [1, 2] { x * 2 } fallback { 0 }
+] @test(eq, [2, 4])
+
+// else with multiple fields
+elseMultipleFields: {
+	if false { a: 1 } else { b: 2, c: 3 }
+	@test(eq, {b: 2, c: 3})
+}
+
+// else embeds into existing struct
+elseEmbeds: {
+	existing: 1
+	if false { added: 2 } else { fallback: 3 }
+	@test(eq, {existing: 1, fallback: 3})
+}
+
+// fallback with outer scope access
+outerScope: {
+	let threshold = 10
+	for x in [] { x } fallback { fallbackField: threshold }
+	@test(eq, {fallbackField: 10})
+}
+
+// The fallback body is evaluated outside the comprehension's clauses, so a
+// reference in it names the field of the struct holding the comprehension,
+// not one the clauses bring into scope.
+tryBindFallbackScope: {
+	shadowed: 1
+	inner: {
+		shadowed: 2
+		try x = missing? { fromTry: x } else { fromFallback: shadowed }
+		@test(eq, {shadowed: 2, fromFallback: 2})
+	}
+}
+
+// The number of try bindings a comprehension declares does not affect the
+// scope of its fallback body.
+tryTwoBindsFallbackScope: {
+	shadowed: 1
+	inner: {
+		shadowed: 2
+		try x = missing? try y = missing? { fromTry: x + y } fallback { fromFallback: shadowed }
+		@test(eq, {shadowed: 2, fromFallback: 2})
+	}
+}
+
+// A fallback body directly inside a top-level field, with two bindings to
+// skip, leaves no scope to spare above it.
+tryTwoBindsPastRoot: {
+	shadowed: 1
+	try x = missing? try y = missing? { fromTry: x + y } fallback { fromFallback: shadowed }
+	@test(eq, {shadowed: 1, fromFallback: 1})
+}
+
+// The struct form declares no binding; covered for contrast.
+tryStructFallbackScope: {
+	shadowed: 1
+	inner: {
+		shadowed: 2
+		try { fromTry: missing? } else { fromFallback: shadowed }
+		@test(eq, {shadowed: 2, fromFallback: 2})
+	}
+}
+
+// if-else: nested body fields - else yields once
+ifNestedBody: {
+	if false { a: b: 1 } else { c: 2 }
+	@test(eq, {c: 2})
+}
+
+// if-else: nested else fields
+ifNestedElse: {
+	if false { a: 1 } else { b: c: 2 }
+	@test(eq, {b: {c: 2}})
+}
+
+// if-else: nested fields in both
+ifNestedBoth: {
+	if false { a: b: 1 } else { c: d: 2 }
+	@test(eq, {c: {d: 2}})
+}
+
+// if-else: deeply nested fields
+ifDeeplyNested: {
+	if false { a: b: c: 1 } else { a: b: c: 2 }
+	@test(eq, {a: {b: {c: 2}}})
+}
+
+// for-fallback: nested body fields, empty source
+forNestedEmpty: {
+	for x in [] { a: b: (x): x } fallback { a: b: none: true }
+	@test(eq, {a: {b: {none: true}}})
+}
+
+// for-fallback: nested body fields, non-empty source - no fallback
+forNestedNonEmpty: {
+	for x in [1] { a: b: "\(x)": x } fallback { a: b: none: true }
+	@test(eq, {a: {b: {"1": 1}}})
+}
+
+// nested comprehensions - outer fallback triggers
+nestedOuterFallback: {
+	for x in [] { for y in [1] { y } fallback { inner: true } } fallback { outer: true }
+	@test(eq, {outer: true})
+}
+
+// nested comprehensions - inner fallback triggers
+nestedInnerFallback: {
+	for x in [1] { for y in [] { y } fallback { inner: true } } fallback { outer: true }
+	@test(eq, {inner: true})
+}
+
+// A guard reads a field before an else clause adds to it.
+guardReadsElseField: {
+	x: {
+		n: string
+		if false {} else { n: "b" }
+	}
+	if x.n == "b" { z: 1 }
+	@test(eq, {x: {n: "b"}, z: 1})
+}
+
+// A guard reads a field before a for-fallback clause adds to it.
+guardReadsFallbackField: {
+	x: {
+		n: string
+		for _ in [] {} fallback { n: "b" }
+	}
+	if x.n == "b" { z: 1 }
+	@test(eq, {x: {n: "b"}, z: 1})
+}
+
+// A guard reads a field declared only by an else clause.
+guardReadsElseOnlyField: {
+	x: {
+		if false {} else { n: "b" }
+	}
+	if x.n == "b" { z: 1 }
+	@test(eq, {x: {n: "b"}, z: 1})
+}
+
+// A guard reads a field declared only by an else clause which does not run.
+guardReadsUnusedElseField: {
+	x: {
+		if true {} else { n: "b" }
+	}
+	if x.n == "b" { z: 1 }
+	@test(err, code=incomplete, contains="undefined field: n")
+}
+
+// A guard reads a field declared by both the body and the else clause.
+guardReadsSharedField: {
+	x: {
+		if true { n: "a" } else { n: "b" }
+	}
+	if x.n == "a" { z: 1 }
+	@test(eq, {x: {n: "a"}, z: 1})
+}
+
+// A guard reads a field declared only by its own else clause.
+guardReadsOwnElseField: {
+	x: {
+		if x.n == "b" { m: 1 } else { n: "b" }
+	}
+	@test(err, code=cycle, at=x, contains="cyclic reference to field n")
+}
+
+// A required-field error points at the structs which do not declare the
+// field. A struct declaring it in an else clause is not one of them.
+requiredDeclaredInElse: {
+	x: matchN(1, [{n!: int}])
+	x: { if true {} else { n: 1 } }
+	@test(err, code=incomplete, at=x,
+		suberr=(code=incomplete, contains="does not satisfy matchN", pos=[1:5, 1:12, 2:5]),
+		suberr=(code=incomplete, contains="field is required but not present", pos=[1:5, 1:17, 2:15]))
+}
+-- out/errors.txt --
+[incomplete] guardReadsUnusedElseField: undefined field: n:
+    ./in.cue:262:7
+    ./in.cue:259:2
+[cycle] guardReadsOwnElseField.x: cyclic reference to field n:
+    ./in.cue:278:8
+[incomplete] requiredDeclaredInElse.x: invalid value {} (does not satisfy matchN): 0 matched, expected 1:
+    ./in.cue:286:5
+    ./in.cue:286:12
+    ./in.cue:287:5
+requiredDeclaredInElse.x.n: field is required but not present:
+    ./in.cue:286:5
+    ./in.cue:286:17
+    ./in.cue:287:15
+-- out/eval/stats --
+Leaks:  41
+Freed:  116
+Reused: 78
+Allocs: 79
+Retain: 0
+
+Unifications: 157
+Conjuncts:    186
+Disjuncts:    0
+
+NumCloseIDs: 8

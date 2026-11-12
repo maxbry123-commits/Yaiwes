@@ -1,0 +1,191 @@
+
+#exp:explicitopen
+
+# Test single-embed shorthands (where { expr } ≡ expr, so no wrapper needed)
+# and TODO comments generated inside comprehensions.
+
+-- cue.mod/module.cue --
+module: "shorthands.test"
+
+language: version: "v0.15.0"
+
+-- in.cue --
+package foo
+
+#A: a: int
+#D: x: int
+_repo: {}
+
+// Top-level definition embedding → opened with TODO.
+#A
+
+// Single definition embedding → use definition directly.
+singleDef: {
+	#D
+}
+
+// Embedded and() call → single embed, used directly.
+embeddedAnd: {
+	and([#A, #D])
+}
+
+// Embedded or() call → single embed, used directly.
+embeddedOr: {
+	or([#A, #D])
+}
+
+// Embedded pkg.Func() call → no change (std lib doesn't return closed).
+embeddedPkgFunc: {
+	len("foo")
+}
+
+// Embedded selector (e.g. foo.bar) → single embed, used directly.
+embeddedSel: {
+	_repo.foo
+}
+
+// Definition in comprehension → TODO.
+compDef: {
+	for v in _repo {
+		#D
+	}
+}
+
+// Non-def reference in comprehension → TODO.
+compRef: {
+	for v in _repo {
+		v
+	}
+}
+
+// A hoisted close() in a comprehension value: one TODO, on the hoisted
+// argument; the embedding inside it gets neither a TODO nor a NOTE.
+compClose: {
+	for v in _repo {
+		close({_repo})
+		x: 1
+	}
+}
+
+// A nested literal in a comprehension value: the TODO goes on the literal
+// embedded in the value, whatever inside it was opened.
+compNested: {
+	for v in _repo {
+		{_repo}
+		x: 1
+	}
+}
+
+// Comprehension inside a list.
+inList: {
+	steps: [
+		for v in _repo.checkoutCode {v},
+		for v in _repo.installGo {v},
+		{
+			name: "foo"
+		},
+	]
+}
+
+-- out/fixmod --
+--- cue.mod/module.cue
+module: "shorthands.test"
+language: version: "v0.15.0"
+--- in.cue
+@experiment(explicitopen)
+
+package foo
+
+#A: a: int
+#D: x: int
+_repo: {}
+
+// Top-level definition embedding → opened with TODO.
+//
+// TODO(cue-fix): the top-level definition embedding below is opened; if it is
+// intended as a schema, remove its '...'.
+#A...
+
+// Single definition embedding → use definition directly.
+singleDef: {
+	#D
+}
+
+// Embedded and() call → single embed, used directly.
+embeddedAnd: {
+	and([#A, #D])
+}
+
+// Embedded or() call → single embed, used directly.
+embeddedOr: {
+	or([#A, #D])
+}
+
+// Embedded pkg.Func() call → no change (std lib doesn't return closed).
+embeddedPkgFunc: {
+	len("foo")
+}
+
+// Embedded selector (e.g. foo.bar) → single embed, used directly.
+embeddedSel: {
+	_repo.foo
+}
+
+// Definition in comprehension → TODO.
+compDef: {
+	for v in _repo {
+		// TODO(cue-fix): under the old semantics the embedding below closed the
+		// enclosing struct when the comprehension fired; it no longer does.
+		#D...
+	}
+}
+
+// Non-def reference in comprehension → TODO.
+compRef: {
+	for v in _repo {
+		// TODO(cue-fix): under the old semantics the embedding below closed the
+		// enclosing struct when the comprehension fired; it no longer does.
+		v...
+	}
+}
+
+// A hoisted close() in a comprehension value: one TODO, on the hoisted
+// argument; the embedding inside it gets neither a TODO nor a NOTE.
+compClose: {
+	for v in _repo {
+		// TODO(cue-fix): under the old semantics the embedding below closed the
+		// enclosing struct when the comprehension fired; it no longer does.
+		{_repo...}
+		x: 1
+	}
+}
+
+// A nested literal in a comprehension value: the TODO goes on the literal
+// embedded in the value, whatever inside it was opened.
+compNested: {
+	for v in _repo {
+		// TODO(cue-fix): under the old semantics the embedding below closed the
+		// enclosing struct when the comprehension fired; it no longer does.
+		{_repo...}
+		x: 1
+	}
+}
+
+// Comprehension inside a list.
+inList: {
+	steps: [
+		for v in _repo.checkoutCode {
+			// TODO(cue-fix): under the old semantics the embedding below closed the
+			// enclosing struct when the comprehension fired; it no longer does.
+			v...
+		},
+		for v in _repo.installGo {
+			// TODO(cue-fix): under the old semantics the embedding below closed the
+			// enclosing struct when the comprehension fired; it no longer does.
+			v...
+		},
+		{
+			name: "foo"
+		},
+	]
+}

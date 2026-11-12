@@ -1,0 +1,1030 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Package loader for extracting metadata from workflow library files.
+//!
+//! This module provides functionality to safely load dynamic library files (.so/.dylib/.dll)
+//! via the fidius-host plugin API and extract package metadata.
+
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use tempfile::TempDir;
+use tokio::fs;
+
+use crate::registry::error::LoaderError;
+
+/// Get the platform-specific dynamic library extension.
+pub fn get_library_extension() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
+}
+
+/// Metadata extracted from a workflow package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageMetadata {
+    /// Package name
+    pub package_name: String,
+    /// Workflow name the package registers (the `#[workflow(name = "...")]`
+    /// value) — the identifier the runner/cron scheduler executes by. Distinct
+    /// from `package_name` (e.g. package `demo-slow-rust` → workflow
+    /// `demo_slow_workflow`). Persisted so the API can expose it and callers
+    /// can execute by it (CLOACI-T-0671 / T-0663). `#[serde(default)]` keeps
+    /// older stored metadata (without this field) deserializable.
+    #[serde(default)]
+    pub workflow_name: String,
+    /// Package version (extracted from library or defaults to "1.0.0")
+    pub version: String,
+    /// Package description
+    pub description: Option<String>,
+    /// Package author
+    pub author: Option<String>,
+    /// List of tasks provided by this package
+    pub tasks: Vec<TaskMetadata>,
+    /// Workflow graph data (if available)
+    pub graph_data: Option<serde_json::Value>,
+    /// Library architecture info
+    pub architecture: String,
+    /// Required symbols present in the library
+    pub symbols: Vec<String>,
+    /// I-0102 / T-A: Trigger names this package's workflow subscribes to,
+    /// sourced from `#[workflow(triggers = […])]`. The reconciler binds
+    /// each named trigger to the workflow at load time.
+    #[serde(default)]
+    pub workflow_triggers: Vec<String>,
+    /// CLOACI-I-0128 / T-0756: declared workflow params (named, JSON-Schema-typed
+    /// input slots) from `#[workflow(params(...))]`, read via the input-interface
+    /// FFI entrypoint at extraction time. Empty for packages that declare none or
+    /// predate the entrypoint.
+    #[serde(default)]
+    pub declared_params: Vec<cloacina_api_types::InputSlot>,
+    /// CLOACI-I-0128 / T-0758: declared input interfaces of the package's
+    /// non-workflow injectable surfaces (computation graphs, reactors,
+    /// accumulators), read from the same `get_input_interface` entrypoint. Lets
+    /// the server validate operator injections (reactor fire / accumulator
+    /// inject) against the surface's boundary types. Empty when none are declared
+    /// or the package predates the entrypoint.
+    #[serde(default)]
+    pub declared_surfaces: Vec<cloacina_api_types::DeclaredSurface>,
+    /// CLOACI-T-0754: the compiler's raw build-time doc parse (`what`/`why` per
+    /// local task id), preserved verbatim so load paths that rebuild the task
+    /// list AFTER build — the Python path has no cdylib, so its `tasks` are
+    /// written by the reconciler at load — can re-merge docs instead of losing
+    /// them. Rust packages get their docs overlaid onto `tasks` at build; this
+    /// map is the durable source either way. Empty for undocumented packages
+    /// and metadata predating the field.
+    #[serde(default)]
+    pub task_docs: std::collections::HashMap<String, TaskDocs>,
+}
+
+/// Individual task metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMetadata {
+    /// Task index in the package
+    pub index: u32,
+    /// Local task identifier
+    pub local_id: String,
+    /// Namespaced ID template
+    pub namespaced_id_template: String,
+    /// Task dependencies as a list of local task IDs
+    pub dependencies: Vec<String>,
+    /// Human-readable description
+    pub description: String,
+    /// Source location information
+    pub source_location: String,
+    /// CLOACI-T-0752 "what" — a short summary of what the task does, parsed
+    /// from the author's doc-comment / docstring at build time. `None` when the
+    /// task is undocumented. `#[serde(default)]` keeps older stored metadata
+    /// deserializable.
+    #[serde(default)]
+    pub doc_what: Option<String>,
+    /// CLOACI-T-0752 "why" — the rationale for the task (why it exists / when it
+    /// matters), parsed from the doc-comment / docstring. `None` when absent.
+    #[serde(default)]
+    pub doc_why: Option<String>,
+}
+
+/// Structured "what & why" documentation for a single task (CLOACI-T-0752),
+/// parsed compiler-side from the author's source (Rust doc-comments / Python
+/// docstrings) and overlaid onto the persisted [`TaskMetadata`]. Keyed by the
+/// task's local id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskDocs {
+    /// Short summary of what the task does.
+    pub what: Option<String>,
+    /// Rationale — why the task exists / when it matters.
+    pub why: Option<String>,
+}
+
+/// Install the engine's `CloacinaHost` callback table on a freshly loaded
+/// library (CLOACI-T-0897), so a packaged task that calls `defer_until` can
+/// reach back for its concurrency slot.
+///
+/// Best-effort by design, in three ways that all matter:
+///
+/// * A package that declares no host interface — every package built before
+///   this existed — imports nothing, `bind` reports `false`, and the package
+///   loads and runs exactly as before. This is why the change does not force a
+///   rebuild of the world.
+/// * A version or hash mismatch is a LOAD-time error from fidius, logged here
+///   rather than propagated: the package's tasks are still perfectly runnable
+///   as long as none of them defers, and one that does gets a clear
+///   `NotBound` at its first `defer_until` instead of the whole package
+///   failing to load.
+/// * Binding is once-only per library; a second attempt is refused and simply
+///   logged.
+pub(crate) fn bind_engine_host(loaded: &fidius_host::loader::LoadedLibrary, library_path: &Path) {
+    use cloacina_workflow_plugin::{CloacinaHost, CloacinaHostBinding};
+
+    let host: std::sync::Arc<dyn CloacinaHost> = std::sync::Arc::new(crate::executor::EngineHost);
+    match CloacinaHostBinding::bind(loaded, host) {
+        Ok(true) => {
+            tracing::debug!(
+                library = %library_path.display(),
+                "CloacinaHost bound — package can use defer_until"
+            );
+        }
+        Ok(false) => {
+            // The common case: the package never imports the interface.
+            tracing::trace!(
+                library = %library_path.display(),
+                "package imports no host interface; nothing bound"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                library = %library_path.display(),
+                error = %e,
+                "could not bind CloacinaHost — tasks in this package that call \
+                 defer_until will fail with a not-bound error; the rest run normally"
+            );
+        }
+    }
+}
+
+/// Package loader for extracting metadata from workflow library files.
+///
+/// Loaded libraries are cached to prevent dlclose. The `inventory` crate
+/// (used by fidius) builds a global linked list via `__attribute__((constructor))`.
+/// If a cdylib is dlclosed, the linked-list nodes are unmapped but the head
+/// pointer still references them. Loading a second cdylib then crashes when
+/// its constructors traverse the corrupted list (macOS sends SIGKILL).
+/// Keeping libraries alive avoids this entirely.
+/// Shared cache of plugin handles kept alive to prevent dlclose.
+///
+/// The `inventory` crate (used by fidius) builds a global intrusive linked list
+/// via `__attribute__((constructor))`. If a cdylib is dlclosed, the list nodes
+/// are unmapped but the head pointer still references them. Loading a second
+/// cdylib then crashes when its constructors traverse the corrupted list
+/// (macOS sends SIGKILL). Keeping handles alive avoids dlclose entirely.
+pub type PluginHandleCache = std::sync::Arc<std::sync::Mutex<Vec<fidius_host::PluginHandle>>>;
+
+pub struct PackageLoader {
+    temp_dir: TempDir,
+    /// Shared cache — prevents dlclose of loaded libraries.
+    handle_cache: PluginHandleCache,
+}
+
+impl PackageLoader {
+    /// Create a new package loader with a temporary directory for safe operations.
+    pub fn new() -> Result<Self, LoaderError> {
+        let temp_dir = TempDir::new().map_err(|e| LoaderError::TempDirectory {
+            error: e.to_string(),
+        })?;
+
+        Ok(Self {
+            temp_dir,
+            handle_cache: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        })
+    }
+
+    /// Create a package loader with a shared handle cache.
+    pub fn with_handle_cache(cache: PluginHandleCache) -> Result<Self, LoaderError> {
+        let temp_dir = TempDir::new().map_err(|e| LoaderError::TempDirectory {
+            error: e.to_string(),
+        })?;
+
+        Ok(Self {
+            temp_dir,
+            handle_cache: cache,
+        })
+    }
+
+    /// Get the shared handle cache (for passing to TaskRegistrar).
+    pub fn handle_cache(&self) -> PluginHandleCache {
+        self.handle_cache.clone()
+    }
+
+    /// Generate graph data from task dependencies.
+    fn generate_graph_data_from_tasks(
+        &self,
+        tasks: &[TaskMetadata],
+    ) -> Result<serde_json::Value, LoaderError> {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+
+        for task in tasks {
+            nodes.push(serde_json::json!({
+                "id": task.local_id,
+                "label": task.local_id,
+                "description": task.description,
+                "node_type": "task"
+            }));
+        }
+
+        for task in tasks {
+            for dependency in &task.dependencies {
+                edges.push(serde_json::json!({
+                    "source": dependency,
+                    "target": task.local_id,
+                    "edge_type": "dependency"
+                }));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "nodes": nodes,
+            "edges": edges,
+            "metadata": {
+                "task_count": tasks.len(),
+                "generated_from": "task_dependencies"
+            }
+        }))
+    }
+
+    /// Extract metadata from compiled library bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `package_data` - Raw bytes of the compiled cdylib (.so / .dylib).
+    ///   The reconciler is responsible for unpacking and compiling any source
+    ///   archives before calling this method.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(PackageMetadata)` - Successfully extracted metadata
+    /// * `Err(LoaderError)` - If extraction fails
+    pub async fn extract_metadata(
+        &self,
+        package_data: &[u8],
+    ) -> Result<PackageMetadata, LoaderError> {
+        let library_extension = get_library_extension();
+        let unique_id = uuid::Uuid::new_v4();
+        let temp_path = self
+            .temp_dir
+            .path()
+            .join(format!("pkg_{}.{}", unique_id, library_extension));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        self.extract_metadata_from_so(&temp_path).await
+    }
+
+    /// Extract metadata from a library file using the fidius-host plugin API.
+    ///
+    /// The loaded library is cached to prevent dlclose — see struct-level docs.
+    async fn extract_metadata_from_so(
+        &self,
+        library_path: &Path,
+    ) -> Result<PackageMetadata, LoaderError> {
+        // Load via fidius-host — validates magic, ABI version, wire format, etc.
+        let loaded = fidius_host::loader::load_library(library_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: library_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+
+        // CLOACI-T-0897: install the host-callback table BEFORE any plugin
+        // method runs, so a task that calls `defer_until` can reach back for
+        // its slot. Must happen here — `loaded` is consumed just below, and
+        // binding is per loaded library.
+        bind_engine_host(&loaded, library_path);
+
+        let plugin =
+            loaded
+                .plugins
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoaderError::MetadataExtraction {
+                    reason: "Plugin library contains no plugins".to_string(),
+                })?;
+
+        let handle = fidius_host::PluginHandle::from_loaded(plugin);
+
+        let ffi_metadata: cloacina_workflow_plugin::PackageTasksMetadata = handle
+            .call_method(cloacina_workflow_plugin::METHOD_GET_TASK_METADATA, &())
+            .map_err(|e| LoaderError::MetadataExtraction {
+                reason: format!("Failed to call get_task_metadata: {}", e),
+            })?;
+
+        // CLOACI-I-0128 / T-0756: pull the declared input interface (method index
+        // 9, optional since v3). Older packages return NotImplemented → no
+        // declared params. The workflow-surface entry's `slots_json` is a JSON
+        // array of InputSlot.
+        let iface_result: Result<
+            cloacina_workflow_plugin::InputInterfaceDescriptor,
+            fidius_host::CallError,
+        > = handle.call_method(cloacina_workflow_plugin::METHOD_GET_INPUT_INTERFACE, &());
+        let (declared_params, declared_surfaces): (
+            Vec<cloacina_api_types::InputSlot>,
+            Vec<cloacina_api_types::DeclaredSurface>,
+        ) = match iface_result {
+            Ok(desc) => {
+                let mut params: Vec<cloacina_api_types::InputSlot> = Vec::new();
+                let mut surfaces: Vec<cloacina_api_types::DeclaredSurface> = Vec::new();
+                for e in desc.entries {
+                    let slots =
+                        serde_json::from_str::<Vec<cloacina_api_types::InputSlot>>(&e.slots_json)
+                            .unwrap_or_default();
+                    if e.surface_kind == "workflow" {
+                        // Workflow params land in declared_params (T-0756).
+                        params.extend(slots);
+                    } else {
+                        // graph / reactor / accumulator surfaces (T-0758).
+                        surfaces.push(cloacina_api_types::DeclaredSurface {
+                            kind: e.surface_kind,
+                            name: e.surface_name,
+                            slots,
+                        });
+                    }
+                }
+                (params, surfaces)
+            }
+            Err(fidius_host::CallError::NotImplemented { .. }) => (Vec::new(), Vec::new()),
+            Err(e) => {
+                tracing::warn!(
+                    "get_input_interface failed: {:?}; treating as no declared interface",
+                    e
+                );
+                (Vec::new(), Vec::new())
+            }
+        };
+
+        // Keep the handle alive — dropping it triggers dlclose which corrupts
+        // the inventory linked list (see struct-level docs).
+        // PluginHandle holds an Arc<Library> that keeps the dylib mapped.
+        if let Ok(mut cache) = self.handle_cache.lock() {
+            cache.push(handle);
+        }
+
+        let mut pkg = self.convert_plugin_metadata_to_rust(ffi_metadata)?;
+        pkg.declared_params = declared_params;
+        pkg.declared_surfaces = declared_surfaces;
+        Ok(pkg)
+    }
+
+    /// Convert `PackageTasksMetadata` from the fidius plugin into the `PackageMetadata`
+    /// struct used by the rest of the registry.
+    fn convert_plugin_metadata_to_rust(
+        &self,
+        meta: cloacina_workflow_plugin::PackageTasksMetadata,
+    ) -> Result<PackageMetadata, LoaderError> {
+        let tasks: Vec<TaskMetadata> = meta
+            .tasks
+            .into_iter()
+            .map(|t| TaskMetadata {
+                index: t.index,
+                local_id: t.id,
+                namespaced_id_template: t.namespaced_id_template,
+                dependencies: t.dependencies,
+                description: t.description,
+                source_location: t.source_location,
+                // FFI metadata carries no docs; the compiler overlays parsed
+                // doc-comments at build success (CLOACI-T-0752).
+                doc_what: None,
+                doc_why: None,
+            })
+            .collect();
+
+        // Build graph data from tasks if no serialized graph is present
+        let graph_data = match meta.graph_data_json.as_deref() {
+            Some(json) if !json.trim().is_empty() => {
+                match serde_json::from_str::<serde_json::Value>(json) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        tracing::debug!(
+                            "graph_data_json is not valid JSON, generating from {} tasks",
+                            tasks.len()
+                        );
+                        self.generate_graph_data_from_tasks(&tasks).ok()
+                    }
+                }
+            }
+            _ => {
+                if !tasks.is_empty() {
+                    self.generate_graph_data_from_tasks(&tasks).ok()
+                } else {
+                    None
+                }
+            }
+        };
+
+        let architecture = if cfg!(target_arch = "x86_64") {
+            "x86_64".to_string()
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64".to_string()
+        } else {
+            std::env::consts::ARCH.to_string()
+        };
+
+        Ok(PackageMetadata {
+            package_name: meta.package_name,
+            workflow_name: meta.workflow_name,
+            version: "1.0.0".to_string(),
+            description: meta.package_description,
+            author: meta.package_author,
+            tasks,
+            graph_data,
+            architecture,
+            symbols: vec!["fidius_get_registry".to_string()],
+            workflow_triggers: meta.triggers,
+            // Populated by the caller via the input-interface entrypoint
+            // (extract_metadata_from_so); empty here.
+            declared_params: Vec::new(),
+            declared_surfaces: Vec::new(),
+            // Docs come from the compiler parse at build success (T-0754).
+            task_docs: Default::default(),
+        })
+    }
+
+    /// Extract computation graph metadata from compiled library bytes.
+    ///
+    /// Calls `get_graph_metadata()` (method index 2) on the fidius plugin.
+    /// Returns `None` if the plugin doesn't support graph metadata (workflow-only packages).
+    pub async fn extract_graph_metadata(
+        &self,
+        package_data: &[u8],
+    ) -> Result<Option<cloacina_workflow_plugin::GraphPackageMetadata>, LoaderError> {
+        let library_extension = get_library_extension();
+        let temp_path = self.temp_dir.path().join(format!(
+            "graph_{}.{}",
+            uuid::Uuid::new_v4(),
+            library_extension
+        ));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        let loaded = fidius_host::loader::load_library(&temp_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+
+        let plugin =
+            loaded
+                .plugins
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoaderError::MetadataExtraction {
+                    reason: "Plugin library contains no plugins".to_string(),
+                })?;
+
+        let handle = fidius_host::PluginHandle::from_loaded(plugin);
+
+        let result = match handle.call_method::<(), cloacina_workflow_plugin::GraphPackageMetadata>(
+            cloacina_workflow_plugin::METHOD_GET_GRAPH_METADATA,
+            &(),
+        ) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                // Plugin doesn't support graph metadata — that's OK for workflow-only packages
+                tracing::debug!("get_graph_metadata not supported by plugin: {}", e);
+                Ok(None)
+            }
+        };
+
+        // Keep handle alive to prevent dlclose
+        if let Ok(mut cache) = self.handle_cache.lock() {
+            cache.push(handle);
+        }
+
+        result
+    }
+
+    /// Extract reactor metadata from compiled library bytes (T-B / I-0102).
+    ///
+    /// Calls `get_reactor_metadata()` (method index 4) on the fidius plugin.
+    /// Plugins that predate trait v2 — and per-macro `_ffi` blocks emitting
+    /// the empty stub — both return `Ok(vec![])` here. Real reactor entries
+    /// come from packages built against the unified `cloacina::package!()`
+    /// shell.
+    pub async fn extract_reactor_metadata(
+        &self,
+        package_data: &[u8],
+    ) -> Result<Vec<cloacina_workflow_plugin::ReactorPackageMetadata>, LoaderError> {
+        let library_extension = get_library_extension();
+        let temp_path = self.temp_dir.path().join(format!(
+            "reactor_{}.{}",
+            uuid::Uuid::new_v4(),
+            library_extension
+        ));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        let loaded = fidius_host::loader::load_library(&temp_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+
+        let plugin =
+            loaded
+                .plugins
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoaderError::MetadataExtraction {
+                    reason: "Plugin library contains no plugins".to_string(),
+                })?;
+
+        let handle = fidius_host::PluginHandle::from_loaded(plugin);
+
+        let result = crate::computation_graph::packaging_bridge::call_get_reactor_metadata(&handle)
+            .map_err(|e| LoaderError::MetadataExtraction { reason: e });
+
+        if let Ok(mut cache) = self.handle_cache.lock() {
+            cache.push(handle);
+        }
+
+        result
+    }
+
+    /// Extract packaged `constructor!(...)` node declarations from compiled library
+    /// bytes (CLOACI-T-0832).
+    ///
+    /// Calls `get_constructor_metadata()` (method index 10) on the fidius plugin.
+    /// Plugins that predate trait v4 return `Ok(vec![])` here. Each returned
+    /// [`cloacina_workflow_plugin::ConstructorPackageMetadata`] is resolved by the
+    /// host (which links the WASM constructor loader) via `load_constructor_node`
+    /// — applying the tenant capability grants — and injected into the rebuilt
+    /// workflow DAG.
+    pub async fn extract_constructor_metadata(
+        &self,
+        package_data: &[u8],
+    ) -> Result<Vec<cloacina_workflow_plugin::ConstructorPackageMetadata>, LoaderError> {
+        let library_extension = get_library_extension();
+        let temp_path = self.temp_dir.path().join(format!(
+            "constructor_{}.{}",
+            uuid::Uuid::new_v4(),
+            library_extension
+        ));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        let loaded = fidius_host::loader::load_library(&temp_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+
+        let plugin =
+            loaded
+                .plugins
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoaderError::MetadataExtraction {
+                    reason: "Plugin library contains no plugins".to_string(),
+                })?;
+
+        let handle = fidius_host::PluginHandle::from_loaded(plugin);
+
+        let result =
+            crate::computation_graph::packaging_bridge::call_get_constructor_metadata(&handle)
+                .map_err(|e| LoaderError::MetadataExtraction { reason: e });
+
+        if let Ok(mut cache) = self.handle_cache.lock() {
+            cache.push(handle);
+        }
+
+        result
+    }
+
+    /// Extract trigger metadata from compiled library bytes (T-B / I-0102).
+    ///
+    /// Calls `get_trigger_metadata()` (method index 5) on the fidius plugin.
+    /// Cron-vs-custom routing happens at the reconciler based on the
+    /// returned `cron_expression` field.
+    pub async fn extract_trigger_metadata(
+        &self,
+        package_data: &[u8],
+    ) -> Result<Vec<cloacina_workflow_plugin::TriggerPackageMetadata>, LoaderError> {
+        let library_extension = get_library_extension();
+        let temp_path = self.temp_dir.path().join(format!(
+            "trigger_{}.{}",
+            uuid::Uuid::new_v4(),
+            library_extension
+        ));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        let loaded = fidius_host::loader::load_library(&temp_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+
+        let plugin =
+            loaded
+                .plugins
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoaderError::MetadataExtraction {
+                    reason: "Plugin library contains no plugins".to_string(),
+                })?;
+
+        let handle = fidius_host::PluginHandle::from_loaded(plugin);
+
+        let result = crate::computation_graph::packaging_bridge::call_get_trigger_metadata(&handle)
+            .map_err(|e| LoaderError::MetadataExtraction { reason: e });
+
+        if let Ok(mut cache) = self.handle_cache.lock() {
+            cache.push(handle);
+        }
+
+        result
+    }
+
+    /// Extract trigger-less computation graph metadata from compiled
+    /// library bytes (T-0553 follow-up — Trigger-less CG FFI bridge).
+    ///
+    /// Calls `get_triggerless_graph_metadata()` (method index 7) on
+    /// the fidius plugin. Returns one entry per `#[computation_graph]`
+    /// without a `trigger = reactor(...)` clause; the reconciler
+    /// installs each into the runtime via a host-side adapter that
+    /// dispatches `graph_fn` through `invoke_triggerless_graph` (FFI
+    /// method index 8).
+    pub async fn extract_triggerless_graph_metadata(
+        &self,
+        package_data: &[u8],
+    ) -> Result<Vec<cloacina_workflow_plugin::TriggerlessGraphMetadataEntry>, LoaderError> {
+        let library_extension = get_library_extension();
+        let temp_path = self.temp_dir.path().join(format!(
+            "triggerless_{}.{}",
+            uuid::Uuid::new_v4(),
+            library_extension
+        ));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        let loaded = fidius_host::loader::load_library(&temp_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+
+        let plugin =
+            loaded
+                .plugins
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoaderError::MetadataExtraction {
+                    reason: "Plugin library contains no plugins".to_string(),
+                })?;
+
+        let handle = fidius_host::PluginHandle::from_loaded(plugin);
+
+        // Method index 7 = get_triggerless_graph_metadata. NotImplemented
+        // (older plugins) returns an Ok(Vec::new()) at the call_method
+        // layer — the reconciler treats that as "package declares no
+        // trigger-less graphs".
+        let result: Result<
+            Vec<cloacina_workflow_plugin::TriggerlessGraphMetadataEntry>,
+            fidius_host::CallError,
+        > = handle.call_method(
+            cloacina_workflow_plugin::METHOD_GET_TRIGGERLESS_GRAPH_METADATA,
+            &(),
+        );
+
+        let out = match result {
+            Ok(v) => Ok(v),
+            Err(fidius_host::CallError::NotImplemented { .. }) => Ok(Vec::new()),
+            Err(e) => Err(LoaderError::MetadataExtraction {
+                reason: format!("get_triggerless_graph_metadata failed: {:?}", e),
+            }),
+        };
+
+        if let Ok(mut cache) = self.handle_cache.lock() {
+            cache.push(handle);
+        }
+
+        out
+    }
+
+    /// Get the temporary directory path. Test-only: production code does not
+    /// inspect the loader's temp dir directly.
+    #[cfg(test)]
+    pub fn temp_dir(&self) -> &Path {
+        self.temp_dir.path()
+    }
+
+    /// Validate that a package has the required symbols by loading it via fidius-host.
+    ///
+    /// Returns an empty `Vec` on success (fidius validated the plugin registry),
+    /// or the known symbol names if the library loads without error.
+    pub async fn validate_package_symbols(
+        &self,
+        package_data: &[u8],
+    ) -> Result<Vec<String>, LoaderError> {
+        let library_extension = get_library_extension();
+        let temp_path = self
+            .temp_dir
+            .path()
+            .join(format!("validation_package.{}", library_extension));
+        fs::write(&temp_path, package_data)
+            .await
+            .map_err(|e| LoaderError::FileSystem {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            })?;
+
+        // Load via fidius-host — if this succeeds the plugin is valid.
+        // Keep the loaded library alive to prevent dlclose.
+        let loaded = fidius_host::loader::load_library(&temp_path).map_err(
+            |e: fidius_host::LoadError| LoaderError::LibraryLoad {
+                path: temp_path.to_string_lossy().to_string(),
+                error: e.to_string(),
+            },
+        )?;
+        // Prevent dlclose by keeping the library handle alive
+        std::mem::forget(loaded);
+
+        // Return the fidius registry symbol
+        Ok(vec!["fidius_get_registry".to_string()])
+    }
+}
+
+impl Default for PackageLoader {
+    fn default() -> Self {
+        Self::new().expect("Failed to create default PackageLoader")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create invalid binary data
+    fn create_invalid_binary_data() -> Vec<u8> {
+        b"This is not a valid ELF file".to_vec()
+    }
+
+    /// Helper to create a mock ELF-like binary for testing
+    fn create_mock_elf_data(size: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(size);
+
+        // ELF magic number
+        data.extend_from_slice(b"\x7fELF");
+        data.extend_from_slice(&[0x02, 0x01, 0x01, 0x00]);
+
+        while data.len() < 64 {
+            data.push(0x00);
+        }
+
+        for i in 64..size {
+            data.push((i % 256) as u8);
+        }
+
+        data
+    }
+
+    #[tokio::test]
+    async fn test_package_loader_creation() {
+        let loader = PackageLoader::new().expect("Failed to create PackageLoader");
+        assert!(loader.temp_dir().exists());
+        assert!(loader.temp_dir().is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_package_loader_default() {
+        let loader = PackageLoader::default();
+        assert!(loader.temp_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_metadata_with_invalid_elf() {
+        let loader = PackageLoader::new().unwrap();
+        let invalid_data = create_invalid_binary_data();
+
+        let result = loader.extract_metadata(&invalid_data).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LoaderError::LibraryLoad { path, error } => {
+                let library_extension = get_library_extension();
+                assert!(path.contains(&format!(".{}", library_extension)));
+                assert!(path.contains("pkg_"));
+                assert!(!error.is_empty());
+            }
+            other => panic!("Expected LibraryLoad error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_metadata_with_empty_data() {
+        let loader = PackageLoader::new().unwrap();
+        let empty_data = Vec::new();
+
+        let result = loader.extract_metadata(&empty_data).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LoaderError::LibraryLoad { .. } => {}
+            other => panic!("Expected LibraryLoad error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_metadata_with_large_invalid_data() {
+        let loader = PackageLoader::new().unwrap();
+        let large_invalid_data = vec![0xAB; 1024 * 1024]; // 1MB of invalid data
+
+        let result = loader.extract_metadata(&large_invalid_data).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LoaderError::LibraryLoad { .. } => {}
+            other => panic!("Expected LibraryLoad error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_package_symbols_with_invalid_data() {
+        let loader = PackageLoader::new().unwrap();
+        let invalid_data = create_invalid_binary_data();
+
+        let result = loader.validate_package_symbols(&invalid_data).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LoaderError::LibraryLoad { .. } => {}
+            other => panic!("Expected LibraryLoad error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_package_symbols_with_empty_data() {
+        let loader = PackageLoader::new().unwrap();
+        let empty_data = Vec::new();
+
+        let result = loader.validate_package_symbols(&empty_data).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_temp_dir_isolation() {
+        let loader1 = PackageLoader::new().unwrap();
+        let loader2 = PackageLoader::new().unwrap();
+
+        assert_ne!(loader1.temp_dir(), loader2.temp_dir());
+        assert!(loader1.temp_dir().exists());
+        assert!(loader2.temp_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_package_loading() {
+        use std::sync::Arc;
+        use tokio::task;
+
+        let loader = Arc::new(PackageLoader::new().unwrap());
+        let mut handles = Vec::new();
+
+        for i in 0..5 {
+            let loader_clone = Arc::clone(&loader);
+            let handle = task::spawn(async move {
+                let mut test_data = create_invalid_binary_data();
+                test_data.push(i);
+
+                let result = loader_clone.extract_metadata(&test_data).await;
+                assert!(result.is_err());
+                i
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let task_id = handle.await.expect("Task should complete");
+            assert!(task_id < 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_system_operations() {
+        let loader = PackageLoader::new().unwrap();
+        let test_data = create_mock_elf_data(512);
+
+        let result = loader.extract_metadata(&test_data).await;
+
+        assert!(result.is_err());
+        assert!(loader.temp_dir().exists());
+        assert!(loader.temp_dir().is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_error_types_and_messages() {
+        let loader = PackageLoader::new().unwrap();
+
+        let result = loader.extract_metadata(b"invalid").await;
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        match &error {
+            LoaderError::LibraryLoad { path, error: msg } => {
+                let library_extension = get_library_extension();
+                assert!(path.contains(&format!(".{}", library_extension)));
+                assert!(!msg.is_empty());
+            }
+            other => panic!("Expected LibraryLoad error, got: {:?}", other),
+        }
+
+        let error_string = format!("{}", error);
+        assert!(error_string.contains("Failed to load library"));
+    }
+
+    #[tokio::test]
+    async fn test_package_loader_memory_safety() {
+        for _ in 0..100 {
+            let loader = PackageLoader::new().unwrap();
+            let test_data = vec![0x7f, 0x45, 0x4c, 0x46];
+            let _ = loader.extract_metadata(&test_data).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_temp_directory_cleanup() {
+        let _temp_path = {
+            let loader = PackageLoader::new().unwrap();
+            let path = loader.temp_dir().to_path_buf();
+            assert!(path.exists());
+            path
+        };
+    }
+
+    #[test]
+    fn test_package_loader_sync_creation() {
+        let result = PackageLoader::new();
+        assert!(result.is_ok());
+
+        let loader = result.unwrap();
+        assert!(loader.temp_dir().exists());
+    }
+
+    #[test]
+    fn test_get_library_extension() {
+        let extension = get_library_extension();
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(extension, "dll");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(extension, "dylib");
+        } else {
+            assert_eq!(extension, "so");
+        }
+    }
+}

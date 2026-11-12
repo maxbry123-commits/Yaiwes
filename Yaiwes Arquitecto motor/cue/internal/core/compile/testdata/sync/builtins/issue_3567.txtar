@@ -1,0 +1,14 @@
+-- in.cue --
+import "strings"
+a: strings.Join( [ strings.Join(["1"]), "2" ], "\n")
+
+-- out/compile --
+--- in.cue
+{
+  a: 〈import;strings〉.Join([
+    〈import;strings〉.Join([
+      "1",
+    ]),
+    "2",
+  ], "\n")
+}

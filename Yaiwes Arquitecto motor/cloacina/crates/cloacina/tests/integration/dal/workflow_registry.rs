@@ -1,0 +1,996 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+use crate::fixtures::get_or_init_fixture;
+use cloacina::registry::traits::RegistryStorage;
+use cloacina::registry::workflow_registry::WorkflowRegistryImpl;
+use serial_test::serial;
+use std::sync::OnceLock;
+use uuid::Uuid;
+
+/// After `register_workflow_package`, a row lands with
+/// `build_status = 'pending'`. The registry's read APIs filter to
+/// `success` so the reconciler doesn't try to load unbuilt rows. For
+/// these DAL tests there's no compiler attached — drive the row through
+/// success manually so the read assertions see it.
+async fn drive_to_success<S: RegistryStorage + Send + Sync>(
+    registry: &WorkflowRegistryImpl<S>,
+    package_id: Uuid,
+) {
+    registry.claim_next_build().await.expect("claim_next_build");
+    registry
+        .mark_build_success(package_id, Vec::new())
+        .await
+        .expect("mark_build_success");
+}
+
+/// Cached mock package data.
+///
+/// This is a fidius source package (bzip2 tar + package.toml) packed from
+/// the pre-built packaged-workflows example source directory.
+/// The example must exist in examples/features/workflows/packaged-workflows.
+static MOCK_PACKAGE: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Get the cached mock package, packing it from the example source directory.
+///
+/// IMPORTANT: Uses `fidius_core::package::pack_package` directly on the
+/// example source directory — no cargo subprocess is spawned.
+/// Run `angreal cloacina integration` to set up the environment before tests.
+fn get_mock_package() -> Vec<u8> {
+    MOCK_PACKAGE.get_or_init(create_source_package).clone()
+}
+
+/// Create a fidius source package from the packaged-workflows example directory.
+///
+/// Calls `fidius_core::package::pack_package` on the source directory, which
+/// produces a bzip2 tar archive containing the source files and `package.toml`.
+fn create_source_package() -> Vec<u8> {
+    // Find workspace root (crates/cloacina -> crates -> project root)
+    let cargo_manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let workspace_path = std::path::PathBuf::from(&cargo_manifest_dir);
+    let workspace_root = workspace_path
+        .parent()
+        .expect("Should have parent directory (crates)")
+        .parent()
+        .expect("Should have parent directory (project root)");
+    let project_path = workspace_root.join("examples/features/workflows/packaged-workflows");
+
+    if !project_path.exists() {
+        panic!("Project path does not exist: {}", project_path.display());
+    }
+
+    // Verify package.toml exists (required for fidius source packaging)
+    assert!(
+        project_path.join("package.toml").exists(),
+        "package.toml not found in: {}",
+        project_path.display()
+    );
+
+    // Pack the source directory into a bzip2 tar archive
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp directory");
+    let unique_id = Uuid::new_v4().to_string();
+    let package_path = temp_dir
+        .path()
+        .join(format!("test_package_{}.cloacina", unique_id));
+
+    fidius_core::package::pack_package(&project_path, Some(&package_path))
+        .expect("Failed to pack source package");
+
+    // Read and return the package data
+    std::fs::read(&package_path).expect("Failed to read package file")
+}
+
+#[tokio::test]
+#[serial]
+async fn test_register_and_get_workflow_package() {
+    // Test with database storage only - filesystem storage is not compatible with
+    // database metadata due to foreign key constraint on workflow_packages.registry_id
+    test_register_and_get_workflow_package_with_db_storage().await;
+}
+
+async fn test_register_and_get_workflow_package_with_db_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    // Package building spawns cargo subprocess which must happen before OpenSSL init
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Register the package
+    let package_id = registry_dal
+        .register_workflow_package(package_data.clone())
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Retrieve the package by ID
+    let retrieved = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get workflow package by ID");
+
+    assert!(retrieved.is_some());
+    let (metadata, binary_data) = retrieved.unwrap();
+    assert_eq!(metadata.package_name, "packaged-workflow-example");
+    // Version will be the workflow fingerprint from the real package
+    assert_eq!(binary_data, package_data);
+}
+
+#[allow(dead_code)]
+async fn test_register_and_get_workflow_package_with_fs_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Register the package
+    let package_id = registry_dal
+        .register_workflow_package(package_data.clone())
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Retrieve the package by ID
+    let retrieved = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get workflow package by ID");
+
+    assert!(retrieved.is_some());
+    let (metadata, binary_data) = retrieved.unwrap();
+    assert_eq!(metadata.package_name, "packaged-workflow-example");
+    // Version will be the workflow fingerprint from the real package
+    assert_eq!(binary_data, package_data);
+}
+
+/// CLOACI-T-0760: Python packages build to an empty artifact, so the cdylib
+/// metadata extraction is skipped. Declared params parsed from Python source by
+/// the compiler must still be persisted onto the stored metadata at build
+/// success. Drives the empty-artifact path of `mark_build_success_with_docs`
+/// with a declared-params list and asserts it lands on the stored metadata.
+#[tokio::test]
+#[serial]
+async fn test_python_declared_params_persisted_on_empty_artifact_build() {
+    use cloacina::input_interface::InputSlot;
+
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("register");
+
+    let declared = vec![
+        InputSlot::required("source_id", serde_json::json!({"type": "string"})),
+        InputSlot::optional(
+            "batch_size",
+            serde_json::json!({"type": "integer"}),
+            Some(serde_json::json!(500)),
+        ),
+    ];
+
+    // Empty artifact = the Python build path.
+    registry_dal
+        .claim_next_build()
+        .await
+        .expect("claim_next_build");
+    registry_dal
+        .mark_build_success_with_docs(
+            package_id,
+            Vec::new(),
+            std::collections::HashMap::new(),
+            declared.clone(),
+            Vec::new(),
+        )
+        .await
+        .expect("mark_build_success_with_docs");
+
+    let (metadata, _) = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("get_workflow_package_by_id")
+        .expect("package present");
+
+    assert_eq!(
+        metadata.declared_params.len(),
+        2,
+        "declared params parsed from Python source should persist on the empty-artifact build"
+    );
+    let sid = metadata
+        .declared_params
+        .iter()
+        .find(|s| s.name == "source_id")
+        .expect("source_id slot");
+    assert!(sid.required);
+    let bs = metadata
+        .declared_params
+        .iter()
+        .find(|s| s.name == "batch_size")
+        .expect("batch_size slot");
+    assert!(!bs.required);
+    assert_eq!(bs.default, Some(serde_json::json!(500)));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_workflow_package_by_name() {
+    // Test with database storage
+    test_get_workflow_package_by_name_with_db_storage().await;
+    // Test with filesystem storage
+    test_get_workflow_package_by_name_with_fs_storage().await;
+}
+
+async fn test_get_workflow_package_by_name_with_db_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    // Package building spawns cargo subprocess which must happen before OpenSSL init
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Register the package
+    let package_id = registry_dal
+        .register_workflow_package(package_data.clone())
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Get the registered package to find out its actual name and version
+    let registered = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get registered package")
+        .expect("Package should exist");
+
+    // Retrieve the package by name and version using actual values
+    let retrieved = registry_dal
+        .get_workflow_package_by_name(&registered.0.package_name, &registered.0.version)
+        .await
+        .expect("Failed to get workflow package by name");
+
+    assert!(retrieved.is_some());
+    let (metadata, binary_data) = retrieved.unwrap();
+    assert_eq!(metadata.package_name, "packaged-workflow-example");
+    // Version will be the workflow fingerprint from the real package
+    assert_eq!(binary_data, package_data);
+}
+
+async fn test_get_workflow_package_by_name_with_fs_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    // Package building spawns cargo subprocess which must happen before OpenSSL init
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Register the package
+    let package_id = registry_dal
+        .register_workflow_package(package_data.clone())
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Get the registered package to find out its actual name and version
+    let registered = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get registered package")
+        .expect("Package should exist");
+
+    // Retrieve the package by name and version using actual values
+    let retrieved = registry_dal
+        .get_workflow_package_by_name(&registered.0.package_name, &registered.0.version)
+        .await
+        .expect("Failed to get workflow package by name");
+
+    assert!(retrieved.is_some());
+    let (metadata, binary_data) = retrieved.unwrap();
+    assert_eq!(metadata.package_name, "packaged-workflow-example");
+    // Version will be the workflow fingerprint from the real package
+    assert_eq!(binary_data, package_data);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unregister_workflow_package_by_id() {
+    // Test with database storage
+    test_unregister_workflow_package_by_id_with_db_storage().await;
+    // Test with filesystem storage
+    test_unregister_workflow_package_by_id_with_fs_storage().await;
+}
+
+async fn test_unregister_workflow_package_by_id_with_db_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Create and register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Verify it exists
+    assert!(
+        registry_dal
+            .exists_by_id(package_id)
+            .await
+            .expect("Failed to check existence")
+    );
+
+    // Unregister the package
+    registry_dal
+        .unregister_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to unregister workflow package");
+
+    // Verify it's gone
+    assert!(
+        !registry_dal
+            .exists_by_id(package_id)
+            .await
+            .expect("Failed to check existence")
+    );
+}
+
+async fn test_unregister_workflow_package_by_id_with_fs_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Create and register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Verify it exists
+    assert!(
+        registry_dal
+            .exists_by_id(package_id)
+            .await
+            .expect("Failed to check existence")
+    );
+
+    // Unregister the package
+    registry_dal
+        .unregister_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to unregister workflow package");
+
+    // Verify it's gone
+    assert!(
+        !registry_dal
+            .exists_by_id(package_id)
+            .await
+            .expect("Failed to check existence")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unregister_workflow_package_by_name() {
+    // Test with database storage
+    test_unregister_workflow_package_by_name_with_db_storage().await;
+    // Test with filesystem storage
+    test_unregister_workflow_package_by_name_with_fs_storage().await;
+}
+
+async fn test_unregister_workflow_package_by_name_with_db_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Create and register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Get the actual package metadata
+    let registered = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get registered package")
+        .expect("Package should exist");
+    let package_name = &registered.0.package_name;
+    let package_version = &registered.0.version;
+
+    // Verify it exists
+    assert!(
+        registry_dal
+            .exists_by_name(package_name, package_version)
+            .await
+            .expect("Failed to check existence")
+    );
+
+    // Unregister the package by name
+    registry_dal
+        .unregister_workflow_package_by_name(package_name, package_version)
+        .await
+        .expect("Failed to unregister workflow package");
+
+    // Verify it's gone
+    assert!(
+        !registry_dal
+            .exists_by_name(package_name, package_version)
+            .await
+            .expect("Failed to check existence")
+    );
+}
+
+async fn test_unregister_workflow_package_by_name_with_fs_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Create and register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Get the actual package metadata
+    let registered = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get registered package")
+        .expect("Package should exist");
+    let package_name = &registered.0.package_name;
+    let package_version = &registered.0.version;
+
+    // Verify it exists
+    assert!(
+        registry_dal
+            .exists_by_name(package_name, package_version)
+            .await
+            .expect("Failed to check existence")
+    );
+
+    // Unregister the package by name
+    registry_dal
+        .unregister_workflow_package_by_name(package_name, package_version)
+        .await
+        .expect("Failed to unregister workflow package");
+
+    // Verify it's gone
+    assert!(
+        !registry_dal
+            .exists_by_name(package_name, package_version)
+            .await
+            .expect("Failed to check existence")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_list_packages() {
+    // Test with database storage
+    test_list_packages_with_db_storage().await;
+    // Test with filesystem storage
+    test_list_packages_with_fs_storage().await;
+}
+
+async fn test_list_packages_with_db_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Get initial count
+    let initial_packages = registry_dal
+        .list_packages()
+        .await
+        .expect("Failed to list packages");
+    let initial_count = initial_packages.len();
+
+    // Register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // List packages and verify count increased
+    let packages = registry_dal
+        .list_packages()
+        .await
+        .expect("Failed to list packages");
+    assert_eq!(packages.len(), initial_count + 1);
+
+    // Find our package in the list (package name comes from #[packaged_workflow(package = "packaged-workflow-example")])
+    let our_package = packages
+        .iter()
+        .find(|p| p.package_name == "packaged-workflow-example");
+    assert!(our_package.is_some());
+}
+
+async fn test_list_packages_with_fs_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Get initial count
+    let initial_packages = registry_dal
+        .list_packages()
+        .await
+        .expect("Failed to list packages");
+    let initial_count = initial_packages.len();
+
+    // Register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // List packages and verify count increased
+    let packages = registry_dal
+        .list_packages()
+        .await
+        .expect("Failed to list packages");
+    assert_eq!(packages.len(), initial_count + 1);
+
+    // Find our package in the list (package name comes from #[packaged_workflow(package = "packaged-workflow-example")])
+    let our_package = packages
+        .iter()
+        .find(|p| p.package_name == "packaged-workflow-example");
+    assert!(our_package.is_some());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_register_duplicate_package_is_idempotent() {
+    // Under the supersede-based lifecycle (T-0497), uploading identical bytes is an
+    // idempotent no-op — the handler detects the matching content_hash on the active
+    // row and returns the existing UUID without touching storage.
+    test_register_duplicate_package_idempotent_with_db_storage().await;
+    test_register_duplicate_package_idempotent_with_fs_storage().await;
+}
+
+async fn test_register_duplicate_package_idempotent_with_db_storage() {
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    let first_id = registry_dal
+        .register_workflow_package(package_data.clone())
+        .await
+        .expect("Failed to register workflow package first time");
+
+    let second_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Re-upload of identical bytes should be idempotent, not an error");
+
+    assert_eq!(
+        first_id, second_id,
+        "Idempotent re-upload must return the existing package UUID"
+    );
+}
+
+async fn test_register_duplicate_package_idempotent_with_fs_storage() {
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    let first_id = registry_dal
+        .register_workflow_package(package_data.clone())
+        .await
+        .expect("Failed to register workflow package first time");
+
+    let second_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Re-upload of identical bytes should be idempotent, not an error");
+
+    assert_eq!(first_id, second_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_exists_operations() {
+    // Test with database storage
+    test_exists_operations_with_db_storage().await;
+    // Test with filesystem storage
+    test_exists_operations_with_fs_storage().await;
+}
+
+async fn test_exists_operations_with_db_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Check non-existent package
+    let fake_id = Uuid::new_v4();
+    assert!(
+        !registry_dal
+            .exists_by_id(fake_id)
+            .await
+            .expect("Failed to check existence")
+    );
+    assert!(
+        !registry_dal
+            .exists_by_name("nonexistent", "1.0.0")
+            .await
+            .expect("Failed to check existence")
+    );
+
+    // Register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Check existing package
+    assert!(
+        registry_dal
+            .exists_by_id(package_id)
+            .await
+            .expect("Failed to check existence")
+    );
+    // Get actual package metadata to check existence
+    let registered = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get registered package")
+        .expect("Package should exist");
+
+    assert!(
+        registry_dal
+            .exists_by_name(&registered.0.package_name, &registered.0.version)
+            .await
+            .expect("Failed to check existence")
+    );
+}
+
+async fn test_exists_operations_with_fs_storage() {
+    // IMPORTANT: Get mock package BEFORE initializing database to avoid SIGSEGV
+    let package_data = get_mock_package();
+
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    // Check non-existent package
+    let fake_id = Uuid::new_v4();
+    assert!(
+        !registry_dal
+            .exists_by_id(fake_id)
+            .await
+            .expect("Failed to check existence")
+    );
+    assert!(
+        !registry_dal
+            .exists_by_name("nonexistent", "1.0.0")
+            .await
+            .expect("Failed to check existence")
+    );
+
+    // Register a package
+    let package_id = registry_dal
+        .register_workflow_package(package_data)
+        .await
+        .expect("Failed to register workflow package");
+    drive_to_success(&registry_dal, package_id).await;
+
+    // Check existing package
+    assert!(
+        registry_dal
+            .exists_by_id(package_id)
+            .await
+            .expect("Failed to check existence")
+    );
+    // Get actual package metadata to check existence
+    let registered = registry_dal
+        .get_workflow_package_by_id(package_id)
+        .await
+        .expect("Failed to get registered package")
+        .expect("Package should exist");
+
+    assert!(
+        registry_dal
+            .exists_by_name(&registered.0.package_name, &registered.0.version)
+            .await
+            .expect("Failed to check existence")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_nonexistent_package() {
+    // Test with database storage
+    test_get_nonexistent_package_with_db_storage().await;
+    // Test with filesystem storage
+    test_get_nonexistent_package_with_fs_storage().await;
+}
+
+async fn test_get_nonexistent_package_with_db_storage() {
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let registry_dal = dal.workflow_registry(storage);
+
+    let fake_id = Uuid::new_v4();
+
+    // Try to get non-existent package by ID
+    let result = registry_dal
+        .get_workflow_package_by_id(fake_id)
+        .await
+        .expect("Failed to get nonexistent package by ID");
+    assert!(result.is_none());
+
+    // Try to get non-existent package by name
+    let result = registry_dal
+        .get_workflow_package_by_name("nonexistent", "1.0.0")
+        .await
+        .expect("Failed to get nonexistent package by name");
+    assert!(result.is_none());
+}
+
+async fn test_get_nonexistent_package_with_fs_storage() {
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let registry_dal = dal.workflow_registry(storage);
+
+    let fake_id = Uuid::new_v4();
+
+    // Try to get non-existent package by ID
+    let result = registry_dal
+        .get_workflow_package_by_id(fake_id)
+        .await
+        .expect("Failed to get nonexistent package by ID");
+    assert!(result.is_none());
+
+    // Try to get non-existent package by name
+    let result = registry_dal
+        .get_workflow_package_by_name("nonexistent", "1.0.0")
+        .await
+        .expect("Failed to get nonexistent package by name");
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unregister_nonexistent_package() {
+    // Test with database storage
+    test_unregister_nonexistent_package_with_db_storage().await;
+    // Test with filesystem storage
+    test_unregister_nonexistent_package_with_fs_storage().await;
+}
+
+async fn test_unregister_nonexistent_package_with_db_storage() {
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    let fake_id = Uuid::new_v4();
+
+    // Try to unregister non-existent package by ID - should be idempotent
+    let result = registry_dal
+        .unregister_workflow_package_by_id(fake_id)
+        .await;
+    assert!(
+        result.is_ok(),
+        "Unregistering nonexistent package should be idempotent"
+    );
+
+    // Try to unregister non-existent package by name - should be idempotent
+    let result = registry_dal
+        .unregister_workflow_package_by_name("nonexistent", "1.0.0")
+        .await;
+    assert!(
+        result.is_ok(),
+        "Unregistering nonexistent package should be idempotent"
+    );
+}
+
+async fn test_unregister_nonexistent_package_with_fs_storage() {
+    let fixture = get_or_init_fixture().await;
+    let mut fixture = fixture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture.reset_database().await;
+    fixture.initialize().await;
+
+    let dal = fixture.get_dal();
+    let storage = fixture.create_filesystem_storage();
+    let mut registry_dal = dal.workflow_registry(storage);
+
+    let fake_id = Uuid::new_v4();
+
+    // Try to unregister non-existent package by ID - should be idempotent
+    let result = registry_dal
+        .unregister_workflow_package_by_id(fake_id)
+        .await;
+    assert!(
+        result.is_ok(),
+        "Unregistering nonexistent package should be idempotent"
+    );
+
+    // Try to unregister non-existent package by name - should be idempotent
+    let result = registry_dal
+        .unregister_workflow_package_by_name("nonexistent", "1.0.0")
+        .await;
+    assert!(
+        result.is_ok(),
+        "Unregistering nonexistent package should be idempotent"
+    );
+}

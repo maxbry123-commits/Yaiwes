@@ -1,0 +1,1978 @@
+-- in.cue --
+@experiment(try)
+
+// =============================================================================
+// Basic try with successful evaluation
+// =============================================================================
+
+a: 1
+b: 2
+c?: int  // undefined optional field
+incomplete: int
+
+// Try with successful optional references (both defined)
+success: {
+    try { result: a? + b? }
+}
+
+// Try with single optional reference
+single: {
+    x: 5
+    try { y: x? * 2 }
+}
+
+// =============================================================================
+// Try with else clause
+// =============================================================================
+
+// Else NOT triggered when try succeeds (value is defined)
+fallbackDef: 42
+elseNotTriggered: {
+	try { v: fallbackDef? } else { fallback: 0 }
+}
+
+// Else triggered when try fails (optional field undefined)
+// Note: else uses different field name to avoid merge conflicts with trial evaluation
+elseTriggered: {
+    try { v: c? } else { fallback: -1 }
+}
+
+// Else with different field names (avoids conflict with trial evaluation)
+elseMultiField: {
+    try { x: c?, y: c? } else { fallback: true }
+}
+
+// =============================================================================
+// Try with undefined optional references
+// =============================================================================
+
+// Try produces empty struct when optional fails (no else)
+emptyOnFail: {
+	try { z: c? + 1 }
+}
+
+// Try with mix of defined and undefined - all must succeed
+mixedRefs: {
+	try { x: a?, y: c? } else { fallback: true }
+}
+
+incompleteOK: {
+	try { x: incomplete? } else { fallback: 23 }
+}
+
+// Nested struct in try body with incomplete value
+incompleteNestedBody: {
+	try { x: y: incomplete? } else { fallback: 23 }
+}
+
+// =============================================================================
+// Required fields
+// =============================================================================
+
+// Unfilled required field triggers else
+requiredUnfilled: {
+	a!: _
+	try { x: a? } else { fallback: 23 }
+}
+
+// Filled required field succeeds
+requiredFilled: {
+	a!: _
+	a: 5
+	try { x: a? } else { fallback: 23 }
+}
+
+// Required field with type constraint triggers else
+requiredWithType: {
+	a!: int
+	try { x: a? } else { fallback: 23 }
+}
+
+// =============================================================================
+// Try with for comprehension
+// =============================================================================
+
+// For with optional source that exists
+forWithDefinedSource: {
+    try { for x in [b?] { val: x } }
+}
+
+// For with optional source that's undefined
+forWithUndefinedSource: {
+	try { for x in [c?] { val: x } } else { empty: true }
+}
+
+// =============================================================================
+// Nested structures
+// =============================================================================
+
+nested: {
+	// Try inside struct
+	outer: {
+		try { inner: a? }
+	}
+
+	// Multiple try clauses in same struct
+	multi: {
+		try { first: a? }
+		try { second: b? }
+	}
+
+	// Try with nested struct in body
+	deepNested: {
+		try {
+			level1: {
+				level2: a?
+			}
+		}
+	}
+}
+
+// =============================================================================
+// Complex expressions in try
+// =============================================================================
+
+complexExpr: {
+	// Binary operations
+	binOp: {
+		try { sum: a? + b?, prod: a? * b? }
+	}
+
+	// Conditional with optional
+	list: {
+		try { items: [a?, b?, a? + b?] }
+	}
+}
+
+// =============================================================================
+// Selector expressions with optional
+// =============================================================================
+
+	selectorTests: {
+	data: {
+		nested: {
+			value: 100
+		}
+	}
+
+	// Selector on defined path
+	definedSelector: {
+		try { v: data.nested.value? }
+	}
+
+
+	// Note: selector on undefined path would be compile error
+}
+
+// =============================================================================
+// Refer to closed structs
+// =============================================================================
+closedness: {
+	#Def: {f: int}
+
+	d: #Def
+
+	exists: {
+		try { v: #Def.f? }
+	}
+	notExistsDef: {
+		try { v: #Def.g? }
+	}
+	notExistsValue: {
+		try { v: d.g? }
+	}
+}
+
+
+// =============================================================================
+// Index expressions with optional
+// =============================================================================
+
+indexTests: {
+	closedList: [10, 20, 30]
+	openList: [10, 20, 30, ...]
+
+	// Index on defined position (closed list)
+	definedIndex: {
+		try { v: closedList[0]? }
+	}
+
+	// Index on defined position (middle)
+	middleIndex: {
+		try { v: closedList[1]? }
+	}
+
+	// Index out of range on CLOSED list - should ERROR (can never be satisfied)
+	outOfRangeClosed: {
+		try { v: closedList[10]? } else { fallback: -1 }
+	}
+
+	// Index out of range on CLOSED list without else - should ERROR
+	outOfRangeClosedNoElse: {
+		try { v: closedList[100]? }
+	}
+
+	// Index out of range on OPEN list - should trigger else (list might grow)
+	outOfRangeOpen: {
+		try { v: openList[10]? } else { fallback: -1 }
+	}
+
+	// Index out of range on OPEN list without else - empty struct
+	outOfRangeOpenNoElse: {
+		try { v: openList[100]? }
+	}
+
+	// Multiple index accesses on closed list
+	multipleIndex: {
+		try { x: closedList[0]?, y: closedList[1]?, z: closedList[2]? }
+	}
+}
+
+// =============================================================================
+// Edge cases
+// =============================================================================
+
+edgeCases: {
+	// Empty try body (should produce empty struct)
+	emptyBody: {
+		try { }
+	}
+
+	// Try with only literal (no optional refs) - should always succeed
+	literalOnly: {
+		try { x: 42 }
+	}
+
+	// Multiple optional refs, first fails
+	firstFails: {
+		try { x: c?, y: a? } else { skipped: true }
+	}
+
+	// Multiple optional refs, second fails
+	secondFails: {
+		try { x: a?, y: c? } else { skipped: true }
+	}
+
+	referenceError: {
+		a: 1 / 0
+		a: _b: 2
+
+		direct: {
+			try { v: a? } else { skipped: true }
+			// v shares the error from a
+		}
+		dontSkipError1: {
+			try { a._b? } else { skipped: true }
+		}
+		dontSkipError2: {
+			try { a?._b? } else { skipped: true }
+		}
+	}
+}
+
+// =============================================================================
+// Referencing into try results
+// =============================================================================
+
+// When referencing a field from a successful try, the field is guaranteed
+// to exist and be concrete. No ? needed outside of try context.
+
+refIntoTry: {
+	// Try that succeeds - inner fields are accessible
+	source: {
+		try { val: a? }
+	}
+	// Reference into successful try result (no ? needed)
+	ref: source.val // Should resolve to 1
+
+	// Nested try - outer succeeds, inner may or may not
+	nestedSource: {
+		try {
+			inner: {
+				try { deep: b? }
+			}
+		}
+	}
+	// Reference into nested try result (no ? needed)
+	nestedRef: nestedSource.inner.deep // Should resolve to 2
+
+	// Try that fails - struct is empty, reference fails
+	nestedSkipped?: { try { c? } }
+	mixedSource: {
+		try { foo: nestedSkipped? }
+		bar?: 1
+		baz: 1
+	}
+	// Reference into failed try - use try to handle the missing field
+	skippedRef: {
+		try { v: mixedSource.foo? } else { missing: true }
+	}
+	failedRef1: {
+		try { v: mixedSource.foo } else { missing: true }
+	}
+	failedRef2: {
+		try { v: mixedSource.foo } else { missing: true }
+	}
+	successRef: {
+		try { v: mixedSource.baz? } else { missing: true }
+	}
+}
+
+// =============================================================================
+// Error precedence: real errors should not be masked by OptionalUndefined
+// =============================================================================
+
+errorPrecedence: {
+	// Type error with optional that exists - should error
+	typeErrorDefined: {
+		try { v: a? + "string" } else { fallback: "ok" }
+	}
+
+	// Type error AND undefined optional - depends on evaluation order
+	// If c? is evaluated first and fails, the type error is never reached
+	typeErrorUndefined: {
+		try { v: c? + "string" } else { fallback: "ok" }
+	}
+
+	// Division by zero with optional
+	divByZero: {
+		try { v: a? / 0 } else { fallback: "ok" }
+	}
+
+	// Error from conflicting values
+	conflictError: {
+		try { v: a? & "notanint" } else { fallback: "ok" }
+	}
+
+	// Mixed case: OptionalUndefined in one field, real error in another
+	// The real error should still propagate
+	mixedError: {
+		try {
+			x: c?      // undefined
+			y: 1 / 0   // real error (independent)
+		} else { fallback: "ok" }
+	}
+
+	// Mixed case 2: multiple optionals, one undefined, one with error
+	mixedErrorMultiple: {
+		try {
+			x: a?      // defined (1)
+			y: c?      // undefined
+			z: a? / 0  // real error
+		} else { fallback: "ok" }
+	}
+}
+
+// =============================================================================
+// Assignment form: try x = expr
+// =============================================================================
+
+assignmentForm: {
+	// Basic assignment with defined value
+	basicDefined: {
+		try x = a? { result: x }
+	}
+
+	// Assignment with undefined optional - should trigger else
+	basicUndefined: {
+		try x = c? { result: x } else { fallback: 0 }
+	}
+
+	// Assignment without else - should produce empty struct
+	noElseUndefined: {
+		try x = c? { result: x }
+	}
+
+	// Assignment with expression
+	withExpression: {
+		try sum = a? + b? { result: sum }
+	}
+
+	// Assignment with failing expression - triggers else
+	withFailingExpr: {
+		try sum = a? + c? { result: sum } else { fallback: -1 }
+	}
+
+	// Chained assignments
+	chained: {
+		try x = a? try y = b? { result: x + y }
+	}
+
+	// Assignment with selector
+	withSelector: {
+		data: { inner: 42 }
+		try v = data.inner? { result: v }
+	}
+
+	// Assignment with index
+	withIndex: {
+		list: [10, 20, 30]
+		try v = list[1]? { result: v }
+	}
+
+	// Assignment with out-of-range index on closed list - should ERROR
+	withOutOfRangeIndex: {
+		list: [10, 20, 30]
+		try v = list[10]? { result: v } else { fallback: -1 }
+	}
+
+	// Assignment with out-of-range index on open list - should trigger else
+	withOutOfRangeIndexOpen: {
+		list: [10, 20, 30, ...]
+		try v = list[10]? { result: v } else { fallback: -1 }
+	}
+
+	// Assignment used in nested expression
+	nestedUse: {
+		try x = a? { inner: { value: x * 2 } }
+	}
+
+	// Multiple chained try assignments with one failing
+	chainedOneFails: {
+		try x = a? try y = c? { result: x + y }
+	}
+
+	// Assignment with real error - should propagate
+	withRealError: {
+		try x = a? / 0 { result: x } else { fallback: "ok" }
+	}
+
+	// Assignment combined with for
+	withFor: {
+		try x = b? for i, v in [1, 2] { "\(i)": x + v }
+	}
+
+	// Assignment combined with if
+	withIf: {
+		try x = a? if x > 0 { positive: x }
+	}
+
+	// Assignment combined with let
+	withLet: {
+		try x = a? let y = x * 2 { doubled: y }
+	}
+}
+
+// =============================================================================
+// Nested try clauses: an empty inner try in the outer try body should be a
+// no-op and must not interfere with the outer try's detection of failed
+// optional references. https://cuelang.org/issue/4347
+// =============================================================================
+
+// Outer try has a failed optional reference (foo?). The empty inner try {}
+// is a no-op and must not interfere with the outer's detection of the
+// failure. The selector on the struct literal forces concrete evaluation.
+nestedTry: emptyInnerInBody: {
+	foo?: foo2: int
+	bar: {
+		try {
+			foo?.foo2 & { try {} }
+		}
+	}
+}.bar
+
+nestedTry: emptyInnerWithElse: {
+	foo?: foo2: int
+	bar: {
+		try {
+			foo?.foo2 & { try {} }
+		} else {
+			fallback: -1
+		}
+	}
+}.bar
+
+// Sibling form: the empty inner try {} is in a sibling field, not in a
+// conjunction with the failing optional reference.
+nestedTry: emptyInnerSibling: {
+	foo?: foo2: int
+	bar: {
+		try {
+			x: foo?.foo2
+			y: { try {} }
+		} else {
+			fallback: -1
+		}
+	}
+}.bar
+
+// Parent and child try clauses both reference the same optional field.
+// Undefined: both should fail and the outer's else should run.
+nestedTry: sameFieldUndefined: {
+	try {
+		x: c?
+		try { y: c? }
+	} else {
+		fallback: -1
+	}
+}
+
+// Parent and child try clauses both reference the same optional field.
+// Defined: both succeed; the outer yields the merged body.
+nestedTry: sameFieldDefined: {
+	foo: 99
+	try {
+		x: foo?
+		try { y: foo? }
+	} else {
+		fallback: -1
+	}
+}
+
+// Two sibling try clauses referencing the same optional field.
+// Undefined: both fail and yield nothing.
+siblingTries: sameFieldUndefined: {
+	try { x: c? }
+	try { y: c? }
+}
+
+// Two sibling try clauses referencing the same optional field.
+// Defined: both succeed and contribute their body.
+siblingTries: sameFieldDefined: {
+	foo: 99
+	try { x: foo? }
+	try { y: foo? }
+}
+
+// Variants of emptyInnerInBody where the inner try body itself contains a
+// ?-marked reference. The inner try therefore registers its own body, but the
+// outer foo? failure is attributed to the outer body by structural ancestry,
+// so the inner try does not erase it and the outer try still discards.
+
+// Inner body references a defined optional; the outer foo? fails, so the whole
+// outer try yields nothing.
+nestedTry: optionalInnerDefined: {
+	foo?: foo2: int
+	bar: 7
+	out: {
+		try {
+			foo?.foo2 & { try { z: bar? } }
+		}
+	}
+}.out
+
+// As above but with an else clause, which runs because the outer foo? fails.
+nestedTry: optionalInnerDefinedWithElse: {
+	foo?: foo2: int
+	bar: 7
+	out: {
+		try {
+			foo?.foo2 & { try { z: bar? } }
+		} else {
+			fallback: -1
+		}
+	}
+}.out
+
+// Inner body references an undefined optional; the inner try fails on its own
+// and the outer foo? also fails, so the else clause runs.
+nestedTry: optionalInnerUndefined: {
+	foo?: foo2: int
+	out: {
+		try {
+			foo?.foo2 & { try { z: c? } }
+		} else {
+			fallback: -1
+		}
+	}
+}.out
+
+// =============================================================================
+// Try bodies containing disjunctions. Evaluating a disjunction clones the
+// node context, so attribution of a failed ?-marked reference must survive
+// cloning. https://cuelang.org/issue/4347
+// =============================================================================
+
+// Disjunction as a sibling field within the try body. The optional resolves,
+// so the try yields its body, including the unresolved disjunction.
+nestedTry: disjSiblingDefined: {
+	foo: 7
+	try {
+		pick: *1 | 2
+		v: foo?
+	} else { fallback: -1 }
+}
+
+// As above but the optional is undefined, so the try is discarded and the
+// else runs. The sibling disjunction never materializes.
+nestedTry: disjSiblingUndefined: {
+	foo?: int
+	try {
+		pick: *1 | 2
+		v: foo?
+	} else { fallback: -1 }
+}
+
+// The try body root is itself a disjunction. The optional resolves in the
+// first branch, so the try yields the whole disjunction.
+nestedTry: disjBodyDefined: {
+	foo: 9
+	try { {x: foo?} | {x: 0} } else { fallback: -1 }
+}
+
+// The try body root is a disjunction and its first branch references an
+// undefined optional. A failed ?-reference in any branch discards the whole
+// try, so the else runs even though the second branch is self-consistent.
+nestedTry: disjBodyUndefined: {
+	foo?: int
+	try { {x: foo?} | {x: 0} } else { fallback: -1 }
+}
+
+// =============================================================================
+// Original recursive tests
+// =============================================================================
+
+recursive: t1: { try { for x in [b?] { x } } }
+recursive: t2: { try { {x: b?, y: c?} } }
+recursive: t3: { try { {x: b?, y: c?} } else { z: 23 }}
+
+// =============================================================================
+// Try clause as a list element
+// =============================================================================
+
+listElems: {
+	// Struct form yielding a value into the list when the reference resolves.
+	defined: [try { a? }]
+
+	// Struct form discards its output when the optional reference fails.
+	undefined: [try { c? }]
+
+	// Binding form in a list element.
+	binding: [try v = a? { v + 1 }]
+
+	// for clause followed by a try clause in a list element.
+	forTry: [for x in [a, b] try { x }]
+
+	// else clause when the optional reference fails.
+	withElse: [try { c? } else { -1 }]
+}
+
+// =============================================================================
+// Let referenced from a try body over a still-evaluating struct
+// =============================================================================
+
+// A let referenced from a try body resolves to a cycle placeholder while the
+// enclosing struct is still evaluating. Looking up a field on the unified
+// result used to recompute that placeholder without bound, hanging evaluation;
+// it must terminate with an incomplete error for the unprotected reference to
+// the absent optional field. https://cuelang.org/issue/4421
+letTryCycle: {
+	_d: {
+		let _x = {inner?: bool}
+		try { c: "\(_x.inner)" }
+	}
+	out: (_d & {}).c
+}
+
+// =============================================================================
+// A sibling for comprehension over a field the try body contributes to
+// =============================================================================
+
+// The for comprehension must wait for the preceding try to complete before
+// iterating a.items; evalv3 used to iterate too early, leaving a.results
+// empty. Also, the try body's sandbox pre-evaluation must not freeze the
+// pending a.items.item1 arc in the main tree. https://cuelang.org/issue/4098
+issue4098: {
+	a: {
+		flag?: bool
+		items: [string]:   string
+		results: [string]: int
+	}
+
+	a: flag: true
+
+	try {
+		if a.flag? == true {
+			a: items: item1: "data1"
+		}
+	}
+
+	for k, v in a.items {
+		a: results: (k): 2
+	}
+
+}
+
+// Only the try body itself is pre-evaluated tentatively. Rooted vertices it
+// references, such as ext, must evaluate exactly as they would without the
+// try: here, a and b depend on each other cyclically, which must surface as
+// an error. Deferring the unblocking of their tasks as well left ext
+// finalized with a computed from a partial b, and b later gaining x.
+tryRootedCycle: {
+	try {out: ext}
+	ext: {
+		a: [for k, v in b {k}]
+		b: {seed: 1, if len(a) == 1 {x: 1}}
+	}
+}
+
+tryNestedRootedCycle: {
+	try {try {out: ext}}
+	ext: {
+		a: [for k, v in b {k}]
+		b: {seed: 1, if len(a) == 1 {x: 1}}
+	}
+}
+
+// As a default disjunct, the cyclic struct is discarded in favor of the
+// other disjunct, just as without the try.
+tryRootedCycleDisjunct: {
+	try {out: ext}
+	ext: *{
+		a: [for k, v in b {k}]
+		b: {seed: 1, if len(a) == 1 {x: 1}}
+	} | {}
+}
+
+// =============================================================================
+// Try body fields shadowing fields of the enclosing struct
+// =============================================================================
+
+// The try body is embedded into the enclosing struct, so a ?-marked reference
+// through a field the body declares must see the fields the enclosing struct
+// contributes to that field as well.
+// https://github.com/cue-lang/cue/discussions/4482
+shadowing: {
+	// The reporter's example: x.a is only declared outside the try body.
+	outerField: {
+		x: {a?: int, b?: int}
+		x: a: 1
+		try { x: b: x.a? } else { fallback: -1 }
+	}
+
+	// Still discarded when the field is absent from both.
+	outerFieldUndefined: {
+		x: {a?: int, b?: int}
+		try { x: b: x.a? } else { fallback: -1 }
+	}
+
+	// Deeper path through body fields.
+	nestedPath: {
+		x: y: a: 1
+		try { x: y: b: x.y.a? }
+	}
+
+	// Index form.
+	indexForm: {
+		x: {a: 1}
+		try { x: b: x["a"]? }
+	}
+
+	// The shadowing body belongs to an enclosing try, whose pre-evaluation
+	// hosts the inner one.
+	nestedTry: {
+		x: a: 1
+		try {
+			x: b: 2
+			try { x: c: x.a? }
+		}
+	}
+
+	// The outer field is produced by a comprehension.
+	outerFieldFromFor: {
+		src: {a: 1}
+		x: { for k, v in src { (k): v } }
+		try { x: b: x.a? }
+	}
+
+	// The binding form evaluates its expression on its own: nothing outside
+	// the struct literal can supply the field its own a? refers to.
+	bindingExpr: {
+		a: 1
+		try v = {a?: int, b: a?} {ok: true} else {fallback: true}
+	}
+
+	// A chained ?-marked selector through a field the body declares.
+	chained: {
+		x: a: foo: 1
+		try { x: b: x.a?.foo? } else { fallback: true }
+	}
+
+	chainedUndefined: {
+		x: a: {}
+		try { x: b: x.a?.foo? } else { fallback: true }
+	}
+
+	// The base of the failing lookup is reached through a let or for binding,
+	// or through a field structure-shared with a rooted vertex.
+	letBase: {
+		x: a: 1
+		try { x: b: 1, let L = x, y: L.a? } else { fallback: true }
+	}
+
+	forBase: {
+		x: a: 1
+		try { x: b: 1, for k, v in {p: x} { y: (k): v.a? } } else { fallback: true }
+	}
+
+	sharedBase: {
+		x: a: 1
+		s: {c: 1}
+		try { x: s, y: x.a? } else { fallback: true }
+	}
+}
+
+// =============================================================================
+// Optional field that is a sibling of the try clause
+// =============================================================================
+
+// Evaluating a ?-marked reference to an absent optional sibling blocks the
+// try body's task on that lazily evaluated arc. Finalizing the body must run
+// the task, as a failed ?-marked reference is only attributed to the try
+// while its body is being pre-evaluated; leaving it for a later regular
+// finalize yields the body for real, and the reference then fails for good.
+// https://cuelang.org/issue/4483
+issue4483: {
+	binary: {
+		a?: int
+		try {b: a? + 1}
+	}
+	comparison: {
+		a?: int
+		try {b: a? > 1}
+	}
+	interpolation: {
+		a?: string
+		try {b: "x\(a?)"}
+	}
+	bound: {
+		a?: int
+		try x = {value: a? + 1} {b: x}
+	}
+	// The guard on the yielded body fails to hold; before the guards case
+	// below was fixed, this shape panicked as well.
+	guarded: {
+		a?: int
+		try x = {value: a? + 1} if x.value > 5 {b: x}
+	}
+	// Using the reference as a conjunct, or with the optional field in an
+	// enclosing scope, never blocked; covered for contrast.
+	conjunct: {
+		a?: int
+		try {b: a?}
+	}
+	enclosing: {
+		a?: int
+		s: {try {b: a? + 1}}
+	}
+	// Both guards block on the lazily evaluated optional siblings, so both
+	// comprehensions are retried by the same unblocking loop of the enclosing
+	// vertex, the second one behind the first try body's finalize. That
+	// finalize used to clear the tail of the shared blocking queue under the
+	// loop, which then panicked on the nil entry.
+	guards: {
+		a?: int
+		try x = {value: 1} if x.value > a {out: x}
+		b?: int
+		try y = {value: 1} if y.value > b {out: y}
+	}
+}
+
+-- out/compile --
+--- in.cue
+{
+  a: 1
+  b: 2
+  c?: int
+  incomplete: int
+  success: {
+    try {
+      result: (〈2;a〉? + 〈2;b〉?)
+    }
+  }
+  single: {
+    x: 5
+    try {
+      y: (〈1;x〉? * 2)
+    }
+  }
+  fallbackDef: 42
+  elseNotTriggered: {
+    try {
+      v: 〈2;fallbackDef〉?
+    } else {
+      fallback: 0
+    }
+  }
+  elseTriggered: {
+    try {
+      v: 〈2;c〉?
+    } else {
+      fallback: -1
+    }
+  }
+  elseMultiField: {
+    try {
+      x: 〈2;c〉?
+      y: 〈2;c〉?
+    } else {
+      fallback: true
+    }
+  }
+  emptyOnFail: {
+    try {
+      z: (〈2;c〉? + 1)
+    }
+  }
+  mixedRefs: {
+    try {
+      x: 〈2;a〉?
+      y: 〈2;c〉?
+    } else {
+      fallback: true
+    }
+  }
+  incompleteOK: {
+    try {
+      x: 〈2;incomplete〉?
+    } else {
+      fallback: 23
+    }
+  }
+  incompleteNestedBody: {
+    try {
+      x: {
+        y: 〈3;incomplete〉?
+      }
+    } else {
+      fallback: 23
+    }
+  }
+  requiredUnfilled: {
+    a!: _
+    try {
+      x: 〈1;a〉?
+    } else {
+      fallback: 23
+    }
+  }
+  requiredFilled: {
+    a!: _
+    a: 5
+    try {
+      x: 〈1;a〉?
+    } else {
+      fallback: 23
+    }
+  }
+  requiredWithType: {
+    a!: int
+    try {
+      x: 〈1;a〉?
+    } else {
+      fallback: 23
+    }
+  }
+  forWithDefinedSource: {
+    try {
+      for _, x in [
+        〈3;b〉?,
+      ] {
+        val: 〈1;x〉
+      }
+    }
+  }
+  forWithUndefinedSource: {
+    try {
+      for _, x in [
+        〈3;c〉?,
+      ] {
+        val: 〈1;x〉
+      }
+    } else {
+      empty: true
+    }
+  }
+  nested: {
+    outer: {
+      try {
+        inner: 〈3;a〉?
+      }
+    }
+    multi: {
+      try {
+        first: 〈3;a〉?
+      }
+      try {
+        second: 〈3;b〉?
+      }
+    }
+    deepNested: {
+      try {
+        level1: {
+          level2: 〈4;a〉?
+        }
+      }
+    }
+  }
+  complexExpr: {
+    binOp: {
+      try {
+        sum: (〈3;a〉? + 〈3;b〉?)
+        prod: (〈3;a〉? * 〈3;b〉?)
+      }
+    }
+    list: {
+      try {
+        items: [
+          〈4;a〉?,
+          〈4;b〉?,
+          (〈4;a〉? + 〈4;b〉?),
+        ]
+      }
+    }
+  }
+  selectorTests: {
+    data: {
+      nested: {
+        value: 100
+      }
+    }
+    definedSelector: {
+      try {
+        v: 〈2;data〉.nested.value?
+      }
+    }
+  }
+  closedness: {
+    #Def: {
+      f: int
+    }
+    d: 〈0;#Def〉
+    exists: {
+      try {
+        v: 〈2;#Def〉.f?
+      }
+    }
+    notExistsDef: {
+      try {
+        v: 〈2;#Def〉.g?
+      }
+    }
+    notExistsValue: {
+      try {
+        v: 〈2;d〉.g?
+      }
+    }
+  }
+  indexTests: {
+    closedList: [
+      10,
+      20,
+      30,
+    ]
+    openList: [
+      10,
+      20,
+      30,
+      ...,
+    ]
+    definedIndex: {
+      try {
+        v: 〈2;closedList〉[0]?
+      }
+    }
+    middleIndex: {
+      try {
+        v: 〈2;closedList〉[1]?
+      }
+    }
+    outOfRangeClosed: {
+      try {
+        v: 〈2;closedList〉[10]?
+      } else {
+        fallback: -1
+      }
+    }
+    outOfRangeClosedNoElse: {
+      try {
+        v: 〈2;closedList〉[100]?
+      }
+    }
+    outOfRangeOpen: {
+      try {
+        v: 〈2;openList〉[10]?
+      } else {
+        fallback: -1
+      }
+    }
+    outOfRangeOpenNoElse: {
+      try {
+        v: 〈2;openList〉[100]?
+      }
+    }
+    multipleIndex: {
+      try {
+        x: 〈2;closedList〉[0]?
+        y: 〈2;closedList〉[1]?
+        z: 〈2;closedList〉[2]?
+      }
+    }
+  }
+  edgeCases: {
+    emptyBody: {
+      try {}
+    }
+    literalOnly: {
+      try {
+        x: 42
+      }
+    }
+    firstFails: {
+      try {
+        x: 〈3;c〉?
+        y: 〈3;a〉?
+      } else {
+        skipped: true
+      }
+    }
+    secondFails: {
+      try {
+        x: 〈3;a〉?
+        y: 〈3;c〉?
+      } else {
+        skipped: true
+      }
+    }
+    referenceError: {
+      a: (1 / 0)
+      a: {
+        _b: 2
+      }
+      direct: {
+        try {
+          v: 〈2;a〉?
+        } else {
+          skipped: true
+        }
+      }
+      dontSkipError1: {
+        try {
+          〈2;a〉._b?
+        } else {
+          skipped: true
+        }
+      }
+      dontSkipError2: {
+        try {
+          〈2;a〉?._b?
+        } else {
+          skipped: true
+        }
+      }
+    }
+  }
+  refIntoTry: {
+    source: {
+      try {
+        val: 〈3;a〉?
+      }
+    }
+    ref: 〈0;source〉.val
+    nestedSource: {
+      try {
+        inner: {
+          try {
+            deep: 〈5;b〉?
+          }
+        }
+      }
+    }
+    nestedRef: 〈0;nestedSource〉.inner.deep
+    nestedSkipped?: {
+      try {
+        〈3;c〉?
+      }
+    }
+    mixedSource: {
+      try {
+        foo: 〈2;nestedSkipped〉?
+      }
+      bar?: 1
+      baz: 1
+    }
+    skippedRef: {
+      try {
+        v: 〈2;mixedSource〉.foo?
+      } else {
+        missing: true
+      }
+    }
+    failedRef1: {
+      try {
+        v: 〈2;mixedSource〉.foo
+      } else {
+        missing: true
+      }
+    }
+    failedRef2: {
+      try {
+        v: 〈2;mixedSource〉.foo
+      } else {
+        missing: true
+      }
+    }
+    successRef: {
+      try {
+        v: 〈2;mixedSource〉.baz?
+      } else {
+        missing: true
+      }
+    }
+  }
+  errorPrecedence: {
+    typeErrorDefined: {
+      try {
+        v: (〈3;a〉? + "string")
+      } else {
+        fallback: "ok"
+      }
+    }
+    typeErrorUndefined: {
+      try {
+        v: (〈3;c〉? + "string")
+      } else {
+        fallback: "ok"
+      }
+    }
+    divByZero: {
+      try {
+        v: (〈3;a〉? / 0)
+      } else {
+        fallback: "ok"
+      }
+    }
+    conflictError: {
+      try {
+        v: (〈3;a〉? & "notanint")
+      } else {
+        fallback: "ok"
+      }
+    }
+    mixedError: {
+      try {
+        x: 〈3;c〉?
+        y: (1 / 0)
+      } else {
+        fallback: "ok"
+      }
+    }
+    mixedErrorMultiple: {
+      try {
+        x: 〈3;a〉?
+        y: 〈3;c〉?
+        z: (〈3;a〉? / 0)
+      } else {
+        fallback: "ok"
+      }
+    }
+  }
+  assignmentForm: {
+    basicDefined: {
+      try x = 〈2;a〉? {
+        result: 〈1;x〉
+      }
+    }
+    basicUndefined: {
+      try x = 〈2;c〉? {
+        result: 〈1;x〉
+      } else {
+        fallback: 0
+      }
+    }
+    noElseUndefined: {
+      try x = 〈2;c〉? {
+        result: 〈1;x〉
+      }
+    }
+    withExpression: {
+      try sum = (〈2;a〉? + 〈2;b〉?) {
+        result: 〈1;sum〉
+      }
+    }
+    withFailingExpr: {
+      try sum = (〈2;a〉? + 〈2;c〉?) {
+        result: 〈1;sum〉
+      } else {
+        fallback: -1
+      }
+    }
+    chained: {
+      try x = 〈2;a〉? try y = 〈3;b〉? {
+        result: (〈2;x〉 + 〈1;y〉)
+      }
+    }
+    withSelector: {
+      data: {
+        inner: 42
+      }
+      try v = 〈0;data〉.inner? {
+        result: 〈1;v〉
+      }
+    }
+    withIndex: {
+      list: [
+        10,
+        20,
+        30,
+      ]
+      try v = 〈0;list〉[1]? {
+        result: 〈1;v〉
+      }
+    }
+    withOutOfRangeIndex: {
+      list: [
+        10,
+        20,
+        30,
+      ]
+      try v = 〈0;list〉[10]? {
+        result: 〈1;v〉
+      } else {
+        fallback: -1
+      }
+    }
+    withOutOfRangeIndexOpen: {
+      list: [
+        10,
+        20,
+        30,
+        ...,
+      ]
+      try v = 〈0;list〉[10]? {
+        result: 〈1;v〉
+      } else {
+        fallback: -1
+      }
+    }
+    nestedUse: {
+      try x = 〈2;a〉? {
+        inner: {
+          value: (〈2;x〉 * 2)
+        }
+      }
+    }
+    chainedOneFails: {
+      try x = 〈2;a〉? try y = 〈3;c〉? {
+        result: (〈2;x〉 + 〈1;y〉)
+      }
+    }
+    withRealError: {
+      try x = (〈2;a〉? / 0) {
+        result: 〈1;x〉
+      } else {
+        fallback: "ok"
+      }
+    }
+    withFor: {
+      try x = 〈2;b〉? for i, v in [
+        1,
+        2,
+      ] {
+        "\(〈1;i〉)": (〈2;x〉 + 〈1;v〉)
+      }
+    }
+    withIf: {
+      try x = 〈2;a〉? if (〈0;x〉 > 0) {
+        positive: 〈1;x〉
+      }
+    }
+    withLet: {
+      try x = 〈2;a〉? let y = (〈0;x〉 * 2) {
+        doubled: 〈1;y〉
+      }
+    }
+  }
+  nestedTry: {
+    emptyInnerInBody: {
+      foo?: {
+        foo2: int
+      }
+      bar: {
+        try {
+          (〈2;foo〉?.foo2 & {
+            try {}
+          })
+        }
+      }
+    }.bar
+  }
+  nestedTry: {
+    emptyInnerWithElse: {
+      foo?: {
+        foo2: int
+      }
+      bar: {
+        try {
+          (〈2;foo〉?.foo2 & {
+            try {}
+          })
+        } else {
+          fallback: -1
+        }
+      }
+    }.bar
+  }
+  nestedTry: {
+    emptyInnerSibling: {
+      foo?: {
+        foo2: int
+      }
+      bar: {
+        try {
+          x: 〈2;foo〉?.foo2
+          y: {
+            try {}
+          }
+        } else {
+          fallback: -1
+        }
+      }
+    }.bar
+  }
+  nestedTry: {
+    sameFieldUndefined: {
+      try {
+        x: 〈3;c〉?
+        try {
+          y: 〈4;c〉?
+        }
+      } else {
+        fallback: -1
+      }
+    }
+  }
+  nestedTry: {
+    sameFieldDefined: {
+      foo: 99
+      try {
+        x: 〈1;foo〉?
+        try {
+          y: 〈2;foo〉?
+        }
+      } else {
+        fallback: -1
+      }
+    }
+  }
+  siblingTries: {
+    sameFieldUndefined: {
+      try {
+        x: 〈3;c〉?
+      }
+      try {
+        y: 〈3;c〉?
+      }
+    }
+  }
+  siblingTries: {
+    sameFieldDefined: {
+      foo: 99
+      try {
+        x: 〈1;foo〉?
+      }
+      try {
+        y: 〈1;foo〉?
+      }
+    }
+  }
+  nestedTry: {
+    optionalInnerDefined: {
+      foo?: {
+        foo2: int
+      }
+      bar: 7
+      out: {
+        try {
+          (〈2;foo〉?.foo2 & {
+            try {
+              z: 〈4;bar〉?
+            }
+          })
+        }
+      }
+    }.out
+  }
+  nestedTry: {
+    optionalInnerDefinedWithElse: {
+      foo?: {
+        foo2: int
+      }
+      bar: 7
+      out: {
+        try {
+          (〈2;foo〉?.foo2 & {
+            try {
+              z: 〈4;bar〉?
+            }
+          })
+        } else {
+          fallback: -1
+        }
+      }
+    }.out
+  }
+  nestedTry: {
+    optionalInnerUndefined: {
+      foo?: {
+        foo2: int
+      }
+      out: {
+        try {
+          (〈2;foo〉?.foo2 & {
+            try {
+              z: 〈6;c〉?
+            }
+          })
+        } else {
+          fallback: -1
+        }
+      }
+    }.out
+  }
+  nestedTry: {
+    disjSiblingDefined: {
+      foo: 7
+      try {
+        pick: (*1|2)
+        v: 〈1;foo〉?
+      } else {
+        fallback: -1
+      }
+    }
+  }
+  nestedTry: {
+    disjSiblingUndefined: {
+      foo?: int
+      try {
+        pick: (*1|2)
+        v: 〈1;foo〉?
+      } else {
+        fallback: -1
+      }
+    }
+  }
+  nestedTry: {
+    disjBodyDefined: {
+      foo: 9
+      try {
+        ({
+          x: 〈2;foo〉?
+        }|{
+          x: 0
+        })
+      } else {
+        fallback: -1
+      }
+    }
+  }
+  nestedTry: {
+    disjBodyUndefined: {
+      foo?: int
+      try {
+        ({
+          x: 〈2;foo〉?
+        }|{
+          x: 0
+        })
+      } else {
+        fallback: -1
+      }
+    }
+  }
+  recursive: {
+    t1: {
+      try {
+        for _, x in [
+          〈4;b〉?,
+        ] {
+          〈1;x〉
+        }
+      }
+    }
+  }
+  recursive: {
+    t2: {
+      try {
+        {
+          x: 〈4;b〉?
+          y: 〈4;c〉?
+        }
+      }
+    }
+  }
+  recursive: {
+    t3: {
+      try {
+        {
+          x: 〈4;b〉?
+          y: 〈4;c〉?
+        }
+      } else {
+        z: 23
+      }
+    }
+  }
+  listElems: {
+    defined: [
+      try {
+        〈3;a〉?
+      },
+    ]
+    undefined: [
+      try {
+        〈3;c〉?
+      },
+    ]
+    binding: [
+      try v = 〈2;a〉? {
+        (〈1;v〉 + 1)
+      },
+    ]
+    forTry: [
+      for _, x in [
+        〈3;a〉,
+        〈3;b〉,
+      ] try {
+        〈1;x〉
+      },
+    ]
+    withElse: [
+      try {
+        〈3;c〉?
+      } else {
+        -1
+      },
+    ]
+  }
+  letTryCycle: {
+    _d: {
+      let _x#1 = {
+        inner?: bool
+      }
+      try {
+        c: "\(〈1;let _x#1〉.inner)"
+      }
+    }
+    out: (〈0;_d〉 & {}).c
+  }
+  issue4098: {
+    a: {
+      flag?: bool
+      items: {
+        [string]: string
+      }
+      results: {
+        [string]: int
+      }
+    }
+    a: {
+      flag: true
+    }
+    try {
+      if (〈1;a〉.flag? == true) {
+        a: {
+          items: {
+            item1: "data1"
+          }
+        }
+      }
+    }
+    for k, v in 〈0;a〉.items {
+      a: {
+        results: {
+          〈3;k〉: 2
+        }
+      }
+    }
+  }
+  tryRootedCycle: {
+    try {
+      out: 〈1;ext〉
+    }
+    ext: {
+      a: [
+        for k, v in 〈1;b〉 {
+          〈1;k〉
+        },
+      ]
+      b: {
+        seed: 1
+        if (len(〈1;a〉) == 1) {
+          x: 1
+        }
+      }
+    }
+  }
+  tryNestedRootedCycle: {
+    try {
+      try {
+        out: 〈2;ext〉
+      }
+    }
+    ext: {
+      a: [
+        for k, v in 〈1;b〉 {
+          〈1;k〉
+        },
+      ]
+      b: {
+        seed: 1
+        if (len(〈1;a〉) == 1) {
+          x: 1
+        }
+      }
+    }
+  }
+  tryRootedCycleDisjunct: {
+    try {
+      out: 〈1;ext〉
+    }
+    ext: (*{
+      a: [
+        for k, v in 〈1;b〉 {
+          〈1;k〉
+        },
+      ]
+      b: {
+        seed: 1
+        if (len(〈1;a〉) == 1) {
+          x: 1
+        }
+      }
+    }|{})
+  }
+  shadowing: {
+    outerField: {
+      x: {
+        a?: int
+        b?: int
+      }
+      x: {
+        a: 1
+      }
+      try {
+        x: {
+          b: 〈1;x〉.a?
+        }
+      } else {
+        fallback: -1
+      }
+    }
+    outerFieldUndefined: {
+      x: {
+        a?: int
+        b?: int
+      }
+      try {
+        x: {
+          b: 〈1;x〉.a?
+        }
+      } else {
+        fallback: -1
+      }
+    }
+    nestedPath: {
+      x: {
+        y: {
+          a: 1
+        }
+      }
+      try {
+        x: {
+          y: {
+            b: 〈2;x〉.y.a?
+          }
+        }
+      }
+    }
+    indexForm: {
+      x: {
+        a: 1
+      }
+      try {
+        x: {
+          b: 〈1;x〉["a"]?
+        }
+      }
+    }
+    nestedTry: {
+      x: {
+        a: 1
+      }
+      try {
+        x: {
+          b: 2
+        }
+        try {
+          x: {
+            c: 〈1;x〉.a?
+          }
+        }
+      }
+    }
+    outerFieldFromFor: {
+      src: {
+        a: 1
+      }
+      x: {
+        for k, v in 〈1;src〉 {
+          〈1;k〉: 〈1;v〉
+        }
+      }
+      try {
+        x: {
+          b: 〈1;x〉.a?
+        }
+      }
+    }
+    bindingExpr: {
+      a: 1
+      try v = {
+        a?: int
+        b: 〈0;a〉?
+      } {
+        ok: true
+      } else {
+        fallback: true
+      }
+    }
+    chained: {
+      x: {
+        a: {
+          foo: 1
+        }
+      }
+      try {
+        x: {
+          b: 〈1;x〉.a?.foo?
+        }
+      } else {
+        fallback: true
+      }
+    }
+    chainedUndefined: {
+      x: {
+        a: {}
+      }
+      try {
+        x: {
+          b: 〈1;x〉.a?.foo?
+        }
+      } else {
+        fallback: true
+      }
+    }
+    letBase: {
+      x: {
+        a: 1
+      }
+      try {
+        x: {
+          b: 1
+        }
+        let L#2 = 〈0;x〉
+        y: 〈0;let L#2〉.a?
+      } else {
+        fallback: true
+      }
+    }
+    forBase: {
+      x: {
+        a: 1
+      }
+      try {
+        x: {
+          b: 1
+        }
+        for k, v in {
+          p: 〈1;x〉
+        } {
+          y: {
+            〈2;k〉: 〈2;v〉.a?
+          }
+        }
+      } else {
+        fallback: true
+      }
+    }
+    sharedBase: {
+      x: {
+        a: 1
+      }
+      s: {
+        c: 1
+      }
+      try {
+        x: 〈1;s〉
+        y: 〈0;x〉.a?
+      } else {
+        fallback: true
+      }
+    }
+  }
+  issue4483: {
+    binary: {
+      a?: int
+      try {
+        b: (〈1;a〉? + 1)
+      }
+    }
+    comparison: {
+      a?: int
+      try {
+        b: (〈1;a〉? > 1)
+      }
+    }
+    interpolation: {
+      a?: string
+      try {
+        b: "x\(〈1;a〉?)"
+      }
+    }
+    bound: {
+      a?: int
+      try x = {
+        value: (〈1;a〉? + 1)
+      } {
+        b: 〈1;x〉
+      }
+    }
+    guarded: {
+      a?: int
+      try x = {
+        value: (〈1;a〉? + 1)
+      } if (〈0;x〉.value > 5) {
+        b: 〈1;x〉
+      }
+    }
+    conjunct: {
+      a?: int
+      try {
+        b: 〈1;a〉?
+      }
+    }
+    enclosing: {
+      a?: int
+      s: {
+        try {
+          b: (〈2;a〉? + 1)
+        }
+      }
+    }
+    guards: {
+      a?: int
+      try x = {
+        value: 1
+      } if (〈0;x〉.value > 〈1;a〉) {
+        out: 〈1;x〉
+      }
+      b?: int
+      try y = {
+        value: 1
+      } if (〈0;y〉.value > 〈1;b〉) {
+        out: 〈1;y〉
+      }
+    }
+  }
+}

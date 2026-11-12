@@ -1,0 +1,600 @@
+---
+name: Nightly Tests
+
+on:
+  schedule:
+    # Run at 3am UTC every day
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+  # Allow release workflow to trigger nightly as a prerequisite
+  workflow_call: {}
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+# Resilience against transient crates.io download flakes ([56] connection reset /
+# SSL eof) that have repeatedly failed coverage (cargo install cargo-tarpaulin)
+# and sdk-contract on otherwise-green code. cargo retries its own fetches.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Force HTTP/1.1 for crates.io fetches — HTTP/2 multiplexing intermittently
+  # fails with "[16] Error in the HTTP2 framing layer" (exit 56) on dependency
+  # downloads, which CARGO_NET_RETRY does not recover. (CLOACI v0.9.0 recovery)
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Full test suite — unit, integration, macros, feature builds
+  # -----------------------------------------------------------------------
+
+  cloacina-tests:
+    name: Full Test Suite
+    uses: ./.github/workflows/cloacina.yml
+
+  # -----------------------------------------------------------------------
+  # Examples & tutorials validation
+  # -----------------------------------------------------------------------
+
+  examples-docs:
+    name: Examples & Documentation
+    uses: ./.github/workflows/examples-docs.yml
+
+  # -----------------------------------------------------------------------
+  # Constructor provider suite (CLOACI-T-0917)
+  #
+  # The 14 feature-gated test targets (constructors-wasm implies
+  # constructor-packaging) previously ran in NO lane — only wave-day certify
+  # exercised the path. Nightly (not per-PR): the tail targets compile
+  # fixture crates inside the tests (wasm components + native cdylibs),
+  # which blew the per-PR time budget in local measurement. This workflow is
+  # also the release gate (unified_release.yml calls it), so the suite is
+  # release-blocking.
+  #
+  # The packaging path shells out to `cargo build --target wasm32-wasip2`
+  # on the fixture crates under examples/constructor-contract (and builds
+  # host cdylibs for the native provider fixtures under providers/), so the
+  # wasm target must be installed. Targets are scoped ('*constructor*' +
+  # provider_bundle) because an unscoped `cargo test -p cloacina` would also
+  # run the postgres-backed `fixtures` target, which needs a live DB this
+  # job doesn't have.
+  # -----------------------------------------------------------------------
+
+  constructor-suite:
+    name: Constructor Suite (wasm + packaging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (with wasm32-wasip2)
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cloacina-constructor-suite"
+
+      - name: Install PostgreSQL dev libraries
+        # cloacina's default features include postgres → links libpq.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: Run constructor suite
+        run: cargo test -p cloacina --features constructors-wasm --test '*constructor*' --test provider_bundle
+
+  # -----------------------------------------------------------------------
+  # Code coverage — cargo-tarpaulin on cloacina core
+  # -----------------------------------------------------------------------
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cloacina
+          POSTGRES_PASSWORD: cloacina
+          POSTGRES_DB: cloacina
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U cloacina"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cloacina-coverage"
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      # Pre-build the primitive-only cdylib fixtures (T-0550 / I-0102 T-D).
+      # `crates/cloacina/tests/integration/dal/reconciler_e2e_load.rs::read_fixture_dylib`
+      # panics when these aren't on disk; the integration angreal task does
+      # this pre-build but tarpaulin invokes cargo directly and bypasses it.
+      # Mirrors `.angreal/test/integration.py::build_test_packages`.
+      - name: Pre-build test fixtures
+        run: |
+          for fixture in reactor-only-rust reactor-subscriber-rust trigger-only-rust mixed-rust; do
+            echo "Building $fixture..."
+            (cd "examples/fixtures/$fixture" && cargo build -p "$fixture")
+          done
+
+      - name: Run coverage (cloacina core)
+        run: |
+          cargo tarpaulin \
+            -p cloacina \
+            --features postgres,sqlite,macros \
+            --out xml \
+            --output-dir target/coverage \
+            --skip-clean \
+            --timeout 300 \
+            --exclude-files "crates/cloacina/tests/*" \
+            --exclude-files "crates/cloacina/src/python/*" \
+            -- --test-threads=1
+        env:
+          DATABASE_URL: postgres://cloacina:cloacina@localhost:15432/cloacina
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/coverage/cobertura.xml
+          retention-days: 30
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f target/coverage/cobertura.xml ]; then
+            echo "Coverage report generated successfully"
+            # Extract line rate from cobertura XML
+            LINE_RATE=$(grep -oP 'line-rate="\K[^"]+' target/coverage/cobertura.xml | head -1)
+            PERCENT=$(echo "$LINE_RATE * 100" | bc -l 2>/dev/null | head -c 5 || echo "N/A")
+            echo "## Coverage: ${PERCENT}%" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Coverage report not generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # -----------------------------------------------------------------------
+  # macOS — library + daemon surface only.
+  #
+  # macOS is a workstation platform for cloacina: the embedded library (and
+  # its Python bindings) and the DB-less execution daemon (cloacina-agent).
+  # cloacina-server, the compiler service, and the Postgres they require
+  # are Linux deployments and are not checked here — no Homebrew Postgres
+  # cluster, no server lib/auth suites, no postgres integration leg. The
+  # PR lane (cloacina.yml unit-tests) already runs the macOS unit tests;
+  # this is the nightly integration pass for the library on its embedded
+  # backend. libpq is still installed: cloacina's default features link it.
+  # -----------------------------------------------------------------------
+
+  macos-library-daemon:
+    name: macOS Library + Daemon (sqlite)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Install libpq
+        run: |
+          brew install libpq
+          echo "LIBRARY_PATH=$(brew --prefix libpq)/lib" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cloacina -> target"
+          shared-key: "cloacina-macos-latest"
+
+      - name: Build library + daemon
+        run: cargo build -p cloacina -p cloacina-agent -p cloacinactl
+
+      - name: Run integration tests (sqlite)
+        env:
+          RUST_BACKTRACE: full
+        run: angreal test integration --backend sqlite
+
+  # -----------------------------------------------------------------------
+  # SDK contract matrix (CLOACI-I-0113 / T-0648)
+  #
+  # Boots cloacina-server on a fresh DB and runs all three SDK contract
+  # suites (Rust, Python, TypeScript) against it — the drift gate between
+  # utoipa annotations and handler behavior. Also enforces the static
+  # coverage rule and SDK version lockstep. Release-blocking: this
+  # workflow is the release gate (unified_release.yml calls it).
+  # -----------------------------------------------------------------------
+
+  sdk-contract:
+    name: SDK Contract Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cloacina-nightly-sdk"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Run SDK contract matrix
+        run: angreal test sdk-contract
+
+  # -----------------------------------------------------------------------
+  # UI acceptance e2e (CLOACI-I-0117 / T-0661)
+  #
+  # Full Playwright suite against the orchestrated stack (server + compiler +
+  # seeded workload + served SPA). The PR gate runs only the cheap UI checks;
+  # the browser-driven acceptance scenarios run here, mirroring the
+  # SDK-contract fast-PR / full-nightly cadence.
+  # -----------------------------------------------------------------------
+
+  ui-e2e:
+    name: UI Acceptance E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The lane builds the Leptos UI via trunk (I-0141) before embedding it
+      # in the server build.
+      - name: Install trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin trunk
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cloacina-nightly-ui-e2e"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Run UI acceptance e2e
+        run: angreal test ui-e2e
+
+  # -----------------------------------------------------------------------
+  # Nightly Docker image (CLOACI-I-0111 / T-0604)
+  #
+  # Pushes ghcr.io/<owner>/cloacina-server:nightly so users tracking the
+  # bleeding edge get a fresh build every morning without waiting for a
+  # tagged release.
+  # -----------------------------------------------------------------------
+
+  # Per-arch NATIVE builds (T-0940): the old single-job
+  # `platforms: linux/amd64,linux/arm64` compiled the whole Rust workspace for
+  # arm64 under QEMU — 4.5h on a version-bump commit (every cargo layer cache
+  # busted). Native arm runners build in ~25m, in parallel with amd64; the
+  # manifest job stitches the digests into the multi-arch tag.
+  nightly-docker:
+    name: Nightly cloacina-server image
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name
+        id: img
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/cloacina-server" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push by digest (native ${{ matrix.platform }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.img.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=server-image-${{ matrix.arch }}
+          # ignore-error: the GHA cache backend intermittently 404s on cache
+          # export (`ERROR: failed to solve: not_found`) AFTER the image has
+          # already been pushed — a lost cache is not worth a red nightly.
+          cache-to: type=gha,mode=max,ignore-error=true,scope=server-image-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-image-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  nightly-docker-manifest:
+    name: Nightly image manifest
+    needs: [nightly-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Compute image name
+        id: img
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/cloacina-server" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: nightly-image-digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create :nightly manifest
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "${IMAGE}:nightly" \
+            $(printf -- "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:nightly"
+
+  # -----------------------------------------------------------------------
+  # Failure notification — auto-create GitHub issue
+  # -----------------------------------------------------------------------
+
+  notify-failure:
+    name: Notify on Failure
+    needs: [cloacina-tests, examples-docs, constructor-suite, coverage, macos-library-daemon, sdk-contract, ui-e2e, nightly-docker-manifest]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Check for existing nightly-failure issue
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'nightly-failure',
+              state: 'open',
+            });
+            core.setOutput('exists', issues.data.length > 0 ? 'true' : 'false');
+            if (issues.data.length > 0) {
+              core.setOutput('issue_number', issues.data[0].number);
+            }
+
+      - name: Create GitHub Issue on failure
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Nightly test failure — ${new Date().toISOString().split('T')[0]}`;
+            const body = [
+              '## Nightly Test Failure',
+              '',
+              `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `**Date:** ${new Date().toISOString()}`,
+              '',
+              'One or more nightly tests failed. Check the run logs for details.',
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['nightly-failure'],
+            });
+
+      - name: Comment on existing issue
+        if: steps.check.outputs.exists == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.check.outputs.issue_number }},
+              body: `Still failing — [run ${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            });
+
+  # -----------------------------------------------------------------------
+  # Close resolved — auto-close nightly-failure issue on success
+  # -----------------------------------------------------------------------
+
+  close-resolved:
+    name: Close Resolved Issues
+    needs: [cloacina-tests, examples-docs, constructor-suite, coverage, macos-library-daemon, sdk-contract, ui-e2e, nightly-docker-manifest]
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Close nightly-failure issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'nightly-failure',
+              state: 'open',
+            });
+
+            for (const issue of issues.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Resolved — nightly passed in [run ${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }
+
+  # -----------------------------------------------------------------------
+  # Cache hygiene — keep storage usage down by pruning superseded caches
+  #
+  # Strategy:
+  #   - Drop every cache scoped to a closed PR's ref (refs/pull/N/merge that
+  #     no longer maps to an open PR — GH already does this after 7 days
+  #     untouched, but we accelerate it).
+  #   - On main, keep only the most recent cache per (key prefix, ref). Older
+  #     caches for the same scope are superseded by the run that just
+  #     finished and cost storage with no upside.
+  #   - Never touch caches on refs/tags/*; the release workflow handles those.
+  # -----------------------------------------------------------------------
+
+  prune-caches:
+    name: Prune Stale Caches
+    needs: [cloacina-tests, examples-docs, constructor-suite, coverage, macos-library-daemon, sdk-contract, ui-e2e, nightly-docker-manifest]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete superseded caches on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # List caches on main, group by key prefix (drop the trailing
+          # restore-key hash component), keep the newest id per prefix,
+          # delete the rest.
+          gh api --paginate "repos/${REPO}/actions/caches?per_page=100&ref=refs/heads/main" \
+            --jq '.actions_caches[] | [.id, .created_at, .key] | @tsv' \
+              > caches.tsv || { echo "no caches"; exit 0; }
+          if [ ! -s caches.tsv ]; then
+            echo "no caches on main"
+            exit 0
+          fi
+          # Strip the last "-<hash>" component to form a stable prefix.
+          awk -F'\t' '{ n=split($3, a, "-"); prefix=""; for (i=1;i<n;i++) prefix = prefix (i>1 ? "-" : "") a[i]; print $1"\t"$2"\t"prefix }' caches.tsv \
+            | sort -t$'\t' -k3,3 -k2,2r \
+            | awk -F'\t' '!seen[$3]++ { keep[$1]=1; next } { print $1 }' > to_delete.txt
+          if [ ! -s to_delete.txt ]; then
+            echo "nothing superseded"
+            exit 0
+          fi
+          echo "Deleting $(wc -l < to_delete.txt) superseded caches:"
+          cat to_delete.txt
+          while read id; do
+            gh api -X DELETE "repos/${REPO}/actions/caches/${id}" || true
+          done < to_delete.txt

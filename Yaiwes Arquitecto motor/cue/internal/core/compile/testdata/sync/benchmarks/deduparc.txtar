@@ -1,0 +1,49 @@
+-- in.cue --
+package bench1
+
+#Value: {type: "float"} | {type: "string"}
+
+foo: {type: "string"}
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+foo: #Value
+
+-- out/compile --
+--- in.cue
+{
+  #Value: ({
+    type: "float"
+  }|{
+    type: "string"
+  })
+  foo: {
+    type: "string"
+  }
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+  foo: 〈0;#Value〉
+}

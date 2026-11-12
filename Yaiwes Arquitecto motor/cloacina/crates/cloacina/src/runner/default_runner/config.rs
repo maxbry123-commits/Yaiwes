@@ -1,0 +1,1063 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Configuration types for the DefaultRunner.
+//!
+//! This module contains the configuration structs and builders for
+//! configuring the DefaultRunner's behavior.
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+
+use crate::Database;
+use crate::Runtime;
+use crate::TaskScheduler;
+use crate::dispatcher::{DefaultDispatcher, Dispatcher, TaskExecutor};
+use crate::executor::ThreadTaskExecutor;
+use crate::executor::types::ExecutorConfig;
+use crate::executor::workflow_executor::WorkflowExecutionError;
+
+use super::DefaultRunner;
+use super::service_manager::ServiceManager;
+
+/// Errors that can occur during configuration validation.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("Invalid configuration: {0}")]
+    Invalid(String),
+}
+
+/// Configuration for the default runner
+///
+/// This struct defines the configuration parameters that control the behavior
+/// of the DefaultRunner. It includes settings for concurrency, timeouts,
+/// polling intervals, and database connection management.
+///
+/// # Construction
+///
+/// Use [`DefaultRunnerConfig::builder()`] to create a configuration:
+///
+/// ```rust,ignore
+/// let config = DefaultRunnerConfig::builder()
+///     .max_concurrent_tasks(8)
+///     .task_timeout(Duration::from_secs(600))
+///     .build();
+/// ```
+///
+/// Or use the default configuration:
+///
+/// ```rust,ignore
+/// let config = DefaultRunnerConfig::default();
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DefaultRunnerConfig {
+    max_concurrent_tasks: usize,
+    scheduler_poll_interval: Duration,
+    task_timeout: Duration,
+    workflow_timeout: Option<Duration>,
+    db_pool_size: u32,
+    enable_recovery: bool,
+    enable_cron_scheduling: bool,
+    cron_poll_interval: Duration,
+    cron_max_catchup_executions: usize,
+    cron_enable_recovery: bool,
+    cron_recovery_interval: Duration,
+    cron_lost_threshold_minutes: i32,
+    cron_max_recovery_age: Duration,
+    cron_max_recovery_attempts: usize,
+    enable_trigger_scheduling: bool,
+    trigger_base_poll_interval: Duration,
+    trigger_poll_timeout: Duration,
+    enable_registry_reconciler: bool,
+    registry_reconcile_interval: Duration,
+    registry_enable_startup_reconciliation: bool,
+    registry_storage_path: Option<std::path::PathBuf>,
+    registry_storage_backend: String,
+    /// CLOACI-T-0571: defense-in-depth signature existence check.
+    /// When true, the reconciler refuses to load packages with no
+    /// matching `package_signatures` row.
+    require_signatures: bool,
+    /// Trusted org UUID forwarded to the reconciler for audit logging
+    /// when the existence check fails. Mirrors `cloacina-server`'s
+    /// `--verification-org-id`.
+    verification_org_id: Option<crate::UniversalUuid>,
+    enable_claiming: bool,
+    heartbeat_interval: Duration,
+    stale_claim_sweep_interval: Duration,
+    stale_claim_threshold: Duration,
+    runner_id: Option<String>,
+    runner_name: Option<String>,
+    /// Executor key every task is dispatched to (CLOACI-T-0640). `"default"`
+    /// (thread) unless the server opts into another registered executor (e.g.
+    /// `"fleet"`).
+    default_executor: String,
+    /// Tenant this runner serves (CLOACI-T-0781). Flows into the reconciler's
+    /// `default_tenant_id`, so every task this runner registers is namespaced
+    /// `tenant::package::workflow::task` — which is what the fleet executor
+    /// routes on. `"public"` for the admin/global runner; a per-tenant runner
+    /// sets it to its tenant so the tenant's tasks reach the tenant's agents.
+    tenant_id: String,
+}
+
+impl DefaultRunnerConfig {
+    /// Creates a new configuration builder with default values.
+    pub fn builder() -> DefaultRunnerConfigBuilder {
+        DefaultRunnerConfigBuilder::default()
+    }
+
+    /// Maximum number of concurrent task executions allowed.
+    pub fn max_concurrent_tasks(&self) -> usize {
+        self.max_concurrent_tasks
+    }
+
+    /// How often the scheduler checks for ready tasks.
+    pub fn scheduler_poll_interval(&self) -> Duration {
+        self.scheduler_poll_interval
+    }
+
+    /// Maximum time allowed for a single task to execute.
+    pub fn task_timeout(&self) -> Duration {
+        self.task_timeout
+    }
+
+    /// Optional maximum time for an entire workflow execution.
+    pub fn workflow_timeout(&self) -> Option<Duration> {
+        self.workflow_timeout
+    }
+
+    /// Number of database connections in the pool.
+    pub fn db_pool_size(&self) -> u32 {
+        self.db_pool_size
+    }
+
+    /// Whether automatic recovery is enabled.
+    pub fn enable_recovery(&self) -> bool {
+        self.enable_recovery
+    }
+
+    /// Whether cron scheduling is enabled.
+    pub fn enable_cron_scheduling(&self) -> bool {
+        self.enable_cron_scheduling
+    }
+
+    /// Poll interval for cron schedules.
+    pub fn cron_poll_interval(&self) -> Duration {
+        self.cron_poll_interval
+    }
+
+    /// Maximum catchup executions for missed cron runs.
+    pub fn cron_max_catchup_executions(&self) -> usize {
+        self.cron_max_catchup_executions
+    }
+
+    /// Whether cron recovery is enabled.
+    pub fn cron_enable_recovery(&self) -> bool {
+        self.cron_enable_recovery
+    }
+
+    /// How often to check for lost cron executions.
+    pub fn cron_recovery_interval(&self) -> Duration {
+        self.cron_recovery_interval
+    }
+
+    /// Minutes before an execution is considered lost.
+    pub fn cron_lost_threshold_minutes(&self) -> i32 {
+        self.cron_lost_threshold_minutes
+    }
+
+    /// Maximum age of executions to recover.
+    pub fn cron_max_recovery_age(&self) -> Duration {
+        self.cron_max_recovery_age
+    }
+
+    /// Maximum recovery attempts per execution.
+    pub fn cron_max_recovery_attempts(&self) -> usize {
+        self.cron_max_recovery_attempts
+    }
+
+    /// Whether trigger scheduling is enabled.
+    pub fn enable_trigger_scheduling(&self) -> bool {
+        self.enable_trigger_scheduling
+    }
+
+    /// Base poll interval for trigger readiness checks.
+    pub fn trigger_base_poll_interval(&self) -> Duration {
+        self.trigger_base_poll_interval
+    }
+
+    /// Timeout for trigger poll operations.
+    pub fn trigger_poll_timeout(&self) -> Duration {
+        self.trigger_poll_timeout
+    }
+
+    /// Whether the registry reconciler is enabled.
+    pub fn enable_registry_reconciler(&self) -> bool {
+        self.enable_registry_reconciler
+    }
+
+    /// How often to run registry reconciliation.
+    pub fn registry_reconcile_interval(&self) -> Duration {
+        self.registry_reconcile_interval
+    }
+
+    /// Whether startup reconciliation is enabled.
+    pub fn registry_enable_startup_reconciliation(&self) -> bool {
+        self.registry_enable_startup_reconciliation
+    }
+
+    /// Path for registry storage (filesystem backend).
+    pub fn registry_storage_path(&self) -> Option<&std::path::Path> {
+        self.registry_storage_path.as_deref()
+    }
+
+    /// CLOACI-T-0571: when true, the reconciler refuses to load packages
+    /// with no matching `package_signatures` row.
+    pub fn require_signatures(&self) -> bool {
+        self.require_signatures
+    }
+
+    /// The tenant this runner serves (CLOACI-T-0781). Namespaces its tasks.
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    /// Override the tenant — used by the per-tenant runner cache when cloning the
+    /// base config for a tenant-scoped runner so its tasks namespace correctly.
+    pub fn set_tenant_id(&mut self, tenant_id: impl Into<String>) {
+        self.tenant_id = tenant_id.into();
+    }
+
+    /// Trusted org UUID forwarded to the reconciler for audit logging
+    /// when the signature-existence check fails.
+    pub fn verification_org_id(&self) -> Option<crate::UniversalUuid> {
+        self.verification_org_id
+    }
+
+    /// Registry storage backend type.
+    pub fn registry_storage_backend(&self) -> &str {
+        &self.registry_storage_backend
+    }
+
+    /// Whether task claiming is enabled for horizontal scaling.
+    pub fn enable_claiming(&self) -> bool {
+        self.enable_claiming
+    }
+
+    /// Heartbeat interval for claimed tasks.
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    /// Interval for stale claim sweep (only when claiming is enabled).
+    pub fn stale_claim_sweep_interval(&self) -> Duration {
+        self.stale_claim_sweep_interval
+    }
+
+    /// How old a heartbeat must be to consider a claim stale.
+    pub fn stale_claim_threshold(&self) -> Duration {
+        self.stale_claim_threshold
+    }
+
+    /// Optional runner identifier for logging.
+    pub fn runner_id(&self) -> Option<&str> {
+        self.runner_id.as_deref()
+    }
+
+    /// Optional runner name for logging.
+    pub fn runner_name(&self) -> Option<&str> {
+        self.runner_name.as_deref()
+    }
+
+    /// Executor key every task is dispatched to.
+    pub fn default_executor(&self) -> &str {
+        &self.default_executor
+    }
+}
+
+/// Builder for [`DefaultRunnerConfig`].
+///
+/// Use this builder to create a customized configuration:
+///
+/// ```rust,ignore
+/// let config = DefaultRunnerConfig::builder()
+///     .max_concurrent_tasks(8)
+///     .enable_cron_scheduling(false)
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct DefaultRunnerConfigBuilder {
+    config: DefaultRunnerConfig,
+}
+
+impl Default for DefaultRunnerConfigBuilder {
+    fn default() -> Self {
+        Self {
+            config: DefaultRunnerConfig {
+                max_concurrent_tasks: 4,
+                scheduler_poll_interval: Duration::from_millis(100),
+                task_timeout: Duration::from_secs(300),
+                workflow_timeout: Some(Duration::from_secs(3600)),
+                db_pool_size: 10,
+                enable_recovery: true,
+                enable_cron_scheduling: true,
+                cron_poll_interval: Duration::from_secs(30),
+                cron_max_catchup_executions: 100,
+                cron_enable_recovery: true,
+                cron_recovery_interval: Duration::from_secs(300),
+                cron_lost_threshold_minutes: 10,
+                cron_max_recovery_age: Duration::from_secs(86400),
+                cron_max_recovery_attempts: 3,
+                enable_trigger_scheduling: true,
+                trigger_base_poll_interval: Duration::from_secs(1),
+                trigger_poll_timeout: Duration::from_secs(30),
+                enable_registry_reconciler: true,
+                registry_reconcile_interval: Duration::from_secs(5),
+                registry_enable_startup_reconciliation: true,
+                registry_storage_path: None,
+                registry_storage_backend: "filesystem".to_string(),
+                require_signatures: false,
+                verification_org_id: None,
+                enable_claiming: true,
+                heartbeat_interval: Duration::from_secs(10),
+                stale_claim_sweep_interval: Duration::from_secs(30),
+                stale_claim_threshold: Duration::from_secs(60),
+                runner_id: None,
+                runner_name: None,
+                default_executor: "default".to_string(),
+                tenant_id: "public".to_string(),
+            },
+        }
+    }
+}
+
+impl DefaultRunnerConfigBuilder {
+    /// Sets the maximum number of concurrent task executions.
+    pub fn max_concurrent_tasks(mut self, value: usize) -> Self {
+        self.config.max_concurrent_tasks = value;
+        self
+    }
+
+    /// Sets the scheduler poll interval.
+    pub fn scheduler_poll_interval(mut self, value: Duration) -> Self {
+        self.config.scheduler_poll_interval = value;
+        self
+    }
+
+    /// Sets the task timeout.
+    pub fn task_timeout(mut self, value: Duration) -> Self {
+        self.config.task_timeout = value;
+        self
+    }
+
+    /// Sets the workflow timeout.
+    pub fn workflow_timeout(mut self, value: Option<Duration>) -> Self {
+        self.config.workflow_timeout = value;
+        self
+    }
+
+    /// Sets the database pool size.
+    pub fn db_pool_size(mut self, value: u32) -> Self {
+        self.config.db_pool_size = value;
+        self
+    }
+
+    /// Enables or disables automatic recovery.
+    pub fn enable_recovery(mut self, value: bool) -> Self {
+        self.config.enable_recovery = value;
+        self
+    }
+
+    /// Enables or disables cron scheduling.
+    pub fn enable_cron_scheduling(mut self, value: bool) -> Self {
+        self.config.enable_cron_scheduling = value;
+        self
+    }
+
+    /// Sets the cron poll interval.
+    pub fn cron_poll_interval(mut self, value: Duration) -> Self {
+        self.config.cron_poll_interval = value;
+        self
+    }
+
+    /// Sets the maximum catchup executions for cron.
+    pub fn cron_max_catchup_executions(mut self, value: usize) -> Self {
+        self.config.cron_max_catchup_executions = value;
+        self
+    }
+
+    /// Enables or disables cron recovery.
+    pub fn cron_enable_recovery(mut self, value: bool) -> Self {
+        self.config.cron_enable_recovery = value;
+        self
+    }
+
+    /// Sets the cron recovery interval.
+    pub fn cron_recovery_interval(mut self, value: Duration) -> Self {
+        self.config.cron_recovery_interval = value;
+        self
+    }
+
+    /// Sets the cron lost threshold in minutes.
+    pub fn cron_lost_threshold_minutes(mut self, value: i32) -> Self {
+        self.config.cron_lost_threshold_minutes = value;
+        self
+    }
+
+    /// Sets the maximum cron recovery age.
+    pub fn cron_max_recovery_age(mut self, value: Duration) -> Self {
+        self.config.cron_max_recovery_age = value;
+        self
+    }
+
+    /// Sets the maximum cron recovery attempts.
+    pub fn cron_max_recovery_attempts(mut self, value: usize) -> Self {
+        self.config.cron_max_recovery_attempts = value;
+        self
+    }
+
+    /// Enables or disables trigger scheduling.
+    pub fn enable_trigger_scheduling(mut self, value: bool) -> Self {
+        self.config.enable_trigger_scheduling = value;
+        self
+    }
+
+    /// Sets the trigger base poll interval.
+    pub fn trigger_base_poll_interval(mut self, value: Duration) -> Self {
+        self.config.trigger_base_poll_interval = value;
+        self
+    }
+
+    /// Sets the trigger poll timeout.
+    pub fn trigger_poll_timeout(mut self, value: Duration) -> Self {
+        self.config.trigger_poll_timeout = value;
+        self
+    }
+
+    /// Enables or disables the registry reconciler.
+    pub fn enable_registry_reconciler(mut self, value: bool) -> Self {
+        self.config.enable_registry_reconciler = value;
+        self
+    }
+
+    /// Sets the registry reconcile interval.
+    pub fn registry_reconcile_interval(mut self, value: Duration) -> Self {
+        self.config.registry_reconcile_interval = value;
+        self
+    }
+
+    /// Enables or disables startup reconciliation.
+    pub fn registry_enable_startup_reconciliation(mut self, value: bool) -> Self {
+        self.config.registry_enable_startup_reconciliation = value;
+        self
+    }
+
+    /// Sets the registry storage path.
+    pub fn registry_storage_path(mut self, value: Option<std::path::PathBuf>) -> Self {
+        self.config.registry_storage_path = value;
+        self
+    }
+
+    /// Sets the registry storage backend.
+    pub fn registry_storage_backend(mut self, value: impl Into<String>) -> Self {
+        self.config.registry_storage_backend = value.into();
+        self
+    }
+
+    /// CLOACI-T-0571: enable the reconciler's defense-in-depth
+    /// signature-existence check. Mirrors `cloacina-server`'s
+    /// `--require-signatures` CLI flag.
+    pub fn require_signatures(mut self, value: bool) -> Self {
+        self.config.require_signatures = value;
+        self
+    }
+
+    /// CLOACI-T-0571: trusted org UUID forwarded to the reconciler so
+    /// signature-existence-check failures are audit-logged with the
+    /// correct org_id. Mirrors `cloacina-server`'s
+    /// `--verification-org-id` CLI flag.
+    pub fn verification_org_id(mut self, value: Option<crate::UniversalUuid>) -> Self {
+        self.config.verification_org_id = value;
+        self
+    }
+
+    /// Sets the runner identifier.
+    pub fn runner_id(mut self, value: Option<String>) -> Self {
+        self.config.runner_id = value;
+        self
+    }
+
+    /// Sets the runner name.
+    pub fn runner_name(mut self, value: Option<String>) -> Self {
+        self.config.runner_name = value;
+        self
+    }
+
+    /// Sets the executor key every task is dispatched to (CLOACI-T-0640).
+    /// Defaults to `"default"` (the thread executor).
+    pub fn default_executor(mut self, value: impl Into<String>) -> Self {
+        self.config.default_executor = value.into();
+        self
+    }
+
+    /// Enables or disables task claiming for horizontal scaling.
+    pub fn enable_claiming(mut self, value: bool) -> Self {
+        self.config.enable_claiming = value;
+        self
+    }
+
+    /// Sets the heartbeat interval for claimed tasks.
+    pub fn heartbeat_interval(mut self, value: Duration) -> Self {
+        self.config.heartbeat_interval = value;
+        self
+    }
+
+    /// Sets how old a claimed task's heartbeat must be before its claim is
+    /// considered stale and reclaimed by the sweeper. Must be greater than
+    /// `heartbeat_interval` (enforced in `build()`). Lower values shorten the
+    /// crash-recovery window (default 60s). (CLOACI-T-0667)
+    pub fn stale_claim_threshold(mut self, value: Duration) -> Self {
+        self.config.stale_claim_threshold = value;
+        self
+    }
+
+    /// Sets how often the stale-claim sweeper runs (default 30s). Only has
+    /// effect when claiming + recovery are enabled. (CLOACI-T-0667)
+    pub fn stale_claim_sweep_interval(mut self, value: Duration) -> Self {
+        self.config.stale_claim_sweep_interval = value;
+        self
+    }
+
+    /// Builds and validates the configuration.
+    ///
+    /// Returns an error if any configuration value is out of bounds.
+    pub fn build(self) -> Result<DefaultRunnerConfig, ConfigError> {
+        if self.config.max_concurrent_tasks == 0 {
+            return Err(ConfigError::Invalid(
+                "max_concurrent_tasks must be > 0".into(),
+            ));
+        }
+        if self.config.db_pool_size == 0 {
+            return Err(ConfigError::Invalid("db_pool_size must be > 0".into()));
+        }
+        if self.config.scheduler_poll_interval < Duration::from_millis(10) {
+            return Err(ConfigError::Invalid(
+                "scheduler_poll_interval must be >= 10ms".into(),
+            ));
+        }
+        if self.config.stale_claim_threshold <= self.config.heartbeat_interval {
+            return Err(ConfigError::Invalid(format!(
+                "stale_claim_threshold ({:?}) must be greater than heartbeat_interval ({:?})",
+                self.config.stale_claim_threshold, self.config.heartbeat_interval
+            )));
+        }
+        if self.config.cron_max_catchup_executions > 1000 {
+            return Err(ConfigError::Invalid(format!(
+                "cron_max_catchup_executions ({}) must be <= 1000",
+                self.config.cron_max_catchup_executions
+            )));
+        }
+        Ok(self.config)
+    }
+}
+
+impl Default for DefaultRunnerConfig {
+    fn default() -> Self {
+        DefaultRunnerConfigBuilder::default()
+            .build()
+            .expect("default config must be valid")
+    }
+}
+
+/// Builder for creating a DefaultRunner with PostgreSQL schema-based multi-tenancy
+///
+/// This builder supports PostgreSQL schema-based multi-tenancy for complete tenant isolation.
+/// Each schema provides complete data isolation with zero collision risk.
+///
+/// # Example
+/// ```rust,ignore
+/// // Single-tenant PostgreSQL (uses public schema)
+/// let runner = DefaultRunnerBuilder::new()
+///     .database_url("postgresql://user:pass@localhost/cloacina")
+///     .build()
+///     .await?;
+///
+/// // Multi-tenant PostgreSQL with schema isolation
+/// let tenant_a = DefaultRunnerBuilder::new()
+///     .database_url("postgresql://user:pass@localhost/cloacina")
+///     .schema("tenant_a")
+///     .build()
+///     .await?;
+///
+/// let tenant_b = DefaultRunnerBuilder::new()
+///     .database_url("postgresql://user:pass@localhost/cloacina")
+///     .schema("tenant_b")
+///     .build()
+///     .await?;
+/// ```
+pub struct DefaultRunnerBuilder {
+    pub(super) database_url: Option<String>,
+    pub(super) schema: Option<String>,
+    pub(super) config: DefaultRunnerConfig,
+    pub(super) runtime: Option<Runtime>,
+    pub(super) runtime_arc: Option<Arc<Runtime>>,
+    /// Optional secret resolution side channel (CLOACI-T-0858). Kept on the
+    /// builder (not the `Clone`/`Debug` config) so the server KEK it carries is
+    /// never printed. When set, the thread executor attaches it to every task
+    /// context so `context.secret(...)` resolves.
+    pub(super) secret_resolver: Option<Arc<dyn cloacina_workflow::secret::SecretResolver>>,
+}
+
+impl Default for DefaultRunnerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DefaultRunnerBuilder {
+    /// Creates a new builder with default configuration
+    pub fn new() -> Self {
+        Self {
+            database_url: None,
+            schema: None,
+            config: DefaultRunnerConfig::default(),
+            runtime: None,
+            runtime_arc: None,
+            secret_resolver: None,
+        }
+    }
+
+    /// Wire a secret resolution side channel (CLOACI-T-0858 / I-0133 D-1).
+    ///
+    /// On the embedded / in-process path the host configures this so packaged
+    /// tasks can resolve tenant secrets via `context.secret("name")`. Construct
+    /// one from [`crate::security::SecretStoreResolver`] — e.g.
+    /// `SecretStoreResolver::from_env(store, org_id)` to source the server KEK
+    /// from `CLOACINA_SECRET_KEK`. When unset, `context.secret(...)` returns a
+    /// clear "secrets backend not configured" error.
+    pub fn secret_resolver(
+        mut self,
+        resolver: Arc<dyn cloacina_workflow::secret::SecretResolver>,
+    ) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
+    /// Sets the database URL
+    pub fn database_url(mut self, url: &str) -> Self {
+        self.database_url = Some(url.to_string());
+        self
+    }
+
+    /// Sets the PostgreSQL schema for multi-tenant isolation
+    ///
+    /// # Arguments
+    /// * `schema` - The schema name (must be alphanumeric with underscores only)
+    pub fn schema(mut self, schema: &str) -> Self {
+        self.schema = Some(schema.to_string());
+        self
+    }
+
+    /// Sets the full configuration
+    pub fn with_config(mut self, config: DefaultRunnerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Sets a scoped [`Runtime`] for this runner.
+    ///
+    /// When set, the runner (and all components it creates) will use this
+    /// runtime's registries instead of the process-global registries.
+    /// If not set, a fresh inventory-seeded [`Runtime`] (i.e.
+    /// [`Runtime::default`], equivalent to [`Runtime::new`]) is used.
+    pub fn runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Use an existing shared [`Arc<Runtime>`] for this runner.
+    ///
+    /// Unlike [`runtime`](Self::runtime), this preserves the caller's `Arc`
+    /// identity so other components (e.g. Python decorators installed via
+    /// `ScopedRuntime`) that already hold a clone of the same `Arc<Runtime>`
+    /// share state with the runner. If both are set, `runtime_arc` wins.
+    pub fn runtime_arc(mut self, runtime: Arc<Runtime>) -> Self {
+        self.runtime_arc = Some(runtime);
+        self
+    }
+
+    /// Validates the schema name contains only alphanumeric characters and underscores
+    pub(super) fn validate_schema_name(schema: &str) -> Result<(), WorkflowExecutionError> {
+        if !schema.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(WorkflowExecutionError::Configuration {
+                message: "Schema name must contain only alphanumeric characters and underscores"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Builds the DefaultRunner
+    pub async fn build(self) -> Result<DefaultRunner, WorkflowExecutionError> {
+        let database_url =
+            self.database_url
+                .ok_or_else(|| WorkflowExecutionError::Configuration {
+                    message: "Database URL is required".to_string(),
+                })?;
+
+        if let Some(ref schema) = self.schema {
+            Self::validate_schema_name(schema)?;
+
+            // Validate schema is only used with PostgreSQL
+            if !database_url.starts_with("postgresql://")
+                && !database_url.starts_with("postgres://")
+            {
+                return Err(WorkflowExecutionError::Configuration {
+                    message: "Schema isolation is only supported with PostgreSQL. \
+                             For SQLite multi-tenancy, use separate database files instead."
+                        .to_string(),
+                });
+            }
+        }
+
+        // Create the database with schema support
+        let database = Database::new_with_schema(
+            &database_url,
+            "cloacina",
+            self.config.db_pool_size(),
+            self.schema.as_deref(),
+        );
+
+        // Set up schema if specified (PostgreSQL only)
+        #[cfg(feature = "postgres")]
+        {
+            if let Some(ref schema) = self.schema {
+                database.setup_schema(schema).await.map_err(|e| {
+                    WorkflowExecutionError::Configuration {
+                        message: format!("Failed to set up schema '{}': {}", schema, e),
+                    }
+                })?;
+            } else {
+                // Run migrations in public schema
+                database
+                    .run_migrations()
+                    .await
+                    .map_err(|e| WorkflowExecutionError::DatabaseConnection { message: e })?;
+            }
+        }
+
+        #[cfg(not(feature = "postgres"))]
+        {
+            // SQLite: just run migrations (schemas not supported)
+            database
+                .run_migrations()
+                .await
+                .map_err(|e| WorkflowExecutionError::DatabaseConnection { message: e })?;
+        }
+
+        // Resolve runtime: prefer a caller-supplied Arc (so shared state with
+        // e.g. Python ScopedRuntime is preserved), else wrap a by-value
+        // Runtime, else create a fresh inventory-seeded one.
+        // CLOACI-T-0924: bind the handle to this runner's tenant. The caller's
+        // registries are still shared (only the scope differs), so a handle the
+        // caller kept — a Python `ScopedRuntime`, say — sees the same entries.
+        let runtime = Arc::new(
+            self.runtime_arc
+                .unwrap_or_else(|| Arc::new(self.runtime.unwrap_or_default()))
+                .scoped_to_tenant(self.config.tenant_id()),
+        );
+
+        // Create scheduler with the scoped runtime
+        let scheduler = TaskScheduler::with_poll_interval(
+            database.clone(),
+            self.config.scheduler_poll_interval(),
+        )
+        .await
+        .map_err(|e| WorkflowExecutionError::Executor(e.into()))?
+        .with_runtime(runtime.clone());
+
+        // Create task executor
+        let executor_config = ExecutorConfig {
+            max_concurrent_tasks: self.config.max_concurrent_tasks(),
+            task_timeout: self.config.task_timeout(),
+            enable_claiming: self.config.enable_claiming(),
+            heartbeat_interval: self.config.heartbeat_interval(),
+        };
+
+        // Create executor with the scoped runtime — skip with_global_registry() since
+        // the runtime provides task lookups and the old TaskRegistry is unused.
+        let executor = ThreadTaskExecutor::with_runtime_and_registry(
+            database.clone(),
+            Arc::new(crate::TaskRegistry::new()),
+            runtime.clone(),
+            executor_config,
+        )
+        // CLOACI-T-0858: thread the secret resolution side channel to the
+        // executor so task contexts can resolve secrets in-process.
+        .with_secret_resolver(self.secret_resolver.clone());
+
+        // Configure dispatcher for push-based task execution. Every task is sent
+        // to the one configured executor key (CLOACI-T-0640).
+        let dal = crate::dal::DAL::new(database.clone());
+        let dispatcher = DefaultDispatcher::new(dal, self.config.default_executor());
+
+        // Register the executor with the dispatcher
+        dispatcher.register_executor("default", Arc::new(executor) as Arc<dyn TaskExecutor>);
+
+        let scheduler = scheduler.with_dispatcher(Arc::new(dispatcher));
+
+        let default_runner = DefaultRunner {
+            runtime,
+            database,
+            config: self.config.clone(),
+            scheduler: Arc::new(scheduler),
+            service_manager: Arc::new(RwLock::new(ServiceManager::new())),
+            cron_change: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        // Start the background services immediately
+        default_runner.start_background_services().await?;
+
+        Ok(default_runner)
+    }
+
+    /// Sets the executor key every task is dispatched to (CLOACI-T-0640).
+    ///
+    /// Defaults to `"default"` (the thread executor). Set to another registered
+    /// executor key (e.g. `"fleet"`) to send all work there instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runner = DefaultRunner::builder()
+    ///     .database_url("sqlite://test.db")
+    ///     .default_executor("fleet")
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn default_executor(mut self, executor: impl Into<String>) -> Self {
+        self.config.default_executor = executor.into();
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_runner_config() {
+        let config = DefaultRunnerConfig::default();
+
+        // Test default values via getter methods
+        assert_eq!(config.max_concurrent_tasks(), 4);
+        assert_eq!(config.scheduler_poll_interval(), Duration::from_millis(100));
+        assert_eq!(config.task_timeout(), Duration::from_secs(300));
+        assert_eq!(config.workflow_timeout(), Some(Duration::from_secs(3600)));
+        assert!(config.enable_recovery());
+        assert!(config.enable_cron_scheduling());
+        assert!(config.enable_registry_reconciler());
+        assert_eq!(config.registry_storage_backend(), "filesystem");
+        assert!(config.registry_storage_path().is_none());
+        assert!(config.runner_id().is_none());
+        assert!(config.runner_name().is_none());
+    }
+
+    #[test]
+    fn test_stale_claim_builder_setters() {
+        // CLOACI-T-0667: the stale-claim timing is tunable through the builder.
+        // Defaults: threshold 60s, sweep interval 30s.
+        let def = DefaultRunnerConfig::default();
+        assert_eq!(def.stale_claim_threshold(), Duration::from_secs(60));
+        assert_eq!(def.stale_claim_sweep_interval(), Duration::from_secs(30));
+
+        // A valid override (threshold > heartbeat_interval) is honored end-to-end.
+        let config = DefaultRunnerConfig::builder()
+            .heartbeat_interval(Duration::from_secs(2))
+            .stale_claim_threshold(Duration::from_secs(10))
+            .stale_claim_sweep_interval(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(config.stale_claim_threshold(), Duration::from_secs(10));
+        assert_eq!(config.stale_claim_sweep_interval(), Duration::from_secs(5));
+
+        // A threshold <= heartbeat_interval is rejected by build() validation.
+        let err = DefaultRunnerConfig::builder()
+            .heartbeat_interval(Duration::from_secs(10))
+            .stale_claim_threshold(Duration::from_secs(5))
+            .build();
+        assert!(
+            err.is_err(),
+            "threshold <= heartbeat_interval must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_registry_storage_backend_configuration() {
+        // Test filesystem backend (default)
+        let config = DefaultRunnerConfig::default();
+        assert_eq!(config.registry_storage_backend(), "filesystem");
+
+        // Test sqlite backend via builder
+        let config = DefaultRunnerConfig::builder()
+            .registry_storage_backend("sqlite")
+            .build()
+            .unwrap();
+        assert_eq!(config.registry_storage_backend(), "sqlite");
+
+        // Test postgres backend via builder
+        let config = DefaultRunnerConfig::builder()
+            .registry_storage_backend("postgres")
+            .build()
+            .unwrap();
+        assert_eq!(config.registry_storage_backend(), "postgres");
+
+        // Test custom path for filesystem via builder
+        let custom_path = std::path::PathBuf::from("/custom/registry/path");
+        let config = DefaultRunnerConfig::builder()
+            .registry_storage_path(Some(custom_path.clone()))
+            .build()
+            .unwrap();
+        assert_eq!(config.registry_storage_path(), Some(custom_path.as_path()));
+    }
+
+    #[test]
+    fn test_runner_identification() {
+        let config = DefaultRunnerConfig::builder()
+            .runner_id(Some("test-runner-123".to_string()))
+            .runner_name(Some("Test Runner".to_string()))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.runner_id(), Some("test-runner-123"));
+        assert_eq!(config.runner_name(), Some("Test Runner"));
+    }
+
+    #[test]
+    fn test_registry_configuration_options() {
+        // Test disabling registry reconciler via builder
+        let config = DefaultRunnerConfig::builder()
+            .enable_registry_reconciler(false)
+            .build()
+            .unwrap();
+        assert!(!config.enable_registry_reconciler());
+
+        // Test custom reconcile interval via builder
+        let config = DefaultRunnerConfig::builder()
+            .registry_reconcile_interval(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.registry_reconcile_interval(),
+            Duration::from_secs(30)
+        );
+
+        // Test disabling startup reconciliation via builder
+        let config = DefaultRunnerConfig::builder()
+            .registry_enable_startup_reconciliation(false)
+            .build()
+            .unwrap();
+        assert!(!config.registry_enable_startup_reconciliation());
+    }
+
+    #[test]
+    fn test_cron_configuration() {
+        // Test cron settings via builder
+        let config = DefaultRunnerConfig::builder()
+            .cron_poll_interval(Duration::from_secs(60))
+            .cron_recovery_interval(Duration::from_secs(300))
+            .cron_lost_threshold_minutes(15)
+            .cron_max_recovery_age(Duration::from_secs(86400))
+            .cron_max_recovery_attempts(5)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.cron_poll_interval(), Duration::from_secs(60));
+        assert_eq!(config.cron_recovery_interval(), Duration::from_secs(300));
+        assert_eq!(config.cron_lost_threshold_minutes(), 15);
+        assert_eq!(config.cron_max_recovery_age(), Duration::from_secs(86400));
+        assert_eq!(config.cron_max_recovery_attempts(), 5);
+    }
+
+    #[test]
+    fn test_db_pool_size_default() {
+        let config = DefaultRunnerConfig::default();
+        assert_eq!(config.db_pool_size(), 10); // Default pool size for both backends
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = DefaultRunnerConfig::default();
+        let cloned = config.clone();
+
+        assert_eq!(
+            config.registry_storage_backend(),
+            cloned.registry_storage_backend()
+        );
+        assert_eq!(config.max_concurrent_tasks(), cloned.max_concurrent_tasks());
+        assert_eq!(
+            config.enable_registry_reconciler(),
+            cloned.enable_registry_reconciler()
+        );
+    }
+
+    #[test]
+    fn test_config_debug() {
+        let config = DefaultRunnerConfig::default();
+        let debug_str = format!("{:?}", config);
+
+        // Verify debug formatting includes key fields
+        assert!(debug_str.contains("registry_storage_backend"));
+        assert!(debug_str.contains("filesystem"));
+        assert!(debug_str.contains("max_concurrent_tasks"));
+    }
+
+    #[test]
+    fn test_builder_all_fields() {
+        // Test that builder can set all fields
+        let config = DefaultRunnerConfig::builder()
+            .max_concurrent_tasks(8)
+            .scheduler_poll_interval(Duration::from_millis(200))
+            .task_timeout(Duration::from_secs(600))
+            .workflow_timeout(Some(Duration::from_secs(7200)))
+            .db_pool_size(20)
+            .enable_recovery(false)
+            .enable_cron_scheduling(false)
+            .cron_poll_interval(Duration::from_secs(60))
+            .cron_max_catchup_executions(10)
+            .cron_enable_recovery(false)
+            .enable_trigger_scheduling(false)
+            .trigger_base_poll_interval(Duration::from_secs(5))
+            .trigger_poll_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.max_concurrent_tasks(), 8);
+        assert_eq!(config.scheduler_poll_interval(), Duration::from_millis(200));
+        assert_eq!(config.task_timeout(), Duration::from_secs(600));
+        assert_eq!(config.workflow_timeout(), Some(Duration::from_secs(7200)));
+        assert_eq!(config.db_pool_size(), 20);
+        assert!(!config.enable_recovery());
+        assert!(!config.enable_cron_scheduling());
+        assert_eq!(config.cron_poll_interval(), Duration::from_secs(60));
+        assert_eq!(config.cron_max_catchup_executions(), 10);
+        assert!(!config.cron_enable_recovery());
+        assert!(!config.enable_trigger_scheduling());
+        assert_eq!(config.trigger_base_poll_interval(), Duration::from_secs(5));
+        assert_eq!(config.trigger_poll_timeout(), Duration::from_secs(60));
+    }
+}

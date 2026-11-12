@@ -1,0 +1,78 @@
+import subprocess
+import sys
+
+import angreal  # type: ignore
+
+from ._utils import print_final_success, print_section_header
+
+test = angreal.command_group(name="test", about="Cloacina test suites (unit, integration, e2e, soak)")
+
+
+@test()
+@angreal.command(
+    name="unit",
+    about="run unit tests",
+    when_to_use=["testing core functionality", "validating changes", "CI/CD pipelines"],
+    when_not_to_use=["integration testing", "end-to-end testing", "performance testing"]
+)
+@angreal.argument(
+    name="filter",
+    required=False,
+    help="filter tests by name pattern"
+)
+@angreal.argument(
+    name="backend",
+    long="backend",
+    required=False,
+    help="(ignored) backend parameter for CI compatibility - tests run with both backends"
+)
+def unit(filter=None, backend=None):
+    """Run unit tests (tests embedded in src/ modules only).
+
+    Tests are compiled once with both PostgreSQL and SQLite backends enabled.
+    The --backend parameter is accepted for CI compatibility but ignored.
+    """
+
+    print_section_header("Running unit tests")
+
+    # Run cloacina-workflow unit tests first (minimal crate, no features needed)
+    print("Running cloacina-workflow unit tests...")
+    workflow_cmd = ["cargo", "test", "-p", "cloacina-workflow", "--lib"]
+    if filter:
+        workflow_cmd.append(filter)
+
+    try:
+        subprocess.run(workflow_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"cloacina-workflow unit tests failed with error: {e}", file=sys.stderr)
+        raise RuntimeError(f"Unit tests failed with return code {e.returncode}")
+
+    # Run cloacina unit tests
+    print("Running cloacina unit tests...")
+    cmd = ["cargo", "test", "-p", "cloacina", "--lib", "--features", "postgres,sqlite,macros"]
+    if filter:
+        cmd.append(filter)
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Unit tests failed with error: {e}", file=sys.stderr)
+        raise RuntimeError(f"Unit tests failed with return code {e.returncode}")
+
+    # Run cloacinactl unit tests. Previously in NO lane at all — two scaffold
+    # tests sat failing for three minors with CI green (found during 0.10.0
+    # release prep). Feature set mirrors the distributed CLI build.
+    print("Running cloacinactl unit tests...")
+    ctl_cmd = [
+        "cargo", "test", "-p", "cloacinactl",
+        "--no-default-features", "--features", "postgres,sqlite",
+    ]
+    if filter:
+        ctl_cmd.append(filter)
+
+    try:
+        subprocess.run(ctl_cmd, check=True)
+        print_final_success("All unit tests passed!")
+    except subprocess.CalledProcessError as e:
+        print(f"cloacinactl unit tests failed with error: {e}", file=sys.stderr)
+        raise RuntimeError(f"Unit tests failed with return code {e.returncode}")

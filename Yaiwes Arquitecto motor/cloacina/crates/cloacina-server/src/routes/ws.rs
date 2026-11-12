@@ -1,0 +1,609 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! WebSocket handlers for accumulator and reactor endpoints.
+//!
+//! - `/v1/ws/accumulator/{name}` — external producers push events to accumulators
+//! - `/v1/ws/reactor/{name}` — operators send manual commands to reactors
+//!
+//! Auth is validated on the HTTP upgrade request before promoting to WebSocket.
+//! Business logic (registry lookup, message forwarding) is wired in later tasks.
+
+use axum::{
+    extract::{Path, Query, State, WebSocketUpgrade},
+    response::{IntoResponse, Response},
+};
+use serde::Deserialize;
+use tracing::{debug, info, warn};
+
+use cloacina::computation_graph::SourceName;
+use cloacina::computation_graph::reactor::{ManualCommand, ReactorCommand, ReactorResponse};
+use cloacina::computation_graph::registry::{EndpointRegistry, EndpointScope, KeyContext};
+use cloacina::computation_graph::types::InputCache;
+
+use super::auth::{AuthenticatedKey, validate_token};
+use crate::AppState;
+use crate::routes::error::ApiError;
+
+/// Query parameter for passing a single-use ticket on WebSocket upgrade.
+///
+/// WebSocket clients can't set custom headers on the upgrade request in
+/// browsers, so we accept a **ticket** (not an API key) as a query parameter:
+/// `ws://host/v1/ws/accumulator/alpha?token=<ticket>`
+///
+/// Tickets are obtained via `POST /auth/ws-ticket` and are single-use with
+/// a short TTL. Raw API keys are NOT accepted in query parameters.
+#[derive(Deserialize)]
+pub struct WsAuthQuery {
+    pub token: Option<String>,
+}
+
+/// Where the auth credential came from — determines validation strategy.
+enum WsTokenSource {
+    /// Bearer token from Authorization header — validated as API key.
+    Header(String),
+    /// Single-use ticket from query parameter — consumed from WsTicketStore.
+    QueryTicket(String),
+}
+
+/// Extract the auth token from either the Authorization header or query param.
+fn extract_ws_token(headers: &axum::http::HeaderMap, query: &WsAuthQuery) -> Option<WsTokenSource> {
+    // Prefer header — accepts Bearer API keys
+    if let Some(val) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(s) = val.to_str() {
+            if let Some(token) = s.strip_prefix("Bearer ") {
+                return Some(WsTokenSource::Header(token.to_string()));
+            }
+        }
+    }
+    // Query param — treated as a single-use ticket, NOT a raw API key
+    query
+        .token
+        .as_ref()
+        .map(|t| WsTokenSource::QueryTicket(t.clone()))
+}
+
+/// Authenticate a WebSocket upgrade request using the appropriate strategy.
+async fn authenticate_ws(
+    state: &AppState,
+    source: WsTokenSource,
+) -> Result<AuthenticatedKey, ApiError> {
+    match source {
+        WsTokenSource::Header(token) => validate_token(state, &token).await.map_err(|_| {
+            record_ws_auth_failure("invalid_signature");
+            ApiError::unauthorized("invalid bearer token")
+        }),
+        WsTokenSource::QueryTicket(ticket) => {
+            state.ws_tickets.consume(&ticket).await.ok_or_else(|| {
+                record_ws_auth_failure("ticket_expired");
+                ApiError::unauthorized("invalid or expired WebSocket ticket")
+            })
+        }
+    }
+}
+
+/// Increment the `cloacina_ws_auth_failures_total` counter with a bounded
+/// `reason` label. The four documented reasons (see I-0099 / T-0588):
+/// `ticket_expired`, `invalid_signature`, `tenant_mismatch`, `not_authorized`.
+fn record_ws_auth_failure(reason: &'static str) {
+    metrics::counter!(
+        "cloacina_ws_auth_failures_total",
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
+/// Record one inbound or outbound WebSocket message. `endpoint` is the
+/// bounded `{accumulator, reactor}` enum; `direction` is `{in, out}`.
+fn record_ws_message(endpoint: &'static str, direction: &'static str) {
+    metrics::counter!(
+        "cloacina_ws_messages_total",
+        "endpoint" => endpoint,
+        "direction" => direction,
+    )
+    .increment(1);
+}
+
+/// RAII guard for `cloacina_ws_connections_active`. Increments on
+/// construction and decrements on Drop so a panic or early return inside
+/// the handler still releases the slot — defends the gauge against leak
+/// bugs of the kind that motivated T-0534.
+struct WsConnectionGuard {
+    endpoint: &'static str,
+}
+
+impl WsConnectionGuard {
+    fn new(endpoint: &'static str) -> Self {
+        metrics::gauge!(
+            "cloacina_ws_connections_active",
+            "endpoint" => endpoint,
+        )
+        .increment(1.0);
+        Self { endpoint }
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "cloacina_ws_connections_active",
+            "endpoint" => self.endpoint,
+        )
+        .decrement(1.0);
+    }
+}
+
+/// WebSocket handler for accumulator endpoints.
+///
+/// `GET /v1/ws/accumulator/{name}` — upgrades to WebSocket after PAK auth.
+/// Currently a stub: accepts the connection, logs, and closes.
+/// Business logic (forwarding to registry) wired in T-0373.
+pub async fn accumulator_ws(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<WsAuthQuery>,
+    ws: WebSocketUpgrade,
+    request: axum::extract::Request,
+) -> Response {
+    let source = match extract_ws_token(request.headers(), &query) {
+        Some(s) => s,
+        None => {
+            record_ws_auth_failure("not_authorized");
+            return ApiError::unauthorized("missing auth token").into_response();
+        }
+    };
+
+    let auth = match authenticate_ws(&state, source).await {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+
+    let ctx = KeyContext {
+        key_id: &auth.key_id,
+        tenant_id: auth.tenant_id.as_deref(),
+        is_admin: auth.is_admin,
+    };
+
+    // CLOACI-T-0851 / A-0012 Amendment 3: if another replica owns the reactor
+    // hosting this accumulator, redirect at the HANDSHAKE. The upgrade request
+    // is ordinary HTTP, so a 307 here steers the client to the owner ONCE, and
+    // the connection then stays pinned there for its lifetime — every
+    // subsequent frame is an in-process channel send on the owner. A connection
+    // accepted here instead would pay a per-event forward forever; a redirect
+    // mid-stream is impossible (WS clients only follow redirects pre-upgrade).
+    //
+    // Runs BEFORE the local auth check, which fails CLOSED for foreign
+    // accumulators (no local registration → no policy — observed live as a 403
+    // at the non-owner for an inject the owner accepted with 200). Guarded by
+    // the equivalent authz — admin, untenanted, or tenant-match — so the
+    // redirect does not become an unauthenticated probe for reactor placement.
+    // Checked BEFORE on_upgrade — after acceptance the 307 can never be sent.
+    let mut known_foreign = false;
+    if let Some(reactor_key) = state
+        .graph_scheduler
+        .foreign_reactor_for_accumulator(ctx.tenant_id, &name)
+        .await
+    {
+        let authorized = ctx.is_admin
+            || ctx.tenant_id.is_none()
+            || ctx.tenant_id == reactor_key.tenant_id.as_deref();
+        if authorized {
+            let dal = cloacina::dal::unified::DAL::new(state.database.clone());
+            match dal
+                .reactor_owner_addresses()
+                .lookup(reactor_key.tenant_id.as_deref(), &reactor_key.name)
+                .await
+            {
+                Ok(Some(owner_addr)) => {
+                    let location = format!(
+                        "{}/v1/ws/accumulators/{}",
+                        owner_addr.trim_end_matches('/'),
+                        name
+                    );
+                    info!(
+                        accumulator = %name,
+                        owner = %location,
+                        "accumulator owned by another replica; redirecting WS handshake"
+                    );
+                    return Response::builder()
+                        .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+                        .header(axum::http::header::LOCATION, location)
+                        .body(axum::body::Body::empty())
+                        .unwrap_or_else(|_| {
+                            ApiError::internal("redirect construction failed").into_response()
+                        });
+                }
+                // No address published (mid-takeover) — accept the connection in
+                // fallback mode: frames go through the inject path (local try,
+                // then durable outbox), so events are slow but never lost. The
+                // client's next reconnect gets the redirect once the new owner
+                // publishes.
+                Ok(None) => {
+                    known_foreign = true;
+                }
+                Err(e) => {
+                    warn!(accumulator = %name, "owner-address lookup failed: {e}");
+                }
+            }
+        }
+    }
+
+    // Per-endpoint authorization check (skipped only when the connection is
+    // already known-foreign and authorized above — there is no local policy to
+    // consult for an endpoint this replica does not host).
+    if !known_foreign {
+        if let Err(_e) = state
+            .endpoint_registry
+            .check_accumulator_auth(&name, &ctx)
+            .await
+        {
+            record_ws_auth_failure("tenant_mismatch");
+            return ApiError::forbidden(
+                "endpoint_access_denied",
+                format!("not authorized for accumulator '{}'", name),
+            )
+            .into_response();
+        }
+    }
+
+    info!(
+        accumulator = %name,
+        key = %auth.name,
+        "WebSocket upgrade accepted for accumulator"
+    );
+
+    let registry = state.endpoint_registry.clone();
+    let dal = cloacina::dal::unified::DAL::new(state.database.clone());
+    ws.on_upgrade(move |socket| {
+        handle_accumulator_socket(socket, name, auth, registry, dal, known_foreign)
+    })
+}
+
+/// WebSocket handler for reactor endpoints.
+///
+/// `GET /v1/ws/reactor/{name}` — upgrades to WebSocket after PAK auth.
+/// Currently a stub: accepts the connection, logs, and closes.
+/// Business logic (command handling) wired in T-0374.
+pub async fn reactor_ws(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<WsAuthQuery>,
+    ws: WebSocketUpgrade,
+    request: axum::extract::Request,
+) -> Response {
+    let source = match extract_ws_token(request.headers(), &query) {
+        Some(s) => s,
+        None => {
+            record_ws_auth_failure("not_authorized");
+            return ApiError::unauthorized("missing auth token").into_response();
+        }
+    };
+
+    let auth = match authenticate_ws(&state, source).await {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+
+    // Per-endpoint authorization check
+    let ctx = KeyContext {
+        key_id: &auth.key_id,
+        tenant_id: auth.tenant_id.as_deref(),
+        is_admin: auth.is_admin,
+    };
+    if let Err(_e) = state
+        .endpoint_registry
+        .check_reactor_auth(&name, &ctx)
+        .await
+    {
+        record_ws_auth_failure("tenant_mismatch");
+        return ApiError::forbidden(
+            "endpoint_access_denied",
+            format!("not authorized for reactor '{}'", name),
+        )
+        .into_response();
+    }
+
+    info!(
+        reactor = %name,
+        key = %auth.name,
+        "WebSocket upgrade accepted for reactor"
+    );
+
+    let registry = state.endpoint_registry.clone();
+    ws.on_upgrade(move |socket| handle_reactor_socket(socket, name, auth, registry))
+}
+
+/// Handle an accepted accumulator WebSocket connection.
+///
+/// Reads incoming messages and forwards them to all accumulators registered
+/// under this name via the EndpointRegistry. External clients send JSON;
+/// the accumulator socket receiver handles deserialization.
+async fn handle_accumulator_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    name: String,
+    auth: AuthenticatedKey,
+    registry: EndpointRegistry,
+    dal: cloacina::dal::unified::DAL,
+    // Decided at handshake: this accumulator's reactor is owned elsewhere and
+    // no redirect was possible (no address published). Frames route through
+    // the inject fallback rather than the direct registry send.
+    known_foreign: bool,
+) {
+    debug!(accumulator = %name, key = %auth.name, "accumulator WebSocket connected");
+    let _conn_guard = WsConnectionGuard::new("accumulator");
+
+    while let Some(msg) = socket.recv().await {
+        match msg {
+            Ok(axum::extract::ws::Message::Binary(data)) => {
+                record_ws_message("accumulator", "in");
+                // Forward raw bytes to accumulator — it deserializes JSON internally.
+                let bytes: Vec<u8> = data.into();
+                // CLOACI-T-0921: `{name}` from the URL is resolved inside the
+                // AUTHENTICATED key's tenant, so two tenants may both own an
+                // accumulator called `ticks` without cross-wiring.
+                let scope = EndpointScope {
+                    tenant_id: auth.tenant_id.as_deref(),
+                    is_admin: auth.is_admin,
+                };
+                // CLOACI-T-0851: a connection accepted for a KNOWN-FOREIGN
+                // accumulator (mid-takeover — no owner address existed at
+                // handshake, so no redirect was possible) routes through
+                // `inject_event`: local first (covers a takeover TO this
+                // replica), then the durable outbox — slow but never lost.
+                // Decided ONCE at handshake, not per frame, so the ordinary
+                // local path below pays nothing for this. If ownership is
+                // lost MID-connection instead, the local send fails, the
+                // 4404 close fires, and the client's reconnect handshake
+                // performs the redirect — which is the correct recovery.
+                if known_foreign {
+                    match cloacina::computation_graph::reactor_routing::inject_event(
+                        &registry,
+                        Some(&dal),
+                        &name,
+                        auth.tenant_id.as_deref(),
+                        bytes,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            record_ws_message("accumulator", "in");
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(accumulator = %name, error = %e, "foreign-frame forward failed; closing");
+                        }
+                    }
+                    let _ = socket
+                        .send(axum::extract::ws::Message::Close(Some(
+                            axum::extract::ws::CloseFrame {
+                                code: 4404,
+                                reason: format!("accumulator '{}' not reachable", name).into(),
+                            },
+                        )))
+                        .await;
+                    break;
+                }
+                match registry.send_to_accumulator(&name, scope, bytes).await {
+                    Ok(count) => {
+                        debug!(accumulator = %name, recipients = count, "forwarded binary message");
+                    }
+                    Err(e) => {
+                        warn!(accumulator = %name, error = %e, "failed to forward message");
+                        if socket
+                            .send(axum::extract::ws::Message::Close(Some(
+                                axum::extract::ws::CloseFrame {
+                                    code: 4404,
+                                    reason: format!("accumulator '{}' not registered", name).into(),
+                                },
+                            )))
+                            .await
+                            .is_ok()
+                        {
+                            record_ws_message("accumulator", "out");
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(axum::extract::ws::Message::Text(_)) => {
+                record_ws_message("accumulator", "in");
+                warn!(accumulator = %name, "text frames not supported — send JSON as binary frame");
+            }
+            Ok(axum::extract::ws::Message::Close(_)) => {
+                record_ws_message("accumulator", "in");
+                debug!(accumulator = %name, "client sent close frame");
+                break;
+            }
+            Ok(_) => {} // ping/pong handled by axum
+            Err(e) => {
+                warn!(accumulator = %name, error = %e, "WebSocket error");
+                break;
+            }
+        }
+    }
+
+    debug!(accumulator = %name, "accumulator WebSocket disconnected");
+}
+
+/// Handle an accepted reactor WebSocket connection.
+///
+/// Receives JSON `ReactorCommand` messages, dispatches to the reactor via
+/// the EndpointRegistry (ForceFire/FireWith) or ReactorHandle (GetState/Pause/Resume),
+/// and sends back `ReactorResponse` JSON.
+async fn handle_reactor_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    name: String,
+    auth: AuthenticatedKey,
+    registry: EndpointRegistry,
+) {
+    debug!(reactor = %name, key = %auth.name, "reactor WebSocket connected");
+    let _conn_guard = WsConnectionGuard::new("reactor");
+
+    // Get the reactor handle for GetState/Pause/Resume. CLOACI-T-0921: resolved
+    // within the authenticated key's tenant.
+    let scope = EndpointScope {
+        tenant_id: auth.tenant_id.as_deref(),
+        is_admin: auth.is_admin,
+    };
+    let handle = registry.get_reactor_handle(&name, scope).await;
+
+    while let Some(msg) = socket.recv().await {
+        match msg {
+            Ok(axum::extract::ws::Message::Text(text)) => {
+                record_ws_message("reactor", "in");
+                let response = match serde_json::from_str::<ReactorCommand>(&text) {
+                    Ok(cmd) => {
+                        process_reactor_command(
+                            &name,
+                            cmd,
+                            &registry,
+                            &handle,
+                            auth.key_id,
+                            auth.tenant_id.clone(),
+                            auth.is_admin,
+                        )
+                        .await
+                    }
+                    Err(e) => ReactorResponse::Error {
+                        message: format!("invalid command: {}", e),
+                    },
+                };
+
+                let json = serde_json::to_string(&response).unwrap_or_else(|e| {
+                    format!(
+                        "{{\"type\":\"error\",\"message\":\"serialization failed: {}\"}}",
+                        e
+                    )
+                });
+                if socket
+                    .send(axum::extract::ws::Message::Text(json.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                record_ws_message("reactor", "out");
+            }
+            Ok(axum::extract::ws::Message::Close(_)) => {
+                record_ws_message("reactor", "in");
+                debug!(reactor = %name, "client sent close frame");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(reactor = %name, error = %e, "WebSocket error");
+                break;
+            }
+        }
+    }
+
+    debug!(reactor = %name, "reactor WebSocket disconnected");
+}
+
+/// Map a ReactorCommand to its corresponding ReactorOp for authZ checks.
+fn command_to_op(cmd: &ReactorCommand) -> cloacina::computation_graph::registry::ReactorOp {
+    use cloacina::computation_graph::registry::ReactorOp;
+    match cmd {
+        ReactorCommand::ForceFire => ReactorOp::ForceFire,
+        ReactorCommand::FireWith { .. } => ReactorOp::FireWith,
+        ReactorCommand::GetState => ReactorOp::GetState,
+        ReactorCommand::Pause => ReactorOp::Pause,
+        ReactorCommand::Resume => ReactorOp::Resume,
+    }
+}
+
+/// Process a single reactor command and return the response.
+async fn process_reactor_command(
+    name: &str,
+    cmd: ReactorCommand,
+    registry: &EndpointRegistry,
+    handle: &Option<cloacina::computation_graph::reactor::ReactorHandle>,
+    key_id: uuid::Uuid,
+    key_tenant_id: Option<String>,
+    key_is_admin: bool,
+) -> ReactorResponse {
+    // Per-command authZ check
+    let op = command_to_op(&cmd);
+    let ctx = KeyContext {
+        key_id: &key_id,
+        tenant_id: key_tenant_id.as_deref(),
+        is_admin: key_is_admin,
+    };
+    if let Err(_e) = registry.check_reactor_op_auth(name, &ctx, &op).await {
+        return ReactorResponse::Error {
+            message: format!("operation {:?} not permitted on reactor '{}'", op, name),
+        };
+    }
+
+    // CLOACI-T-0921: commands resolve the reactor inside the caller's tenant.
+    let scope = EndpointScope::from_key_context(&ctx);
+
+    match cmd {
+        ReactorCommand::ForceFire => {
+            match registry
+                .send_to_reactor(name, scope, ManualCommand::ForceFire)
+                .await
+            {
+                Ok(()) => ReactorResponse::Fired,
+                Err(e) => ReactorResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        ReactorCommand::FireWith { cache } => {
+            let mut input_cache = InputCache::new();
+            for (k, v) in cache {
+                input_cache.update(SourceName::new(&k), v);
+            }
+            match registry
+                .send_to_reactor(name, scope, ManualCommand::FireWith(input_cache))
+                .await
+            {
+                Ok(()) => ReactorResponse::Fired,
+                Err(e) => ReactorResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        ReactorCommand::GetState => match handle {
+            Some(h) => {
+                let state = h.get_state().await;
+                ReactorResponse::State { cache: state }
+            }
+            None => ReactorResponse::Error {
+                message: format!("no reactor handle for '{}'", name),
+            },
+        },
+        ReactorCommand::Pause => match handle {
+            Some(h) => {
+                h.pause();
+                ReactorResponse::Paused
+            }
+            None => ReactorResponse::Error {
+                message: format!("no reactor handle for '{}'", name),
+            },
+        },
+        ReactorCommand::Resume => match handle {
+            Some(h) => {
+                h.resume();
+                ReactorResponse::Resumed
+            }
+            None => ReactorResponse::Error {
+                message: format!("no reactor handle for '{}'", name),
+            },
+        },
+    }
+}

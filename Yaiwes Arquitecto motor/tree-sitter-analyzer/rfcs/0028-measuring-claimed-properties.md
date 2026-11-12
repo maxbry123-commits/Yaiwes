@@ -1,0 +1,1144 @@
+# RFC-0028: Measuring the properties we already claim
+
+- **Status**: draft
+- **Author(s)**: @lead-agent
+- **Created**: 2026-08-19
+- **Last updated**: 2026-08-20
+- **Tracking issue**: TBD
+- **Relationship to other RFCs**: complements [RFC-0025](0025-instant-causal-proprioception.md)
+  (sensing, L1–L5), [RFC-0027](0027-agent-secretary-and-calibration.md)
+  (secretary layer, L6–L10), and [RFC-0029](0029-does-this-test-constrain-this-code.md)
+  (the on-demand "does this test constrain this code" query). It converts four
+  load-bearing claims into executable invariants and closes one measurement gap
+  in the north star. It is the reflexive application of CLAUDE.md §11 to the
+  project's own foundational beliefs. **It adds no product capability** — the one
+  surface change it does make (§1's `completeness` field) exists solely to expose
+  a property the AST cache already records and the response layer currently drops.
+- **Division of labour with RFC-0029** (drawn by *mechanism*, not by
+  gate-versus-test): **this RFC owns static, always-on, CI-enforced invariants**;
+  **RFC-0029 owns the on-demand, per-pair, non-gating query.** Under that split
+  the ESM-dispatch defect (#3) and the synthetic-fixture defect (#1) belong here;
+  RFC-0029 keeps them only as engine-validation fixtures, never as justification.
+- **Affected source paths** (pin them — reviewers watch for drift here):
+  - `tree_sitter_analyzer/mcp/tools/callers_tool.py` (§1 — `completeness` field)
+  - `tests/unit/mcp/tools/test_tool_response_contract.py` (§1 — response-surface contract)
+  - `tests/benchmarks/claims/test_unknown_vs_absent_invariant.py` (new — §1)
+  - `tests/benchmarks/claims/test_unknown_rate_ratchet.py` (§1 reconciliation, §3.2 instance)
+  - `tests/contracts/test_reachability_invariants.py` (new — §3.1)
+  - `tests/contracts/test_gate_effectiveness.py` (new — §3.2)
+  - `.pre-commit-config.yaml` (§3.2 — the seven first-party local hooks)
+  - `.github/workflows/dogfood-pr-check.yml` (§1/§3.2 — the job that must collect)
+  - `docs/CODEMAPS/*.md` (§3.2 counts)
+  - *Prospective, does not exist today:* `tree_sitter_analyzer/calibration/`
+    (§2 — created only if RFC-0027 is accepted; see §2)
+
+## Summary
+
+On 2026-08-19 a single working session found seven defects that shared one shape:
+**the absence of a signal was read as a positive signal.**
+
+| # | defect | why it looked fine |
+|---|---|---|
+| 1 | the codemap-sync gate's two detectors matched nothing | hook exited 0 → read as "no violation" |
+| 2 | a built, tested MCP tool was reachable from no facade | a test **pinned the orphan state as expected** |
+| 3 | a suffix fix was unreachable for ESM; the resolver was never called | tests called the private helper directly → read as "it works" |
+| 4 | `ImportGraph` dropped every cross-directory edge on Windows | Linux CI structurally cannot see a separator mismatch |
+| 5 | a doc example named a file that did not exist and whose name a hook bans | the weak-assertion ratchet parses `.py` via `ast` and cannot see markdown |
+| 6 | an agent silently falls back to `grep` when a tool is too slow | the agent does not report non-use; VCSR cannot distinguish it |
+| 7 | `assert p50_ns > 0` was claimed to lock a latency fix it cannot distinguish from the bug | the test is green against the bug and against the fix — owned by [RFC-0029](0029-does-this-test-constrain-this-code.md) |
+
+**Count convention, reconciled with RFC-0029: seven.** An earlier draft of this
+RFC said *six*, omitting #7 on the grounds that it is RFC-0029's subject rather
+than this RFC's. It is counted here anyway so the two documents cannot drift on
+the same session's evidence. The *invariant* for #7 still lives in RFC-0029; only
+the count is shared.
+
+Five of the seven were invisible to a green CI (#1–#5). #6 is invisible to the
+north star itself. #7 was invisible to the test written specifically to catch it.
+None of them is a bug in a feature; each is a **missing invariant**.
+
+This RFC specifies four of those invariants and one new measurement, and hands #7
+to RFC-0029. It adds one response field (§1's `completeness`) and no new
+user-facing capability beyond it.
+
+## Motivation
+
+### The project's central claim is not merely unmeasured — on the flagship route it is not implemented
+
+TSA's moat, as stated in `ROADMAP-no1-agent-trust.md` and enforced by hand in
+review after review, is conservative resolution: *a visible `unknown` is safer
+than a confident unsupported edge.*
+
+The primary user articulated why that matters better than any spec text in this
+repository:
+
+> Every other tool I have silently conflates "there is none" with "I could not
+> determine it." `grep` returns fewer lines; it does not tell me whether the
+> callers are absent or merely invisible to it. I cannot see the difference. The
+> mistake I make most often is trusting a confidently incomplete answer.
+
+That property is the reason to prefer TSA over `grep` for a safety question. The
+first draft of this RFC said it was "a belief: nothing in CI measures it." Both
+halves of that sentence are wrong, and correcting them is the reason this section
+is the largest in the RFC.
+
+**Wrong half one: on the flagship route, the property is not implemented.**
+Measured 2026-08-19 (E0, this host):
+
+- `tree_sitter_analyzer/mcp/tools/_verdict.py:23` — `_LEGAL_VERDICTS` is a
+  **closed** `frozenset` of exactly eight values (`SAFE`, `CAUTION`, `REVIEW`,
+  `UNSAFE`, `INFO`, `WARN`, `ERROR`, `NOT_FOUND`). There is no `UNKNOWN`, and
+  `_canonicalize_verdict` silently coerces anything outside the set to `INFO`.
+- `tree_sitter_analyzer/mcp/tools/callers_tool.py:187` — the verdict is binary:
+  `"INFO" if callers or total_callers else "NOT_FOUND"`. There is no third
+  outcome to express "I could not determine it."
+- Run against a purpose-built corpus of dict-dispatch and `getattr` call sites
+  with a **real built index**, the callers route answers
+  `verdict=NOT_FOUND, caller_count=0, callers=[]` — while the index itself
+  records `callee_resolution='unknown'` on exactly those edges.
+
+So **the honest `unknown` exists in the store and is dropped on the callers
+route.** The moat's substrate is real; its answer surface erases it. That is a
+worse finding than "unmeasured", and it is the finding this RFC is built on.
+
+The same route emits `next_step` "Symbol not in the index", which is **false**
+whenever the symbol *is* indexed and only its callers are unresolved — the
+response actively misdirects the agent toward re-indexing instead of toward the
+unresolved edges.
+
+**Wrong half two: something in CI does measure `unknown` — with the opposite
+sign.** `tests/benchmarks/claims/test_unknown_rate_ratchet.py` exists and
+pressures the unknown rate **down** ("must not exceed 6.0%", "the threshold must
+NEVER increase"). §1's ratchet pressures a count of `unknown`s **up**. That
+apparent contradiction is reconciled in §1 below; the honest statement is not
+"nothing measures it" but "one thing measures a different denominator, in the
+opposite direction, in a test no CI job collects" (§3.2).
+
+The concrete risk is not hypothetical. A future change that reduces `unknown`
+counts in the name of "improved precision" would leave every existing test green,
+because every existing test asserts conformance to a shape, not the preservation
+of epistemic honesty.
+
+### VCSR cannot see adoption failure
+
+The north star is Verified Change Success Rate. It measures whether a change
+succeeded. It does **not** measure whether TSA was consulted.
+
+An agent that finds `edit action=safe` too slow does not report "I skipped TSA."
+It uses `grep`, proceeds, and the run may well succeed. Measured on this
+repository: `edit action=safe` warm p50 is **3322.89 ms** (p95 3393.28 ms, 5
+samples), from the committed artifact
+`docs/baselines/rfc0025-l5-latency-windows-e0.json` at commit `9137b39b`
+(RFC-0025 L5, PR #1315; Windows, E0, single un-isolated host). Every other route
+in that artifact drops to milliseconds (`nav` 2.7 ms, `search` 17.2 ms). 3.3 s is
+squarely inside the range where an agent routes around a tool.
+
+> An earlier draft of this section cited **~3.7 s p50**. That number came from a
+> pre-re-pin revision that was superseded *inside PR #1315 itself*; the artifact
+> as merged says 3322.89 ms. Citing a superseded intermediate as if it were the
+> committed baseline is a CLAUDE.md §11 rule-3 violation ("a locked claim carries
+> its evidence: measurement command + last-measured date") committed by the RFC
+> whose whole purpose is to enforce §11. Recorded rather than quietly fixed.
+>
+> **And the precondition is scheduled for deletion.** PR #1320 takes this same
+> route to **~47 ms**. §2 therefore must not be written as if 3.3 s were a
+> standing property of the tool: §2's motivating precondition has a known expiry,
+> and §2 survives it only as the *mechanism* for recording an explicit decline,
+> not as a claim that this route is slow. If #1320 lands before §2 is
+> implemented, re-derive the bypass-candidate argument from the then-current
+> artifact or drop it.
+
+So the world where TSA is fast and useful and the world where it is bypassed are
+**indistinguishable in the north star**. Adoption failure is silent. This is
+defect #6, and it is the same shape as the other six: a missing signal read as
+a positive one.
+
+### Three classes of defect the suite is structurally blind to
+
+Six of the seven defects cluster into three blind classes, none of which
+RFC-0025 or RFC-0027 addresses (#7 is RFC-0029's class — does a test constrain
+the code it names — and is not addressed here):
+
+1. **Reachability** — is this code actually called? (#2, #3)
+2. **Gate effectiveness** — does this gate actually gate? (#1, #5)
+3. **Platform specificity** — does this hold where CI cannot look? (#4)
+
+The good news, and the reason this RFC is small: **two of the three are already
+within reach of existing primitives pointed at a new question.** CLAUDE.md rule 5
+already states that a static call graph is sound for zero-coverage detection —
+"methods with 0 callers are definitely untested" — because its false positives
+only go one way. An MCP tool registered in no facade *is* a zero-caller symbol.
+The capability exists; nothing asks it about the right subjects.
+
+## Detailed design
+
+### §1 — The `unknown`-vs-absent differential invariant
+
+**Claim under test:** TSA distinguishes "no callers exist" from "callers could not
+be determined." A text search cannot.
+
+**This section requires a surface change. It is not test-only.** The measured
+finding above means there is no field on the callers response capable of carrying
+the distinction, so an invariant asserting it would be RED-forever against the
+current shape. The first draft claimed §1 fit inside a "no new surface" scope;
+that was wrong and is corrected here.
+
+**Design:** a fixture corpus in which call edges are genuinely undecidable by
+text search — dynamic dispatch, string-keyed invocation, reflection, computed
+attribute access, decorator-mediated registration — each with a hand-checked
+ground truth recording whether the edge exists.
+
+For each corpus symbol, run both:
+
+- TSA's resolved caller query, and
+- a text search standing in for the naive tool.
+
+Assert the **one-directional** property:
+
+```
+For every symbol where ground truth says an edge EXISTS but text search
+returns no hit, TSA MUST NOT report a confident empty result.
+It must report the edge, or report `unknown`. Never a bare zero.
+```
+
+```python
+def test_undecidable_edge_is_never_reported_as_confidently_absent() -> None:
+    """The moat, as an executable invariant.
+
+    A confident empty answer where an edge genuinely exists is the single
+    failure mode that makes an agent conclude "safe to change" and be
+    wrong. This test does not require TSA to *resolve* the edge — being
+    unable to resolve it is acceptable and expected. It requires TSA to
+    say so.
+    """
+```
+
+Deliberately **not** asserted: that TSA resolves more edges than text search.
+That is a precision claim and it belongs to the benchmark, not here. This
+invariant is about honesty only, which is why it can be one-directional and
+therefore stable.
+
+#### §1.1 The surface: a new `completeness` field, not a ninth verdict
+
+Add to the callers response (and to any route that answers a
+"who-touches-this" question from resolved edges):
+
+```
+completeness: "complete" | "incomplete" | "unknown"
+```
+
+- `complete` — every edge into this symbol resolved; a `caller_count` of 0 is a
+  real zero.
+- `incomplete` — callers were found *and* at least one edge into this symbol is
+  unresolved; the list is a lower bound.
+- `unknown` — no callers were resolved *and* at least one edge into this symbol
+  is unresolved. This is the case that today returns `NOT_FOUND` + `count=0`.
+
+**Why a field and not a ninth verdict.** `_LEGAL_VERDICTS` is a closed
+cross-surface contract: MCP tools, the CLI, and third-party clients (Claude Code,
+Cursor, Cline) branch on the string, and the vocabulary is pinned twice — in
+`_verdict.py` and in `_N_VERDICT_VOCABULARY` in
+`tests/unit/mcp/tools/test_tool_response_contract.py`. Widening a closed
+vocabulary forces every consumer's branch table to change and is the **more**
+invasive edit; adding an orthogonal field leaves every existing branch correct
+and lets a consumer that ignores it behave exactly as today. Verdict stays
+`NOT_FOUND`/`INFO`; `completeness` carries the epistemic status.
+
+`next_step` must be corrected in the same change: "Symbol not in the index" may
+only be emitted when the symbol is genuinely absent from the index. When
+`completeness != "complete"` it must name the unresolved edges instead.
+
+#### §1.2 Ratchet, and how it reconciles with the existing unknown-rate cap
+
+**Ratchet:** the count of corpus cases where TSA answers `completeness="unknown"`
+rather than a bare confident zero may **increase or hold, never decrease**. A
+change that converts an `unknown` into a confident empty fails this gate even if
+every other test is green. Same mechanism as the existing weak-assertion ratchet.
+
+That is the **opposite sign** from `tests/benchmarks/claims/test_unknown_rate_ratchet.py`,
+which lives in the very directory §1 targets and caps unknowns at 6.0% with "the
+threshold must NEVER increase". The two are not in conflict, because the
+denominators are different things:
+
+| | existing unknown-rate cap | §1's ratchet |
+|---|---|---|
+| denominator | every `kind='calls'` row in `edges`, repo-wide | the hand-checked **undecidable** corpus cases only |
+| unit | a percentage | a count |
+| measures | **resolution quality** — how much the resolver *can* resolve | **honesty where resolution is impossible** |
+| direction | down (fewer unknowns is better) | up (fewer silent zeros is better) |
+
+A genuine resolver improvement moves **both** favourably: repo-wide unknown rate
+falls (cap satisfied) and corpus cases move from `unknown` to a *resolved edge*,
+which §1 accepts because §1 forbids only the transition
+`unknown → confident-empty`, never `unknown → resolved`. **Which wins if they
+ever do collide: §1.** A change that lowers the repo-wide unknown rate by
+converting undecidable cases into confident zeros is precisely the failure §1
+exists to block, and the cap may be re-pinned upward with a reviewed decision
+where §1 may not be relaxed at all.
+
+**Scope guard against §3.1 (see §3.1).** §1 applies **only** to symbols whose
+containing file has at least one unresolved edge. A symbol in a fully-resolved
+file must answer `complete`, so "answer `unknown` whenever the file contains a
+dynamic construct" is not a legal way to satisfy this ratchet.
+
+#### §1.2 amendment — the scope guard counted calls that cannot be local
+
+Measured 2026-09-12 on the 2,174-file self-repo corpus (164,392 CALLS rows),
+because implementation showed the guard above was far broader than its own
+justification. The sentence "an unresolved call inside a file may target anything
+that file declares" is true of the text; it is not true of the *edges* the guard
+was counting.
+
+| | gated files | share of the 2,060 files holding CALLS edges |
+|---|---|---|
+| guard as originally written | 1,562 | 75.8% |
+| after counting `external` as terminal | 1,363 | 66.2% |
+| after excluding builtin receivers (**amended definition**) | **1,029** | **50.0%** |
+
+The largest contributors were calls that cannot name a file-local symbol at all:
+`list.append` (2,327 rows), `dict.get` (369), `conn.execute` (446), `set.add`
+(275), `logger.debug` (215), `dict.items` (152), `super().__init__` (130). Before
+the amendment, a single `logger.debug(...)` barred every symbol in its file from
+ever answering `complete` — the failure the RFC's motivation attributes to
+computed dispatch, reproduced instead by ordinary attribute access.
+
+**What the guard now counts** is unchanged in intent and narrower in fact: an
+unresolved edge gates its file unless its callee is a dotted name whose receiver
+is a builtin type (`_can_target_local_symbol`, `graph/edge_store.py`). After the
+amendment, 3,635 unresolved edges are excused on this corpus and **6,674 are
+still counted** — bare names, `self.`/`cls.`, `getattr(...)`, string-keyed
+dispatch (`handlers["read_resource"]`), and any receiver that is a local variable
+(`extractors.run`) all keep gating, because each may name something the file
+declares.
+
+**Why the remaining half is not narrowed further.** The next-largest receivers are
+`conn` (689), `self` (302), `pytest` (258), `logger` (242), `tree_sitter` (172),
+`monkeypatch` (130), `extractor` (85), `path` (71). Excusing `pytest` and
+`tree_sitter` needs the file's import table joined to a project-module test;
+`conn`, `logger`, `monkeypatch`, `extractor`, and `path` are local variables bound
+to objects, which needs dataflow rather than syntax. Neither is available to the
+edge reader today, and both can under-count, which is the one direction §1
+forbids. They are recorded here as the measured remainder rather than guessed at.
+
+**Why this is a safe narrowing and not a relaxation.** Every exclusion requires
+proving the receiver is a builtin type; nothing is excused by absence of
+information. Over-counting only holds a symbol at `incomplete`, while
+under-counting certifies absence over a real edge — so the amendment removes only
+the cases where the exclusion is provable, and the ratchet above is unchanged.
+
+#### §1.2 amendment 2 — the guard matches on name when nothing calls the symbol (#1596)
+
+Measured in dogfood rounds 3 and 4 (2026-10-15): module-level functions answered
+`unknown` 18/18 and 12/12, including ones nothing referenced. Any unresolved
+attribute call in the declaring file (`"\n".join`, `header.get`) was treated as
+something that could target the function, even though its attribute name differs.
+
+When the symbol has **0 callers**, an unresolved site now gates the file only if
+it could name the symbol: its callee text ends in the symbol's name, or the name
+is computed (`getattr(x, name)`, any subscript such as `HANDLERS[name]` or
+`globals()[...]`, `vars(`, `eval(` and similar). A literal `getattr(x, "n")`
+gates only when `n` is the symbol's name. Sites ruled out this way are reported in
+`excluded_sites` with `reason_code: names_other_symbol`, so the two lists still
+partition one scan.
+
+**Why this is a proof, not a relaxation.** A call site with a different name can
+reach the symbol only through a value: an alias (`f = target`), a callback
+argument, a container entry, or a decorator that registers it. The first three
+are name references, which the non-call reference gate (#1593) scans for in every
+indexed same-language file before 0 can be `complete`. The fourth is covered by a
+new gate: a declaration with a decorator that may register it answers `unknown`
+with `DECORATOR_MAY_REGISTER`. The non-call reference gate runs only when there
+are 0 callers, so the narrowing applies only then; a symbol with callers keeps
+the original guard.
+
+**Re-landing after dogfood round 5 (#1622, #1623, #1624).** The first version of
+this amendment (#1614) was reverted (#1626) because three gaps let it certify
+absence over real uses:
+
+- Module-scope call sites (`X = f()`, class bodies, `if __name__ == "__main__"`,
+  module-level lambdas and comprehensions, decorator arguments and factories)
+  were not counted as callers. They are now listed as `<module>` callers (#1628).
+- Names in code strings and config files (`"pkg.mod:f"`, `exec("m.f()")`,
+  `pyproject.toml`, workflow YAML) were not scanned. They now are (#1629).
+- Decorators were read by scanning consecutive `@` lines, and the wrapper
+  exemption matched on the bare name. Multi-line decorators, a comment between
+  decorator and definition, and a project's own `def cache(fn):
+  HANDLERS.append(fn)` used as `@cache` all passed. Decorators are now read
+  from the definition's syntax tree (Python `ast` `decorator_list`; tree-sitter
+  decorator/annotation nodes for other languages). A decorator is exempt only if
+  it resolves, through the file's imports, to a known wrapper-only decorator
+  (`functools.lru_cache`/`cache`/`wraps`, builtin
+  `staticmethod`/`classmethod`/`property`, `abc.abstractmethod`,
+  `typing.overload`, `dataclasses.dataclass`, `contextlib.contextmanager`, and
+  similar). A name bound in the file, a relative or star import, or a name with
+  two possible origins is not exempt, and non-Python annotations are never
+  exempt. A declaration whose decorators cannot be read (syntax error,
+  unreadable file, grammar unavailable) is treated as possibly registered.
+
+**Dogfood round 6 (#1633).** Five shapes still answered `complete, 0` where grep
+finds a reference. The non-call reference scan now covers them, and each hit
+answers `unknown` with `NON_CALL_REFERENCES`:
+
+- JSON (`function.json`, tool configs): only string values that are exactly
+  the name or a dotted/colon path ending in it. Keys and prose strings are not
+  counted. Files larger than 64 KiB are treated as data and are not scanned.
+  Measured 2026-10-16 (`git ls-files "*.json"`): 116 tracked files, 587 KB in
+  total, p99 42 KB; the only file over the bound is the 68 KB
+  `grammar_snapshot.json`.
+- `.ipynb` code cells, scanned as Python; markdown cells are not.
+- String arguments of `exec` / `eval` / `compile` (not method calls such as
+  `re.compile`), scanned as code, so bare names count.
+- `{{ ... }}` / `{% ... %}` expressions in `.html` / `.jinja` / `.j2` /
+  `.jinja2` templates.
+- Doctest lines in docstrings. The rest of a docstring is still prose.
+
+Markdown, rst and txt files are still not scanned.
+
+#### §1.3 — Carry the evidence, not only the count
+
+**Problem.** §1.1 adds `completeness`, and §1.2 makes it precise, but the caller
+still receives a *number*: `unresolved_in_declaring_files: 319`. A number says how
+much is unknown and nothing about *what*. To act on it, the caller must find the
+319 edges itself — by reading the file, which is the cost the response was
+supposed to remove. A residual that cannot be located cheaply is a residual the
+caller will route around, and a tool that is routed around is not used.
+
+**Change.** The response carries `unresolved_sites`: the sites themselves, each
+with its line, its callee text, and a `mechanism` classifying the syntactic shape
+that left it unresolved — `string_keyed_dispatch`, `reflection`,
+`own_class_attribute`, `module_or_object_attribute`, `expression`, `bare_name`.
+The list is capped (`unresolved_sites_truncated`) with `unresolved_sites_total`
+beside it, the same honest-truncation pattern the caller list already uses. The
+count is `len(...)` of the same derivation, so the number and the sites cannot
+describe different edge sets. `next_step` names the first few inline.
+
+**Why this is the load-bearing half.** A count converts an unbounded search into a
+search of unknown size. Sites convert it into a bounded one. Measured on the
+2,174-file self-repo corpus, the single worst file is
+`tree_sitter_analyzer/knowledge_graph/static/app.js` with **319 unresolved CALLS
+rows**. Reported as a count, that file is permanently `incomplete` and the reader
+learns nothing. Reported as sites, the mechanism mix is immediate:
+
+| mechanism | sites |
+|---|---|
+| `module_or_object_attribute` | 141 |
+| `bare_name` | 126 |
+| `expression` | 33 |
+| `string_keyed_dispatch` | 19 |
+
+The first rows are `document.getElementById`, `fetch`, `String(v ?? "").replace`,
+`new URLSearchParams(params).toString` — **browser globals and DOM builtins, not
+project symbols**. They cannot target anything the project declares, and the
+`bare_name` majority is the same class. The count could not say this; the
+mechanisms say it at a glance, and they are the raw material for the named
+exclusions §1.3 will need next: a `runtime_global` exclusion is provable for
+`fetch` in a browser asset, and it is exactly the kind of proof that turns
+"permanently incomplete" into `complete`.
+
+**The negative space is reported too.** `excluded_sites` carries the sites that
+were ruled out, each with a `reason_code` (`builtin_receiver` today), plus
+`excluded_by_reason` as the summary. Both lists come from one scan of the same
+file and one `exclusion_reason` decision, so they partition the non-resolved
+edges rather than being two lists that can drift. Measured on the self-repo
+corpus: **6,674 sites gate their files and 3,635 are excluded** — the exclusions
+account for 35.3% of non-resolved call sites, and until they were reported a
+caller could not tell a file gated by one genuine dispatch site from one gated by
+three hundred builtin attribute calls.
+
+The same measurement shows what the current proofs cannot reach. The worst file,
+`static/app.js`, has **319 sites and zero exclusions**: 141
+`module_or_object_attribute`, 126 `bare_name`, 33 `expression`, 19
+`string_keyed_dispatch`. Every one of them is a shape the builtin-receiver proof
+does not cover, and most of them are browser globals. That file does not need a
+better bound; it needs the next proof — `runtime_global`, valid relative to a
+*declared* runtime environment, with the declaration carried in the payload so
+the assumption is visible and disputable.
+
+**What this does not do.** It does not reduce the unknown rate by one edge. The
+count is the same before and after. What changes is whether the residual is
+*actionable* — and per §1.1's own reasoning, a residual the caller cannot act on
+is indistinguishable from one they never received.
+
+### §2 — Consultation records: making non-use visible
+
+**Claim under test:** TSA is used.
+
+**§2 is conditional on RFC-0027 being accepted, and is empty until RFC-0027 L6.2
+exists.** Stated plainly, because the first draft of this RFC asserted "no change
+to the RFC-0025 or RFC-0027 designs" in the same document that proposed *adding a
+record kind* to RFC-0027's L9 ledger — adding a record kind **is** a design
+change. Measured 2026-08-19:
+
+- RFC-0027 is `draft`, not accepted. Extending its ledger is a change to an
+  unapproved design.
+- `tree_sitter_analyzer/calibration/` **does not exist**. The first draft listed
+  it under Affected source paths as if it did; it is now marked prospective.
+- There is no `QueryCost`, no declared budget, and **no caller-side rejection
+  path anywhere in the package**. Nothing can populate `declined_reason`.
+
+Therefore `declined_reason` would be `None` on **100%** of records until
+RFC-0027 L6.2 ships. §2's own Drawbacks entry said "measures a proxy, not the
+thing"; the accurate statement is stronger: **the proxy is not weak, it is
+currently empty.** §2 must not be implemented before RFC-0027 is accepted and
+L6.2 lands, and its acceptance criteria are gated on that below.
+
+Conditional on that, extend RFC-0027's L9 ledger with a third record kind
+alongside `Prediction` and `Outcome`:
+
+```python
+@dataclass(frozen=True)
+class Consultation:
+    """One question an agent asked, and whether the answer was usable.
+
+    ``declined_reason`` is how a bypass becomes visible: a route that
+    returns a cost estimate the caller rejects, or that exceeds a
+    declared budget, records WHY it was not used. A tool that is
+    routinely too slow then shows up as a population of declines rather
+    than as silence.
+    """
+
+    consultation_id: str
+    tool: str
+    action: str
+    generation: str
+    served_from: Literal["cache", "computed"]
+    elapsed_ns: int
+    declined_reason: str | None   # BUDGET_EXCEEDED / COST_REJECTED / None
+```
+
+Surfaced by `--self-health` (RFC-0025 L5) as consultation counts and decline
+rates per route, alongside the existing latency percentiles.
+
+**What this can and cannot do — stated plainly.** TSA cannot observe an agent
+that never calls it; nothing inside a process can record a call that did not
+happen. What it *can* do is make the **precondition** measurable: a route whose
+p95 sits in the seconds while its sibling routes sit in milliseconds is a
+bypass candidate, and RFC-0027's L6.2 `QueryCost` gives a caller a place to
+decline explicitly rather than silently. This turns an unobservable into a
+weak but real signal. Claiming more would be the same overreach this RFC exists
+to correct.
+
+**Explicitly out of scope:** any telemetry that leaves the machine. Local
+records only; the L9.5 storage discipline (identities and outcomes, never source
+text, secret-canary tested) applies unchanged.
+
+**Also out of scope until its precondition is re-measured:** the "this route is a
+bypass candidate because its p95 sits in the seconds" argument. PR #1320 takes
+`edit action=safe` to ~47 ms. The mechanism (an explicit decline record instead
+of silence) is what §2 contributes; the specific slow route that motivated it is
+scheduled for deletion.
+
+### §3 — Invariants for the three blind classes
+
+#### §3.1 Reachability
+
+Point the existing zero-caller machinery at three questions it is not currently
+asked:
+
+1. **Registered-surface reachability.** Every MCP tool class and every CLI
+   command module must be reachable from the tool registry or the argument
+   parser. A tool that is built and tested but registered nowhere fails.
+   *This catches defect #2 — and note that a test currently pins that orphan
+   state as expected; that assertion must be corrected, not preserved.*
+
+   **The orphan count is six, not one.** Measured against the live registry on
+   2026-08-19: `CodeGraphPRReviewTool`, `CodeGraphRefactorTool`,
+   `GetProjectSummaryTool`, `MiddlewareDetectorTool`, `UniversalAnalyzeTool`,
+   `UnreachableCodeTool`. The first draft's "the known orphan", singular,
+   understated this by ~6×.
+
+   **Disposition rule (mandatory — the invariant is not implementable without
+   it).** Without a stated rule, an implementer facing six red rows will add an
+   allowlist of six entries plus three for the abstract bases below, tick the
+   box, and thereby **manufacture a new pinned-orphan-state test — the exact
+   anti-pattern this item exists to kill.** So: every orphan must be resolved
+   into exactly one of three dispositions, recorded in the invariant's data, and
+   an allowlist entry is not one of them:
+
+   - **delete** — no consumer, no plan: remove the tool and its tests;
+   - **wire** — register it in the facade/registry it belongs to;
+   - **deprecate with an expiry** — keep it, mark it deprecated with a named
+     removal version, and let the invariant **fail once that version ships**.
+
+   **Abstract-base exclusion.** `FacadeTool`, `MCPTool` and `_CallTreeBase` are
+   abstract/base classes and are legitimately not registered. The exclusion is
+   structural, not an allowlist: a class is exempt iff it is `abc`-abstract or
+   has no concrete `execute`. Naming them individually would be the allowlist
+   pattern again.
+2. **`next_step` routability.** Restated, because the first draft's wording is
+   **false as written**. Real emitted strings include "Pass roots within the
+   project boundary." and "Check server logs for details." — English prose, not
+   routes; an invariant requiring every `next_step` to name a resolving route
+   fails on correct behaviour. The invariant is:
+
+   > Any `next_step` containing a token matching a known tool / facade / action
+   > name must resolve to a **registered** route.
+
+   That formulation still catches the class this section records. *Measured
+   correction (2026-09-12).* The defect named here has since been fixed, and was
+   mis-located: `get_project_summary` is back in `facade_map.LEGACY_TOOL_MAP`
+   (resolving to `project action=card`), and its mention in
+   `build_project_index_tool.py` is inside the tool **description**, not a
+   `next_step`. So the live instance is gone; the class is not.
+
+   The gate that covers it (`tests/unit/mcp/test_next_step_routability.py`)
+   harvests `next_step` string constants by AST and resolves every token that
+   collides with a published name. Measuring it exposed the class this section's
+   wording cannot reach: a name a breaking change **removed** resolves nowhere by
+   construction, so a vocabulary of currently-resolving names cannot see it.
+   `facade_map.REMOVED_TOOL_NAMES` is what makes "removed" machine-checkable, and
+   injecting `search_content` into a `next_step` now fails the gate rather than
+   being silently skipped.
+3. **Dispatch reachability.** For each language-family branch in a resolver
+   dispatch, at least one test must reach it **through the public entry point**,
+   not by calling the private helper. *This catches defect #3, where the ESM
+   branch was unreachable in production while its helper's unit tests passed:
+   `ImportGraph._resolve_import` (`import_graph.py:350`) dispatches, and the
+   `startswith("import ")` branch at `:372` is what the private-helper tests
+   never exercised.*
+
+**Rule 5's caveat, corrected.** The first draft repeated CLAUDE.md rule 5's
+figure of "~50 modules" imported by `conftest.py`'s autouse singleton reset. That
+figure is stale in two ways, measured 2026-08-19:
+
+- `tests/conftest.py:334` (`_reset_all_singletons`) states in its own docstring
+  that it uses `importlib.import_module()` with **string paths specifically so
+  that static call-graph tools do not record a conftest→module edge** — the fix
+  for **issue #220**. The phantom edges rule 5 warns about were deliberately
+  removed.
+- It touches **10 distinct modules** across 11 `import_module` call sites (the
+  formatter registry is re-imported inside its own reset lambda), not ~50:
+  `core.analysis_engine`, `core.language_detector`, `core.query`,
+  `formatters.formatter_registry`, `core.engine_manager`,
+  `mcp.utils.file_output_factory`, `cache.answer_cache`, `language_loader`,
+  `query_loader`, `latency`.
+
+So §3.1's one-way property is **safe, but the stated reason for it was wrong**.
+These invariants still use only the zero-caller signal, because one-way false
+positives are the conservative choice on principle. But the contamination that
+made a positive-caller assertion unusable has been fixed, so a positive-caller
+assertion **may now be available again** — worth measuring before assuming it is
+not, and out of scope here.
+
+**§3.1's zero-signal is exempt from §1's ratchet, and §1 is scoped away from
+it.** The cheapest way to maximise §1's ratchet is "answer `unknown` whenever the
+file contains any dynamic construct" — and dynamic construction is exactly how
+the orphan-detection subjects are built (`health_facade.py` is assembled by a
+function-local import; `plugins/manager.py:72` uses `importlib.import_module`).
+Under that implementation a genuine orphan would answer `unknown` instead of `0`,
+§3.1 would silently stop detecting anything, and **both gates would be green** —
+a new instance of this RFC's own defect shape. Therefore, normatively:
+
+- §1 applies only to symbols whose file has **at least one unresolved edge**
+  (§1.2); and
+- §3.1's zero-caller signal is **exempt** from §1's ratchet — a zero there must
+  remain a zero, and a `completeness` field is not a licence to soften it.
+
+#### §3.2 Gate effectiveness
+
+Every **first-party, detector-bearing** gate must carry a **self-check**
+proving its detector still matches live production, asserting **exact** set
+equality — not a `count > 0` lower bound.
+
+**Scope, stated precisely, because "every blocking gate" is unimplementable.**
+`.pre-commit-config.yaml` declares **28 hooks, of which 21 are third-party**:
+`ruff` + `ruff-format`, 14 `pre-commit-hooks`, `detect-secrets`, `bandit`,
+`mypy`, `pyupgrade`, `actionlint`. You cannot add a `--self-check` mode to
+`ruff`, and requirement 2 below ("count of surface items outside the watch
+filter == 0") has **no referent at all** for `check-yaml` — it has no watched
+surface to be outside of. §3.2 therefore scopes to the **7 local hooks**:
+
+*Measured correction (2026-09-12).* This section previously read "27 hooks … 6
+local hooks" and omitted `test-encoding-ratchet` from the table below. Both
+numbers are now derived from the configuration by
+`tests/governance/test_first_party_gate_inventory.py`, which fails if this table
+and `.pre-commit-config.yaml` disagree. The omission is not cosmetic: the missing
+row is `test-encoding-ratchet`, and its script (`scripts/check_test_encoding.py`)
+carried the exact defect this section exists to catch — resolved against the
+caller's cwd, it reported `encoding-unsafe text calls in tests/: 0 across 0
+files` and exited `0` when run from any directory but the repository root. The
+table omitted the one local hook that was actually dead, and that hook is itself
+a ratchet, the same class whose dead-detector defect this section records as #1.
+
+| local hook | has a live surface to drift from? |
+|---|---|
+| `tsa-codemap-sync` | **yes** — the MCP/CLI registry; already rebuilt this way in #1314 |
+| `weak-assertion-ratchet` | **yes** — the set of assertions it can parse (its blind spot to markdown is defect #5) |
+| `test-encoding-ratchet` | **yes** — the count of non-UTF-8-safe test files it measures against a grandfathered baseline |
+| `block-banned-test-names` | **yes** — the banned-pattern list vs the live test-file set |
+| `workflow-consistency-tests` | **yes** — the set of workflows it checks vs `.github/workflows/*` |
+| `block-local-artifacts` | partial — a static path/glob denylist; requirement 1 applies, requirement 2 does not |
+| `tsa-ps-ascii` | partial — a static character-class check over `.ps1`; requirement 1 applies, requirement 2 does not |
+
+Third-party hooks are out of scope: they are versioned upstream, and a pinned
+`rev` bump is the review surface for their behaviour. Requirements 1 and 2 apply
+to every row with a live surface — five in the table below, six once correction 1
+is applied; requirements 3 and 4 apply to all seven local hooks.
+
+**Two further scope corrections, measured 2026-09-12** while implementing the
+self-checks. The table above was written from recollection of the config rather
+than from the config, and two of its remaining cells are wrong. They are
+corrected here rather than silently edited.
+
+1. **`tsa-ps-ascii` has a live surface; requirement 2 does apply.** The table
+   calls it "a static character-class check over `.ps1`". Measured, it watches
+   `.github/workflows/*.yml|*.yaml` and `.github/actions/**/action.yml|*.yaml`
+   (30 files), and the surface the rule is *about* is the 27 of those carrying a
+   `run:` block. That is a real set with a real watch filter, so the coverage
+   invariant is well-defined and is now asserted — and it fires on a planted
+   `.github/zz-probe.yml` that carries `run:` outside the filter.
+2. **`block-banned-test-names` is a staged-diff gate, not a live-tree gate.**
+   The table gives its surface as "the banned-pattern list vs the live test-file
+   set". Measured, it reads `git diff --cached --name-only --diff-filter=A`, so
+   it sees **newly added staged** test files only; the live test-file set is
+   never enumerated. Requirement 2 is still meaningful for it, but over
+   `^tests/.*\.py$` restricted to staged additions, not over the tree.
+
+One further finding, negative and therefore worth recording: the cwd defect is
+**not** systemic across the local hooks. `check_loose_assertions.py`,
+`check-test-file-names.sh`, and `check-local-artifacts.sh` were each run from
+`scripts/` and from an unrelated subdirectory and behave identically to the
+repository root — the first because it already anchors on
+`Path(__file__).resolve().parents[1]`, the latter two because
+`git diff --cached --name-only` reports repository-root-relative paths
+regardless of cwd. Measured 2026-09-12; this narrows the defect to
+`check_test_encoding.py` and `check_ps_ascii.py`.
+
+This is now precedent rather than proposal: #1314 rebuilt
+`scripts/codemap-sync-check.sh` this way after the old gate's `count > 0` guard
+was shown to pass against a tree where both detectors were fully dead. Note the
+irony worth preserving in the record: **the anti-staleness guard was violating
+the exact-assertion rule it existed to enforce.**
+
+Required of every gate:
+
+1. a `--self-check` mode asserting exact equality against the live surface;
+2. a **coverage invariant** — the count of surface items falling outside the
+   gate's watch filter must be exactly `0`;
+3. its test fixture derived from **real** production files, never a synthetic
+   imitation of their shape;
+4. the test **invoked by a named CI job** whose failure fails the job, or —
+   where no CI job blocks — wired into pre-commit, **naming which**. The codemap
+   gate's own test was referenced by no workflow at all before #1314.
+
+   **The blocking layer is pre-commit, not CI.** Measured 2026-08-19 via the
+   GitHub API: `branches/develop/protection` returns **404 — not protected**, and
+   the repository's only ruleset (`main-branch-protect`) restricts just
+   `deletion` and `non_fast_forward`, with **no `required_status_checks`**. So
+   today *no CI job can block a merge*, and "wired into CI" is not by itself a
+   sufficient discharge of this requirement. Two acceptable resolutions, and
+   §3.2 requires one of them to be named per gate:
+
+   a. add `required_status_checks` to a `develop` ruleset covering the job — this
+      is itself in scope for §3.2, since a gate that cannot fail a merge is the
+      §3.2 defect shape one level up; or
+   b. wire the gate into pre-commit, the only actually-blocking layer, and state
+      that CI collection is corroboration rather than enforcement.
+
+#### §3.2 instances already live in the tree
+
+Two of them sit in the directory §1 targets, which is why they are recorded here
+rather than left as footnotes:
+
+1. **A ratchet that no CI job collects.**
+   `tests/benchmarks/claims/test_unknown_rate_ratchet.py` declares
+   `pytestmark = [benchmark, claims_benchmark, full_language]`. Measured against
+   the two marker expressions that exist: `reusable-test.yml` runs
+   `-m "not slow and not e2e and not network and not benchmark and not full_language"`
+   → **0 collected**; `dogfood-pr-check.yml:127` (job `claim-invariants`) runs
+   `-m "claims_benchmark and not full_language"` → **0 collected**. The gate runs
+   **nowhere**.
+
+   This matters beyond the one file: it means **§1's acceptance criterion
+   "ratchet wired into CI" is tickable against a test CI never collects** — which
+   is defect #1 from this RFC's own table (a gate that exits 0 because it matched
+   nothing), reproduced by the RFC that exists to prevent it. Stated here rather
+   than discovered later. §1 and §3.2 therefore require every gate to name its
+   **marker set** *and* its **workflow job**, not only its file path, and to
+   prove collection with a non-zero collected count.
+
+2. **A tautological assertion in the same directory.**
+   `test_unknown_rate_threshold_value` asserts
+   `UNKNOWN_RATE_THRESHOLD_PCT == 6.0` — a module constant compared against its
+   own literal. It cannot fail for any reason other than someone editing both
+   lines, measures nothing about the repository, and is a T-3 instance
+   (a test whose only effect is to exist). The sibling
+   `test_unknown_rate_threshold_is_documented_in_this_file` reads its own source
+   and asserts substrings are present — same class. Both must be replaced by a
+   live measurement or deleted.
+
+**Doc-example verification** belongs here too (defect #5). The weak-assertion
+ratchet parses staged `.py` via `ast` and cannot reach fenced code blocks in
+markdown. Extract executable examples from agent-facing docs and run them.
+The author of this RFC replaced a loose `>= 1` with a pinned `== 2` in
+`docs/TESTING.md` where the correct value was `1`, because nothing runs those
+examples — an exactly-wrong exact assertion, which is worse than the bound it
+replaced.
+
+#### §3.2 self-check landing record (2026-09-12)
+
+Six of the seven local hooks now carry a `--self-check`. The seventh is
+`workflow-consistency-tests`, which is a `pytest` invocation rather than a script,
+so it has no flag to add and is the one remaining gap against the acceptance box.
+
+| local hook | self-check asserts | red→green verified |
+|---|---|---|
+| `tsa-codemap-sync` | exact set equality, MCP and CLI surfaces; 0 flags outside the watch filter | pre-existing (#1314) |
+| `weak-assertion-ratchet` | exact violation set on a planted weak assert, no false positive on a strong one, and 100% parse coverage of `tests/**/*.py` | yes |
+| `test-encoding-ratchet` | scan base anchored to the repository, non-empty surface, every live file parses | yes |
+| `block-banned-test-names` | planted banned name detected exactly, innocent name ignored, path outside `tests/` not reported | yes |
+| `block-local-artifacts` | each blocked pattern still matches exactly, innocent paths ignored | yes |
+| `tsa-ps-ascii` | watched set vs the live `run:` surface, difference empty | yes |
+
+Two findings from the work, both instances of this RFC's subject:
+
+- **The parse-coverage arm is not decoration.** `check_loose_assertions.py`
+  returns `[]` for a file it cannot parse — "skip silently (CI lint step catches
+  syntax errors)". A tree of unparseable tests therefore reads as clean. The
+  self-check turns that silent skip into a failure; measured by planting a
+  syntax-error file under `tests/`.
+- **`block-local-artifacts` can only fire on a force-added path.** Both of its
+  patterns (`threads/`, `REDESIGN_PROPOSAL.md`) are already in `.gitignore`, so
+  `git diff --cached` cannot normally contain them. It is a backstop for
+  `git add -f`, verified by staging a force-added `REDESIGN_PROPOSAL.md` and
+  watching the gate reject it, rather than a gate that fires in normal use.
+
+The cwd-relative defect the first two self-checks found is recorded above: two
+gates resolved their watch base against the caller's cwd, so from `scripts/` they
+scanned nothing and exited `0`. Both are now anchored to the repository root, and
+`tests/governance/test_gate_self_checks.py` runs every self-check from a
+non-root directory and asserts each gate's output is byte-identical from the root
+and from `scripts/`.
+
+**Requirement 4 for this module.** The enforcement layer is CI plus the local
+quick gate: `tests/governance` is in `pytest.ini` `testpaths` so bare
+`uv run pytest` collects it, and the module is unmarked so the `reusable-test.yml`
+matrix expressions select it. Pre-commit does not run it. Collection is non-zero —
+11 collected — and the module was verified to fail on a degraded gate rather than
+merely passing.
+
+**Acceptance boxes deliberately left unchecked.** The self-check box requires all
+seven local hooks and is one short. The marker-set/non-zero-collection box
+requires a per-gate statement for every gate, which this record does not make
+beyond the seven hooks above. The enforcement-layer box requires either a
+`develop` ruleset carrying `required_status_checks` or a per-gate declaration;
+neither exists. The remaining two boxes (the tautological threshold assertions,
+and doc-example extraction) are untouched. Naming them here is the point: §3.2
+exists because "self-declared and never measured" reads as done.
+
+#### §3.3 Platform specificity
+
+For any invariant whose correctness depends on filesystem or OS semantics —
+path separators, case sensitivity, symlinks, line endings, locale codecs — the
+test must either run on every axis or **fail closed on the axes where it cannot
+run**, never skip silently.
+
+Defect #4 is the worked example: `ImportGraph` dropped every import edge crossing
+a directory on Windows (POSIX cache keys versus `os.path.normpath` backslashes),
+language-independently, making the import graph effectively empty for any real
+project — and Linux CI could not observe it because POSIX paths have no
+separator mismatch. It surfaced only when a test was finally written against the
+public API instead of a private helper.
+
+**PR attribution, reconciled with RFC-0029: the fix is `pre-#1312`.** The work
+was authored on **#1312**'s branch and reached `develop` folded into **#1308**'s
+merge, so both numbers are defensible; this RFC and RFC-0029 both say
+`pre-#1312`, naming where the change was written. An earlier draft of this RFC
+said `pre-#1308`.
+
+**Minimum invariant:** any code comparing a path against an AST-cache key must be
+covered by a test asserting the comparison holds under **both** separator
+conventions, independent of the host. This is cheap and it is the specific bug
+class already shown to be live.
+
+## Three-Surface impact (CLI ↔ MCP parity)
+
+| capability | CLI | MCP |
+|---|---|---|
+| `completeness` on caller answers (§1) | present on the JSON payload | present on the TOON payload |
+| consultation + decline rates (§2, conditional) | `--self-health` (extends RFC-0025 L5) | `health action=self` |
+
+**§1 is a surface change and this RFC no longer claims otherwise.** It adds one
+**response field**, `completeness`, on both surfaces with identical values — a
+parity test pins that. It adds **no new flag and no new action**, and it does
+**not** widen `_LEGAL_VERDICTS` (see §1.1 for why a ninth verdict is the more
+invasive option). §3 is tests and gates only. §2 extends an existing report and
+is conditional on RFC-0027. The locked TOON-on-MCP / JSON-on-CLI asymmetry is
+untouched; per CLAUDE.md §1 the TOON payload must carry the same scalar field
+rather than dropping it.
+
+## Drawbacks
+
+1. **Near-pure cost, no feature.** Nothing here makes the product do anything
+   new; the one field §1 adds only exposes a status the store already holds. It
+   makes existing claims falsifiable. The argument for paying it is that five of
+   the seven motivating defects survived a green CI, and one of them shipped a
+   Windows-wide correctness bug.
+2. **The §1 corpus is hand-curated and will rot.** Ground truth requires human
+   judgement about whether a dynamically-dispatched edge exists. Mitigated by
+   keeping the corpus small and the invariant one-directional.
+3. **§1 will fail on merge, and more widely than §3.1.** Adding `completeness`
+   changes the response shape of the callers route, so the response-surface
+   contract test (`test_tool_response_contract.py`) and every fixture that pins
+   the callers payload go red, on both surfaces. This is the **larger** of the
+   two merge-time failures in this RFC and was missing from the first draft
+   entirely, which is why it is listed above §3.1's.
+4. **§3.1 will fail on merge.** Six existing orphans, and at least one test that
+   pins an orphan as expected. That is the point, and the fix is to apply the
+   §3.1 disposition rule — not to add an allowlist.
+5. **§2 is empty until RFC-0027 L6.2 exists.** Not "a weak proxy": with no
+   `QueryCost` and no rejection path, `declined_reason` is `None` on 100% of
+   records. Non-invocation is additionally unobservable from inside. Both stated
+   in the design rather than papered over.
+6. **§3.2 imposes work on every future first-party gate.** Acceptable: a gate
+   that cannot prove it still fires is worse than no gate, because it
+   manufactures confidence. Third-party hooks are explicitly out of scope
+   (§3.2).
+7. **§3.2 may require a repository-settings change, not only code.** With no
+   `required_status_checks` on `develop`, "the test is invoked by a CI job that
+   can fail" is not satisfiable in code alone.
+
+## Alternatives
+
+- **A: Trust review to catch these.** Rejected on evidence. Five review rounds by
+  an automated reviewer on one PR produced a stream of individually-valid
+  findings about an unbounded enumeration, and never named the architecture as
+  the defect. Review finds instances; invariants close classes.
+- **B: Raise coverage instead.** Rejected. All seven defects lived in *covered*
+  code. Defect #3's helper had passing unit tests while being unreachable in
+  production. Coverage measures execution, not reachability from a real entry
+  point — and T-3 prohibits coverage as a goal.
+- **C: Assert TSA resolves more edges than text search** (§1). Rejected: that is
+  a precision claim, it belongs to the RFC-0021 benchmark, and it is fragile.
+  The honesty property is the one worth a permanent gate.
+- **D: Emit telemetry to measure adoption** (§2). Rejected outright — a
+  local-first tool does not phone home. The decline-record proxy is weaker and
+  is the correct trade.
+
+## Prior art
+
+- **Metamorphic testing.** §1 is a metamorphic relation: it does not require a
+  known correct output, only that a property hold between two systems on the same
+  input. That is what makes an honesty invariant expressible at all, since the
+  ground truth for "is this dynamic edge real" is expensive while "must not claim
+  confident absence" is cheap.
+- **Mutation testing.** §3.2's self-check is a targeted, cheap mutation test: it
+  asks whether the detector would still fire, rather than assuming it. The repo
+  already has `mutation-baseline.yml`; this applies the same idea to gates.
+- **Google Tricorder.** Analyzer abandonment above ~10% false-positive rate is
+  the documented failure mode; §2's decline records are the local analogue of
+  measuring "did anyone act on this finding."
+- **`git`'s abbreviated object names.** Adopted in RFC-0027 §L6.3 for the same
+  reason it appears here: an identifier that can silently resolve to the wrong
+  thing is worse than one that fails loudly.
+
+## Test plan (RED-first)
+
+1. §1 corpus: at least one case per undecidable mechanism (dynamic dispatch,
+   string-keyed call, reflection, computed attribute, decorator registration),
+   each with hand-checked ground truth. RED against a deliberately-weakened
+   resolver that returns a bare zero.
+2. §1 ratchet: a synthetic regression converting one `unknown` into a confident
+   empty must fail the gate.
+3. §3.1: RED today — the registered-surface invariant must fail on the known
+   orphan before the orphan is wired.
+4. §3.1: `next_step` routability must fail on an unroutable token. RED-first was
+   not available here: the string this item named is fixed, and no unroutable
+   token remains in the tree. The gate was instead proven by injection — adding
+   `search_content` to a `next_step` fails it — which is the same evidence the
+   original RED case would have supplied. See the *Measured correction* above.
+5. §3.2: for each existing blocking gate, a self-check asserting exact set
+   equality, plus its coverage-invariant-equals-zero.
+6. §3.2: doc-example extraction must fail on a deliberately wrong pinned count.
+7. §3.3: a path-comparison test asserting both separator conventions, failing
+   against the pre-#1312 resolver.
+8. §2 (only once RFC-0027 L6.2 exists): a declined consultation is recorded with
+   its exact reason code; an unavailable one is `null`, never `0`.
+9. §1.1: the callers route on the undecidable corpus must emit
+   `completeness="unknown"`, and its `next_step` must **not** say "Symbol not in
+   the index" while the symbol is indexed. RED today.
+10. §1.2: a synthetic change that answers `unknown` for a symbol in a
+    fully-resolved file must **fail** — the scope guard, not just the ratchet.
+11. §3.1: an allowlist-shaped resolution of an orphan must fail the invariant;
+    only delete / wire / deprecate-with-expiry may make it green.
+12. §3.2: each named gate must report a **non-zero collected count** under the
+    marker expression of the CI job (or pre-commit hook) that claims it. RED
+    today for `test_unknown_rate_ratchet.py`, which collects 0 everywhere.
+
+## Acceptance criteria
+
+- [x] §1.1 `completeness` field emitted by the callers route on both surfaces;
+      response-surface contract test updated; parity test green
+- [x] §1.1 `_LEGAL_VERDICTS` **unchanged** — no ninth verdict added
+- [x] §1.1 `next_step` no longer claims "Symbol not in the index" for an indexed
+      symbol with unresolved callers
+- [x] §1 corpus + one-directional invariant green
+- [x] §1 ratchet wired into a **named** CI job **and** its marker set recorded,
+      with a proven non-zero collected count (not merely a committed file)
+- [x] §1.2 reconciliation with `test_unknown_rate_ratchet.py` recorded in both
+      test files, including which gate wins on collision
+- [x] §1.2 scope guard green: a symbol in a fully-resolved file answers
+      `complete`, never `unknown`
+- [x] §1 documented as the executable form of the conservative-resolution claim,
+      cross-referenced from `ROADMAP-no1-agent-trust.md`
+- [ ] §2 **blocked until RFC-0027 is accepted and L6.2 (`QueryCost`) lands** —
+      not tickable before then
+- [ ] §2 `Consultation` record persisted in the L9 ledger; decline rates in
+      `--self-health`; CLI↔MCP parity test green
+- [ ] §2 scope limitation stated in the emitted payload, not only in this RFC,
+      including that `declined_reason` is `None` until a rejection path exists
+- [x] §3.1 registered-surface reachability green; all **six** orphans given a
+      delete / wire / deprecate-with-expiry disposition; the test that pins an
+      orphan **corrected**, not preserved; **no allowlist**
+- [x] §3.1 abstract-base exemption is structural (`abc`-abstract / no concrete
+      `execute`), not a list of three names
+
+      *Measured correction.* The gate found a **seventh** orphan the 2026-08-19
+      manual measurement did not name: `MCPTool`, a backward-compatibility
+      protocol base whose own docstring says "deprecated, use `BaseMCPTool`
+      instead". It is dispositioned `deprecate` with a removal version, not
+      exempted. That exposes a tension in this section's own wording: the stated
+      exemption rule does **not** exempt `MCPTool` or `_CallTreeBase` — both are
+      non-abstract and define a concrete `execute` — yet the text names them as
+      legitimately not registered. They are in fact reached through the MRO of
+      registered tools (`edit action=pr` holds a `_PRReviewViaFacade`, not a
+      `CodeGraphPRReviewTool`), which is the mechanism that carries them; a gate
+      comparing class identity reports a wired route as an orphan forever. The
+      exemption rule is implemented exactly as written and is exercised — the
+      probe case below depends on it — but it is not what makes those two
+      classes pass.
+- [ ] §3.1 `next_step` routability green under the token-matching formulation
+- [x] §3.1 zero-caller signal exempt from §1's ratchet, asserted by a test that
+      fails if a genuine orphan starts answering `unknown`
+
+      Asserted as a **hard binary** rather than as a vocabulary check.
+      `_offender_reason` in `tests/unit/mcp/test_registered_surface_reachability.py`
+      is pure, so the three properties are testable directly: a genuine orphan
+      always yields a verdict; no verdict borrows §1's vocabulary
+      (`unknown` / `incomplete` / …), which is what a softened signal would look
+      like; and a live `deprecate` is the only soft outcome, bounded by its
+      removal version. The exemption holds **by construction** — §3.1 reads the
+      registry and the dispositions, never `completeness` — and these tests are
+      what keep it that way if someone later reaches for the field.
+- [x] §3.1 dispatch reachability asserted through public entry points
+
+      Asserted per **call site**, not per resolver.
+      `tests/unit/mcp/test_dispatch_reachability.py` drives `ImportGraph.build()`
+      with one fixture per language family and pairs each resolver invocation with
+      the *line inside the dispatch* that made it, then requires that set to equal
+      the resolver call sites found by parsing the dispatch. Coarse pairing would
+      pass while a second, unreachable call site sat beside a reachable one.
+
+      Doing so found defect #3's second instance, still standing after the
+      [#1312](https://github.com/aimasteracc/tree-sitter-analyzer/pull/1312) fix:
+      the text-sniff arm that routed `require(` / `from '` / `from "` to the JS
+      resolver was reached by no public input. Every file that can carry recorded
+      imports has an extension in `EXT_TO_LANG`, so a JS/TS file is routed by
+      language before the sniff, and no other extractor (measured across C, Go,
+      Java, Rust, Lua, Ruby, PHP) emits those forms. No test called the private
+      dispatch either, which is why it went unnoticed. The dead arm is deleted
+      rather than allowlisted, and the surviving Python-shaped arm is documented
+      with the producers that actually reach it (Go's `import "x"`, Java's
+      `import a.b;`).
+- [ ] §3.2 each of the **seven first-party local hooks** has an exact-equality
+      self-check; the five with a live surface additionally have a
+      coverage-invariant of exactly 0
+
+      *Partially landed (2026-09-12).* The scope itself is now enforced:
+      `tests/governance/test_first_party_gate_inventory.py` derives the hook set
+      from `.pre-commit-config.yaml`, fails if this section's table disagrees with
+      it, and asserts every hook's `entry` resolves to a file that exists. That
+      check is what establishes the count as **seven**, not six. The per-hook
+      `--self-check` modes and the coverage invariants are still open.
+- [ ] §3.2 every gate names its **marker set + workflow job** (or its pre-commit
+      hook) and proves a non-zero collected count
+
+      *Partially landed.* Both halves are now enumerated and checked:
+      `tests/governance/test_first_party_gate_inventory.py` asserts every scoped
+      hook runs at the `pre-commit` stage, and
+      `tests/governance/test_workflow_marker_sets.py` derives **10 marker-driven
+      gates across 6 workflows** from the workflow YAML, names each one's job,
+      and asserts every positive marker in each expression is carried by at least
+      one test — the vacuity case, where `pytest -m "<marker>"` collects nothing
+      and always succeeds. It also pins the one shell-templated set
+      (`e2e${EXTRA_MARKS}`) as a decision rather than a silent skip.
+
+      **What is still missing is the collected count itself.** Collection costs
+      5–15 s per expression here, so five expressions would add about a minute to
+      the fast suite; the static check catches vacuity and typos without that
+      cost, and does not read a count.
+- [ ] §3.2 the enforcement layer is named per gate: either
+      `required_status_checks` added to a `develop` ruleset, or pre-commit
+      declared as the blocking layer
+
+      *Partially landed.* Pre-commit is the working layer and the inventory gate
+      pins that every scoped hook is present there. The per-gate naming this item
+      asks for, and the ruleset alternative, are still open.
+- [x] §3.2 `test_unknown_rate_threshold_value` and
+      `test_unknown_rate_threshold_is_documented_in_this_file` replaced by a live
+      measurement
+
+      Replaced, not deleted. `test_unknown_rate_is_measured_within_threshold`
+      indexes the product source (`workers=1`, ~13 s on the `full_language` axis)
+      and measures the rate against the ceiling. Measured **2026-09-12: 9.78% on
+      the product source (4,941 / 50,528 CALLS edges)** and 6.27% on a 2,174-file
+      self-repo subset, against a 6.0% ceiling — the claim is **not met**, and was
+      not met while the two self-referential tests passed. The measurement is a
+      strict `xfail`, so it is recorded rather than hidden, and it is removed only
+      by a genuine improvement. Proved by experiment: raising
+      `UNKNOWN_RATE_THRESHOLD_PCT` to 10.0 makes the assertion pass, which turns
+      the `xfail` into an unexpected pass and **fails the run** — the "never
+      increase without a reviewed decision" rule is now enforced instead of
+      documented.
+- [ ] §3.2 doc-example extraction runs agent-facing doc examples in CI
+- [ ] §3.3 path-comparison invariant covers both separator conventions
+- [ ] Docs/CODEMAPS updated
+
+## What this RFC does NOT do (deferred)
+
+- **No new product capability.** By design.
+- **No shell-script analysis.** Defect #1 was a dead regex in a `bash` gate. TSA
+  does not analyse shell, and §3.2 addresses it by requiring every gate to prove
+  itself, not by teaching TSA `bash`. **A dead detector inside an unanalysed
+  language remains out of reach** and the mitigation is procedural.
+- **No runtime platform emulation.** §3.3 requires path invariants to hold under
+  both conventions; it does **not** claim TSA can predict OS-specific runtime
+  behaviour generally. That class stays out of reach.
+- **No adoption telemetry.** §2 is a local proxy and says so.
+- **No change to the RFC-0025 design.** This RFC adds invariants over it. It
+  *does* propose a change to RFC-0027 (a third L9 record kind), which is why §2
+  is explicitly conditional on RFC-0027's acceptance rather than claiming to
+  leave it untouched.
+- **No interactive per-test mutation query.** That is
+  [RFC-0029](0029-does-this-test-constrain-this-code.md). Split by mechanism:
+  static, always-on, CI-enforced invariants here; on-demand, per-pair,
+  non-gating query there.
+- **No public claim.** Every number cited here is an E0 dogfood measurement from
+  2026-08-19; public wording stays bound by the RFC-0021 evidence ladder.
+
+## Open questions
+
+1. How large should the §1 corpus be? Small enough to keep ground truth honest,
+   large enough to cover the mechanisms. **Proposal: five mechanisms, three cases
+   each, and grow only when a real escape is found.**
+2. Should the §1 ratchet be per-mechanism or aggregate? Aggregate lets a
+   regression in one mechanism hide behind an improvement in another.
+   **Proposal: per-mechanism.**
+3. Does §3.1 belong in `tests/contracts/` or in a new `tests/invariants/`?
+   **Proposal: `tests/contracts/`, since these are contracts about the surface;
+   avoid a new top-level directory.**
+4. Should §2's decline records feed the RFC-0026 VCSR denominator? **Proposal:
+   no. VCSR stays the single north star; decline rate is a supporting signal,
+   per the roadmap's "no weighted score may hide a regression" rule.**
+
+## v1.29.5 release integration clarification (2026-09-08)
+
+The main v1.29.5 release published the following existing inner tools through MCP and CLI. Merge-back retains these public capabilities alongside develop's newer JSON-only protocol; it does not widen rename's conservative Python support. `plan_rename` continues to reject apply-like arguments and force preview, and `release_snapshot` retains its existing process-local lease exception.
+
+| Capability | CLI | MCP |
+|---|---|---|
+| Python rename, preview by default; explicit apply writes | `--rename SYMBOL --rename-new-name NAME [--rename-mode preview|apply]` | `edit action=rename` |
+| Unreachable statements within functions | `FILE --unreachable-code`; project mode available | `health action=unreachable` |
+| Middleware/interceptor chain discovery | `--detect-middleware` | `health action=middleware` |
+
+The previous `UnreachableCodeTool` deprecation rationale conflated statement-level analysis with `dead_code_analyzer`'s function-level external-caller concern. They use different analyzers. Both it and `MiddlewareDetectorTool` now have `wire` dispositions, backed by live registry checks and CLI parity. `UniversalAnalyzeTool` keeps its separate deprecation deadline. Tests must cover default rename preview, explicit apply, unchanged preview-only planning, unreachable analysis success/errors, and the exact facade/CLI maps.

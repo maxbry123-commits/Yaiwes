@@ -1,0 +1,382 @@
+---
+name: Examples & Documentation
+
+on:
+  workflow_call:  # Only called by ci.yml
+
+concurrency:
+  group: examples-docs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # angreal auto-installs shell completion on first run and prints a banner to
+  # stdout; that banner corrupts `angreal demos matrix` when captured into
+  # $GITHUB_OUTPUT (and is noise everywhere else). Suppress it globally.
+  ANGREAL_NO_AUTO_COMPLETION: "1"
+
+# Lane layout (CI-perf pass, 2026-09): this workflow used to fan out to ~60
+# runners (10 Rust tutorials + 21 Python tutorial/backend pairs + one per
+# feature example). Each leg paid the full runner setup and a cold compile
+# for a program that runs in seconds — the 21 Python legs each rebuilt the
+# same release-mode cloaca wheel (~7 min) — and the account's 20-runner cap
+# turned that into an hour of queueing. Now:
+#   * rust-tutorials   — one job, `angreal demos tutorials rust all`, with
+#                        CARGO_TARGET_DIR on the restored workspace build so
+#                        the shared deps compile zero times.
+#   * python-tutorials — one job, `angreal demos tutorials python all`: one
+#                        wheel, both backends, every tutorial.
+#   * rust-examples    — discovery still drives the matrix (no hand list),
+#                        dealt into a few shards; inside a shard the
+#                        compiler's shared target dir makes every example
+#                        after the first incremental, and that dir is cached
+#                        across runs on the lockfile.
+# Per-item retry moved into the harness (`--attempts`) / the shard loop, so
+# the INFRA flake tolerance the per-leg retry wrapper provided is kept.
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Step 0: Single build that the packaged-example shards and the Rust
+  # tutorials share (target/debug/cloacina-server + cloacina-compiler, and
+  # the workspace deps).
+  # -----------------------------------------------------------------------
+
+  build-cache:
+    name: Build Cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-examples-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Build workspace
+        run: cargo build --features "postgres,sqlite,macros"
+
+  # -----------------------------------------------------------------------
+  # Rust tutorials — all of them, one runner. Every tutorial is its own
+  # `[workspace]` with path deps on the workspace crates, so pointing
+  # CARGO_TARGET_DIR at the restored root target/ reuses the workspace
+  # build's artifacts (same crates, same default features, same profile).
+  # -----------------------------------------------------------------------
+
+  rust-tutorials:
+    name: Rust Tutorial Tests
+    needs: [build-cache]
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: full
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-examples-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      # Only tutorial 06 (multi-tenancy) needs Postgres; nothing here needs
+      # Kafka or Dex, so start just the database.
+      - name: Start backing services
+        uses: hoverkraft-tech/compose-action@v2.0.1
+        with:
+          compose-file: ".angreal/docker-compose.yaml"
+          services: postgres
+
+      # CLOACI-T-0917: retries kept deliberately — this lane runs a real docker
+      # stack + crates.io fetches, so INFRA flake tolerance is still warranted.
+      # Per-tutorial (`--attempts`), so one flaky tutorial doesn't re-run the
+      # rest. Remove if/when a run history shows attempts>1 is never what
+      # saves it (retries can mask real product flakes).
+      - name: Run all Rust tutorials
+        run: angreal demos tutorials rust all --attempts 3
+
+  # -----------------------------------------------------------------------
+  # Feature examples — CI executes ALL runnable examples. The matrix comes
+  # from `angreal demos matrix` (the same discovery that registers the
+  # `demos features <name>` commands), so a new example directory joins CI
+  # automatically — there is no hand-maintained list to drift. `--shards`
+  # deals that set into a fixed number of runners.
+  # -----------------------------------------------------------------------
+
+  discover-examples:
+    name: Discover Examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: List runnable examples (sharded)
+        id: list
+        run: |
+          shards=$(angreal demos matrix --shards 4)
+          echo "$shards"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
+  rust-examples:
+    name: Rust Example Tests (shard ${{ matrix.shard }})
+    needs: [build-cache, discover-examples]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover-examples.outputs.shards) }}
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: full
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          # fs-grant-demo packages a constructor provider to wasm32-wasip2 at
+          # runtime (CLOACI-T-0892); the target is a no-op for other examples.
+          targets: wasm32-wasip2
+
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-examples-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      # The packaged (server gold-path) examples are compiled by the
+      # cloacina-compiler service into this shared target dir. Every example
+      # resolves the same ~100 transitive deps, so once one has compiled the
+      # rest are incremental — and with the dir cached on the lockfile the
+      # first one is too. Keyed on Cargo.lock only: example source changes
+      # invalidate their own crates, not the dependency graph.
+      - name: Cache compiler target dir
+        uses: actions/cache@v4
+        with:
+          path: target/compiler-e2e-cache
+          key: ${{ runner.os }}-compiler-e2e-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-compiler-e2e-
+
+      - name: Start backing services
+        uses: hoverkraft-tech/compose-action@v2.0.1
+        with:
+          compose-file: ".angreal/docker-compose.yaml"
+
+      # CLOACI-T-0917: retries kept deliberately — every example boots
+      # against a real docker stack, so INFRA flake tolerance is still
+      # warranted. Per example (3 attempts, 15 min each — the old per-leg
+      # wrapper's numbers), so one flaky example never re-runs the shard.
+      # Remove if/when run history shows attempts>1 is never what saves it.
+      - name: Run examples (${{ matrix.examples }})
+        env:
+          EXAMPLES: ${{ matrix.examples }}
+        run: |
+          failed=()
+          for example in ${EXAMPLES}; do
+            ok=0
+            for attempt in 1 2 3; do
+              echo "::group::${example} (attempt ${attempt}/3)"
+              if timeout 15m angreal demos features "${example}"; then
+                ok=1
+              fi
+              echo "::endgroup::"
+              [ "${ok}" = 1 ] && break
+              echo "::warning::${example} failed attempt ${attempt}/3"
+            done
+            [ "${ok}" = 1 ] || failed+=("${example}")
+          done
+          echo "=== Example summary (shard ${{ matrix.shard }}) ==="
+          for example in ${EXAMPLES}; do
+            case " ${failed[*]} " in
+              *" ${example} "*) echo "  FAIL ${example}" ;;
+              *) echo "  ok   ${example}" ;;
+            esac
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::${#failed[@]} example(s) failed: ${failed[*]}"
+            exit 1
+          fi
+
+  # -----------------------------------------------------------------------
+  # Python tutorials — every tutorial against every backend it supports,
+  # one runner, one cloaca wheel. Tutorial 05 is postgres-only and 06
+  # switches itself to postgres; the harness owns those rules.
+  # -----------------------------------------------------------------------
+
+  python-tutorials:
+    name: Python Tutorial Tests
+    timeout-minutes: 45
+    # CLOACI-T-0917: continue-on-error: true removed — it dated from the
+    # PyO3/tokio GIL flake era; post-I-0140 that flake class is closed, so
+    # python tutorial failures must fail CI like every other lane.
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: full
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      # The wheel is a release build of the cloacina-python crate; nothing
+      # else in CI builds that profile, so this lane keeps its own cache.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cloacina-python-tutorials"
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      # CLOACI-T-0917: retries kept deliberately — the postgres pass runs a
+      # real docker stack, so INFRA flake tolerance is still warranted. Now
+      # that continue-on-error is gone this retry is the ONLY tolerance
+      # channel on this lane; per tutorial, so one flake never rebuilds the
+      # wheel. Remove if/when run history shows attempts>1 never saves it.
+      - name: Run all Python tutorials (sqlite + postgres)
+        run: angreal demos tutorials python all --backend both --attempts 3
+
+  # -----------------------------------------------------------------------
+  # Documentation
+  # -----------------------------------------------------------------------
+
+  documentation:
+    name: Build Documentation
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install angreal
+        run: |
+          python -m pip install --upgrade pip
+          pip install angreal
+
+      # The docs are a Starlight site (docs/). `angreal docs build` renders the
+      # API reference with plissken 0.2.1 first (as docs.yml does).
+      - name: Install plissken
+        run: |
+          tarball="plissken-0.2.1-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSLO "https://github.com/colliery-io/plissken/releases/download/v0.2.1/${tarball}"
+          echo "bf41f2fbc6f375552e29cf56a78b675cf857a1fa689c9905a5caba109ad292bf  ${tarball}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/plissken"
+          tar -xzf "${tarball}" -C "$RUNNER_TEMP/plissken"
+          rm "${tarball}"
+          echo "$RUNNER_TEMP/plissken" >> "$GITHUB_PATH"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Build documentation
+        run: angreal docs build

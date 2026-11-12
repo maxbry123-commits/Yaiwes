@@ -1,0 +1,156 @@
+# Tests for non-definition reference closedness.
+# When a definition's body is solely a reference to a non-definition,
+# the definition should still be closed.
+-- test.cue --
+package test
+
+#WrapsHidden: _hidden
+
+_hidden: {
+	h?: int
+}
+
+_shared: {
+	v?: int
+}
+
+#WrapsShared: _shared
+#WrapsConjunction: _shared & _hidden
+#WrapsConjunctionOfDisjunctions: ({h?: int} | int) & ({v?: int} | int)
+
+t01?: #WrapsHidden
+t02open?: _shared
+t02closed?: #WrapsShared
+t03closed?: #WrapsConjunction
+t03open?: _shared & _hidden
+t04closed?: #WrapsConjunctionOfDisjunctions
+t04open?: ({h?: int} | int) & ({v?: int} | int)
+
+-- datatest/testdata.cue --
+package datatest
+hiddenValid: {
+	data: {t01: {h: 1}}
+}
+hiddenExtra: {
+	data:  {t01: {h: 1, extra: true}}
+	error: true
+}
+sharedOpenExtra: {
+	data: {t02open: {v: 1, extra: true}}
+}
+sharedClosedValid: {
+	data: {t02closed: {v: 1}}
+}
+sharedClosedExtra: {
+	data:  {t02closed: {v: 1, extra: true}}
+	error: true
+}
+conjunctionOpenExtra: {
+	data: {t03open: {h: 1, v: 1, extra: true}}
+}
+conjunctionClosedExtra: {
+	data: {t03closed: {h: 1, v: 1, extra: true}}
+	error: true
+}
+conjunctionOfDisjunctionsOpenExtra: {
+	data: {t04open: {h: 1, v: 1, extra: true}}
+}
+// BUG: this incorrectly allows extra fields, but fixing that requires
+// a deeper fix: lifting properties to the top level so they're all in one place.
+conjunctionOfDisjunctionsClosedExtra: {
+	data: {t04closed: {h: 1, v: 1, extra: true}}
+}
+conjunctionOfDisjunctionsClosedExtra: {
+	data: {t04closed: {h: 1, v: 1}}
+}
+-- out/generate-v3/schema --
+{
+	$schema: "https://json-schema.org/draft/2020-12/schema"
+	$defs: {
+		WrapsConjunction: {
+			type:                 "object"
+			additionalProperties: false
+			properties: {
+				h: type: "integer"
+				v: type: "integer"
+			}
+		}
+		WrapsConjunctionOfDisjunctions: allOf: [{
+			anyOf: [{
+				type: "object"
+				properties: v: type: "integer"
+			}, {
+				type: "integer"
+			}]
+		}, {
+			anyOf: [{
+				type: "object"
+				properties: h: type: "integer"
+			}, {
+				type: "integer"
+			}]
+		}]
+		WrapsHidden: {
+			type:                 "object"
+			additionalProperties: false
+			properties: h: type: "integer"
+		}
+		WrapsShared: {
+			type:                 "object"
+			additionalProperties: false
+			properties: v: type: "integer"
+		}
+		"_hidden": {
+			type: "object"
+			properties: h: type: "integer"
+		}
+		"_shared": {
+			type: "object"
+			properties: v: type: "integer"
+		}
+	}
+	type: "object"
+	properties: {
+		t01: $ref:       "#/$defs/WrapsHidden"
+		t02closed: $ref: "#/$defs/WrapsShared"
+		t02open: $ref:   "#/$defs/_shared"
+		t03closed: $ref: "#/$defs/WrapsConjunction"
+		t03open: allOf: [{
+			$ref: "#/$defs/_hidden"
+		}, {
+			type: "object"
+			$ref: "#/$defs/_shared"
+		}]
+		t04closed: $ref: "#/$defs/WrapsConjunctionOfDisjunctions"
+		t04open: allOf: [{
+			anyOf: [{
+				type: "object"
+				properties: v: type: "integer"
+			}, {
+				type: "integer"
+			}]
+		}, {
+			anyOf: [{
+				type: "object"
+				properties: h: type: "integer"
+			}, {
+				type: "integer"
+			}]
+		}]
+	}
+}
+-- out/generate-v3/hiddenValid --
+-- out/generate-v3/hiddenExtra --
+hiddenExtra.data.t01.extra: field not allowed:
+    ./datatest/testdata.cue:6:22
+-- out/generate-v3/sharedOpenExtra --
+-- out/generate-v3/sharedClosedValid --
+-- out/generate-v3/sharedClosedExtra --
+sharedClosedExtra.data.t02closed.extra: field not allowed:
+    ./datatest/testdata.cue:16:28
+-- out/generate-v3/conjunctionClosedExtra --
+conjunctionClosedExtra.data.t03closed.extra: field not allowed:
+    ./datatest/testdata.cue:23:33
+-- out/generate-v3/conjunctionOpenExtra --
+-- out/generate-v3/conjunctionOfDisjunctionsClosedExtra --
+-- out/generate-v3/conjunctionOfDisjunctionsOpenExtra --

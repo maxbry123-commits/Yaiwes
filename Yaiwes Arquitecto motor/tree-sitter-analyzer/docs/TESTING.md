@@ -1,0 +1,690 @@
+# Testing Guide
+
+This document provides comprehensive guidelines for testing the tree-sitter-analyzer codebase, including patterns, best practices, and coverage requirements.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Test Structure](#test-structure)
+- [Writing Tests](#writing-tests)
+- [Test Fixtures and Utilities](#test-fixtures-and-utilities)
+- [Coverage Requirements](#coverage-requirements)
+- [Running Tests](#running-tests)
+- [Best Practices](#best-practices)
+- [Examples](#examples)
+
+---
+
+## Overview
+
+The tree-sitter-analyzer project maintains high testing standards with comprehensive test coverage across all components. Our testing philosophy prioritizes:
+
+- **Behavioral assertions first**: every test pins a concrete fact that would fail if
+  the code returned the wrong value. Coverage is a **by-product, never a goal** —
+  CLAUDE.md rule **T-3** is a BLOCKER and writing a test to move a coverage
+  percentage is prohibited.
+- **Clear Documentation**: Self-documenting tests with descriptive names
+- **Maintainability**: DRY principles with reusable fixtures and helpers
+- **Fast Feedback**: Efficient test execution with parallelization where appropriate
+
+## Test Structure
+
+Tests are organized into the following directories:
+
+```
+tests/
+├── fixtures/               # Reusable test utilities
+│   ├── coverage_helpers.py    # Coverage measurement utilities
+│   ├── data_generators.py     # Test data generators
+│   └── assertion_helpers.py   # Custom assertion functions
+├── unit/                   # Module/function behavior tests
+│   ├── mcp/                # MCP-specific unit tests
+│   └── security/           # Security unit tests
+├── contracts/              # Runtime/API/parity contracts
+├── governance/             # CI, GitFlow, release, and process guards
+├── integration/            # Integration tests
+├── e2e/                    # Black-box end-to-end tests
+├── golden/                 # Exhaustive language/corpus golden tests
+├── effectiveness/          # Test-quality and mutation baseline evidence
+├── regression/             # Regression tests
+└── benchmarks/             # Performance benchmarks
+```
+
+### Test Layer Ownership
+
+| Layer | Owns | Should not own |
+|---|---|---|
+| `tests/unit/` | Pure module behavior, small regressions, deterministic value checks | CI policy, workflow routing, repo governance, broad runtime contracts |
+| `tests/contracts/` | Stable API/runtime contracts, MCP/CLI parity, pytest runtime defaults, plugin architecture, agent-facing docs contracts | Process policy or release workflow ownership |
+| `tests/governance/` | CI routing, GitFlow, postmortem guards, README registry counts, skip-tracking policy | Product behavior assertions |
+| `tests/golden/` | Corpus/output drift checks that intentionally compare broad expected output | Day-to-day unit behavior or plugin golden masters |
+| `tests/regression/` | Focused regressions and plugin golden master coverage | Exhaustive all-language corpus sweeps unless marked appropriately |
+| `tests/effectiveness/` | Test-suite quality metrics, mutation/effectiveness baseline evidence | Blocking PR gates unless explicitly promoted |
+| `tests/integration/` | Cross-module and external-surface integration | Single pure-function behavior |
+| `tests/e2e/` | Black-box MCP and real workflow smoke tests | Fast unit feedback |
+| `tests/benchmarks/` | Benchmark-only performance measurement | Normal full-suite assertions |
+
+Fast tests do not automatically belong in `tests/unit/`. A fast governance or
+contract check should live under `tests/governance/` or `tests/contracts/` so a
+failure immediately tells the reader whether to fix product behavior, runtime
+configuration, or process policy.
+
+### Pytest Configuration Source of Truth
+
+`pytest.ini` owns pytest runtime configuration: discovery, strict markers,
+`addopts`, warning filters, timeout/session-timeout, xdist settings, benchmark
+disabling, and marker definitions. `pyproject.toml` must not contain
+`[tool.pytest.ini_options]`; keeping two runtime config surfaces invites drift.
+
+Runtime-default changes must update the relevant contract tests in
+`tests/contracts/test_pytest_runtime_contract.py` and prove that
+`uv run pytest -q` remains bounded and safe. The bare command uses a curated
+high-risk `testpaths` quick gate. The comprehensive local command explicitly
+restores slow and full-language tests while leaving e2e, network, and benchmarks
+to their dedicated lanes.
+
+### Marker And CI Routing Expectations
+
+- `full_language` marks exhaustive all-language golden/regression tests. CI runs
+  these once on the Linux coverage axis, not on every OS/Python matrix cell.
+- `slow` marks tests that are intentionally excluded from quick local loops.
+- `slow_ok` is a narrow exception for tests that must scan enough code to exceed
+  the unit 5-second budget.
+- `benchmark` tests run only with benchmark-specific commands and are disabled
+  in the default quick gate.
+- `e2e` marks black-box workflow checks routed separately from the ordinary test
+  matrix.
+- Platform, optional-dependency, and language-specific markers should preserve
+  existing selection behavior and be documented at the test site when the reason
+  is not obvious.
+
+`config/ci-routing.yml` controls optional expensive jobs. Changes to pytest
+config, CI config, `tests/conftest.py`, `tests/contracts/**`, or
+`tests/governance/**` are high-impact and should route to the full suite.
+
+### Weak-Assertion Ratchet
+
+`scripts/check_loose_assertions.py` blocks newly introduced weak assertions in
+PR diffs. CI calls the shell wrapper, and pre-commit runs the same Python gate
+when staged test files change. The ratchet rejects:
+
+- Loose deterministic count bounds, for example `assert len(items) >= 1`.
+- Placeholder existence checks, for example `assert result is not None`, unless
+  the same test also asserts concrete behavior.
+- None-check tautologies, for example `assert result is not None or result is None`.
+
+Prefer exact, behavior-bearing assertions:
+
+```python
+assert result["status"] == "ok"
+assert [item.name for item in result.items] == ["main", "helper"]
+assert diagnostics == []
+```
+
+Existence checks are acceptable as setup guards only when paired with concrete
+behavior in the same test:
+
+```python
+assert result is not None
+assert result.language == "python"
+```
+
+Baseline modes are triage inputs:
+
+```bash
+uv run python scripts/check_loose_assertions.py --staged
+uv run python scripts/check_loose_assertions.py --baseline
+uv run python scripts/check_loose_assertions.py --baseline --format json
+uv run python scripts/check_loose_assertions.py --baseline --format table
+```
+
+Baseline entries are cleanup candidates, not deletion authority. Before
+rewriting or removing a test, inspect the file-level behavior and classify the
+case: ordinary deterministic assertion, property-style test, performance test,
+platform-dependent test, optional-dependency test, or genuinely nondeterministic
+case with a documented `ratchet: nondeterministic <reason>` exemption. The
+baseline count in `scripts/loose_assertion_baseline.txt` is measured, never
+hand-derived; when the rule scope expands, record the category split there.
+
+### Golden And Benchmark Guidance
+
+Corpus golden tests stay under `tests/golden/` and should link to
+[`tests/golden/TESTING.md`](../tests/golden/TESTING.md) for detailed update
+rules instead of duplicating that guide here. Plugin golden master regressions
+remain separate under `tests/regression/`.
+
+Benchmark-only runs are not normal pytest runs:
+
+```bash
+uv run pytest tests/benchmarks/ -m benchmark --benchmark-enable --benchmark-only -n 0 --session-timeout=0
+```
+
+## Writing Tests
+
+### Test File Naming
+
+- Unit test files: `test_<module>.py` — one file per module.
+  Do NOT create a second file for an existing module. Rule T-1 is a
+  BLOCKER. Add to the existing file instead.
+  The `block-banned-test-names` hook screens the `*_comprehensive*`,
+  `*_edge_cases*`, `*_coverage*`, `*_extended*` and `*_optimized*` patterns,
+  but it is a screen and not a proof — know its two limits:
+  it inspects only **added** files (`--diff-filter=A`), so renaming an existing
+  test into a banned name passes; and it matches the whole **path**, so a
+  legitimate file under a directory such as `tests/unit/grammar_coverage/`
+  trips it. T-1 is your obligation, not the hook's.
+- Integration tests: `test_<feature>_integration.py`
+- End-to-end tests: `test_<workflow>_e2e.py`
+
+### Test Class Organization
+
+Organize tests into logical classes based on functionality:
+
+```python
+class TestBuildParser:
+    """Test argument parser construction."""
+    
+    def test_parser_creation(self) -> None:
+        """Test parser is created successfully."""
+        parser = _build_parser()
+        assert isinstance(parser, argparse.ArgumentParser)
+```
+
+### Test Method Naming
+
+Use descriptive names that clearly indicate what is being tested:
+
+```python
+def test_minimal_valid_arguments(self) -> None:
+    """Test minimal valid argument set."""
+    # Test code here
+
+def test_error_handling_with_invalid_input(self) -> None:
+    """Test error handling when invalid input is provided."""
+    # Test code here
+```
+
+### Docstrings
+
+Every test should have a clear docstring explaining what it tests:
+
+```python
+def test_custom_project_root(self) -> None:
+    """Test custom project root is used."""
+    # Arrange
+    args = argparse.Namespace(...)
+    
+    # Act
+    result = await _run(args)
+    
+    # Assert
+    mock_detect.assert_called_once_with(None, "/custom/path")
+```
+
+## Test Fixtures and Utilities
+
+The `tests/fixtures/` package provides reusable utilities for testing:
+
+### Coverage Helpers
+
+```python
+from tests.fixtures import coverage_helpers
+
+# Create mock parser
+parser = coverage_helpers.create_mock_parser("python")
+
+# Create mock AST node
+node = coverage_helpers.create_mock_node(
+    type="function_definition",
+    text="def foo(): pass"
+)
+
+# Create mock analysis result
+result = coverage_helpers.create_mock_analysis_result(
+    file_path="test.py",
+    elements={"functions": [{"name": "foo"}]}
+)
+
+# Assert coverage improvements
+coverage_helpers.assert_coverage_threshold(85.0, 80.0, "my_module")
+```
+
+### Data Generators
+
+```python
+from tests.fixtures import data_generators
+
+# Generate Python code
+code = data_generators.generate_python_function(
+    name="my_function",
+    params=["x", "y"],
+    body="return x + y"
+)
+
+# Generate Java class
+java_code = data_generators.generate_java_class(
+    name="MyClass",
+    methods=[{
+        "name": "myMethod",
+        "return_type": "void",
+        "params": "",
+        "body": "System.out.println(\"Hello\");"
+    }]
+)
+
+# Generate large file for performance testing
+large_code = data_generators.generate_large_file_content(
+    language="python",
+    num_functions=100,
+    num_classes=20
+)
+```
+
+### Assertion Helpers
+
+```python
+from tests.fixtures import assertion_helpers
+
+# Assert dictionary structure
+assertion_helpers.assert_has_keys(
+    data={"name": "foo", "type": "function"},
+    required_keys=["name", "type"],
+    optional_keys=["line", "column"]
+)
+
+# Assert analysis result validity
+assertion_helpers.assert_analysis_result_valid(
+    result=analysis_result,
+    expected_language="python",
+    require_success=True
+)
+
+# Assert query results
+assertion_helpers.assert_query_result_valid(
+    result=query_results,
+    min_matches=1,
+    require_node=True,
+    require_text=True
+)
+
+# Assert performance
+assertion_helpers.assert_performance_acceptable(
+    elapsed_time=0.5,
+    max_time=1.0,
+    operation="file analysis"
+)
+```
+
+## Coverage Requirements
+
+### Overall Coverage Targets
+
+- **Overall Project**: ≥80%
+- **Critical Modules** (core, interfaces, exceptions): ≥85%
+- **CLI Modules**: ≥85%
+- **Utility Modules**: ≥80%
+- **New Code**: 100% coverage required for new features
+
+### Module-Specific Targets
+
+| Module Category | Coverage Target | Priority |
+|----------------|----------------|----------|
+| Core Engine | ≥85% | Critical |
+| Exceptions | ≥90% | Critical |
+| MCP Interfaces | ≥80% | High |
+| CLI Commands | ≥85% | High |
+| Formatters | ≥80% | Medium |
+| Query Modules | ≥85% | Medium |
+| Utilities | ≥80% | Medium |
+
+### Coverage Reporting
+
+Coverage is automatically reported to [Codecov](https://codecov.io/gh/aimasteracc/tree-sitter-analyzer) on every PR and push to main/develop branches.
+
+View coverage locally:
+
+```bash
+# Generate coverage report
+uv run pytest --cov=tree_sitter_analyzer --cov-report=html --cov-report=term-missing
+
+# Open HTML report
+open htmlcov/index.html  # macOS
+xdg-open htmlcov/index.html  # Linux
+start htmlcov/index.html  # Windows
+```
+
+Before pushing a PR that changes Python source, also check the patch itself:
+
+```bash
+# Use the focused tests reported by --change-impact, but add coverage JSON.
+uv run pytest <focused tests> --cov=tree_sitter_analyzer --cov-report=json --cov-report=term-missing
+
+# Fail locally on added executable lines or branch partials that Codecov would flag.
+uv run python scripts/check_patch_coverage.py --base origin/develop --coverage-json coverage.json
+```
+
+## Running Tests
+
+### Run The Local Quick Gate
+
+```bash
+uv run pytest -q
+```
+
+### Run The Comprehensive Suite
+
+```bash
+uv run pytest tests/ -q --timeout=120 -m "not e2e and not network and not benchmark"
+```
+
+### Run Faster During Development
+
+```bash
+# Skip known exhaustive suites first (recommended for iterative work):
+PYTEST_XDIST_AUTO_NUM_WORKERS=2 uv run pytest -q -m "not slow and not full_language" --maxfail=1
+
+# If your machine is overloaded, force single-process mode:
+PYTEST_XDIST_AUTO_NUM_WORKERS=1 uv run pytest -q --maxfail=1 -m "not slow and not full_language"
+```
+
+### Run with Coverage
+
+```bash
+uv run pytest tests/ --cov=tree_sitter_analyzer --cov-report=term-missing
+```
+
+### Run Specific Test Files
+
+```bash
+# Single file
+uv run pytest tests/unit/test_exceptions_core.py
+
+# Multiple files
+uv run pytest tests/unit/test_*.py
+```
+
+### Run Specific Test Classes or Methods
+
+```bash
+# Specific class
+uv run pytest tests/unit/test_exceptions_core.py::TestTreeSitterAnalyzerError
+
+# Specific test
+uv run pytest tests/unit/test_exceptions_core.py::TestTreeSitterAnalyzerError::test_message_and_error_code
+```
+
+### Run Tests by Marker
+
+```bash
+# Run only fast tests
+uv run pytest -m fast
+
+# Skip slow tests (still keep full-language suites)
+uv run pytest -m "not slow"
+
+# Run integration tests only
+uv run pytest -m integration
+
+# Skip full-language exhaustive suites (biggest speed win for quick local loops)
+uv run pytest -q -m "not full_language and not slow"
+```
+
+### Run Tests in Parallel
+
+```bash
+# The default pytest config uses pytest-xdist.
+uv run pytest -q
+
+# On some hosts, --numprocesses=auto can resolve to a single worker.
+# Pin workers explicitly when you want predictable throughput.
+PYTEST_XDIST_AUTO_NUM_WORKERS=2 uv run pytest -q               # parallel (default-ish, explicit)
+PYTEST_XDIST_AUTO_NUM_WORKERS=1 uv run pytest -q               # force single-process (lighter on local machine)
+
+# Benchmark-only runs should disable xdist and the 5-minute session limit.
+uv run pytest tests/benchmarks/ -m benchmark --benchmark-enable --benchmark-only -n 0 --session-timeout=0
+```
+
+### Generate Coverage Reports
+
+```bash
+# Terminal report
+uv run pytest --cov=tree_sitter_analyzer --cov-report=term-missing
+
+# HTML report
+uv run pytest --cov=tree_sitter_analyzer --cov-report=html
+
+# XML report (for CI)
+uv run pytest --cov=tree_sitter_analyzer --cov-report=xml
+
+# JSON report
+uv run pytest --cov=tree_sitter_analyzer --cov-report=json
+```
+
+## Best Practices
+
+### 1. Arrange-Act-Assert Pattern
+
+Structure tests using the AAA pattern for clarity:
+
+```python
+def test_example(self) -> None:
+    """Test example function."""
+    # Arrange: Set up test data and mocks
+    input_data = {"key": "value"}
+    mock_service = Mock()
+    
+    # Act: Execute the function under test
+    result = my_function(input_data, mock_service)
+    
+    # Assert: Verify the results
+    assert result == expected_value
+    mock_service.method.assert_called_once()
+```
+
+### 2. Use Fixtures for Setup
+
+Leverage pytest fixtures for common setup:
+
+```python
+import pytest
+
+@pytest.fixture
+def sample_code():
+    """Provide sample Python code for testing."""
+    return "def foo():\n    pass"
+
+@pytest.fixture
+def mock_analyzer():
+    """Provide a mock analyzer with a configured return value.
+
+    Two traps this example exists to avoid:
+
+    1. A bare ``Mock()`` returns a fresh unconfigured ``Mock`` from every
+       call, so ``assert result.language == "python"`` would compare two
+       Mock objects and fail. Configure the value you intend to assert.
+    2. ``Mock(spec=SomeClass)`` auto-specs each attribute, and for an
+       ``async def`` method that yields an ``AsyncMock`` whose call returns
+       a **coroutine**, not your value — the assertion then fails with
+       ``AttributeError: 'coroutine' object has no attribute ...``.
+       Only spec against a class whose call shape you are actually
+       modelling, and ``await`` it if the real method is async.
+    """
+    analyzer = Mock()
+    analyzer.analyze.return_value = Mock(language="python")
+    return analyzer
+
+def test_with_fixtures(sample_code, mock_analyzer):
+    """Test using fixtures."""
+    result = mock_analyzer.analyze(sample_code)
+    assert result.language == "python"
+```
+
+### 3. Test Error Conditions
+
+Always test both success and failure paths:
+
+```python
+def test_success_case(self) -> None:
+    """Test successful execution."""
+    result = function_under_test(valid_input)
+    assert result.success is True
+
+def test_error_case(self) -> None:
+    """Test error handling."""
+    with pytest.raises(ValueError) as exc_info:
+        function_under_test(invalid_input)
+    assert "expected error message" in str(exc_info.value)
+```
+
+### 4. Mock External Dependencies
+
+Mock external dependencies to isolate units:
+
+```python
+from unittest.mock import patch, Mock
+
+def test_with_mocked_dependency(self) -> None:
+    """Test with mocked external service."""
+    with patch('module.external_service') as mock_service:
+        mock_service.return_value = {"data": "mocked"}
+        result = my_function()
+        assert result["data"] == "mocked"
+```
+
+### 5. Use Parametrized Tests
+
+Test multiple scenarios efficiently:
+
+```python
+import pytest
+
+@pytest.mark.parametrize("input,expected", [
+    ("hello", "HELLO"),
+    ("world", "WORLD"),
+    ("", ""),
+])
+def test_uppercase(input, expected):
+    """Test uppercase conversion with multiple inputs."""
+    assert input.upper() == expected
+```
+
+### 6. Test Async Code Properly
+
+Use pytest-asyncio for async tests:
+
+```python
+import pytest
+
+@pytest.mark.asyncio
+async def test_async_function():
+    """Test async function."""
+    result = await async_function()
+    assert result["status"] == "ok"
+```
+
+### 7. Clean Up Resources
+
+Use context managers or fixtures with yield:
+
+```python
+@pytest.fixture
+def temp_file(tmp_path):
+    """Create a temporary file."""
+    file_path = tmp_path / "test.txt"
+    file_path.write_text("test content")
+    yield file_path
+    # Cleanup happens automatically
+```
+
+## Examples
+
+### Example 1: Testing CLI Command
+
+```python
+class TestListFilesCommand:
+    """Test list files CLI command."""
+    
+    def test_minimal_execution(self) -> None:
+        """Test minimal execution with required arguments."""
+        # Arrange
+        args = argparse.Namespace(
+            roots=["root1"],
+            output_format="json",
+            quiet=False,
+        )
+        
+        # Act
+        with patch('module.QueryTool') as mock_tool:
+            mock_tool.return_value.execute = AsyncMock(return_value={})
+            result = await _run(args)
+        
+        # Assert
+        assert result == 0
+```
+
+### Example 2: Testing Exception Handling
+
+```python
+class TestAnalysisError:
+    """Test AnalysisError exception."""
+    
+    def test_initialization_with_message(self) -> None:
+        """Test exception initialization with message only."""
+        # Arrange & Act
+        error = AnalysisError("Test error")
+        
+        # Assert
+        assert str(error) == "Test error"
+        assert error.file_path is None
+        assert error.language is None
+```
+
+### Example 3: Testing with Fixtures
+
+```python
+from tests.fixtures import data_generators, assertion_helpers
+
+def test_python_function_analysis(tmp_path):
+    """Test analysis of Python function."""
+    # Arrange: Generate test code
+    code = data_generators.generate_python_function(
+        name="test_func",
+        params=["x", "y"],
+        body="return x + y"
+    )
+    
+    # Create temporary file
+    file_path = tmp_path / "test.py"
+    file_path.write_text(code)
+    
+    # Act: Analyze the code
+    result = analyze_file(str(file_path))
+    
+    # Assert: Validate result
+    assertion_helpers.assert_analysis_result_valid(
+        result,
+        expected_language="python",
+        require_success=True
+    )
+    assert len(result["elements"]["functions"]) == 1
+```
+
+---
+
+## Contributing
+
+When contributing tests:
+
+1. Ensure all new code has corresponding tests
+2. Maintain or improve coverage metrics
+3. Follow the naming conventions outlined above
+4. Use fixtures and helpers from `tests/fixtures/`
+5. Run the full test suite before submitting PRs
+6. Update this guide if you introduce new testing patterns
+
+## Resources
+
+- [pytest documentation](https://docs.pytest.org/)
+- [pytest-cov documentation](https://pytest-cov.readthedocs.io/)
+- [unittest.mock documentation](https://docs.python.org/3/library/unittest.mock.html)
+- [Coverage.py documentation](https://coverage.readthedocs.io/)

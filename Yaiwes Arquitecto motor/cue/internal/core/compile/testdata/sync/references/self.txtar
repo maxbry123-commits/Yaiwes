@@ -1,0 +1,609 @@
+Test various self reference cases.
+-- in.cue --
+@experiment(aliasv2)
+
+// Basic self usage - top level
+a: self.b
+b: "hello"
+
+// Nested self usage - should refer to x struct
+x: {
+    y: self.z
+    z: "world"
+}
+
+// Shorthand notation - self should refer to foo struct
+foo: bar: self.baz
+foo: baz: "greeting" // TODO(inline): reference marking does not work with "self"
+
+// Multiple levels of nesting
+nested: {
+    level1: {
+        field: self.value
+        value: "level1 value"
+    }
+}
+
+// Self in list context
+listTest: {
+    items: [1, 2, self[0], self[1]]
+    first: 1
+    second: 2
+}
+
+// Self with computed selectors
+computed: {
+    key: "test"
+    value: self["key"]
+}
+
+// Cyclic reference detection
+cycle: self.cycle
+
+-- list.cue --
+@experiment(aliasv2)
+import "list"
+
+#IntStrings: {list.Repeat([int, string], div(len(self), 2))}
+listCheck: ok1: #IntStrings
+listCheck: ok1: [1, "foo", 2, "bar"]
+
+listCheck: err: #IntStrings
+listCheck: err: [1, "foo", "bar", 2]
+
+-- withlet.cue --
+@experiment(try,aliasv2)
+
+withLet: {
+	let X = self
+	foo: 1
+
+	bar: {
+		baz: X.foo
+	}
+}
+
+// A let bound to self must capture fields produced by if/for/try
+// comprehensions, not only statically declared ones.
+// See https://cuelang.org/issue/4376.
+withLetComprehension: {
+	let X = self
+	direct: "a"
+	if true {
+		viaIf: "b"
+	}
+	for k, v in {viaFor: "c"} {
+		(k): v
+	}
+	try {
+		viaTry: "d"
+	}
+	seeDirect: X.direct
+	seeIf:     X.viaIf
+	seeFor:    X.viaFor
+	seeTry:    X.viaTry
+}
+
+// A comprehension inherited by a `let X = self` copy must fully evaluate
+// a dynamic field whose key interpolation contains a call with a
+// reference argument, such as len(K) below.
+// See https://cuelang.org/issue/4420.
+withLetDynamicField: {
+	let X = self
+	h: [string]~K: c: len(K)
+	h: a: _
+	g: _
+	for x in X.h {
+		// TODO: the language may not always allow a dynamic field key that
+		// can lack a value; an if inside its interpolation would then
+		// require an else branch.
+		g: "\({if true {x.c}})": true
+	}
+	for k, _ in g {
+		G: k
+	}
+}
+withLetDynamicField: {
+	let Y = self
+	s: true
+	x: {
+		if Y.s {1}
+		if !Y.s {2}
+	}
+}
+
+// Iterating over a let bound to self sees the enclosing struct's full
+// field set, including the field defined by the comprehension itself.
+// This used to hang before the self experiment was folded into aliasv2.
+// See https://cuelang.org/issue/4099.
+letSelfIterate: {
+	let X = self
+	a: 3
+	d: [for k, _ in X {k}]
+}
+
+// Variant of the above where the call argument is a regular reference
+// rather than a pattern alias.
+withLetDynamicFieldRef: {
+	let X = self
+	h: [string]: c: len(h.a)
+	h: a: _
+	g: _
+	for x in X.h {
+		g: "\({if true {x.c}})": true
+	}
+	for k, _ in g {
+		G: k
+	}
+}
+withLetDynamicFieldRef: {
+	let Y = self
+	s: true
+	x: {
+		if Y.s {1}
+		if !Y.s {2}
+	}
+}
+-- validator.cue --
+@experiment(structcmp)
+@experiment(aliasv2)
+
+validator: {
+	err1: {{{{== (self + 1)}}}}
+	err1: 2
+
+	err2: {== (self + 1)}
+	err2: 2
+}
+
+cyclicErr: {
+	err3: == (self + 1)
+	err3: 4
+}
+
+-- comprehension.cue --
+@experiment(aliasv2)
+
+// self inside the body of a field comprehension resolves to the struct that
+// the yielded fields belong to, not to the comprehension's own scope.
+// Issue #4422.
+forComp: {
+	n: 2
+	for i in [1, 2] {"k\(i)": self.n}
+}
+
+// self inside a list comprehension body refers to the yielded element, not
+// to the enclosing list, so indexing it fails.
+listComp: [10, 20, for _ in [1] {self[0]}]
+
+// self inside an if comprehension.
+ifComp: {
+	n: 3
+	if true {m: self.n}
+}
+
+// self in a nested struct resolves to that struct, not the outer one.
+nestComp: {
+	outer: {
+		v: 5
+		for i in [1] {"c\(i)": self.v}
+	}
+}
+
+// self across two nested for comprehensions.
+doubleComp: {
+	n: 7
+	for i in [1] for j in [1] {"d\(i)\(j)": self.n}
+}
+
+-- letselfinline.cue --
+@experiment(aliasv2)
+
+// A let bound to self is a transparent binding to the enclosing struct.
+// Chained references through it must also work when the struct is unified
+// into an inline (dynamic) vertex, where structure sharing is unavailable.
+// See https://cuelang.org/issue/4428.
+letSelfInline: {
+	S: {
+		let this = self
+		raw:  string
+		data: this.raw
+		chk:  this.data
+	}
+	res: (S & {raw: "alice"}).chk
+}
+
+// Variant with two unified conjuncts, each with its own let-self binding,
+// where one conjunct references a field contributed by the other. This is
+// the shape that cue fix --exp=aliasv2 produces for postfix value aliases.
+letSelfInlineConj: {
+	#T: {
+		let this = self
+		raw:  string
+		data: this.raw
+	}
+	#T: {
+		let this = self
+		chk: this.data
+	}
+	res: (#T & {raw: "alice"}).chk
+}
+
+-- issue4440.cue --
+@experiment(aliasv2)
+
+// A definition combining a dynamic field whose key, a comprehension whose
+// guard, and a re-export that all read through a let-self binding. Reading
+// the options through the re-export used to make the dynamic field key fail
+// with "undefined field: network": the let vertex mirrored the definition,
+// and the mirror's own nested let-self conjunct was parked as a structural
+// cycle, leaving it without arcs. See https://cuelang.org/issue/4440.
+letSelfDynamic: {
+	#Client: {
+		let this = self
+		network: string
+		opt?:    string
+		options: (this.network): "x"
+		if this.opt != _|_ {
+			options: a: "y"
+		}
+		container: options: this.options
+	}
+	c: #Client & {network: "mainnet"}
+	out: c.container.options
+}
+
+-- issue4479.cue --
+@experiment(aliasv2)
+
+// A value alias on a scalar expression has no postfix form, so cue fix
+// rewrites it to a struct literal with a let-self binding. Evaluating the
+// definition on its own used to finalize the literal to an empty struct
+// before the embedding completed, reporting a type error or even the error
+// disjunct instead of a reference cycle. See https://cuelang.org/issue/4479.
+issue4479: {
+	#Even: {let X = self, (2 * div(X, 2)) | error("\(X) is not even")}
+	even: [...#Even]
+	even: [42, 13]
+	even: [_, _]
+
+	#Half: {let X = self, 2 * div(X, 2)}
+	ok:  #Half & 42
+	bad: #Half & 13
+}
+
+-- experiment_test.cue --
+// Test self usage without experiment enabled (should fail)
+
+a: {
+    b: self.c
+    c: 3
+}
+
+-- out/compile --
+--- comprehension.cue
+{
+  forComp: {
+    n: 2
+    for _, i in [
+      1,
+      2,
+    ] {
+      "k\(〈1;i〉)": 〈1〉.n
+    }
+  }
+  listComp: [
+    10,
+    20,
+    for _, _ in [
+      1,
+    ] {
+      〈1〉[0]
+    },
+  ]
+  ifComp: {
+    n: 3
+    if true {
+      m: 〈1〉.n
+    }
+  }
+  nestComp: {
+    outer: {
+      v: 5
+      for _, i in [
+        1,
+      ] {
+        "c\(〈1;i〉)": 〈1〉.v
+      }
+    }
+  }
+  doubleComp: {
+    n: 7
+    for _, i in [
+      1,
+    ] for _, j in [
+      1,
+    ] {
+      "d\(〈2;i〉)\(〈1;j〉)": 〈1〉.n
+    }
+  }
+}
+--- in.cue
+{
+  a: 〈1〉.b
+  b: "hello"
+  x: {
+    y: 〈1〉.z
+    z: "world"
+  }
+  foo: {
+    bar: 〈1〉.baz
+  }
+  foo: {
+    baz: "greeting"
+  }
+  nested: {
+    level1: {
+      field: 〈1〉.value
+      value: "level1 value"
+    }
+  }
+  listTest: {
+    items: [
+      1,
+      2,
+      〈1〉[0],
+      〈1〉[1],
+    ]
+    first: 1
+    second: 2
+  }
+  computed: {
+    key: "test"
+    value: 〈1〉["key"]
+  }
+  cycle: 〈1〉.cycle
+}
+--- issue4440.cue
+{
+  letSelfDynamic: {
+    #Client: {
+      let this#1 = 〈1〉
+      network: string
+      opt?: string
+      options: {
+        〈1;let this#1〉.network: "x"
+      }
+      if (〈0;let this#1〉.opt != _|_(explicit error (_|_ literal) in source)) {
+        options: {
+          a: "y"
+        }
+      }
+      container: {
+        options: 〈1;let this#1〉.options
+      }
+    }
+    c: (〈0;#Client〉 & {
+      network: "mainnet"
+    })
+    out: 〈0;c〉.container.options
+  }
+}
+--- issue4479.cue
+{
+  issue4479: {
+    #Even: {
+      let X#2 = 〈1〉
+      ((2 * div(〈0;let X#2〉, 2))|error("\(〈0;let X#2〉) is not even"))
+    }
+    even: [
+      ...〈1;#Even〉,
+    ]
+    even: [
+      42,
+      13,
+    ]
+    even: [
+      _,
+      _,
+    ]
+    #Half: {
+      let X#3 = 〈1〉
+      (2 * div(〈0;let X#3〉, 2))
+    }
+    ok: (〈0;#Half〉 & 42)
+    bad: (〈0;#Half〉 & 13)
+  }
+}
+--- letselfinline.cue
+{
+  letSelfInline: {
+    S: {
+      let this#4 = 〈1〉
+      raw: string
+      data: 〈0;let this#4〉.raw
+      chk: 〈0;let this#4〉.data
+    }
+    res: (〈0;S〉 & {
+      raw: "alice"
+    }).chk
+  }
+  letSelfInlineConj: {
+    #T: {
+      let this#5 = 〈1〉
+      raw: string
+      data: 〈0;let this#5〉.raw
+    }
+    #T: {
+      let this#6 = 〈1〉
+      chk: 〈0;let this#6〉.data
+    }
+    res: (〈0;#T〉 & {
+      raw: "alice"
+    }).chk
+  }
+}
+--- list.cue
+{
+  #IntStrings: {
+    〈import;list〉.Repeat([
+      int,
+      string,
+    ], div(len(〈1〉), 2))
+  }
+  listCheck: {
+    ok1: 〈1;#IntStrings〉
+  }
+  listCheck: {
+    ok1: [
+      1,
+      "foo",
+      2,
+      "bar",
+    ]
+  }
+  listCheck: {
+    err: 〈1;#IntStrings〉
+  }
+  listCheck: {
+    err: [
+      1,
+      "foo",
+      "bar",
+      2,
+    ]
+  }
+}
+--- validator.cue
+{
+  validator: {
+    err1: {
+      {
+        {
+          {
+            ==(〈1〉 + 1)
+          }
+        }
+      }
+    }
+    err1: 2
+    err2: {
+      ==(〈1〉 + 1)
+    }
+    err2: 2
+  }
+  cyclicErr: {
+    err3: ==(〈1〉 + 1)
+    err3: 4
+  }
+}
+--- withlet.cue
+{
+  withLet: {
+    let X#7 = 〈1〉
+    foo: 1
+    bar: {
+      baz: 〈1;let X#7〉.foo
+    }
+  }
+  withLetComprehension: {
+    let X#8 = 〈1〉
+    direct: "a"
+    if true {
+      viaIf: "b"
+    }
+    for k, v in {
+      viaFor: "c"
+    } {
+      〈1;k〉: 〈1;v〉
+    }
+    try {
+      viaTry: "d"
+    }
+    seeDirect: 〈0;let X#8〉.direct
+    seeIf: 〈0;let X#8〉.viaIf
+    seeFor: 〈0;let X#8〉.viaFor
+    seeTry: 〈0;let X#8〉.viaTry
+  }
+  withLetDynamicField: {
+    let X#9 = 〈1〉
+    h: {
+      [string]: {
+        c: len(〈1;(〈0;-〉)〉)
+      }
+    }
+    h: {
+      a: _
+    }
+    g: _
+    for _, x in 〈0;let X#9〉.h {
+      g: {
+        "\({
+          if true {
+            〈4;x〉.c
+          }
+        })": true
+      }
+    }
+    for k, _ in 〈0;g〉 {
+      G: 〈1;k〉
+    }
+  }
+  withLetDynamicField: {
+    let Y#A = 〈1〉
+    s: true
+    x: {
+      if 〈1;let Y#A〉.s {
+        1
+      }
+      if !〈1;let Y#A〉.s {
+        2
+      }
+    }
+  }
+  letSelfIterate: {
+    let X#B = 〈1〉
+    a: 3
+    d: [
+      for k, _ in 〈1;let X#B〉 {
+        〈1;k〉
+      },
+    ]
+  }
+  withLetDynamicFieldRef: {
+    let X#C = 〈1〉
+    h: {
+      [string]: {
+        c: len(〈2;h〉.a)
+      }
+    }
+    h: {
+      a: _
+    }
+    g: _
+    for _, x in 〈0;let X#C〉.h {
+      g: {
+        "\({
+          if true {
+            〈4;x〉.c
+          }
+        })": true
+      }
+    }
+    for k, _ in 〈0;g〉 {
+      G: 〈1;k〉
+    }
+  }
+  withLetDynamicFieldRef: {
+    let Y#D = 〈1〉
+    s: true
+    x: {
+      if 〈1;let Y#D〉.s {
+        1
+      }
+      if !〈1;let Y#D〉.s {
+        2
+      }
+    }
+  }
+}

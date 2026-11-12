@@ -1,0 +1,40 @@
+# Trimming stdin prints the result to stdout by default.
+stdin x.cue
+exec cue trim -
+cmp stdout want.cue
+
+# An explicit output file is still honored.
+stdin x.cue
+exec cue trim -o out.cue -
+! stdout .
+cmp out.cue want.cue
+
+# Files named outside the current directory are trimmed too.
+cd sub
+exec cue trim -o - ../x.cue
+cmp stdout ../want.cue
+
+-- sub/.keep --
+-- x.cue --
+payments: [{
+	price:    110
+	currency: "EUR"
+}, {
+	price:    35
+	currency: "GBP"
+}]
+
+payments: [...{
+	currency: *"EUR" | string
+}]
+-- want.cue --
+payments: [{
+	price: 110
+}, {
+	price:    35
+	currency: "GBP"
+}]
+
+payments: [...{
+	currency: *"EUR" | string
+}]

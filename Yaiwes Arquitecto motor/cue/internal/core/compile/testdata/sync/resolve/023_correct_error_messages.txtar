@@ -1,0 +1,7 @@
+-- in.cue --
+a: "a" & 1
+-- out/compile --
+--- in.cue
+{
+  a: ("a" & 1)
+}

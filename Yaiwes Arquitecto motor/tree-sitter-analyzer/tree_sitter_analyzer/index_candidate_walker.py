@@ -1,0 +1,370 @@
+"""Bounded incremental filesystem enumeration for index candidates."""
+
+from __future__ import annotations
+
+import os
+import stat
+import time
+from collections.abc import Iterable
+from typing import Any
+
+from .discovery_budget import discovery_deadline
+from .ignore_rules import IgnoreRules
+from .ignore_rules import is_gitignored as _is_gitignored
+from .ignore_rules import load_ignore_rules as _load_ignore_rules
+
+
+class CandidateDiscoveryBudgetExceeded(RuntimeError):
+    """Raised after the first filesystem entry beyond a discovery budget.
+
+    ``budget`` names the tripped limit (``entries`` / ``path_bytes`` / ``time``),
+    ``limit`` its configured ceiling and ``entries`` how many directory entries
+    had been charged when enumeration stopped (#1783).  ``str(exc)`` stays the
+    caller-supplied stable error code.
+    """
+
+    def __init__(
+        self,
+        code: str | None = None,
+        *,
+        budget: str = "unknown",
+        limit: float | None = None,
+        entries: int = 0,
+    ) -> None:
+        super().__init__(*(() if code is None else (code,)))
+        self.budget = budget
+        self.limit = limit
+        self.entries = entries
+
+
+def _budget_exceeded(
+    budget_error: str,
+    *,
+    entry_count: int,
+    entry_budget: int,
+    path_bytes: int,
+    path_byte_budget: int,
+    started: float,
+    discovery_seconds: float | None,
+) -> CandidateDiscoveryBudgetExceeded | None:
+    """Return the first tripped discovery budget, or ``None`` while within all."""
+    if entry_count > entry_budget:
+        return CandidateDiscoveryBudgetExceeded(
+            budget_error, budget="entries", limit=entry_budget, entries=entry_count
+        )
+    if path_bytes > path_byte_budget:
+        return CandidateDiscoveryBudgetExceeded(
+            budget_error,
+            budget="path_bytes",
+            limit=path_byte_budget,
+            entries=entry_count,
+        )
+    deadline = discovery_deadline(started, entry_count, discovery_seconds)
+    if time.monotonic() > deadline:
+        return CandidateDiscoveryBudgetExceeded(
+            budget_error,
+            budget="time",
+            limit=round(deadline - started, 3),
+            entries=entry_count,
+        )
+    return None
+
+
+class CandidateDiscoveryError(RuntimeError):
+    """Raised when filesystem enumeration cannot produce an authoritative scope."""
+
+
+_DISCOVERY_ERROR = "INDEX_CANDIDATE_DISCOVERY_ERROR"
+
+
+def walk_candidate_entries(
+    project_root: str,
+    *,
+    excluded_dir_names: frozenset[str],
+    entry_budget: int,
+    path_byte_budget: int,
+    discovery_seconds: float | None,
+    budget_error: str,
+    start_relative: str = "",
+    visited_dirs: list[str] | None = None,
+) -> Iterable[str]:
+    """Yield non-directories while charging every entry before filtering.
+
+    ``visited_dirs`` (when given) receives the relative path of every directory
+    actually listed, root first, so a caller can bind a memoized result to the
+    exact set of directory listings it was derived from.
+    """
+    started = time.monotonic()
+    entry_count = 0
+    path_bytes = 0
+    scan_relative, ignore_rules, scope_ignored = _scope_ignore_rules(
+        project_root, start_relative
+    )
+    if scope_ignored:
+        return
+    scan_root = (
+        os.path.join(project_root, scan_relative) if scan_relative else project_root
+    )
+    if os.name != "posix":  # pragma: no cover - exercised by Windows CI
+        yield from _walk_path_entries(
+            project_root,
+            scan_root,
+            scan_relative,
+            ignore_rules,
+            excluded_dir_names,
+            entry_budget,
+            path_byte_budget,
+            (started, discovery_seconds),
+            budget_error,
+            visited_dirs,
+        )
+        return
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    scanners: list[tuple[Any, int, str]] = []
+    root_fd: int | None = None
+    root_identity: tuple[int, int, int] | None = None
+    try:
+        try:
+            root_fd = os.open(scan_root, directory_flags)
+            root_info = os.fstat(root_fd)
+            root_identity = (
+                getattr(root_info, "st_dev", 0),
+                getattr(root_info, "st_ino", 0),
+                getattr(root_info, "st_mode", 0),
+            )
+            scanners.append((os.scandir(root_fd), root_fd, scan_relative))
+            if visited_dirs is not None:
+                visited_dirs.append(scan_relative)
+            root_fd = None  # the scanner frame owns it now
+        except OSError as exc:
+            raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+        while scanners:
+            scanner, parent_fd, parent_rel = scanners[-1]
+            try:
+                entry = next(scanner)
+            except StopIteration:
+                scanners.pop()
+                _close_scanner_fd(scanner, parent_fd)
+                continue
+            except OSError as exc:
+                raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+            entry_count += 1
+            rel_path = (
+                os.path.join(parent_rel, entry.name) if parent_rel else entry.name
+            )
+            abs_path = os.path.join(project_root, rel_path)
+            try:
+                path_bytes += len(
+                    os.fspath(abs_path).encode("utf-8", errors="surrogatepass")
+                )
+            except (TypeError, UnicodeError):
+                path_bytes = path_byte_budget + 1
+            exceeded = _budget_exceeded(
+                budget_error,
+                entry_count=entry_count,
+                entry_budget=entry_budget,
+                path_bytes=path_bytes,
+                path_byte_budget=path_byte_budget,
+                started=started,
+                discovery_seconds=discovery_seconds,
+            )
+            if exceeded is not None:
+                raise exceeded
+            try:
+                entry_info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+            if not stat.S_ISDIR(entry_info.st_mode):
+                if not _is_gitignored(
+                    rel_path, ignore_rules.get(parent_rel, []), directory=False
+                ):
+                    yield abs_path
+                continue
+            if entry.name in excluded_dir_names or entry.name.startswith("."):
+                continue
+            if _is_gitignored(
+                rel_path, ignore_rules.get(parent_rel, []), directory=True
+            ):
+                continue
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(
+                    entry.name,
+                    directory_flags | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=parent_fd,
+                )
+                child_info = os.fstat(child_fd)
+                enumerated_identity = (
+                    entry_info.st_dev,
+                    entry_info.st_ino,
+                    entry_info.st_mode,
+                )
+                opened_identity = (
+                    child_info.st_dev,
+                    child_info.st_ino,
+                    child_info.st_mode,
+                )
+                if opened_identity != enumerated_identity:
+                    raise OSError("candidate child identity changed before open")
+                child_scanner = os.scandir(child_fd)
+            except OSError as exc:
+                if child_fd is not None:
+                    os.close(child_fd)
+                raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+            ignore_rules[rel_path] = _load_ignore_rules(
+                project_root, rel_path, ignore_rules.get(parent_rel, [])
+            )
+            scanners.append((child_scanner, child_fd, rel_path))
+            if visited_dirs is not None:
+                visited_dirs.append(rel_path)
+        # Enumeration through the pinned descriptor is authoritative only while
+        # the caller-visible pathname still names that exact directory.  A
+        # rename/replacement must not let an old empty root certify a new tree.
+        try:
+            reopened_fd = os.open(scan_root, directory_flags)
+        except OSError as exc:
+            raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+        try:
+            reopened = os.fstat(reopened_fd)
+            reopened_identity = (
+                getattr(reopened, "st_dev", 0),
+                getattr(reopened, "st_ino", 0),
+                getattr(reopened, "st_mode", 0),
+            )
+            if reopened_identity != root_identity:
+                raise OSError("candidate root identity changed during enumeration")
+        except OSError as exc:
+            raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+        finally:
+            os.close(reopened_fd)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        for scanner, fd, _rel in reversed(scanners):
+            try:
+                _close_scanner_fd(scanner, fd)
+            except OSError:
+                pass
+
+
+def _close_scanner_fd(scanner: Any, fd: int) -> None:
+    try:
+        scanner.close()
+    finally:
+        os.close(fd)
+
+
+def _scope_ignore_rules(
+    project_root: str, start_relative: str
+) -> tuple[str, dict[str, IgnoreRules], bool]:
+    """为子目录扫描预载项目根到 scope 的全部忽略规则。"""
+    normalized = os.path.normpath(start_relative) if start_relative else ""
+    if normalized == ".":
+        normalized = ""
+    if (
+        os.path.isabs(normalized)
+        or normalized == ".."
+        or normalized.startswith(".." + os.sep)
+    ):
+        raise CandidateDiscoveryError(_DISCOVERY_ERROR)
+
+    rules = _load_ignore_rules(project_root, "", [])
+    by_directory: dict[str, IgnoreRules] = {"": rules}
+    current = ""
+    for part in normalized.split(os.sep) if normalized else ():
+        current = os.path.join(current, part) if current else part
+        if _is_gitignored(current, rules, directory=True):
+            return normalized, by_directory, True
+        rules = _load_ignore_rules(project_root, current, rules)
+        by_directory[current] = rules
+    return normalized, by_directory, False
+
+
+def _walk_path_entries(
+    project_root: str,
+    scan_root: str,
+    scan_relative: str,
+    ignore_rules: dict[str, IgnoreRules],
+    excluded_dir_names: frozenset[str],
+    entry_budget: int,
+    path_byte_budget: int,
+    budget: tuple[float, float | None],
+    budget_error: str,
+    visited_dirs: list[str] | None = None,
+) -> Iterable[str]:
+    """Non-POSIX fallback; secure snapshot capture is unsupported on this path."""
+    entry_count = 0
+    path_bytes = 0
+    scanners: list[tuple[Any, str]] = []
+    try:
+        try:
+            scanners.append((os.scandir(scan_root), scan_relative))
+            if visited_dirs is not None:
+                visited_dirs.append(scan_relative)
+        except OSError as exc:
+            raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+        while scanners:
+            scanner, parent_rel = scanners[-1]
+            try:
+                entry = next(scanner)
+            except StopIteration:
+                scanners.pop()[0].close()
+                continue
+            except OSError as exc:
+                raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+            entry_count += 1
+            rel_path = (
+                os.path.join(parent_rel, entry.name) if parent_rel else entry.name
+            )
+            try:
+                path_bytes += len(
+                    os.fspath(entry.path).encode("utf-8", errors="surrogatepass")
+                )
+            except (TypeError, UnicodeError):
+                path_bytes = path_byte_budget + 1
+            exceeded = _budget_exceeded(
+                budget_error,
+                entry_count=entry_count,
+                entry_budget=entry_budget,
+                path_bytes=path_bytes,
+                path_byte_budget=path_byte_budget,
+                started=budget[0],
+                discovery_seconds=budget[1],
+            )
+            if exceeded is not None:
+                raise exceeded
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+            if not is_directory:
+                if not _is_gitignored(
+                    rel_path, ignore_rules.get(parent_rel, []), directory=False
+                ):
+                    yield os.fspath(entry.path)
+            elif (
+                entry.name not in excluded_dir_names
+                and not entry.name.startswith(".")
+                and not _is_gitignored(
+                    rel_path, ignore_rules.get(parent_rel, []), directory=True
+                )
+            ):
+                try:
+                    child_scanner = os.scandir(entry.path)
+                except OSError as exc:
+                    raise CandidateDiscoveryError(_DISCOVERY_ERROR) from exc
+                ignore_rules[rel_path] = _load_ignore_rules(
+                    project_root, rel_path, ignore_rules.get(parent_rel, [])
+                )
+                scanners.append((child_scanner, rel_path))
+                if visited_dirs is not None:
+                    visited_dirs.append(rel_path)
+    finally:
+        for scanner, _rel in reversed(scanners):
+            scanner.close()

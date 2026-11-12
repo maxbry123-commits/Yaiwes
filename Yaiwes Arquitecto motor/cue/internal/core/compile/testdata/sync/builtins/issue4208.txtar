@@ -1,0 +1,33 @@
+# Test that error() in a disjunction used as a pattern constraint key
+# surfaces the custom error message instead of the generic "field not allowed".
+#
+# Issue: https://cuelang.org/issue/4208
+-- in.cue --
+#Environment: "sbx" | "stg" | "pro" | error("Must specify a valid environment")
+#Envs: [#Environment]~(Env,_): {}
+
+// Valid key should work fine.
+valid: #Envs
+valid: sbx: {}
+
+// Invalid key should show the custom error message.
+invalid: #Envs
+invalid: foo: {}
+
+
+-- out/compile --
+--- in.cue
+{
+  #Environment: ("sbx"|"stg"|"pro"|error("Must specify a valid environment"))
+  #Envs: {
+    [〈1;#Environment〉]: {}
+  }
+  valid: 〈0;#Envs〉
+  valid: {
+    sbx: {}
+  }
+  invalid: 〈0;#Envs〉
+  invalid: {
+    foo: {}
+  }
+}

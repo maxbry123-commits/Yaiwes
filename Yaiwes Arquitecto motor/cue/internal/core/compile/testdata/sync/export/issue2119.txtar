@@ -1,0 +1,74 @@
+-- in.cue --
+import (
+	"encoding/yaml"
+	"regexp"
+)
+
+simplified: {
+	x: d: {
+		let R = self
+		".*"
+		[R + ""][0]
+	}
+	out: yaml.Marshal(x)
+}
+
+original: {
+	#testableRegexp: {
+		let R = self
+		string
+
+		#test: close({
+			in:  string
+			out: regexp.FindSubmatch("^" + R + "$", in)[1]
+		})
+	}
+
+	rule: {
+		#patterns: {
+			bar: #testableRegexp & {
+				"(.*)"
+				#test: {in: "testcontent", out: "testcontent"}
+			}
+		}
+	}
+	out: yaml.Marshal(rule)
+}
+-- out/compile --
+--- in.cue
+{
+  simplified: {
+    x: {
+      d: {
+        let R#1 = 〈1〉
+        ".*"
+        [
+          (〈1;let R#1〉 + ""),
+        ][0]
+      }
+    }
+    out: 〈import;"encoding/yaml"〉.Marshal(〈0;x〉)
+  }
+  original: {
+    #testableRegexp: {
+      let R#2 = 〈1〉
+      string
+      #test: close({
+        in: string
+        out: 〈import;regexp〉.FindSubmatch((("^" + 〈1;let R#2〉) + "$"), 〈0;in〉)[1]
+      })
+    }
+    rule: {
+      #patterns: {
+        bar: (〈2;#testableRegexp〉 & {
+          "(.*)"
+          #test: {
+            in: "testcontent"
+            out: "testcontent"
+          }
+        })
+      }
+    }
+    out: 〈import;"encoding/yaml"〉.Marshal(〈0;rule〉)
+  }
+}

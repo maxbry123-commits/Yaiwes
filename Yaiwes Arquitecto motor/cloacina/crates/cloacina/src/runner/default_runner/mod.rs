@@ -1,0 +1,322 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Default runner for workflow execution.
+//!
+//! This module provides the DefaultRunner which coordinates workflow scheduling
+//! and task execution. It combines the functionality of the TaskScheduler and
+//! TaskExecutor into a unified interface.
+//!
+//! ## Components
+//!
+//! - `DefaultRunner`: Main runner struct
+//! - `DefaultRunnerConfig`: Configuration options
+//! - `DefaultRunnerBuilder`: Builder for creating runners with custom settings
+
+mod config;
+mod cron_api;
+mod reactor_subscriptions_api;
+mod service_manager;
+mod services;
+mod workflow_executor_impl;
+mod workflow_result;
+
+pub use config::{DefaultRunnerBuilder, DefaultRunnerConfig, DefaultRunnerConfigBuilder};
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::Database;
+use crate::Runtime;
+use crate::Scheduler;
+use crate::TaskScheduler;
+use crate::dal::DAL;
+use crate::dispatcher::{DefaultDispatcher, Dispatcher, TaskExecutor};
+use crate::executor::ThreadTaskExecutor;
+use crate::executor::types::ExecutorConfig;
+use crate::executor::workflow_executor::WorkflowExecutionError;
+
+use service_manager::ServiceManager;
+
+/// Default runner that coordinates workflow scheduling and task execution.
+///
+/// Holds only top-level state — runtime, database, config, and the task
+/// scheduler. All background services (cron, recovery, registry reconciler,
+/// graph scheduler, stale-claim sweeper, ...) live inside the
+/// [`ServiceManager`], which owns their handles and shutdown wiring.
+///
+/// # Shutdown
+///
+/// Call [`shutdown()`](Self::shutdown) before dropping to gracefully stop
+/// background tasks and release database connections.
+#[must_use = "DefaultRunner runs background tasks; call shutdown() before dropping"]
+pub struct DefaultRunner {
+    /// Scoped runtime holding isolated registries for tasks, workflows, and triggers
+    pub(super) runtime: Arc<Runtime>,
+    /// Database connection for persistence and state management
+    pub(super) database: Database,
+    /// Configuration parameters for the runner
+    pub(super) config: DefaultRunnerConfig,
+    /// Task scheduler for managing workflow execution scheduling
+    pub(super) scheduler: Arc<TaskScheduler>,
+    /// Owns the lifecycle of every background service plus typed accessor slots.
+    pub(super) service_manager: Arc<RwLock<ServiceManager>>,
+    /// Shared wake signal for the timer-driven cron scheduler (CLOACI-T-0743).
+    /// The cron registrar and the runner's cron API call `notify_one` after
+    /// mutating schedules so the scheduler re-arms its sleep immediately
+    /// instead of waiting for the backstop.
+    pub(super) cron_change: Arc<tokio::sync::Notify>,
+}
+
+impl DefaultRunner {
+    /// Creates a new default runner with default configuration
+    pub async fn new(database_url: &str) -> Result<Self, WorkflowExecutionError> {
+        Self::with_config(database_url, DefaultRunnerConfig::default()).await
+    }
+
+    /// Creates a builder for configuring the executor
+    pub fn builder() -> DefaultRunnerBuilder {
+        DefaultRunnerBuilder::new()
+    }
+
+    /// Creates a new executor with PostgreSQL schema-based multi-tenancy
+    pub async fn with_schema(
+        database_url: &str,
+        schema: &str,
+    ) -> Result<Self, WorkflowExecutionError> {
+        Self::builder()
+            .database_url(database_url)
+            .schema(schema)
+            .build()
+            .await
+    }
+
+    /// Creates a new unified executor with custom configuration
+    pub async fn with_config(
+        database_url: &str,
+        config: DefaultRunnerConfig,
+    ) -> Result<Self, WorkflowExecutionError> {
+        // Initialize database
+        let database = Database::new(database_url, "cloacina", config.db_pool_size());
+
+        // Run migrations
+        database
+            .run_migrations()
+            .await
+            .map_err(|e| WorkflowExecutionError::DatabaseConnection { message: e })?;
+
+        Self::with_database(database, config, None).await
+    }
+
+    /// CLOACI-T-0580: construct a runner around a pre-built `Database`,
+    /// optionally sharing an inventory-seeded `Runtime` across runners.
+    ///
+    /// Used by `TenantRunnerCache` to spin up per-tenant `DefaultRunner`
+    /// instances: each tenant has its own `Database` (from
+    /// `TenantDatabaseCache`) but they all share the same `Runtime`
+    /// `Arc` so inventory (TaskRegistry, WorkflowRegistry, etc.) isn't
+    /// duplicated per-tenant.
+    ///
+    /// Migrations are NOT run by this path — the caller must have
+    /// already migrated the schema (the tenant-creation flow does this
+    /// in `DatabaseAdmin::create_tenant`).
+    pub async fn with_database(
+        database: Database,
+        config: DefaultRunnerConfig,
+        shared_runtime: Option<Arc<Runtime>>,
+    ) -> Result<Self, WorkflowExecutionError> {
+        Self::with_database_secrets(database, config, shared_runtime, None).await
+    }
+
+    /// [`Self::with_database`] plus a secret resolution side channel
+    /// (CLOACI-T-0858 / I-0133 D-1) threaded onto the in-process thread
+    /// executor, so `context.secret(...)` resolves for locally-executed
+    /// tasks. Hosts that construct runners per tenant (cloacina-server's
+    /// `TenantRunnerCache`) pass a tenant-scoped
+    /// [`crate::security::SecretStoreResolver`]; `None` keeps the
+    /// fail-closed "secrets backend not configured" behavior.
+    pub async fn with_database_secrets(
+        database: Database,
+        config: DefaultRunnerConfig,
+        shared_runtime: Option<Arc<Runtime>>,
+        secret_resolver: Option<Arc<dyn cloacina_workflow::secret::SecretResolver>>,
+    ) -> Result<Self, WorkflowExecutionError> {
+        // CLOACI-T-0924: `cloacina-server` hands EVERY tenant's runner the same
+        // `Runtime` allocation (`TenantRunnerCache::shared_runtime`), so bind
+        // this runner's handle to its own tenant. The registries underneath are
+        // keyed `(tenant, name)`; everything this constructor builds
+        // (TaskScheduler, ThreadTaskExecutor, and later the reconciler and cron
+        // scheduler) clones the handle and therefore inherits the scope, so two
+        // tenants shipping a workflow called `pipeline` no longer collide.
+        // Registries stay shared — only the view differs.
+        let runtime = Arc::new(
+            shared_runtime
+                .unwrap_or_else(|| Arc::new(Runtime::new()))
+                .scoped_to_tenant(config.tenant_id()),
+        );
+
+        // Create scheduler with the scoped runtime
+        let scheduler =
+            TaskScheduler::with_poll_interval(database.clone(), config.scheduler_poll_interval())
+                .await
+                .map_err(|e| WorkflowExecutionError::Executor(e.into()))?
+                .with_runtime(runtime.clone());
+
+        // Create task executor
+        let executor_config = ExecutorConfig {
+            max_concurrent_tasks: config.max_concurrent_tasks(),
+            task_timeout: config.task_timeout(),
+            enable_claiming: config.enable_claiming(),
+            heartbeat_interval: config.heartbeat_interval(),
+        };
+
+        let executor = ThreadTaskExecutor::with_runtime_and_registry(
+            database.clone(),
+            Arc::new(crate::task::TaskRegistry::new()),
+            runtime.clone(),
+            executor_config,
+        )
+        // CLOACI-T-0858: thread the secret side channel so task contexts can
+        // resolve secrets on the in-process execution path.
+        .with_secret_resolver(secret_resolver);
+
+        // Configure dispatcher for push-based task execution. Every task is sent
+        // to the one configured executor key (CLOACI-T-0640).
+        let dal = DAL::new(database.clone());
+        let dispatcher = DefaultDispatcher::new(dal, config.default_executor());
+
+        dispatcher.register_executor("default", Arc::new(executor) as Arc<dyn TaskExecutor>);
+
+        let scheduler = scheduler.with_dispatcher(Arc::new(dispatcher));
+
+        let default_runner = Self {
+            runtime,
+            database,
+            config,
+            scheduler: Arc::new(scheduler),
+            service_manager: Arc::new(RwLock::new(ServiceManager::new())),
+            cron_change: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        // Start the background services immediately
+        default_runner.start_background_services().await?;
+
+        Ok(default_runner)
+    }
+
+    /// Returns a reference to the database.
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
+    /// Returns the DAL for database operations.
+    pub fn dal(&self) -> DAL {
+        DAL::new(self.database.clone())
+    }
+
+    /// Register an additional `TaskExecutor` on the runner's dispatcher under
+    /// an executor key (CLOACI-T-0633). The `"default"` thread executor is
+    /// registered at construction; this lets a host (e.g. `cloacina-server`)
+    /// plug in extra backends — notably the `FleetExecutor` under key
+    /// `"fleet"` — so the server can select it via `default_executor`
+    /// (CLOACI-T-0640).
+    ///
+    /// Returns `true` if registered, `false` if the scheduler has no
+    /// dispatcher configured (push-based execution disabled).
+    pub fn register_executor(&self, key: &str, executor: Arc<dyn TaskExecutor>) -> bool {
+        if let Some(dispatcher) = self.scheduler.dispatcher() {
+            dispatcher.register_executor(key, executor);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if an executor is registered under `key` on this runner's
+    /// dispatcher. Returns `false` when no dispatcher is configured (push-based
+    /// execution disabled). Used to validate a configured `default_executor`
+    /// key at startup (CLOACI-T-0640).
+    pub fn has_executor(&self, key: &str) -> bool {
+        self.scheduler
+            .dispatcher()
+            .map(|d| d.has_executor(key))
+            .unwrap_or(false)
+    }
+
+    /// Returns a handle to the scoped `Runtime` this runner uses.
+    pub fn runtime(&self) -> Arc<Runtime> {
+        self.runtime.clone()
+    }
+
+    /// Returns the unified scheduler if enabled.
+    pub async fn unified_scheduler(&self) -> Option<Arc<Scheduler>> {
+        self.service_manager.read().await.unified_scheduler.clone()
+    }
+
+    /// Wake the timer-driven cron scheduler so it re-reads the due set
+    /// (CLOACI-T-0927).
+    ///
+    /// The embedded `register_cron_*` / `unregister_*` APIs do this for
+    /// themselves. Anything that writes a cron `schedules` row through the DAL
+    /// directly — notably the server's named-instance routes — must call this,
+    /// or the scheduler keeps sleeping against a stale cached due-time and the
+    /// new schedule does not fire.
+    pub fn notify_cron_change(&self) {
+        self.cron_change.notify_one();
+    }
+
+    /// Set the graph scheduler for computation graph package routing.
+    /// Must be called before `start_services()` so the reconciler can route CG packages.
+    pub async fn set_graph_scheduler(
+        &self,
+        scheduler: Arc<crate::computation_graph::scheduler::ComputationGraphScheduler>,
+    ) {
+        let slot = self.service_manager.read().await.graph_scheduler.clone();
+        *slot.write().await = Some(scheduler);
+    }
+
+    /// Gracefully shuts down the executor and its background services.
+    pub async fn shutdown(&self) -> Result<(), WorkflowExecutionError> {
+        self.service_manager.write().await.shutdown_all().await?;
+        // Close the database connection pool to release all connections
+        self.database.close();
+        Ok(())
+    }
+}
+
+impl Clone for DefaultRunner {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            database: self.database.clone(),
+            config: self.config.clone(),
+            scheduler: self.scheduler.clone(),
+            service_manager: self.service_manager.clone(),
+            // Share the SAME Notify across clones so a cron-change signal from
+            // any runner handle reaches the one scheduler loop (CLOACI-T-0743).
+            cron_change: self.cron_change.clone(),
+        }
+    }
+}
+
+// Implement Drop for graceful shutdown
+impl Drop for DefaultRunner {
+    fn drop(&mut self) {
+        // Note: Can't use async in Drop, but we can attempt shutdown
+        // Users should call shutdown() explicitly for graceful shutdown
+        tracing::info!("DefaultRunner dropping - consider calling shutdown() explicitly");
+    }
+}

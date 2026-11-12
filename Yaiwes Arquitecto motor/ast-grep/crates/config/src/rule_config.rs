@@ -1,0 +1,1160 @@
+use crate::GlobalRules;
+
+use crate::check_var::{check_fix, check_rewriters_in_transform};
+use crate::fixer::{Fixer, FixerError, SerializableFixer};
+use crate::label::{Label, LabelConfig, get_default_labels, get_labels_from_config};
+use crate::rewriter::RewriterError;
+pub use crate::rewriter::SerializableRewriter;
+use crate::rule::DeserializeEnv;
+use crate::rule_core::{RuleCore, RuleCoreError, SerializableRuleCore};
+
+use ast_grep_core::language::Language;
+use ast_grep_core::replacer::Replacer;
+use ast_grep_core::source::Content;
+use ast_grep_core::{Doc, Matcher, NodeMatch};
+
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::{Deserialize, Serialize};
+use serde_saphyr::Error as YamlError;
+use thiserror::Error;
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
+
+#[derive(
+  Serialize, Deserialize, Clone, Default, JsonSchema, Debug, PartialOrd, Ord, PartialEq, Eq,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum Severity {
+  /// Turns off the rule.
+  Off,
+  #[default]
+  /// A kind reminder for code with potential improvement.
+  Hint,
+  /// A suggestion that code can be improved or optimized.
+  Info,
+  /// A warning that code might produce bugs or does not follow best practice.
+  Warning,
+  /// An error that code produces bugs or has logic errors.
+  Error,
+}
+
+impl FromStr for Severity {
+  type Err = String;
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s.to_lowercase().as_str() {
+      "hint" => Ok(Severity::Hint),
+      "info" => Ok(Severity::Info),
+      "warning" => Ok(Severity::Warning),
+      "error" => Ok(Severity::Error),
+      "off" => Ok(Severity::Off),
+      _ => Err(format!("Invalid severity level: {}", s)),
+    }
+  }
+}
+
+#[derive(Debug, Error)]
+pub enum RuleConfigError {
+  #[error("Fail to parse yaml as RuleConfig")]
+  Yaml(#[from] Box<YamlError>),
+  #[error("Fail to parse yaml as Rule.")]
+  Core(#[from] RuleCoreError),
+  #[error("`fix` pattern is invalid.")]
+  Fixer(#[from] FixerError),
+  #[error(transparent)]
+  Rewriter(#[from] RewriterError),
+  #[error("Undefined rewriter `{0}` used in transform.")]
+  UndefinedRewriter(String),
+  #[error("Label meta-variable `{0}` must be defined in `rule` or `constraints`.")]
+  LabelVariable(String),
+  #[error("Rule must specify a set of AST kinds to match. Try adding `kind` rule.")]
+  MissingPotentialKinds,
+}
+
+impl From<YamlError> for RuleConfigError {
+  fn from(error: YamlError) -> Self {
+    Self::Yaml(Box::new(error))
+  }
+}
+
+#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+#[schemars(title = "ast-grep rule")]
+pub struct SerializableRuleConfig<L: Language> {
+  #[serde(flatten)]
+  pub core: SerializableRuleCore,
+  /// A pattern string or a FixConfig object to auto fix the issue.
+  /// It can reference metavariables appeared in rule.
+  /// See details in fix [object reference](https://ast-grep.github.io/reference/yaml/fix.html#fixconfig).
+  pub fix: Option<SerializableFixer>,
+  /// Rewrite rules for `rewrite` transformation
+  pub rewriters: Option<Vec<SerializableRewriter>>,
+  /// Unique, descriptive identifier, e.g., no-unused-variable
+  #[serde(default)]
+  pub id: String,
+  /// Specify the language to parse and the file extension to include in matching.
+  pub language: L,
+  /// Main message highlighting why this rule fired. It should be single line and concise,
+  /// but specific enough to be understood without additional context.
+  #[serde(default)]
+  pub message: String,
+  /// Additional notes to elaborate the message and provide potential fix to the issue.
+  /// `notes` can contain markdown syntax, but it cannot reference meta-variables.
+  pub note: Option<String>,
+  /// One of: hint, info, warning, or error
+  #[serde(default)]
+  pub severity: Severity,
+  /// Custom label dictionary to configure reporting. Key is the meta-variable name and
+  /// value is the label message and label style.
+  pub labels: Option<HashMap<String, LabelConfig>>,
+  /// Glob patterns to specify that the rule only applies to matching files
+  pub files: Option<Vec<RuleFileGlob>>,
+  /// Glob patterns that exclude rules from applying to files
+  pub ignores: Option<Vec<RuleFileGlob>>,
+  /// Documentation link to this rule
+  pub url: Option<String>,
+  /// Extra information for the rule
+  pub metadata: Option<Metadata>,
+  /// Rejects keys that no other field consumed. Must stay the last flattened field.
+  #[serde(flatten)]
+  #[schemars(skip)]
+  pub unknown_keys: DenyUnknownKeys,
+}
+
+/// Fields accepted at the top level of a rule, used in the unknown key error message.
+const RULE_CONFIG_FIELDS: &[&str] = &[
+  "id",
+  "language",
+  "rule",
+  "constraints",
+  "utils",
+  "transform",
+  "fix",
+  "rewriters",
+  "message",
+  "note",
+  "severity",
+  "labels",
+  "files",
+  "ignores",
+  "url",
+  "metadata",
+];
+
+/// Marker that fails deserialization if any key is left over.
+///
+/// serde does not support `deny_unknown_fields` together with `flatten`, which
+/// `SerializableRuleConfig` uses for `core`. When flattened after all other fields,
+/// this receives only the keys none of them consumed.
+#[derive(Serialize, Clone, Copy, Debug, Default)]
+pub struct DenyUnknownKeys;
+
+impl<'de> Deserialize<'de> for DenyUnknownKeys {
+  fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    struct UnknownKeysVisitor;
+    impl<'de> serde::de::Visitor<'de> for UnknownKeysVisitor {
+      type Value = DenyUnknownKeys;
+      fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("no unknown keys")
+      }
+      fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+      ) -> Result<Self::Value, A::Error> {
+        match map.next_key::<String>()? {
+          Some(key) => Err(serde::de::Error::unknown_field(&key, RULE_CONFIG_FIELDS)),
+          None => Ok(DenyUnknownKeys),
+        }
+      }
+    }
+    deserializer.deserialize_map(UnknownKeysVisitor)
+  }
+}
+
+#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(untagged)]
+pub enum RuleFileGlob {
+  /// A glob pattern string
+  Glob(String),
+  #[serde(rename_all = "camelCase")]
+  Config {
+    /// A glob pattern string
+    glob: String,
+    /// Whether the glob matching is case insensitive
+    #[serde(default)]
+    case_insensitive: bool,
+  },
+}
+
+/// Arbitrary YAML metadata, including non-string mapping keys and non-finite numbers.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Metadata(HashMap<String, serde_value::Value>);
+
+impl JsonSchema for Metadata {
+  fn schema_name() -> Cow<'static, str> {
+    Cow::Borrowed("Metadata")
+  }
+  fn schema_id() -> Cow<'static, str> {
+    Cow::Borrowed("Metadata")
+  }
+  fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Additional metadata for the rule, can be used to store extra information."
+    })
+  }
+}
+
+impl<L: Language> SerializableRuleConfig<L> {
+  pub fn get_matcher(&self, globals: &GlobalRules) -> Result<RuleCore, RuleConfigError> {
+    // every RuleConfig has one rewriters, and the rewriter is shared between sub-rules
+    // all RuleConfigs has one common globals
+    // every sub-rule has one util
+    let env = DeserializeEnv::new(self.language.clone()).with_globals(globals);
+    let rule = self.core.get_matcher(env.clone())?;
+    self.register_rewriters(&rule, env)?;
+    self.check_labels(&rule)?;
+    Ok(rule)
+  }
+
+  fn check_labels(&self, rule: &RuleCore) -> Result<(), RuleConfigError> {
+    let Some(labels) = &self.labels else {
+      return Ok(());
+    };
+    // labels var must be vars with node, transform var cannot be used
+    let vars = rule.defined_node_vars();
+    for var in labels.keys() {
+      if !vars.contains(var.as_str()) {
+        return Err(RuleConfigError::LabelVariable(var.clone()));
+      }
+    }
+    Ok(())
+  }
+
+  fn register_rewriters(
+    &self,
+    rule: &RuleCore,
+    env: DeserializeEnv<L>,
+  ) -> Result<(), RuleConfigError> {
+    let Some(ser) = &self.rewriters else {
+      return Ok(());
+    };
+    let reg = &env.registration;
+    let vars = rule.defined_vars();
+    for val in ser {
+      let rewriter = val.try_parse_rewriter(&vars, &env)?;
+      reg.insert_rewriter(&val.id, rewriter);
+    }
+    check_rewriters_in_transform(rule, reg.get_rewriters())?;
+    Ok(())
+  }
+}
+
+impl<L: Language> Deref for SerializableRuleConfig<L> {
+  type Target = SerializableRuleCore;
+  fn deref(&self) -> &Self::Target {
+    &self.core
+  }
+}
+
+impl<L: Language> DerefMut for SerializableRuleConfig<L> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.core
+  }
+}
+
+pub struct RuleConfig<L: Language> {
+  inner: SerializableRuleConfig<L>,
+  pub matcher: RuleCore,
+  pub fixer: Vec<Fixer>,
+}
+
+impl<L: Language> RuleConfig<L> {
+  pub fn try_from(
+    inner: SerializableRuleConfig<L>,
+    globals: &GlobalRules,
+  ) -> Result<Self, RuleConfigError> {
+    let matcher = inner.get_matcher(globals)?;
+    if matcher.potential_kinds().is_none() {
+      return Err(RuleConfigError::MissingPotentialKinds);
+    }
+    let fixer = if let Some(fix) = &inner.fix {
+      let env = matcher.get_env(inner.language.clone());
+      Fixer::parse(fix, &env, &inner.transform)?
+    } else {
+      vec![]
+    };
+    check_fix(&matcher, &fixer)?;
+    Ok(Self {
+      inner,
+      matcher,
+      fixer,
+    })
+  }
+
+  pub fn deserialize<'de, D>(
+    deserializer: D,
+    globals: &GlobalRules,
+  ) -> Result<Self, RuleConfigError>
+  where
+    L: Deserialize<'de>,
+    D: serde::Deserializer<'de, Error = YamlError>,
+  {
+    let inner = SerializableRuleConfig::deserialize(deserializer)?;
+    Self::try_from(inner, globals)
+  }
+
+  pub fn get_message<D>(&self, node: &NodeMatch<D>) -> String
+  where
+    D: Doc,
+  {
+    let env = self.matcher.get_env(self.language.clone());
+    let parsed = Fixer::with_transform(&self.message, &env, &self.transform).expect("should work");
+    let bytes = parsed.generate_replacement(node);
+    <D::Source as Content>::encode_bytes(&bytes).to_string()
+  }
+  pub fn get_fixer(&self) -> Result<Vec<Fixer>, RuleConfigError> {
+    if let Some(fix) = &self.fix {
+      let env = self.matcher.get_env(self.language.clone());
+      let parsed = Fixer::parse(fix, &env, &self.transform)?;
+      Ok(parsed)
+    } else {
+      Ok(vec![])
+    }
+  }
+  pub fn get_labels<'t, D: Doc>(&self, node: &NodeMatch<'t, D>) -> Vec<Label<'_, 't, D>> {
+    if let Some(labels_config) = &self.labels {
+      get_labels_from_config(labels_config, node)
+    } else {
+      get_default_labels(node)
+    }
+  }
+}
+impl<L: Language> Deref for RuleConfig<L> {
+  type Target = SerializableRuleConfig<L>;
+  fn deref(&self) -> &Self::Target {
+    &self.inner
+  }
+}
+
+impl<L: Language> DerefMut for RuleConfig<L> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.inner
+  }
+}
+
+#[cfg(test)]
+mod test {
+  use super::*;
+  use crate::from_str;
+  use crate::rewriter::RewriterErrorReason;
+  use crate::test::TypeScript;
+  use crate::{SerializableGlobalRule, SerializableRule};
+  use ast_grep_core::tree_sitter::LanguageExt;
+
+  fn ts_rule_config(rule: SerializableRule) -> SerializableRuleConfig<TypeScript> {
+    let core = SerializableRuleCore {
+      rule,
+      constraints: None,
+      transform: None,
+      utils: None,
+    };
+    SerializableRuleConfig {
+      core,
+      id: "".into(),
+      language: TypeScript::Tsx,
+      rewriters: None,
+      fix: None,
+      message: "".into(),
+      note: None,
+      severity: Severity::Hint,
+      labels: None,
+      files: None,
+      ignores: None,
+      url: None,
+      metadata: None,
+      unknown_keys: DenyUnknownKeys,
+    }
+  }
+
+  fn ts_global_rules(yaml: &str) -> GlobalRules {
+    let globals: Vec<SerializableGlobalRule<TypeScript>> =
+      from_str(yaml).expect("should parse globals");
+    DeserializeEnv::parse_global_utils(globals).expect("should parse global rules")
+  }
+
+  #[test]
+  fn test_rule_message() {
+    let rule = from_str("pattern: class $A {}").expect("cannot parse rule");
+    let mut config = ts_rule_config(rule);
+    config.id = "test".into();
+    config.message = "Found $A".into();
+    let config = RuleConfig::try_from(config, &Default::default()).expect("should work");
+    let grep = TypeScript::Tsx.ast_grep("class TestClass {}");
+    let node_match = grep
+      .root()
+      .find(&config.matcher)
+      .expect("should find match");
+    assert_eq!(config.get_message(&node_match), "Found TestClass");
+  }
+
+  #[test]
+  fn test_parameterized_global_rule_exports_argument_env_only() {
+    let globals = ts_global_rules(
+      r"
+- id: global-rule
+  arguments: [export-var]
+  language: Tsx
+  rule:
+    pattern: Some($A)
+    matches: export-var
+",
+    );
+    let rule = from_str(
+      r"
+matches:
+  global-rule:
+    export-var:
+      pattern: $EXP
+",
+    )
+    .expect("should parse");
+    let config = ts_rule_config(rule);
+    let grep = TypeScript::Tsx.ast_grep("let value = Some(123)");
+    let node_match = grep
+      .root()
+      .find(config.get_matcher(&globals).unwrap())
+      .expect("should found");
+    let env = node_match.get_env();
+    let exp = env.get_match("EXP").expect("should export argument").text();
+    assert_eq!(exp, "Some(123)");
+    assert!(env.get_match("A").is_none());
+  }
+
+  #[test]
+  fn test_parameterized_global_rule_does_not_interfere_with_same_name_local_var() {
+    let globals = ts_global_rules(
+      r"
+- id: global-rule
+  arguments: [export-var]
+  language: Tsx
+  rule:
+    pattern: Some($A)
+    matches: export-var
+",
+    );
+    let rule = from_str(
+      r"
+all:
+  - pattern: $A
+  - matches:
+      global-rule:
+        export-var:
+          pattern: $EXP
+",
+    )
+    .expect("should parse");
+    let config = ts_rule_config(rule);
+    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let node_match = grep
+      .root()
+      .find(config.get_matcher(&globals).unwrap())
+      .expect("should found");
+    let env = node_match.get_env();
+    let a = env.get_match("A").expect("should keep local A").text();
+    assert_eq!(a, "Some(123)");
+    let exp = env.get_match("EXP").expect("should export argument").text();
+    assert_eq!(exp, "Some(123)");
+  }
+
+  #[test]
+  fn test_parameterized_global_rule_metavar_does_not_affect_yaml_rule_matching() {
+    let globals = ts_global_rules(
+      r"
+- id: global-rule
+  arguments: [export-var]
+  language: Tsx
+  rule:
+    pattern: Some($A)
+    matches: export-var
+",
+    );
+    let rule = from_str(
+      r"
+all:
+  - pattern: wrapper($A)
+  - has:
+      stopBy: end
+      matches:
+        global-rule:
+          export-var:
+            pattern: $EXP
+",
+    )
+    .expect("should parse");
+    let config = ts_rule_config(rule);
+    let grep = TypeScript::Tsx.ast_grep("wrapper(Some(123))");
+    let node_match = grep
+      .root()
+      .find(config.get_matcher(&globals).unwrap())
+      .expect("should found");
+    let env = node_match.get_env();
+    let a = env.get_match("A").expect("should keep yaml A").text();
+    assert_eq!(a, "Some(123)");
+    let exp = env.get_match("EXP").expect("should export argument").text();
+    assert_eq!(exp, "Some(123)");
+  }
+
+  #[test]
+  fn test_parameterized_global_rule_argument_vars_do_not_conflict_with_internal_vars() {
+    let globals = ts_global_rules(
+      r"
+- id: global-rule
+  arguments: [export-var]
+  language: Tsx
+  rule:
+    pattern: Some($A)
+    matches: export-var
+",
+    );
+    let rule = from_str(
+      r"
+matches:
+  global-rule:
+    export-var:
+      pattern: $A
+",
+    )
+    .expect("should parse");
+    let config = ts_rule_config(rule);
+    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let node_match = grep
+      .root()
+      .find(config.get_matcher(&globals).unwrap())
+      .expect("should found");
+    let env = node_match.get_env();
+    let a = env.get_match("A").expect("should export caller A").text();
+    assert_eq!(a, "Some(123)");
+  }
+
+  fn get_matches_config() -> SerializableRuleConfig<TypeScript> {
+    let rule = from_str(
+      "
+matches: test-rule
+",
+    )
+    .unwrap();
+    let utils = from_str(
+      "
+test-rule:
+  pattern: some($A)
+",
+    )
+    .unwrap();
+    let mut ret = ts_rule_config(rule);
+    ret.utils = Some(utils);
+    ret
+  }
+
+  #[test]
+  fn test_get_fixer() {
+    let globals = GlobalRules::default();
+    let mut config = get_matches_config();
+    config.fix = Some(from_str("string!!").unwrap());
+    let rule = RuleConfig::try_from(config, &globals).unwrap();
+    let fixer = rule.get_fixer().unwrap().remove(0);
+    let grep = TypeScript::Tsx.ast_grep("some(123)");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    let replacement = fixer.generate_replacement(&nm);
+    assert_eq!(String::from_utf8_lossy(&replacement), "string!!");
+  }
+
+  #[test]
+  fn test_undefined_vars_in_fix() {
+    let src = r"
+id: test
+language: Tsx
+rule: {pattern: console.log($A)}
+constraints: {A: {pattern: $C}}
+transform:
+  B:
+    replace: {source: $C, replace: a, by: b }
+fix: $D
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    match ret {
+      Err(RuleConfigError::Core(RuleCoreError::UndefinedMetaVar(name, section))) => {
+        assert_eq!(name, "D");
+        assert_eq!(section, "fix");
+      }
+      _ => panic!("unexpected result"),
+    }
+  }
+
+  #[test]
+  fn test_add_rewriters() {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+transform:
+  B:
+    rewrite:
+      rewriters: [re]
+      source: $A
+rewriters:
+- id: re
+  rule: {kind: number}
+  fix: yjsnp
+    ",
+    )
+    .expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
+    let grep = TypeScript::Tsx.ast_grep("a = 123");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    let b = nm.get_env().get_transformed("B").expect("should have");
+    assert_eq!(String::from_utf8_lossy(b), "yjsnp");
+  }
+
+  #[test]
+  fn test_rewriters_access_utils() {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+utils:
+  num: { kind: number }
+transform:
+  B:
+    rewrite:
+      rewriters: [re]
+      source: $A
+rewriters:
+- id: re
+  rule: {matches: num, pattern: $NOT}
+  fix: yjsnp
+    ",
+    )
+    .expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
+    let grep = TypeScript::Tsx.ast_grep("a = 456");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    let b = nm.get_env().get_transformed("B").expect("should have");
+    assert!(nm.get_env().get_match("NOT").is_none());
+    assert_eq!(String::from_utf8_lossy(b), "yjsnp");
+  }
+
+  #[test]
+  fn test_rewriter_utils_should_not_pollute_registration() {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: test
+rule: {matches: num}
+language: Tsx
+transform:
+  B:
+    rewrite:
+      rewriters: [re]
+      source: $B
+rewriters:
+- id: re
+  rule: {matches: num}
+  fix: yjsnp
+  utils:
+    num: { kind: number }
+    ",
+    )
+    .expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    assert!(matches!(ret, Err(RuleConfigError::Core(_))));
+  }
+
+  #[test]
+  fn test_rewriter_should_have_fix() {
+    let ret: Result<SerializableRuleConfig<TypeScript>, _> = from_str(
+      r"
+id: test
+rule: {kind: number}
+language: Tsx
+rewriters:
+- id: wrong
+  rule: {matches: num}",
+    );
+    let is_missing_err = matches!(ret, Err(e) if e.to_string().contains("missing field"));
+    assert!(is_missing_err);
+  }
+
+  #[test]
+  fn test_utils_in_rewriter_should_work() {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+transform:
+  B:
+    rewrite:
+      rewriters: [re]
+      source: $A
+rewriters:
+- id: re
+  rule: {matches: num}
+  fix: yjsnp
+  utils:
+    num: { kind: number }
+    ",
+    )
+    .expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
+    let grep = TypeScript::Tsx.ast_grep("a = 114514");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    let b = nm.get_env().get_transformed("B").expect("should have");
+    assert_eq!(String::from_utf8_lossy(b), "yjsnp");
+  }
+
+  #[test]
+  fn test_use_rewriter_recursive() {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+transform:
+  B: { rewrite: { rewriters: [re], source: $A } }
+rewriters:
+- id: handle-num
+  rule: {regex: '114'}
+  fix: '1919810'
+- id: re
+  rule: {kind: number, pattern: $A}
+  transform:
+    B: { rewrite: { rewriters: [handle-num], source: $A } }
+  fix: $B
+    ",
+    )
+    .expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
+    let grep = TypeScript::Tsx.ast_grep("a = 114514");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    let b = nm.get_env().get_transformed("B").expect("should have");
+    assert_eq!(String::from_utf8_lossy(b), "1919810");
+  }
+
+  fn make_undefined_error(src: &str) -> String {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let err = RuleConfig::try_from(rule, &Default::default());
+    match err {
+      Err(RuleConfigError::UndefinedRewriter(name)) => name,
+      _ => panic!("unexpected parsing result"),
+    }
+  }
+
+  #[test]
+  fn test_undefined_rewriter() {
+    let undefined = make_undefined_error(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+transform:
+  B: { rewrite: { rewriters: [not-defined], source: $A } }
+rewriters:
+- id: re
+  rule: {kind: number, pattern: $A}
+  fix: hah
+    ",
+    );
+    assert_eq!(undefined, "not-defined");
+  }
+  #[test]
+  fn test_wrong_rewriter() {
+    let rule: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+rewriters:
+- id: wrong
+  rule: {kind: '114'}
+  fix: '1919810'
+    ",
+    )
+    .expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    match ret {
+      Err(RuleConfigError::Rewriter(e)) => assert_eq!(e.id, "wrong"),
+      _ => panic!("unexpected error"),
+    }
+  }
+
+  #[test]
+  fn test_undefined_rewriter_in_transform() {
+    let undefined = make_undefined_error(
+      r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+transform:
+  B: { rewrite: { rewriters: [re], source: $A } }
+rewriters:
+- id: re
+  rule: {kind: number, pattern: $A}
+  transform:
+    C: { rewrite: { rewriters: [nested-undefined], source: $A } }
+  fix: hah
+    ",
+    );
+    assert_eq!(undefined, "nested-undefined");
+  }
+
+  #[test]
+  fn test_rewriter_use_upper_var() {
+    let src = r"
+id: test
+rule: {pattern: '$B = $A'}
+language: Tsx
+transform:
+  D: { rewrite: { rewriters: [re], source: $A } }
+rewriters:
+- id: re
+  rule: {kind: number, pattern: $C}
+  fix: $B.$C
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    assert!(ret.is_ok());
+  }
+
+  #[test]
+  fn test_rewriter_fix_rejects_undefined_var() {
+    let src = r"
+id: test
+rule: {pattern: '$B = $A'}
+language: Tsx
+transform:
+  D: { rewrite: { rewriters: [re], source: $A } }
+rewriters:
+- id: re
+  rule: {kind: number, pattern: $C}
+  fix: $MISSING.$C
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    match ret {
+      Err(RuleConfigError::Rewriter(RewriterError {
+        id,
+        reason: RewriterErrorReason::Core(RuleCoreError::UndefinedMetaVar(name, section)),
+      })) => {
+        assert_eq!(id, "re");
+        assert_eq!(name, "MISSING");
+        assert_eq!(section, "fix");
+      }
+      _ => panic!("unexpected result"),
+    }
+  }
+
+  #[test]
+  fn test_rewriter_rejects_empty_fix_list() {
+    let src = r"
+id: test
+rule: {pattern: 'a = $A'}
+language: Tsx
+transform:
+  B: { rewrite: { rewriters: [re], source: $A } }
+rewriters:
+- id: re
+  rule: {kind: number, pattern: $C}
+  fix: []
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    assert!(matches!(
+      ret,
+      Err(RuleConfigError::Rewriter(RewriterError {
+        id,
+        reason: RewriterErrorReason::NoFixInRewriter,
+      })) if id == "re"
+    ));
+  }
+
+  #[test]
+  fn test_rewriter_use_undefined_var() {
+    let src = r"
+id: test
+rule: {pattern: '$B = $A'}
+language: Tsx
+transform:
+  B: { rewrite: { rewriters: [re], source: $A } }
+rewriters:
+- id: re
+  rule: {kind: number, pattern: $C}
+  fix: $D.$C
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    assert!(ret.is_err());
+  }
+
+  #[test]
+  fn test_get_message_transform() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string, pattern: $ARG }
+transform:
+  TEST: { replace: { replace: 'a', by: 'b', source: $ARG, } }
+message: $TEST
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("should work");
+    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    assert_eq!(rule.get_message(&nm), "'123'");
+  }
+
+  #[test]
+  fn test_get_message_transform_string() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string, pattern: $ARG }
+transform:
+  TEST: replace($ARG, replace=a, by=b)
+message: $TEST
+    ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("should work");
+    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let nm = grep.root().find(&rule.matcher).unwrap();
+    assert_eq!(rule.get_message(&nm), "'123'");
+  }
+
+  #[test]
+  fn test_complex_metadata() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string }
+metadata:
+  test: [1, 2, 3]
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let rule = RuleConfig::try_from(rule, &Default::default()).expect("should work");
+    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let nm = grep.root().find(&rule.matcher);
+    assert!(nm.is_some());
+  }
+
+  #[test]
+  fn test_yaml_metadata_round_trip() {
+    use serde_value::Value;
+    let config: SerializableRuleConfig<TypeScript> = from_str(
+      r"
+id: metadata
+language: Tsx
+rule: {pattern: foo}
+metadata:
+  values: [null, true, -1, 18446744073709551615, .inf, -.inf, .nan]
+  mapping: {[a, b]: value}
+",
+    )
+    .expect("YAML metadata should retain non-JSON values");
+    let metadata = config.metadata.as_ref().unwrap();
+    let Value::Seq(values) = &metadata.0["values"] else {
+      panic!("metadata should contain a sequence");
+    };
+    assert_eq!(values[0], Value::Unit);
+    assert_eq!(values[1], Value::Bool(true));
+    assert_eq!(values[2], Value::I64(-1));
+    assert_eq!(values[3], Value::U64(u64::MAX));
+    assert_eq!(values[4], Value::F64(f64::INFINITY));
+    assert_eq!(values[5], Value::F64(f64::NEG_INFINITY));
+    assert!(matches!(values[6], Value::F64(f) if f.is_nan()));
+    let Value::Map(mapping) = &metadata.0["mapping"] else {
+      panic!("metadata should contain a mapping");
+    };
+    let key = Value::Seq(vec![Value::String("a".into()), Value::String("b".into())]);
+    assert_eq!(mapping[&key], Value::String("value".into()));
+    let yaml = serde_saphyr::to_string(&config).unwrap();
+    let round_trip: SerializableRuleConfig<TypeScript> = from_str(&yaml).unwrap();
+    assert_eq!(metadata.0, round_trip.metadata.unwrap().0);
+  }
+
+  #[test]
+  fn test_yaml_metadata_rejects_duplicate_keys_and_unknown_tags() {
+    assert!(from_str::<Metadata>("value: {key: 1, key: 2}").is_err());
+    assert!(from_str::<Metadata>("value: !Custom hello").is_err());
+    assert!(from_str::<Metadata>("value: {nested: !Custom hello}").is_err());
+  }
+
+  #[test]
+  fn test_reject_unknown_top_level_key() {
+    // test #2963: a misspelled key such as `ignore` must not be silently dropped
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { pattern: foo() }
+ignore: ['**/*.test.ts']
+";
+    let Err(err) = from_str::<SerializableRuleConfig<TypeScript>>(src) else {
+      panic!("unknown key `ignore` should be rejected");
+    };
+    let err = err.to_string();
+    assert!(err.contains("unknown field `ignore`"), "{err}");
+    assert!(err.contains("ignores"), "{err}");
+    // keys of the flattened rule core are still accepted
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { pattern: foo() }
+constraints: {}
+utils: {}
+transform: {}
+ignores: ['**/*.test.ts']
+";
+    assert!(from_str::<SerializableRuleConfig<TypeScript>>(src).is_ok());
+  }
+
+  #[test]
+  fn test_label() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { pattern: Some($A) }
+labels:
+  A: { style: primary, message: 'var label' }
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    assert!(ret.is_ok());
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { pattern: Some($A) }
+labels:
+  B: { style: primary, message: 'var label' }
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    let ret = RuleConfig::try_from(rule, &Default::default());
+    assert!(matches!(ret, Err(RuleConfigError::LabelVariable(_))));
+  }
+
+  #[test]
+  fn test_file_glob_simple_string() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string }
+files:
+  - '*.ts'
+  - 'src/**/*.tsx'
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    assert!(rule.files.is_some());
+    let files = rule.files.as_ref().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(matches!(files[0], RuleFileGlob::Glob(_)));
+    assert!(matches!(files[1], RuleFileGlob::Glob(_)));
+  }
+
+  #[test]
+  fn test_file_glob_case_insensitive() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string }
+files:
+  - glob: '*.ts'
+    caseInsensitive: true
+  - glob: 'README.md'
+    caseInsensitive: true
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    assert!(rule.files.is_some());
+    let files = rule.files.as_ref().unwrap();
+    assert_eq!(files.len(), 2);
+    match &files[0] {
+      RuleFileGlob::Config {
+        glob,
+        case_insensitive,
+      } => {
+        assert_eq!(glob, "*.ts");
+        assert!(case_insensitive);
+      }
+      _ => panic!("Expected Config variant"),
+    }
+    match &files[1] {
+      RuleFileGlob::Config {
+        glob,
+        case_insensitive,
+      } => {
+        assert_eq!(glob, "README.md");
+        assert!(case_insensitive);
+      }
+      _ => panic!("Expected Config variant"),
+    }
+  }
+
+  #[test]
+  fn test_file_glob_case_sensitive() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string }
+files:
+  - glob: '*.ts'
+    caseInsensitive: false
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+    assert!(rule.files.is_some());
+    let files = rule.files.as_ref().unwrap();
+    assert_eq!(files.len(), 1);
+    match &files[0] {
+      RuleFileGlob::Config {
+        glob,
+        case_insensitive,
+      } => {
+        assert_eq!(glob, "*.ts");
+        assert!(!case_insensitive);
+      }
+      _ => panic!("Expected Config variant"),
+    }
+  }
+
+  #[test]
+  fn test_file_glob_mixed_formats() {
+    let src = r"
+id: test-rule
+language: Tsx
+rule: { kind: string }
+files:
+  - '*.ts'
+  - glob: 'README.md'
+    caseInsensitive: true
+  - 'src/**/*.tsx'
+ignores:
+  - 'test/**'
+  - glob: 'BUILD'
+    caseInsensitive: true
+  ";
+    let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
+
+    assert!(rule.files.is_some());
+    let files = rule.files.as_ref().unwrap();
+    assert_eq!(files.len(), 3);
+    assert!(matches!(files[0], RuleFileGlob::Glob(_)));
+    assert!(matches!(files[1], RuleFileGlob::Config { .. }));
+    assert!(matches!(files[2], RuleFileGlob::Glob(_)));
+
+    assert!(rule.ignores.is_some());
+    let ignores = rule.ignores.as_ref().unwrap();
+    assert_eq!(ignores.len(), 2);
+    assert!(matches!(ignores[0], RuleFileGlob::Glob(_)));
+    assert!(matches!(ignores[1], RuleFileGlob::Config { .. }));
+  }
+}

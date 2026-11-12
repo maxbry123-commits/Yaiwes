@@ -1,0 +1,44 @@
+exec cue cmd ls
+cmp stdout expect-stdout
+
+# A task whose dir field fails to evaluate must surface that error
+# rather than running the command in the current working directory.
+! exec cue cmd baddir
+stderr 'error in call to encoding/json.Marshal'
+
+-- expect-stdout --
+a.txt
+b.txt
+
+-- ls-work-dir/a.txt --
+-- ls-work-dir/b.txt --
+
+-- ls_tool.cue --
+package ls
+
+import (
+    "tool/cli"
+    "tool/exec"
+    "encoding/json"
+)
+
+command: ls: {
+    ls: exec.Run & {
+		cmd:    "ls"
+		dir:    "ls-work-dir"
+		stdout: string
+	}
+
+	task: display: cli.Print & {
+		text: ls.stdout
+	}
+}
+
+command: baddir: run: exec.Run & {
+	cmd: ["true"]
+	dir: json.Marshal({a!: int})
+}
+
+-- cue.mod/module.cue --
+module: "test.example"
+language: version: "v0.9.0"

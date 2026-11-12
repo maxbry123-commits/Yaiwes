@@ -1,0 +1,98 @@
+[package]
+name = "cloacina-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "HTTP API server for Cloacina task orchestration engine."
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+[lib]
+name = "cloacina_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cloacina-server"
+path = "src/main.rs"
+
+[features]
+default = ["postgres"]
+postgres = ["cloacina/postgres", "diesel/postgres"]
+sqlite = ["cloacina/sqlite"]
+
+telemetry = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk"]
+# CLOACI-I-0130: serve the Leptos UI from this binary at the root (single
+# origin, no CORS). Feature-on builds need `trunk` and the
+# wasm32-unknown-unknown target (build.rs runs `trunk build --release` in ui/,
+# unless CLOACINA_EMBEDDED_UI_SKIP_NPM points it at a prebuilt ui/dist).
+embedded-ui = ["dep:rust-embed"]
+
+[dependencies]
+rust-embed = { version = "8", optional = true, features = ["compression"] }
+# `constructors-wasm` is explicit (not just transitive via cloacina-python) so the
+# server can always resolve packaged constructor providers (reconciler Step 5b,
+# CLOACI-T-0836) — packaged workflows are the primary consumer window.
+cloacina = { workspace = true, default-features = false, features = ["constructors-wasm"] }
+# CLOACI-T-0811: the fleet control loop runs raw SQL (Postgres advisory locks for
+# leader election) over a pooled connection — the same `conn.interact` +
+# `diesel::sql_query` idiom the DAL uses. The Postgres backend is enabled via the
+# `postgres` feature so it tracks `cloacina/postgres`.
+diesel = { version = "2.1.0" }
+cloacina-api-types = { workspace = true, features = ["openapi"] }
+utoipa = { version = "6" }
+# Python runtime — server registers the impl at startup so uploaded
+# Python-language packages can be loaded by the reconciler. Compiler
+# service intentionally does not depend on this (T-0529).
+cloacina-python = { workspace = true, default-features = false }
+clap.workspace = true
+anyhow.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+axum = { version = "0.8", features = ["multipart", "ws"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
+lru = "0.18"
+uuid = { version = "1.0", features = ["v4"] }
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+chrono = { version = "0.4" }
+tracing = { version = "0.1" }
+tracing-appender = { version = "0.2" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+base64 = "0.23"
+# CLOACI-T-0789/0790: OIDC relying party. openidconnect handles discovery,
+# JWKS, PKCE, and spec-correct ID-token validation (OQ-6).
+openidconnect = { version = "4", features = ["reqwest"] }
+bincode = "1.3"
+http-body-util = "0.1"
+# CLOACI-T-0810: Docker dev fleet actuator. Talks the Docker Engine API to
+# spawn/stop tenant-labelled `cloacina-agent` containers. Connection is lazy —
+# constructing the client does not require a reachable daemon (the substrate
+# guard probes the socket explicitly before the actuator is built).
+bollard = "0.21"
+# CLOACI-T-0814: Kubernetes production fleet actuator. Drives a per-tenant
+# `cloacina-agent` Deployment's replicas in the tenant's own namespace. Uses
+# rustls (matching reqwest) — never openssl — to avoid pulling a second TLS
+# stack. Client construction is in-cluster + lazy (the substrate guard confirms
+# we are running as a pod before the actuator is built, fail-closed).
+kube = { version = "4", default-features = false, features = ["client", "rustls-tls", "ring"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+tracing-opentelemetry = { version = "0.34", optional = true }
+opentelemetry = { version = "0.33", optional = true }
+opentelemetry-otlp = { version = "0.33", optional = true, features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.33", optional = true, features = ["rt-tokio"] }
+
+[dev-dependencies]
+serial_test = "4"
+# T-0570 contract test signs a temp-file payload before driving the upload
+# handler. Used in tests only.
+tempfile = "3"
+
+[build-dependencies]
+cloacina-build = { workspace = true }

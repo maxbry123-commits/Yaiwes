@@ -1,0 +1,220 @@
+"""高级参数：符号引用核验、项目索引、修改守卫与决策日志。"""
+
+from __future__ import annotations
+
+import argparse
+
+from ...constants import EDIT_KINDS
+
+
+def _add_trace_impact_options(parser: argparse.ArgumentParser) -> None:
+    """``--trace-impact`` family (symbol caller / usage trace)."""
+    parser.add_argument(
+        "--trace-impact",
+        action="store_true",
+        help="Trace symbol impact: find all callers and usage sites of a symbol",
+    )
+    parser.add_argument(
+        "--trace-impact-symbol",
+        metavar="NAME",
+        help="Symbol name to trace for --trace-impact (required)",
+    )
+    parser.add_argument(
+        "--trace-impact-file",
+        metavar="PATH",
+        help=(
+            "Optional source file for --trace-impact "
+            "(filters to the same language to reduce false positives)"
+        ),
+    )
+    parser.add_argument(
+        "--trace-impact-roots",
+        metavar="PATHS",
+        help=(
+            "Optional project root(s) for --trace-impact, comma-separated. "
+            "Defaults to the project root."
+        ),
+    )
+
+
+def _add_environment_probe_options(parser: argparse.ArgumentParser) -> None:
+    """项目索引重建参数。"""
+    parser.add_argument(
+        "--build-project-index",
+        action="store_true",
+        help=(
+            "Rebuild the persistent project index from scratch and save it to disk. "
+            "NOTE: this index feeds --project-card / --overview, NOT --codegraph-sitemap. "
+            "To populate --codegraph-sitemap, run --ast-cache --ast-cache-mode index instead. "
+            "For full options (per-root indexing, notes), call the MCP tool directly."
+        ),
+    )
+    parser.add_argument(
+        "--build-project-index-roots",
+        nargs="+",
+        metavar="PATH",
+        help="Optional directories to index for --build-project-index (defaults to project root)",
+    )
+    parser.add_argument(
+        "--build-project-index-notes",
+        metavar="TEXT",
+        help="Optional architecture notes to attach to the rebuilt index",
+    )
+
+
+def _add_modification_guard_options(parser: argparse.ArgumentParser) -> None:
+    """``--modification-guard`` family (T1 round-37c CLI-MCP parity).
+
+    CLAUDE.md hard requirement — every MCP tool must have a CLI equivalent.
+    在已有引用核验与项目索引参数之外，此参数族
+    补齐修改守卫的 CLI 与 MCP 对应关系。
+    """
+    parser.add_argument(
+        "--modification-guard",
+        action="store_true",
+        help=(
+            "Pre-modification safety check: report how many sites depend on "
+            "the symbol you are about to modify. Use BEFORE editing any "
+            "public symbol."
+        ),
+    )
+    parser.add_argument(
+        "--modification-guard-symbol",
+        metavar="NAME",
+        help=(
+            "Symbol name to check for --modification-guard "
+            "(required; example: 'processPayment', 'UserService')"
+        ),
+    )
+    parser.add_argument(
+        "--modification-guard-type",
+        choices=list(EDIT_KINDS),
+        help=(
+            "Type of modification you plan to make for --modification-guard "
+            "(required; shares the same edit-kind vocabulary as --edit-type: "
+            + " / ".join(EDIT_KINDS)
+            + ")"
+        ),
+    )
+    parser.add_argument(
+        "--modification-guard-file",
+        metavar="PATH",
+        help=(
+            "Optional source file where the symbol is defined for "
+            "--modification-guard (improves accuracy)"
+        ),
+    )
+
+
+def _add_decision_journal_options(parser: argparse.ArgumentParser) -> None:
+    """``--decision-journal`` family (r37fG CLI-MCP parity).
+
+    Persistent journal of architectural decisions. CLI mirrors the four
+    MCP modes (record / get / search / supersede) so agents reading
+    ``--help`` get the same affordances they get over MCP.
+    """
+    _VERDICTS = [
+        "SAFE",
+        "CAUTION",
+        "REVIEW",
+        "UNSAFE",
+        "INFO",
+        "WARN",
+        "ERROR",
+        "NOT_FOUND",
+    ]
+    parser.add_argument(
+        "--decision-journal",
+        action="store_true",
+        help=(
+            "Persistent journal of architectural decisions. Use to record "
+            "rationale + alternatives for non-trivial choices, or search "
+            "for prior decisions before re-litigating. Default mode: search."
+        ),
+    )
+    parser.add_argument(
+        "--decision-journal-mode",
+        choices=["record", "get", "search", "supersede"],
+        default="search",
+        help="Decision-journal mode (default: search).",
+    )
+    parser.add_argument(
+        "--decision-journal-id", metavar="ID", help="Decision id (for get/supersede)."
+    )
+    parser.add_argument(
+        "--decision-journal-new-id",
+        metavar="ID",
+        help="Replacement decision id (for supersede).",
+    )
+    parser.add_argument(
+        "--decision-journal-title", metavar="TEXT", help="Decision title (for record)."
+    )
+    parser.add_argument(
+        "--decision-journal-rationale",
+        metavar="TEXT",
+        help="Decision rationale (for record).",
+    )
+    parser.add_argument(
+        "--decision-journal-verdict",
+        choices=_VERDICTS,
+        help="Decision verdict (required for record; canonical vocabulary).",
+    )
+    parser.add_argument(
+        "--decision-journal-tags",
+        nargs="+",
+        metavar="TAG",
+        help="Decision tags (for record).",
+    )
+    parser.add_argument(
+        "--decision-journal-query",
+        metavar="TEXT",
+        help="Substring query (for search).",
+    )
+    parser.add_argument(
+        "--decision-journal-verdict-filter",
+        choices=_VERDICTS,
+        help="Filter search results by verdict.",
+    )
+    parser.add_argument(
+        "--decision-journal-limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Max results for search (default: 20, max: 100).",
+    )
+
+
+def _add_mutation_probe_options(parser: argparse.ArgumentParser) -> None:
+    """``--mutation-probe`` family (RFC-0029 CLI-MCP parity).
+
+    On-demand query: does this test constrain this code? Applies one AST
+    mutation at a target line and checks whether the named test goes red.
+    """
+    parser.add_argument(
+        "--mutation-probe",
+        metavar="TEST_NODE_ID",
+        help=(
+            "Check whether a test constrains specific code. Supply the pytest "
+            "node id (e.g. 'tests/unit/test_foo.py::test_bar'). "
+            "Requires --mutation-probe-to."
+        ),
+    )
+    parser.add_argument(
+        "--mutation-probe-to",
+        metavar="CODE_LOCATION",
+        help=(
+            "Code location for --mutation-probe, as FILE:LINENO relative to "
+            "the project root (e.g. 'src/foo.py:42'). The mutation is applied "
+            "at the AST node containing that line."
+        ),
+    )
+    parser.add_argument(
+        "--mutation-probe-timeout",
+        metavar="SECONDS",
+        type=float,
+        default=60.0,
+        help=(
+            "Per-run timeout in seconds for --mutation-probe "
+            "(baseline + mutated run each get this limit; default: 60)."
+        ),
+    )

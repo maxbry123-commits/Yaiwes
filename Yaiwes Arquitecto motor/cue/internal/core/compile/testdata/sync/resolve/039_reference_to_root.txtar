@@ -1,0 +1,45 @@
+-- in.cue --
+a: {b: int}
+c: a & {
+	b: 100
+	d: a.b + 3 // do not resolve as c != a.
+}
+x: {
+	b: int
+	c: b + 5
+}
+y: x & {b: 100} // c should resolve to 105
+v: {
+	b: int
+	c: v.b + 5 // reference starting from copied node.
+}
+w:  v & {b: 100}
+wp: v & {b: 100}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    b: int
+  }
+  c: (〈0;a〉 & {
+    b: 100
+    d: (〈1;a〉.b + 3)
+  })
+  x: {
+    b: int
+    c: (〈0;b〉 + 5)
+  }
+  y: (〈0;x〉 & {
+    b: 100
+  })
+  v: {
+    b: int
+    c: (〈1;v〉.b + 5)
+  }
+  w: (〈0;v〉 & {
+    b: 100
+  })
+  wp: (〈0;v〉 & {
+    b: 100
+  })
+}

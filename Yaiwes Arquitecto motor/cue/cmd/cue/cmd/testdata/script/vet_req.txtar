@@ -1,0 +1,109 @@
+! exec cue vet in.cue
+cmp stdout expect-stdout1
+cmp stderr expect-stderr1
+
+exec cue vet -c=false in.cue
+cmp stdout expect-stdout2
+cmp stderr expect-stderr2
+
+! exec cue vet data.json in.cue
+cmp stdout expect-stdout3
+cmp stderr expect-stderr3
+
+! exec cue vet data.yaml in.cue
+cmp stdout expect-stdout4
+cmp stderr expect-stderr4
+
+# Each data file is reported for the required fields it lacks.
+! exec cue vet -c schema.cue data1.yaml data2.yaml data3.json
+cmp stderr expect-stderr5
+
+# Likewise when the schema is a definition.
+! exec cue vet -c -d '#Schema' def.cue data1.yaml
+cmp stderr expect-stderr6
+
+# Likewise for a data file embedded via @embed.
+cd embed
+! exec cue vet -c .
+cmp stderr ../expect-stderr7
+cd ..
+
+-- in.cue --
+x!: string
+-- data.json --
+{}
+-- data.yaml --
+y: 1
+-- schema.cue --
+name!: string
+nested: {
+	req!: int
+}
+-- def.cue --
+#Schema: {
+	name!: string
+	nested: {
+		req!: int
+	}
+}
+-- data1.yaml --
+nested: {}
+-- data2.yaml --
+name: foo
+nested:
+  other: true
+-- data3.json --
+{
+	"nested": {"req": 3}
+}
+-- embed/cue.mod/module.cue --
+module: "test.example"
+language: version: "v0.14.0"
+-- embed/x.cue --
+@extern(embed)
+package p
+
+x: {name!: string} & _ @embed(file=x.json)
+-- embed/x.json --
+{
+	"other": 1
+}
+-- expect-stdout1 --
+-- expect-stderr1 --
+some instances are incomplete; use the -c flag to show errors or -c=false to allow incomplete instances
+-- expect-stdout2 --
+-- expect-stderr2 --
+-- expect-stdout3 --
+-- expect-stderr3 --
+x: field is required but not present:
+    ./data.json:1:1
+    ./in.cue:1:1
+-- expect-stdout4 --
+-- expect-stderr4 --
+x: field is required but not present:
+    ./data.yaml:1:1
+    ./in.cue:1:1
+-- expect-stderr5 --
+name: field is required but not present:
+    ./data1.yaml:1:1
+    ./schema.cue:1:1
+nested.req: field is required but not present:
+    ./data1.yaml:1:9
+    ./schema.cue:3:2
+nested.req: field is required but not present:
+    ./data2.yaml:3:3
+    ./schema.cue:3:2
+name: field is required but not present:
+    ./data3.json:1:1
+    ./schema.cue:1:1
+-- expect-stderr6 --
+name: field is required but not present:
+    ./data1.yaml:1:1
+    ./def.cue:2:2
+nested.req: field is required but not present:
+    ./data1.yaml:1:9
+    ./def.cue:4:3
+-- expect-stderr7 --
+x.name: field is required but not present:
+    ./x.cue:4:5
+    x.json:1:1

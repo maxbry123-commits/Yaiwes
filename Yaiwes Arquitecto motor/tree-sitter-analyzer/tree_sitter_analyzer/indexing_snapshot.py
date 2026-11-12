@@ -1,0 +1,613 @@
+"""Immutable project-file snapshots shared by full-index phases."""
+
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import os
+import os as _native_os  # 目录级 realpath 复用只用真实平台（测试会替换 ``os``）
+import stat
+import sys
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+from .discovery_budget import discovery_deadline
+from .index_candidate_walker import (
+    CandidateDiscoveryBudgetExceeded as _CandidateDiscoveryBudgetExceeded,
+)
+from .index_candidate_walker import (
+    CandidateDiscoveryError as _CandidateDiscoveryError,
+)
+from .index_candidate_walker import walk_candidate_entries as _walk_candidate_entries
+from .index_source_stream import unreadable_source_reason
+from .indexing_limits import normalize_index_max_files
+from .source_oracle import (
+    SourceOracleError,
+    safe_workspace_path,
+    stable_descriptor_chain,
+)
+
+_INDEX_SOURCE_BYTE_LIMIT = 64 * 1024 * 1024
+#: 真实平台（测试会替换模块的 `os`；`sys.platform` 不随之改变）。
+_IS_WINDOWS = sys.platform == "win32"
+_INDEX_SOURCE_READ_SECONDS = 5.0
+_SOURCE_NONREGULAR = "supported source is symlinked or non-regular"
+_SOURCE_TOO_LARGE = "supported source exceeds byte limit"
+_PERMANENT_SOURCE_REJECTIONS = frozenset({_SOURCE_NONREGULAR, _SOURCE_TOO_LARGE})
+_CANDIDATE_ENTRY_BUDGET = 100_000
+_CANDIDATE_PATH_BYTE_BUDGET = 16 * 1024 * 1024
+_CANDIDATE_DISCOVERY_BUDGET_ERROR = "INDEX_CANDIDATE_DISCOVERY_BUDGET"
+
+SnapshotDecision = Literal["selected", "excluded", "skipped", "error"]
+
+
+def walk_index_candidate_entries(
+    project_root: str,
+    *,
+    excluded_dir_names: frozenset[str] = frozenset(),
+    discovery_seconds: float | None = None,
+) -> Iterable[str]:
+    """Incrementally enumerate candidates while charging every directory entry."""
+    return _walk_candidate_entries(
+        project_root,
+        excluded_dir_names=excluded_dir_names,
+        entry_budget=_CANDIDATE_ENTRY_BUDGET,
+        path_byte_budget=_CANDIDATE_PATH_BYTE_BUDGET,
+        discovery_seconds=discovery_seconds,
+        budget_error=_CANDIDATE_DISCOVERY_BUDGET_ERROR,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFileFingerprint:
+    """Filesystem identity captured when an index operation starts."""
+
+    mtime_ns: int
+    ctime_ns: int
+    file_size: int
+    device: int = 0
+    inode: int = 0
+    mode: int = 0
+    content_hash: str = field(default="", compare=False)
+    descriptor_chain: tuple[bytes, ...] = field(default=(), compare=False)
+
+    @classmethod
+    def from_stat(
+        cls,
+        stat_result: os.stat_result,
+        *,
+        content_hash: str = "",
+        descriptor_chain: tuple[bytes, ...] = (),
+    ) -> IndexFileFingerprint:
+        return cls(
+            mtime_ns=int(stat_result.st_mtime_ns),
+            ctime_ns=int(stat_result.st_ctime_ns),
+            file_size=int(stat_result.st_size),
+            device=int(stat_result.st_dev),
+            inode=int(stat_result.st_ino),
+            mode=int(stat_result.st_mode),
+            content_hash=content_hash,
+            descriptor_chain=descriptor_chain,
+        )
+
+
+def decode_index_source(data: bytes) -> str:
+    """对捕获的同一份字节检测编码并统一换行，不复用按路径缓存的编码。"""
+    from .encoding_utils import EncodingManager
+
+    return EncodingManager.normalize_line_endings(EncodingManager.safe_decode(data))
+
+
+def index_source_content_hash(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _capture_candidate_fingerprint(
+    root: str,
+    rel_path: str,
+    admitted: os.stat_result,
+    deadline: float | None = None,
+) -> IndexFileFingerprint:
+    expires_at = (
+        time.monotonic() + _INDEX_SOURCE_READ_SECONDS if deadline is None else deadline
+    )
+    captured = safe_workspace_path(
+        root,
+        rel_path,
+        deadline=expires_at,
+        limit=_INDEX_SOURCE_BYTE_LIMIT,
+    )
+    if captured.kind != "file" or captured.data is None:
+        raise SourceOracleError("DIFF_SNAPSHOT_SPECIAL_FILE")
+    fingerprint = IndexFileFingerprint.from_stat(
+        admitted,
+        content_hash=index_source_content_hash(decode_index_source(captured.data)),
+        descriptor_chain=stable_descriptor_chain(captured.metadata),
+    )
+    leaf = captured.metadata[-1].split(b",")
+    captured_identity = tuple(int(value) for value in leaf)
+    expected_identity = (
+        fingerprint.device,
+        fingerprint.inode,
+        fingerprint.mode,
+        fingerprint.file_size,
+        fingerprint.mtime_ns,
+        fingerprint.ctime_ns,
+    )
+    if captured_identity != expected_identity:
+        raise SourceOracleError("DIFF_SNAPSHOT_SOURCE_CHANGED")
+    return fingerprint
+
+
+def _realpath_of_regular_file(
+    abs_path: str, info: os.stat_result | None, directories: dict[str, str]
+) -> str:
+    """``os.path.realpath`` of a file already ``lstat``-checked as regular.
+
+    #1673: on Windows ``realpath`` opens a handle for every call (about 2 ms per
+    file under load, twice per candidate). A regular file that is not a reparse
+    point cannot redirect its own last component, so its real path is the real
+    path of its directory joined with its name; directory real paths (which do
+    resolve junctions and symlinks) are computed once per directory. Anything
+    that is not a plain regular file, and every POSIX path, uses ``realpath``.
+    """
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if (
+        not _IS_WINDOWS
+        or info is None
+        or not stat.S_ISREG(info.st_mode)
+        or getattr(info, "st_file_attributes", 0) & reparse
+    ):
+        return os.path.realpath(abs_path)
+    parent, name = _native_os.path.split(abs_path)
+    resolved_parent = directories.get(parent)
+    if resolved_parent is None:
+        resolved_parent = _native_os.path.realpath(parent)
+        directories[parent] = resolved_parent
+    return _native_os.path.join(resolved_parent, name)
+
+
+@dataclass(frozen=True, slots=True)
+class IndexSnapshotEntry:
+    """One file inside the max-files selection window."""
+
+    abs_path: str
+    rel_path: str
+    language: str | None
+    decision: SnapshotDecision
+    reason: str | None = None
+    fingerprint: IndexFileFingerprint | None = None
+    frozen_path: str | None = field(default=None, repr=False, compare=False)
+    frozen_identity: tuple[int, int, int] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class IndexCandidateSnapshot:
+    """A complete, immutable view of one full-index operation's file scope."""
+
+    project_root: str
+    max_files: int
+    entries: tuple[IndexSnapshotEntry, ...]
+    present_paths: frozenset[str]
+    discovered: int
+    selected: int
+    excluded: int
+    skipped: int
+    errors: int
+    limited: int
+    discovery_error: str | None = None
+    publication_parent: object | None = field(default=None, repr=False, compare=False)
+    publication_bound: bool = field(default=False, repr=False, compare=False)
+    root_identity: tuple[str, int, int] | None = field(
+        default=None, repr=False, compare=False
+    )
+    frozen_root: str | None = field(default=None, repr=False, compare=False)
+    frozen_root_identity: tuple[int, int] | None = field(
+        default=None, repr=False, compare=False
+    )
+    frozen_error: str | None = field(default=None, repr=False, compare=False)
+    frozen_read_deadline: float | None = field(default=None, repr=False, compare=False)
+    # RFC-0032 slice 5：自定义路径缓存在捕获前的写入修订（``ASTCache.writer_revision()``）；
+    # 原地同步据此在写入前拒绝过时候选。``None`` 为未绑定，仍被接受。
+    writer_revision: object | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def selected_entries(self) -> tuple[IndexSnapshotEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.decision == "selected")
+
+    @property
+    def truncated_by_max_files(self) -> bool:
+        return self.limited > 0
+
+    @property
+    def discovery_reconciled(self) -> bool:
+        return self.discovered == (
+            self.selected + self.excluded + self.skipped + self.errors + self.limited
+        )
+
+    def metrics(self) -> dict[str, int | bool]:
+        """Return the stable scope counters exposed by the full-index result."""
+        return {
+            "discovered": self.discovered,
+            "selected": self.selected,
+            "excluded": self.excluded,
+            "skipped": self.skipped,
+            "errors": self.errors,
+            "limited_by_max_files": self.limited,
+            "truncated_by_max_files": self.truncated_by_max_files,
+            "discovery_reconciled": self.discovery_reconciled,
+            "discovery_complete": self.discovery_error is None,
+            "truncated_by_discovery_error": self.discovery_error is not None,
+        }
+
+
+def validate_index_candidate_snapshot(
+    project_root: str,
+    max_files: int,
+    snapshot: IndexCandidateSnapshot,
+    *,
+    resolve_paths: bool = True,
+) -> None:
+    """Reject forged or incompatible snapshots before they drive cache writes.
+
+    #1737：``resolve_paths=False`` 只用于发布前会重新扫描并复核每个文件的版本路由
+    （RFC-0032）：候选是同一进程刚由版本仓库构建的，逐文件 ``realpath`` 由发布复核的
+    新扫描承担，这里保留其余结构检查。
+    """
+    logical_root = os.path.abspath(project_root)
+    if logical_root != snapshot.project_root:
+        raise ValueError("candidate snapshot belongs to a different project root")
+    if max_files != snapshot.max_files:
+        raise ValueError("candidate snapshot uses a different max_files limit")
+
+    resolved_root = os.path.realpath(logical_root)
+    directories: dict[str, str] = {}
+    for entry in snapshot.entries:
+        logical_path = os.path.abspath(entry.abs_path)
+        entry_info: os.stat_result | None = None
+        if _IS_WINDOWS:  # #1673：只有 Windows 走目录级 realpath 复用
+            try:
+                entry_info = os.stat(logical_path, follow_symlinks=False)
+            except OSError:
+                entry_info = None
+        if resolve_paths:
+            resolved_path = _realpath_of_regular_file(
+                logical_path, entry_info, directories
+            )
+            if not Path(resolved_path).is_relative_to(resolved_root):
+                raise ValueError(
+                    f"candidate path escapes project root: {entry.abs_path}"
+                )
+        expected_rel_path = os.path.relpath(logical_path, logical_root)
+        if os.name == "nt":
+            expected_rel_path = expected_rel_path.replace("\\", "/")
+        if entry.rel_path != expected_rel_path:
+            raise ValueError(f"candidate relative path mismatch: {entry.rel_path}")
+        if entry.decision == "selected" and entry.fingerprint is None:
+            raise ValueError(
+                f"selected candidate lacks metadata; lacks fingerprint: {entry.rel_path}"
+            )
+        if entry.decision == "selected" and entry.language is None:
+            raise ValueError(
+                f"selected candidate lacks metadata; lacks language: {entry.rel_path}"
+            )
+        if entry.decision == "selected":
+            try:
+                # 同一轮刚取得的 lstat 直接复用（#1673）；未取得时照常 stat。
+                source_info = (
+                    entry_info
+                    if entry_info is not None
+                    else os.stat(logical_path, follow_symlinks=False)
+                )
+            except FileNotFoundError:
+                # Deletion after capture is reported by changed_since_snapshot.
+                continue
+            except OSError as exc:
+                raise ValueError(
+                    f"selected candidate is unreadable: {entry.rel_path}"
+                ) from exc
+            if not stat.S_ISREG(source_info.st_mode):
+                raise ValueError(
+                    f"selected candidate is symlinked or non-regular: {entry.rel_path}"
+                )
+
+
+def build_index_candidate_snapshot(
+    project_root: str,
+    *,
+    max_files: int,
+    exclude_patterns: frozenset[str],
+    walk_fn: Callable[[str], Iterable[str]],
+    language_fn: Callable[[str], str | None],
+    language_filter: str | None = None,
+    materialize: bool = False,
+    discovery_seconds: float | None = None,
+    writer_revision: object | None = None,
+) -> IndexCandidateSnapshot:
+    """Walk once and freeze file ordering, scope decisions, and fingerprints.
+
+    Supported paths are validated as yielded, before canonical-path de-duplication.
+    This prevents a regular path followed by a symlink alias from hiding unsafe
+    source-scope evidence.
+
+    ``writer_revision`` binds the candidate to a custom-path cache: read it with
+    ``ASTCache.writer_revision()`` *before* calling this function (RFC-0032 slice 5).
+    """
+    normalized_max = normalize_index_max_files(max_files)
+    logical_root = os.path.abspath(project_root)
+    resolved_root = os.path.realpath(logical_root)
+    from .cache.generation_routing import resolve_index_location
+
+    root_info = os.stat(resolved_root, follow_symlinks=True)
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("candidate project root is not a directory")
+    publication_parent = resolve_index_location(resolved_root).selector
+    root_identity = (resolved_root, int(root_info.st_dev), int(root_info.st_ino))
+    entries: list[IndexSnapshotEntry] = []
+    present_paths: set[str] = set()
+    resolved_paths: set[str] = set()
+    discovered = selected = excluded = skipped = errors = limited = 0
+    yielded = path_bytes = 0
+    discovery_error: str | None = None
+    started = time.monotonic()
+    directories: dict[str, str] = {}
+
+    walker = iter(walk_fn(logical_root))
+    while True:
+        try:
+            raw_path = next(walker)
+        except StopIteration:
+            break
+        except Exception as exc:
+            discovered += 1
+            errors += 1
+            discovery_error = (
+                _CANDIDATE_DISCOVERY_BUDGET_ERROR
+                if isinstance(exc, _CandidateDiscoveryBudgetExceeded)
+                else (
+                    str(exc) or "INDEX_CANDIDATE_DISCOVERY_ERROR"
+                    if isinstance(exc, _CandidateDiscoveryError)
+                    else f"INDEX_CANDIDATE_DISCOVERY_ERROR: {type(exc).__name__}"
+                )
+            )
+            close = getattr(walker, "close", None)
+            if callable(close):
+                close()
+            break
+        # Charge every yielded entry before exclusions, language detection, path
+        # validation, or de-duplication can continue the loop.  In particular,
+        # an infinite stream of unsupported names must remain bounded.
+        yielded += 1
+        deadline = discovery_deadline(started, yielded, discovery_seconds)
+        try:
+            raw_path_text = str(raw_path)
+            path_bytes += len(raw_path_text.encode("utf-8", errors="surrogatepass"))
+        except (TypeError, UnicodeError):
+            raw_path_text = ""
+            path_bytes = _CANDIDATE_PATH_BYTE_BUDGET + 1
+        if (
+            yielded > _CANDIDATE_ENTRY_BUDGET
+            or path_bytes > _CANDIDATE_PATH_BYTE_BUDGET
+            or time.monotonic() > deadline
+        ):
+            discovered += 1
+            errors += 1
+            discovery_error = _CANDIDATE_DISCOVERY_BUDGET_ERROR
+            close = getattr(walker, "close", None)
+            if callable(close):
+                close()
+            break
+
+        abs_path = os.path.abspath(raw_path_text)
+        rel_path = os.path.relpath(abs_path, logical_root)
+        if os.name == "nt":
+            rel_path = rel_path.replace("\\", "/")
+        excluded_match = any(
+            fnmatch.fnmatch(rel_path, pattern) for pattern in exclude_patterns
+        )
+        if excluded_match:
+            discovered += 1
+            present_paths.add(rel_path)
+            excluded += 1
+            entries.append(
+                IndexSnapshotEntry(
+                    abs_path=abs_path,
+                    rel_path=rel_path,
+                    language=None,
+                    decision="excluded",
+                    reason="excluded by pattern",
+                )
+            )
+            continue
+
+        language = language_fn(abs_path)
+        source_info: os.stat_result | None = None
+        invalid_reason: str | None = None
+        if language is not None:
+            if os.name == "posix" and "\\" in rel_path:
+                invalid_reason = "supported source path contains a literal backslash"
+            else:
+                try:
+                    source_info = os.stat(abs_path, follow_symlinks=False)
+                except OSError as exc:
+                    invalid_reason = str(exc)
+                else:
+                    if not stat.S_ISREG(source_info.st_mode) or (
+                        getattr(source_info, "st_file_attributes", 0)
+                        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                    ):
+                        invalid_reason = _SOURCE_NONREGULAR
+                    elif source_info.st_size > _INDEX_SOURCE_BYTE_LIMIT:
+                        invalid_reason = _SOURCE_TOO_LARGE
+        if invalid_reason is not None:
+            discovered += 1
+            present_paths.add(rel_path)
+            errors += 1
+            entries.append(
+                IndexSnapshotEntry(
+                    abs_path=abs_path,
+                    rel_path=rel_path,
+                    language=language,
+                    decision="error",
+                    reason=invalid_reason,
+                )
+            )
+            continue
+
+        # Unsupported extensions are advisory-only and must never claim the
+        # canonical target of a later supported path (including symlink aliases).
+        # Lexical exclusions have already run, so neither class influences de-dup.
+        if language is None:
+            discovered += 1
+            present_paths.add(rel_path)
+            skipped += 1
+            entries.append(
+                IndexSnapshotEntry(
+                    abs_path=abs_path,
+                    rel_path=rel_path,
+                    language=None,
+                    decision="skipped",
+                    reason="unsupported language",
+                )
+            )
+            continue
+
+        resolved_path = _realpath_of_regular_file(abs_path, source_info, directories)
+        if not Path(resolved_path).is_relative_to(resolved_root):
+            raise ValueError(f"candidate path escapes project root: {raw_path}")
+        if resolved_path in resolved_paths:
+            continue
+        resolved_paths.add(resolved_path)
+        discovered += 1
+        present_paths.add(rel_path)
+
+        if language_filter is not None and language != language_filter:
+            skipped += 1
+            entries.append(
+                IndexSnapshotEntry(
+                    abs_path=abs_path,
+                    rel_path=rel_path,
+                    language=language,
+                    decision="skipped",
+                    reason=f"language does not match {language_filter}",
+                )
+            )
+            continue
+
+        # Stop at the first supported candidate beyond the selection budget.  Do
+        # not continue walking merely to populate advisory presence/error data.
+        if selected >= normalized_max:
+            limited = 1
+            close = getattr(walker, "close", None)
+            if callable(close):
+                close()
+            break
+
+        # Supported candidates were lstat-validated before realpath de-duplication.
+        assert source_info is not None
+        try:
+            fingerprint = (
+                _capture_candidate_fingerprint(
+                    resolved_root, rel_path, source_info, deadline
+                )
+                if os.name == "posix"
+                else IndexFileFingerprint.from_stat(source_info)
+            )
+        except (OSError, SourceOracleError) as exc:
+            errors += 1
+            entries.append(
+                IndexSnapshotEntry(
+                    abs_path=abs_path,
+                    rel_path=rel_path,
+                    language=language,
+                    decision="error",
+                    reason=str(exc),
+                )
+            )
+            continue
+        selected += 1
+        entries.append(
+            IndexSnapshotEntry(
+                abs_path=abs_path,
+                rel_path=rel_path,
+                language=language,
+                decision="selected",
+                fingerprint=fingerprint,
+            )
+        )
+
+    snapshot = IndexCandidateSnapshot(
+        project_root=logical_root,
+        max_files=normalized_max,
+        entries=tuple(entries),
+        present_paths=frozenset(present_paths),
+        discovered=discovered,
+        selected=selected,
+        excluded=excluded,
+        skipped=skipped,
+        errors=errors,
+        limited=limited,
+        discovery_error=discovery_error,
+        root_identity=root_identity,
+        publication_parent=publication_parent,
+        publication_bound=True,
+        writer_revision=writer_revision,
+    )
+    if materialize:
+        from .indexing_candidate_materialization import (
+            materialize_index_candidate_snapshot,
+        )
+
+        return materialize_index_candidate_snapshot(snapshot)
+    return snapshot
+
+
+def changed_since_snapshot(entry: IndexSnapshotEntry) -> str | None:
+    """Securely compare a selected file with its captured identity and content."""
+    fingerprint = entry.fingerprint
+    if entry.decision != "selected" or fingerprint is None:
+        return None
+    try:
+        current_stat = os.stat(entry.abs_path, follow_symlinks=False)
+        if not stat.S_ISREG(current_stat.st_mode):
+            return "file changed after candidate snapshot"
+        root = entry.abs_path
+        for _part in Path(entry.rel_path).parts:
+            root = os.path.dirname(root)
+        current = (
+            _capture_candidate_fingerprint(
+                root,
+                entry.rel_path,
+                current_stat,
+                time.monotonic() + _INDEX_SOURCE_READ_SECONDS,
+            )
+            if os.name == "posix"
+            else IndexFileFingerprint.from_stat(current_stat)
+        )
+    except (OSError, SourceOracleError):
+        return "file disappeared after candidate snapshot"
+    if (
+        current.mtime_ns,
+        current.file_size,
+        current.device,
+        current.inode,
+        current.mode,
+    ) != (
+        fingerprint.mtime_ns,
+        fingerprint.file_size,
+        fingerprint.device,
+        fingerprint.inode,
+        fingerprint.mode,
+    ) or (
+        bool(fingerprint.content_hash)
+        # #1654：不可读标记不是摘要；该文件由索引器按单文件失败报告。
+        and unreadable_source_reason(fingerprint.content_hash) is None
+        and current.content_hash != fingerprint.content_hash
+    ):
+        return "file changed after candidate snapshot"
+    return None

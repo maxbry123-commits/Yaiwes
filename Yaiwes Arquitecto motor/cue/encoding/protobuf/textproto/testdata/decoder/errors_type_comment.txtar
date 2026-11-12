@@ -1,0 +1,9 @@
+# A map whose values have no protobuf type, where the value has a comment.
+-- errors.cue --
+m?: {[string]: string | int} @protobuf(1,map[string]string)
+-- input.textproto --
+m: {key: "x" value: 1 # foo
+}
+-- out/decode --
+textproto: unsupported type for field m:
+    input.textproto:1:14

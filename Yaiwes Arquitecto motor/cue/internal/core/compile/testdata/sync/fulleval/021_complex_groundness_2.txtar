@@ -1,0 +1,46 @@
+#name: complex groundness  2
+#evalFull
+-- in.cue --
+r1: f1 & {y: "c"}
+
+f1: {y: string, res: a.b.c & {d: y}}
+
+a: b: c:              {d: string, s: "a" + d}
+a: b: [string]~(C,_): {d: string, s: "a" + d}
+a: b: c: d: string
+-- out/compile --
+--- in.cue
+{
+  r1: (〈0;f1〉 & {
+    y: "c"
+  })
+  f1: {
+    y: string
+    res: (〈1;a〉.b.c & {
+      d: 〈1;y〉
+    })
+  }
+  a: {
+    b: {
+      c: {
+        d: string
+        s: ("a" + 〈0;d〉)
+      }
+    }
+  }
+  a: {
+    b: {
+      [string]: {
+        d: string
+        s: ("a" + 〈0;d〉)
+      }
+    }
+  }
+  a: {
+    b: {
+      c: {
+        d: string
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+# Copyright (c) 2016 Universidade Federal Fluminense (UFF)
+# Copyright (c) 2016 Polytechnic Institute of New York University.
+# This file is part of noWorkflow.
+# Please, consult the license terms in the LICENSE file.
+"""Generate Prospective Provenance in DOT Format"""
+
+from __future__ import absolute_import, division, print_function, unicode_literals
+
+from .analyzer import DefinitionProvenanceAnalyzer
+
+
+def generate_prospective_prov(trial):
+    """Generate prospective provenance as Graphviz DOT format
+
+    Args:
+        trial: Trial object with .id attribute
+
+    Returns:
+        String containing DOT format graph
+    """
+    if trial.id is None:
+        raise ValueError("Error loading trial: the trial has no id")
+
+    analyzer = DefinitionProvenanceAnalyzer(trial.id)
+    return analyzer.build_prospective_graph()

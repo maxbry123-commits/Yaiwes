@@ -1,0 +1,69 @@
+#inlinetest:exclude skip — compile errors.
+-- in.cue --
+disallowTopAsAlias: {X: 1
+}
+
+disallowTopAsLet: {
+	let _ = 1
+}
+
+disallowTopAsLabel: {
+	_: 1
+	a: _ // Should not compile to a reference.
+}
+
+// $ is an ordinary identifier.
+dollarAsLabel: {
+	$: 1
+	a: $
+}
+
+// When printing errors with paths from the compiler or evaluator,
+// ensure that odd string labels get quoted correctly.
+nested: "_": _:    1
+nested: "_foo": _: 1
+nested: "#foo": _: 1
+
+-- out/compile --
+disallowTopAsLet: cannot use _ as alias or let clause:
+    ./in.cue:5:6
+disallowTopAsLabel: cannot use _ as label:
+    ./in.cue:9:2
+nested."_": cannot use _ as label:
+    ./in.cue:21:14
+nested."_foo": cannot use _ as label:
+    ./in.cue:22:17
+nested."#foo": cannot use _ as label:
+    ./in.cue:23:17
+--- in.cue
+{
+  disallowTopAsAlias: {
+    X: 1
+  }
+  disallowTopAsLet: {
+    let _ = 1
+  }
+  disallowTopAsLabel: {
+    _|_(cannot use _ as label)
+    a: _
+  }
+  dollarAsLabel: {
+    $: 1
+    a: 〈0;$〉
+  }
+  nested: {
+    "_": {
+      _|_(cannot use _ as label)
+    }
+  }
+  nested: {
+    "_foo": {
+      _|_(cannot use _ as label)
+    }
+  }
+  nested: {
+    "#foo": {
+      _|_(cannot use _ as label)
+    }
+  }
+}

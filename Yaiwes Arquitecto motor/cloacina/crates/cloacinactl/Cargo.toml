@@ -1,0 +1,50 @@
+[package]
+name = "cloacinactl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for Cloacina task orchestration engine."
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "cloacinactl"
+path = "src/main.rs"
+
+[features]
+default = ["postgres", "sqlite"]
+postgres = ["cloacina/postgres"]
+sqlite = ["cloacina/sqlite"]
+
+[dependencies]
+# `constructor-packaging` gives `cloacinactl constructor package` the provider
+# assembly/sign/pack path (CLOACI-T-0827). It is wasmtime-free (serde-only
+# contract crate) — it does NOT pull `constructors-wasm`, so the CLI stays light.
+cloacina = { workspace = true, default-features = false, features = ["constructor-packaging"] }
+cloacina-client = { workspace = true }
+cloacina-workflow-plugin = { workspace = true }
+clap.workspace = true
+clap_complete = "4"
+anyhow.workspace = true
+fidius-core = { workspace = true }
+fidius-host = { workspace = true }
+tempfile = "3.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1"
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+uuid = { version = "1.0", features = ["v4"] }
+tokio = { version = "1.0", features = ["full"] }
+serde_json = "1.0"
+chrono = { version = "0.4" }
+tracing = { version = "0.1" }
+tracing-appender = { version = "0.2" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls", "stream"] }
+# CLOACI-T-0629: WS client for `cloacinactl execution events --follow` (substrate consumer).
+futures-util = "0.3"
+serde_yaml = "0.9"

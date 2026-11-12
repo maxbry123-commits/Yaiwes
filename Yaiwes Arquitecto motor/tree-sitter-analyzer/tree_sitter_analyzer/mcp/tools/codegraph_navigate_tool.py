@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+CodeGraph Navigate MCP Tool — Unified symbol navigation hub.
+
+Single entry point for "understand this function/class" queries.
+Combines go-to-definition, find-references, callers, callees,
+and call hierarchy into one call — what takes 3-4 separate tool
+invocations today.
+
+Modes:
+  - definition:  Where is this symbol defined? (go-to-def)
+  - references:  Where is this symbol used? (find-all-refs)
+  - hierarchy:   Callers + callees for a function (call hierarchy)
+  - full:        All of the above in one response
+
+CodeGraph parity: equivalent to CodeGraph's unified "navigate symbol" view.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections import deque
+from typing import Any
+
+from ...call_graph import CachedCallGraph, CallGraph
+from ...utils import setup_logger
+from ..utils.format_helper import apply_output_format_to_response
+from .base_tool import BaseMCPTool
+from .index_bound_graph import index_bound_graph, reset_index_bound_graph
+
+logger = setup_logger(__name__)
+
+_MAX_TRANSITIVE = 50
+# Wave 1b (audit nav-08b, sibling of nav-08): cap the EMITTED caller/callee
+# lists. Counts stay accurate; a hub otherwise serialises a large payload that
+# overflows the tool-result token budget. _MAX_TRANSITIVE caps the walk;
+# _MAX_LISTED caps what is serialised back.
+_MAX_LISTED = 50
+
+
+class CodeGraphNavigateTool(BaseMCPTool):
+    """MCP Tool for unified symbol navigation (CodeGraph parity)."""
+
+    def __init__(self, project_root: str | None = None) -> None:
+        self._call_graph: CallGraph | None = None
+        self._cache: Any = None
+        super().__init__(project_root)
+
+    def _on_project_root_changed(self, project_root: str | None) -> None:
+        reset_index_bound_graph(self)
+        self._cache = None
+
+    def _try_get_cache(self) -> Any:
+        try:
+            from ...ast_cache import ASTCache
+
+            if self.project_root is None:
+                return None
+            cache = ASTCache(self.project_root)
+            stats = cache.get_stats()
+            if stats.get("total_files", 0) > 0:
+                return cache
+            cache.close()
+        except Exception:
+            pass
+        return None
+
+    def _drop_shared_cache(self) -> None:
+        """#1611：旧图与本工具共享 ASTCache，丢弃旧图时一并换用新缓存。"""
+        self._cache = None
+
+    def _get_cache(self) -> Any:
+        if self._cache is None:
+            self._cache = self._try_get_cache()
+        return self._cache
+
+    def _get_call_graph(self) -> CallGraph:
+        # #1611：调用图绑定索引身份，同一服务器内刷新索引后即重建。
+        return index_bound_graph(
+            self,
+            self.project_root,
+            self._build_call_graph,
+            on_discard=self._drop_shared_cache,
+        )
+
+    def _build_call_graph(self) -> CallGraph:
+        if not self.project_root:
+            raise ValueError("Project root not set. Call set_project_path first.")
+        cache = self._get_cache()
+        if cache is not None:
+            return CachedCallGraph(self.project_root, cache=cache)
+        return CallGraph(self.project_root)
+
+    def get_call_graph(self) -> CallGraph:
+        """Public alias for _get_call_graph() — use this instead of accessing _call_graph."""
+        return self._get_call_graph()
+
+    def get_cache(self) -> Any:
+        """Public alias for _get_cache() — use this instead of replacing _get_cache."""
+        return self._get_cache()
+
+    @property
+    def call_graph_initialized(self) -> bool:
+        """True if the call graph has been lazily initialized (i.e. cached)."""
+        return self._call_graph is not None
+
+    @property
+    def cache_initialized(self) -> bool:
+        """True if the AST cache has been lazily initialized (i.e. cached)."""
+        return self._cache is not None
+
+    def get_tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": "codegraph_navigate",
+            "description": (
+                "PRIMARY ENTRY POINT for 'understand this symbol' questions — "
+                "try this FIRST before chaining codegraph_symbol_search / "
+                "codegraph_resolve / codegraph_callers / codegraph_callees. "
+                "Unified symbol navigation hub (CodeGraph parity): combines "
+                "go-to-definition, find-references, and call hierarchy "
+                "(callers + callees) in one call. "
+                "Modes: definition, references, hierarchy, full. "
+                "Replaces 3-4 separate tool invocations. "
+                "Requires ast_cache index (run codegraph_autoindex mode=warm)."
+            ),
+            "inputSchema": self.get_tool_schema(),
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        }
+
+    def get_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": (
+                        "Symbol name to navigate. "
+                        "Simple names ('parse_tree') or qualified ('ast_cache.ASTCache.index_file')."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["definition", "references", "hierarchy", "full"],
+                    "default": "full",
+                    "description": (
+                        "definition=go-to-def, references=find-all-refs, "
+                        "hierarchy=CALL hierarchy (callers+callees of functions/methods; "
+                        "for class inheritance use class_hierarchy tool instead), "
+                        "full=all combined"
+                    ),
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate overloaded symbols",
+                },
+                "depth": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "Max transitive depth for hierarchy mode (1=direct, 2=2 hops)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum definitions and references to list in the response "
+                        "(default 50). Counts stay complete, so raise this when the "
+                        "response reports truncation. Narrow with a qualified name "
+                        "(ClassName.method) instead when the name is ambiguous."
+                    ),
+                    "default": 50,
+                    "minimum": 1,
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["json"],
+                    "default": "json",
+                    "description": "Output format",
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        }
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> bool:
+        if not arguments.get("symbol"):
+            raise ValueError("symbol is required")
+        return True
+
+    async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.validate_arguments(arguments)
+        if self.project_root:
+            from ...index_snapshot import certified_index_read
+
+            try:
+                with certified_index_read(self.project_root) as owner:
+                    if owner is not None:
+                        return await self._execute_bound(
+                            arguments, owner.query_cache(), owner.read_source
+                        )
+            except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError):
+                pass
+        return await self._execute_bound(arguments, None, None)
+
+    async def _execute_bound(
+        self, arguments: dict[str, Any], bound_cache: Any, source_reader: Any
+    ) -> dict[str, Any]:
+        symbol = arguments["symbol"]
+        mode = arguments.get("mode", "full")
+        file_path = arguments.get("file_path")
+        depth = min(arguments.get("depth", 2), 5)
+        listed_cap = max(int(arguments.get("limit", _MAX_LISTED)), 1)
+        output_format = arguments.get("output_format", "json")
+
+        result: dict[str, Any] = {
+            "success": True,
+            "symbol": symbol,
+            "mode": mode,
+        }
+
+        if mode in ("definition", "full"):
+            result["definition"] = self._resolve_definition(
+                symbol, listed_cap, bound_cache
+            )
+
+        if mode in ("references", "full"):
+            result["references"] = self._find_references(
+                symbol, listed_cap, bound_cache
+            )
+
+        if mode in ("hierarchy", "full"):
+            result["hierarchy"] = self._call_hierarchy(
+                symbol, file_path, depth, listed_cap, bound_cache
+            )
+
+        # P2: inline verbatim definition bodies so the agent answers from
+        # content, not coordinates — no follow-up Read per file:line.
+        self._inline_definition_bodies(result, bound_cache, source_reader)
+
+        # Pain #16 (dogfood pass 3): codegraph_navigate emitted no verdict.
+        # NOT_FOUND when nothing matched (definition/references/hierarchy
+        # all empty), INFO otherwise. Agents that branch on verdict
+        # were silently treating "no symbol anywhere" as "INFO -> proceed
+        # to edit" — the same anti-pattern symbol_lineage had in pass 1.
+        def_found = bool((result.get("definition") or {}).get("found"))
+        ref_found = bool((result.get("references") or {}).get("found"))
+        hi = result.get("hierarchy", {}) or {}
+        hi_found = bool(hi.get("callers")) or bool(hi.get("callees"))
+        verdict = "INFO" if (def_found or ref_found or hi_found) else "NOT_FOUND"
+        result["verdict"] = verdict
+
+        # R9: every list is capped by ``limit``, so say so in one place. Counts
+        # above stay complete, which is what an agent branches on; this flag is
+        # what tells it the listing is a head rather than the whole answer.
+        definition = result.get("definition") or {}
+        references = result.get("references") or {}
+        result["truncated"] = bool(
+            definition.get("definitions_truncated")
+            or references.get("references_truncated")
+            or (result.get("hierarchy") or {}).get("lists_truncated")
+        )
+        result["listed_cap"] = listed_cap
+
+        if not result.get("definition") and not result.get("references"):
+            if not hi_found:
+                if mode == "hierarchy":
+                    result["hint"] = (
+                        f"No results for '{symbol}'. "
+                        "'hierarchy' mode returns the CALL graph (callers/callees of functions). "
+                        f"If '{symbol}' is a class, use --class-hierarchy "
+                        "--class-hierarchy-mode tree "
+                        f"--class-hierarchy-class {symbol} for inheritance hierarchy. "
+                        "Otherwise check spelling or build AST cache (ast_cache mode=index)."
+                    )
+                else:
+                    result["hint"] = (
+                        f"No results for '{symbol}'. Check spelling or build AST cache "
+                        "(ast_cache mode=index)."
+                    )
+
+        # #577: uniform agent_summary across all facade actions.
+        if verdict == "NOT_FOUND":
+            summary_line = f"navigate: {symbol!r} not found"
+            if mode == "hierarchy":
+                next_step = (
+                    f"Symbol '{symbol}' not in the index or has no callers/callees. "
+                    "For class inheritance: --class-hierarchy --class-hierarchy-mode tree "
+                    f"--class-hierarchy-class {symbol}. "
+                    "For call graph: check spelling or run index action=auto to rebuild."
+                )
+            else:
+                next_step = (
+                    f"Symbol '{symbol}' not in the index. "
+                    "Check spelling or run index action=auto to rebuild."
+                )
+        else:
+            def_count = (result.get("definition") or {}).get("count", 0)
+            ref_count = (result.get("references") or {}).get("reference_count", 0)
+            summary_line = f"navigate: {symbol!r} defs={def_count} refs={ref_count}"
+            if result["truncated"]:
+                listed_defs = len(
+                    (result.get("definition") or {}).get("definitions") or []
+                )
+                listed_refs = len(
+                    (result.get("references") or {}).get("references") or []
+                )
+                summary_line += (
+                    f" (listing {listed_defs}/{def_count} defs, "
+                    f"{listed_refs}/{ref_count} refs)"
+                )
+            next_step = (
+                "Use nav action=callers/callees for the call graph, "
+                "or nav action=impact for blast-radius analysis."
+            )
+            if result["truncated"]:
+                next_step = (
+                    f"Listing is capped at limit={listed_cap}: raise limit for more, "
+                    f"or qualify with ClassName.method to narrow '{symbol}'. "
+                    f"{next_step}"
+                )
+        result["agent_summary"] = {
+            "summary_line": summary_line,
+            "verdict": verdict,
+            "next_step": next_step,
+        }
+
+        return apply_output_format_to_response(result, output_format)
+
+    def _inline_definition_bodies(
+        self, result: dict[str, Any], bound_cache: Any = None, source_reader: Any = None
+    ) -> None:
+        """P2: attach a verbatim source body to each definition record.
+
+        Best-effort: any failure leaves the bare-coordinate response intact.
+        Adds a deterrent ``next_step`` only when at least one body inlined.
+        """
+        definition = result.get("definition")
+        if not isinstance(definition, dict) or not definition.get("found"):
+            return
+        defs = definition.get("definitions")
+        if not isinstance(defs, list) or not defs:
+            return
+        try:
+            from . import symbol_body_inline as sbi
+
+            cache = bound_cache if bound_cache is not None else self.get_cache()
+            if cache is None or not self.project_root:
+                return
+            new_defs = sbi.inline_symbol_bodies(
+                self.project_root, cache, defs, source_reader=source_reader
+            )
+            if any(isinstance(d, dict) and "body" in d for d in new_defs):
+                definition["definitions"] = new_defs
+                definition["bodied_count"] = sum(
+                    1 for d in new_defs if isinstance(d, dict) and "body" in d
+                )
+                definition["body_cap"] = sbi.MAX_DEFINITION_BODIES
+                result.setdefault("next_step", sbi.NAVIGATE_DETERRENT)
+        except Exception as exc:  # best-effort enrichment
+            logger.debug(f"Definition body inlining failed: {exc}")
+
+    def _resolve_definition(
+        self, symbol: str, listed_cap: int, bound_cache: Any = None
+    ) -> dict[str, Any]:
+        cache = bound_cache if bound_cache is not None else self.get_cache()
+        if cache is None:
+            return {"found": False, "reason": "AST cache not available"}
+        try:
+            from ...symbol_resolver import SymbolResolver
+
+            resolver = SymbolResolver(cache)
+            resolve_result = resolver.resolve(symbol)
+            definitions = [d.to_dict() for d in resolve_result.definitions]
+            return {
+                "found": len(definitions) > 0,
+                "count": len(definitions),
+                "definitions": definitions[:listed_cap],
+                "definitions_truncated": len(definitions) > listed_cap,
+                "listed_cap": listed_cap,
+                "resolved_via": resolve_result.resolved_via,
+            }
+        except sqlite3.Error:
+            if bound_cache is not None:
+                raise
+            return {"found": False, "reason": "SQLite definition lookup failed"}
+        except Exception as exc:
+            logger.debug(f"Definition lookup failed: {exc}")
+            return {"found": False, "reason": str(exc)}
+
+    def _find_references(
+        self, symbol: str, listed_cap: int, bound_cache: Any = None
+    ) -> dict[str, Any]:
+        cache = bound_cache if bound_cache is not None else self.get_cache()
+        if cache is None:
+            return {"found": False, "reason": "AST cache not available"}
+        try:
+            from ...symbol_resolver import SymbolResolver
+
+            resolver = SymbolResolver(cache)
+            ref_result = resolver.find_references(symbol)
+            references = [r.to_dict() for r in ref_result.references]
+            return {
+                "found": len(references) > 0,
+                "definition_count": len(ref_result.definitions),
+                "reference_count": len(references),
+                "references": references[:listed_cap],
+                "references_truncated": len(references) > listed_cap,
+                "listed_cap": listed_cap,
+            }
+        except sqlite3.Error:
+            if bound_cache is not None:
+                raise
+            return {"found": False, "reason": "SQLite reference lookup failed"}
+        except Exception as exc:
+            logger.debug(f"Reference lookup failed: {exc}")
+            return {"found": False, "reason": str(exc)}
+
+    def _call_hierarchy(
+        self,
+        symbol: str,
+        file_path: str | None,
+        max_depth: int,
+        listed_cap: int,
+        bound_cache: Any = None,
+    ) -> dict[str, Any]:
+        graph = (
+            CachedCallGraph(self.project_root or ".", cache=bound_cache, fallback=False)
+            if bound_cache is not None
+            else self.get_call_graph()
+        )
+        try:
+            graph.build()
+        except Exception as exc:
+            logger.debug(f"Call graph build failed: {exc}")
+            return {"callers": [], "callees": []}
+
+        direct_callers = graph.callers_of(symbol, file_path)
+        direct_callees = graph.callees_of(symbol, file_path)
+
+        callers = [
+            {
+                "name": c["name"],
+                "file": c["file"],
+                "line": c["line"],
+                "language": c.get("language", ""),
+            }
+            for c in direct_callers
+        ]
+
+        callees = [
+            {
+                "name": c["name"],
+                "file": c["file"],
+                "line": c["line"],
+                "language": c.get("language", ""),
+            }
+            for c in direct_callees
+        ]
+
+        # Wave 1b (audit nav-08b): emit a capped head of each list; the counts
+        # stay accurate so the agent sees the true call hierarchy size. The cap
+        # is the caller's ``limit``, so one parameter bounds every listing this
+        # action returns rather than only the definition and reference halves.
+        truncated = len(callers) > listed_cap or len(callees) > listed_cap
+        result: dict[str, Any] = {
+            "caller_count": len(callers),
+            "callees_count": len(callees),
+            "callers": callers[:listed_cap],
+            "callees": callees[:listed_cap],
+        }
+
+        if max_depth > 1:
+            transitive_callers = _transitive_callers(
+                graph, symbol, file_path, max_depth
+            )
+            transitive_callees = _transitive_callees(
+                graph, symbol, file_path, max_depth
+            )
+            truncated = (
+                truncated
+                or len(transitive_callers) > listed_cap
+                or len(transitive_callees) > listed_cap
+            )
+            result["transitive_caller_count"] = len(transitive_callers)
+            result["transitive_callee_count"] = len(transitive_callees)
+            result["transitive_callers"] = transitive_callers[:listed_cap]
+            result["transitive_callees"] = transitive_callees[:listed_cap]
+
+        result["lists_truncated"] = truncated
+        result["listed_cap"] = listed_cap
+        return result
+
+
+def _transitive_callers(
+    graph: CallGraph,
+    symbol: str,
+    file_path: str | None,
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    visited: set[str] = set()
+    queue: deque[tuple[str, str | None, int]] = deque([(symbol, file_path, 0)])
+    results: list[dict[str, Any]] = []
+
+    while queue and len(results) < _MAX_TRANSITIVE:
+        name, fpath, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+        callers = graph.callers_of(name, fpath)
+        for c in callers:
+            key = f"{c['file']}:{c['name']}:{c['line']}"
+            if key in visited:
+                continue
+            visited.add(key)
+            results.append(
+                {
+                    "name": c["name"],
+                    "file": c["file"],
+                    "line": c["line"],
+                    "depth": depth + 1,
+                }
+            )
+            queue.append((c["name"], c["file"], depth + 1))
+
+    return results
+
+
+def _transitive_callees(
+    graph: CallGraph,
+    symbol: str,
+    file_path: str | None,
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    visited: set[str] = set()
+    queue: deque[tuple[str, str | None, int]] = deque([(symbol, file_path, 0)])
+    results: list[dict[str, Any]] = []
+
+    while queue and len(results) < _MAX_TRANSITIVE:
+        name, fpath, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+        callees = graph.callees_of(name, fpath)
+        for c in callees:
+            key = f"{c['file']}:{c['name']}:{c['line']}"
+            if key in visited:
+                continue
+            visited.add(key)
+            results.append(
+                {
+                    "name": c["name"],
+                    "file": c["file"],
+                    "line": c["line"],
+                    "depth": depth + 1,
+                }
+            )
+            queue.append((c["name"], c["file"], depth + 1))
+
+    return results

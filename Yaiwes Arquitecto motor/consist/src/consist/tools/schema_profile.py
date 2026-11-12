@@ -1,0 +1,464 @@
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Literal
+
+import duckdb
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from consist.core.drivers import TableInfo, TABLE_DRIVERS
+from consist.digest import canonical_json_sha256
+
+if TYPE_CHECKING:
+    from consist.core.identity import IdentityManager
+
+PROFILE_VERSION = 1
+
+MAX_SCHEMA_JSON_BYTES = 65_536
+MAX_INLINE_PROFILE_BYTES = 16_384
+MAX_FIELDS = 2_000
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(identifier: str, *, label: str) -> str:
+    if not _SAFE_IDENTIFIER_RE.fullmatch(identifier):
+        raise ValueError(
+            f"Invalid {label}. Only letters, numbers, and underscores are allowed, "
+            "and the identifier must not start with a number."
+        )
+    return identifier
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _normalize_index_name(name: Any, level: int) -> str:
+    if name is None or name == "":
+        return f"__index_level_{level}__"
+    return str(name)
+
+
+def _parquet_pandas_metadata(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        # reason: pyarrow is optional and only needed when reading parquet metadata.
+        import pyarrow.parquet as pq
+    except ImportError:
+        return None
+
+    try:
+        parquet_file = pq.ParquetFile(path)
+        metadata = parquet_file.metadata
+        if metadata is None:
+            return None
+        kv = metadata.metadata or {}
+        pandas_bytes = None
+        if b"pandas" in kv:
+            pandas_bytes = kv[b"pandas"]
+        elif "pandas" in kv:
+            pandas_bytes = kv["pandas"]
+        if not pandas_bytes:
+            return None
+        return json.loads(pandas_bytes.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _parquet_index_columns(path: str) -> List[str]:
+    metadata = _parquet_pandas_metadata(path)
+    if not metadata:
+        return []
+    raw_index_columns = metadata.get("index_columns") or []
+    index_columns: List[str] = []
+    for level, entry in enumerate(raw_index_columns):
+        name = entry
+        if isinstance(entry, dict):
+            name = entry.get("name")
+        index_columns.append(_normalize_index_name(name, level))
+    return index_columns
+
+
+def _index_info_from_df(df: Any) -> tuple[List[str], Dict[str, str]]:
+    try:
+        # reason: pandas is only needed for DataFrame inspection, so keep the dependency local.
+        import pandas as pd
+    except ImportError:
+        return [], {}
+
+    if not isinstance(df, pd.DataFrame):
+        return [], {}
+
+    names: List[str] = []
+    dtypes: Dict[str, str] = {}
+
+    index = df.index
+    if isinstance(index, pd.MultiIndex):
+        for i, name in enumerate(index.names):
+            norm_name = _normalize_index_name(name, i)
+            names.append(norm_name)
+            dtype = index.get_level_values(i).dtype
+            dtypes[norm_name] = str(dtype).lower()
+    else:
+        norm_name = _normalize_index_name(index.name, 0)
+        names.append(norm_name)
+        dtypes[norm_name] = str(index.dtype).lower()
+
+    return names, dtypes
+
+
+def _pandas_type_to_logical(pandas_type: Optional[str]) -> str:
+    if not pandas_type:
+        return "UNKNOWN"
+    normalized = pandas_type.lower()
+    if "int" in normalized:
+        return "BIGINT"
+    if "float" in normalized or "double" in normalized:
+        return "DOUBLE"
+    if "bool" in normalized:
+        return "BOOLEAN"
+    if "datetime" in normalized or "timestamp" in normalized:
+        return "TIMESTAMP"
+    if "string" in normalized or "unicode" in normalized or "bytes" in normalized:
+        return "VARCHAR"
+    return "UNKNOWN"
+
+
+def _parquet_index_info(path: str) -> tuple[List[str], Dict[str, str]]:
+    metadata = _parquet_pandas_metadata(path)
+    if not metadata:
+        return [], {}
+    index_names: List[str] = []
+    index_types: Dict[str, str] = {}
+    raw_index_columns = metadata.get("index_columns") or []
+    columns = metadata.get("columns") or []
+    by_name = {}
+    for col in columns:
+        name = col.get("name")
+        if name is not None:
+            by_name[name] = col
+    for level, entry in enumerate(raw_index_columns):
+        name = entry
+        if isinstance(entry, dict):
+            name = entry.get("name")
+        name = _normalize_index_name(name, level)
+        index_names.append(name)
+        info = by_name.get(name) or {}
+        index_types[name] = _pandas_type_to_logical(info.get("pandas_type"))
+    return index_names, index_types
+
+
+@dataclass(frozen=True)
+class SchemaFieldProfile:
+    name: str
+    logical_type: str
+    nullable: bool
+    ordinal_position: int
+    stats: Optional[Dict[str, Any]] = None
+    is_enum: bool = False
+    enum_values: Optional[List[str]] = None
+
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "logical_type": self.logical_type,
+            "nullable": self.nullable,
+            "stats": self.stats,
+            "is_enum": self.is_enum,
+            "enum_values": self.enum_values,
+        }
+
+
+@dataclass(frozen=True)
+class SchemaProfileResult:
+    schema_id: str
+    summary: Dict[str, Any]
+    schema_json: Optional[Dict[str, Any]]
+    inline_profile_json: Optional[Dict[str, Any]]
+    fields: Sequence[SchemaFieldProfile]
+
+
+def _json_size_bytes(obj: Any) -> int:
+    return len(
+        json.dumps(
+            obj, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8")
+    )
+
+
+def profile_duckdb_table(
+    *,
+    engine: Engine,
+    table_schema: str,
+    table_name: str,
+    identity: Optional[IdentityManager] = None,
+    source: str = "duckdb",
+    sample_rows: Optional[int] = None,
+) -> SchemaProfileResult:
+    """
+    Infer a schema profile for a DuckDB relation using information_schema.
+
+    This is intended to capture the post-ingest "ground truth" schema (e.g. dlt-normalized),
+    not just file-side dtypes.
+    """
+    del identity
+    sql = text(
+        """
+        SELECT
+            column_name,
+            data_type,
+            is_nullable,
+            ordinal_position
+        FROM information_schema.columns
+        WHERE table_schema = :schema AND table_name = :table
+        ORDER BY ordinal_position
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sql, {"schema": table_schema, "table": table_name}
+        ).fetchall()
+
+    fields: List[SchemaFieldProfile] = []
+    for col_name, data_type, is_nullable, _ordinal in rows:
+        fields.append(
+            SchemaFieldProfile(
+                name=str(col_name),
+                logical_type=str(data_type).lower(),
+                nullable=str(is_nullable).upper() == "YES",
+                ordinal_position=int(_ordinal),
+            )
+        )
+
+    truncated_flags: Dict[str, Any] = {
+        "fields": False,
+        "schema_json": False,
+        "inline_profile": False,
+    }
+
+    field_rows = [f.to_row() for f in fields]
+    hash_obj: Dict[str, Any] = {
+        "profile_version": PROFILE_VERSION,
+        "source": source,
+        "table_schema": table_schema,
+        "table_name": table_name,
+        "sample_rows": sample_rows,
+        "fields": field_rows,
+    }
+    schema_id = canonical_json_sha256(hash_obj)
+
+    summary = {
+        "profile_version": PROFILE_VERSION,
+        "schema_id": schema_id,
+        "source": source,
+        "table_schema": table_schema,
+        "table_name": table_name,
+        "sample_rows": sample_rows,
+        "n_columns": len(fields),
+        "truncated": truncated_flags,
+    }
+
+    profile_obj: Dict[str, Any] = dict(hash_obj)
+    if len(fields) > MAX_FIELDS:
+        truncated_flags["fields"] = True
+        profile_obj["fields"] = []
+
+    schema_json: Optional[Dict[str, Any]] = profile_obj
+    if _json_size_bytes(profile_obj) > MAX_SCHEMA_JSON_BYTES:
+        truncated_flags["schema_json"] = True
+        schema_json = None
+
+    inline_profile_json: Optional[Dict[str, Any]] = profile_obj
+    if schema_json is None or _json_size_bytes(profile_obj) > MAX_INLINE_PROFILE_BYTES:
+        truncated_flags["inline_profile"] = True
+        inline_profile_json = None
+
+    return SchemaProfileResult(
+        schema_id=schema_id,
+        summary=summary,
+        schema_json=schema_json,
+        inline_profile_json=inline_profile_json,
+        fields=fields,
+    )
+
+
+def profile_file_schema(
+    *,
+    path: str,
+    driver: Literal["parquet", "csv", "gtfs", "h5_table"],
+    sample_rows: Optional[int],
+    identity: Optional[IdentityManager] = None,
+    table_path: Optional[str] = None,
+    source: str = "file",
+    view_name: Optional[str] = None,
+) -> SchemaProfileResult:
+    """
+    Infer a schema profile for a file-based tabular artifact.
+
+    Parameters
+    ----------
+    path : str
+        Filesystem path to the file to profile.
+    driver : {"parquet", "csv", "gtfs", "h5_table"}
+        File format driver for the profiler.
+    sample_rows : Optional[int]
+        Maximum number of rows to sample for dtype inference. None means no limit.
+    identity : Optional[IdentityManager], optional
+        Deprecated compatibility parameter; ignored when provided.
+    table_path : Optional[str]
+        HDF5 table path when profiling ``h5_table`` artifacts.
+    source : str, default "file"
+        Source label for the schema observation.
+    view_name : Optional[str], optional
+        Optional DuckDB view name used for profiling queries. Defaults to a
+        randomly generated name when omitted.
+
+    Returns
+    -------
+    SchemaProfileResult
+        Schema profile payload including per-field rows and summary metadata.
+    """
+    del identity
+    conn = duckdb.connect()
+    relation = None
+    if driver == "h5_table":
+        if not table_path:
+            raise ValueError("table_path is required for h5_table profiling.")
+        # reason: pandas is only needed for HDF5 hydration, so keep the dependency local.
+        import pandas as pd
+
+        if sample_rows is not None:
+            df = pd.read_hdf(path, key=table_path, stop=sample_rows)
+        else:
+            df = pd.read_hdf(path, key=table_path)
+        if isinstance(df, pd.Series):
+            df = df.to_frame()
+        if not isinstance(df.index, pd.RangeIndex) or df.index.name is not None:
+            df = df.reset_index()
+        for col in df.columns:
+            if isinstance(df[col].dtype, pd.StringDtype):
+                df[col] = df[col].astype("object")
+        relation = conn.from_df(df)
+    else:
+        info = TableInfo(
+            role=Path(path).stem,
+            table_path=table_path,
+            container_uri=path,
+            driver=driver,
+            schema_id=None,
+        )
+        relation = TABLE_DRIVERS.get(driver).load(info, conn)
+        if sample_rows is not None:
+            relation = relation.limit(sample_rows)
+
+    if view_name is None:
+        view_name = f"consist_tmp_schema_{uuid.uuid4().hex}"
+    fields = _describe_relation(
+        conn,
+        relation,
+        view_name,
+    )
+    if driver == "parquet":
+        index_names, index_types = _parquet_index_info(path)
+        if index_names:
+            existing = {field.name for field in fields}
+            if not isinstance(fields, list):
+                fields = list(fields)
+            for name in index_names:
+                if name in existing:
+                    continue
+                fields.append(
+                    SchemaFieldProfile(
+                        name=name,
+                        logical_type=index_types.get(name, "UNKNOWN"),
+                        nullable=True,
+                        ordinal_position=len(fields) + 1,
+                    )
+                )
+
+    truncated_flags: Dict[str, Any] = {
+        "fields": False,
+        "schema_json": False,
+        "inline_profile": False,
+    }
+
+    field_rows = [f.to_row() for f in fields]
+    hash_obj: Dict[str, Any] = {
+        "profile_version": PROFILE_VERSION,
+        "source": source,
+        "driver": driver,
+        "fields": field_rows,
+    }
+    if driver == "h5_table":
+        hash_obj["table_path"] = table_path
+    schema_id = canonical_json_sha256(hash_obj)
+
+    summary = {
+        "profile_version": PROFILE_VERSION,
+        "schema_id": schema_id,
+        "source": source,
+        "driver": driver,
+        "sample_rows": sample_rows,
+        "n_columns": len(fields),
+        "truncated": truncated_flags,
+    }
+    if driver == "h5_table":
+        summary["table_path"] = table_path
+
+    profile_obj: Dict[str, Any] = dict(hash_obj)
+    if len(fields) > MAX_FIELDS:
+        truncated_flags["fields"] = True
+        profile_obj["fields"] = []
+
+    schema_json: Optional[Dict[str, Any]] = profile_obj
+    if _json_size_bytes(profile_obj) > MAX_SCHEMA_JSON_BYTES:
+        truncated_flags["schema_json"] = True
+        schema_json = None
+
+    inline_profile_json: Optional[Dict[str, Any]] = profile_obj
+    if schema_json is None or _json_size_bytes(profile_obj) > MAX_INLINE_PROFILE_BYTES:
+        truncated_flags["inline_profile"] = True
+        inline_profile_json = None
+
+    return SchemaProfileResult(
+        schema_id=schema_id,
+        summary=summary,
+        schema_json=schema_json,
+        inline_profile_json=inline_profile_json,
+        fields=fields,
+    )
+
+
+def _describe_relation(
+    conn: "duckdb.DuckDBPyConnection",
+    relation: "duckdb.DuckDBPyRelation",
+    view_name: str,
+) -> List[SchemaFieldProfile]:
+    fields: List[SchemaFieldProfile] = []
+    safe_view_name = _validate_identifier(view_name, label="view_name")
+    quoted_view_name = _quote_ident(safe_view_name)
+    try:
+        relation.create_view(safe_view_name, replace=True)
+        rows = conn.sql(f"DESCRIBE {quoted_view_name}").fetchall()
+        for idx, row in enumerate(rows, start=1):
+            col_name = row[0]
+            col_type = row[1]
+            nullable_flag = row[2] if len(row) > 2 else None
+            nullable = True
+            if nullable_flag is not None:
+                nullable = str(nullable_flag).strip().upper() in {"YES", "TRUE", "1"}
+            fields.append(
+                SchemaFieldProfile(
+                    name=str(col_name),
+                    logical_type=str(col_type).lower(),
+                    nullable=nullable,
+                    ordinal_position=idx,
+                )
+            )
+    finally:
+        conn.sql(f"DROP VIEW IF EXISTS {quoted_view_name}")
+    return fields

@@ -1,0 +1,1144 @@
+# tests/unit/test_identity.py
+
+"""
+Unit Tests for Consist's IdentityManager
+
+This module contains unit tests for the `IdentityManager` class within Consist's core,
+focusing on the various hashing mechanisms that establish the unique identity of runs
+and artifacts.
+
+It verifies the correctness of:
+-   **Configuration Hashing**: Ensuring canonicalization, proper handling of exclusions,
+    and correct conversion of various Python and NumPy data types.
+-   **Input Artifact Hashing**: Differentiating between provenance-based inputs
+    (linked to previous runs) and raw file content.
+-   **Callable/Code Hashing**: Verifying the "tiered" code identity strategies
+    (Source vs. Module) and external dependency tracking.
+-   **Code Version Detection**: Accurately detecting the Git commit SHA and
+    flagging "dirty" repository states.
+"""
+
+import pytest
+import hashlib
+import json
+import logging
+import subprocess
+import sys
+import tempfile
+import os
+import time
+import importlib.util
+from unittest.mock import MagicMock, patch
+from pathlib import Path
+
+# Import the class
+from consist.core.identity import IdentityManager
+from consist.core.run_resolution import InputBindingRole
+from consist.digest import normalize_json
+from consist.models.artifact import Artifact
+
+# Conditional numpy import for testing
+try:
+    import numpy as np
+
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+
+class TestConfigHashing:
+    """Tests the `compute_config_hash` method of `IdentityManager`."""
+
+    def test_mixed_type_sets_use_canonical_json_token_order(self):
+        im = IdentityManager()
+        config_a = {"tags": {"beta", 1, "alpha", (2, "nested")}}
+        config_b = {"tags": {(2, "nested"), "alpha", "beta", 1}}
+
+        normalized_a = normalize_json(config_a)
+        normalized_b = normalize_json(config_b)
+
+        assert normalized_a == {"tags": ["alpha", "beta", 1, [2, "nested"]]}
+        assert normalized_a == normalized_b
+        assert im.compute_config_hash(config_a) == im.compute_config_hash(config_b)
+        assert im.compute_run_config_hash(
+            config=config_a, model="demo"
+        ) == im.compute_run_config_hash(config=config_b, model="demo")
+
+    def test_sortable_sets_preserve_legacy_natural_order(self):
+        config = {"values": {2, 10}}
+
+        assert normalize_json(config) == {"values": [2, 10]}
+
+    def test_path_config_values_match_string_values(self):
+        im = IdentityManager()
+
+        assert normalize_json({"path": Path("config.yaml")}) == {"path": "config.yaml"}
+        assert im.compute_config_hash(
+            {"path": Path("config.yaml")}
+        ) == im.compute_config_hash({"path": "config.yaml"})
+
+    def test_mixed_type_set_run_hash_is_stable_across_python_hash_seeds(self):
+        child = """
+import json
+from consist.core.identity import IdentityManager
+from consist.core.validation import validate_config_structure
+from consist.digest import normalize_json
+
+identity = IdentityManager()
+config = {"tags": {"alpha", "beta", 1}}
+normalized = normalize_json(config)
+validate_config_structure(normalized)
+config_hash = identity.compute_run_config_hash(config=normalized, model="demo")
+print(json.dumps({"config_hash": config_hash, "normalized": normalized}, sort_keys=True))
+"""
+        results = []
+        for seed in ("1", "2", "3", "4", "5"):
+            environment = os.environ.copy()
+            environment["PYTHONHASHSEED"] = seed
+            completed = subprocess.run(
+                [sys.executable, "-c", child],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            results.append(json.loads(completed.stdout))
+
+        assert len({json.dumps(result, sort_keys=True) for result in results}) == 1
+        assert results[0]["normalized"] == {"tags": ["alpha", "beta", 1]}
+
+    def test_unsupported_set_member_fails_without_best_effort_hash(self, caplog):
+        class Unsupported:
+            pass
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(TypeError, match="not JSON serializable"):
+                IdentityManager().compute_config_hash({"values": {Unsupported()}})
+
+        assert "Hash stability not guaranteed" not in caplog.text
+
+    def test_canonicalization(self):
+        """
+        Tests that `compute_config_hash` produces identical hashes for configurations
+        that are logically the same but have different dictionary key orders.
+        """
+        im = IdentityManager()
+
+        config_a = {"a": 1, "b": 2, "c": {"x": 10, "y": 20}}
+        config_b = {"c": {"y": 20, "x": 10}, "b": 2, "a": 1}  # Mixed order
+
+        hash_a = im.compute_config_hash(config_a)
+        hash_b = im.compute_config_hash(config_b)
+
+        assert hash_a == hash_b
+
+    def test_exclusions(self):
+        """
+        Tests that `compute_config_hash` correctly excludes specified keys.
+        """
+        im = IdentityManager()
+
+        config_a = {"a": 1, "timestamp": 12345}
+        config_b = {"a": 1, "timestamp": 67890}
+
+        # If we exclude 'timestamp', hashes should match
+        hash_a = im.compute_config_hash(config_a, exclude_keys=["timestamp"])
+        hash_b = im.compute_config_hash(config_b, exclude_keys=["timestamp"])
+
+        assert hash_a == hash_b
+
+        # Verify inclusion changes hash
+        hash_c = im.compute_config_hash(config_b, exclude_keys=[])
+        assert hash_a != hash_c
+
+    @pytest.mark.skipif(not HAS_NUMPY, reason="Numpy not installed")
+    def test_numpy_cleaning(self):
+        """
+        Tests that `compute_config_hash` correctly converts NumPy data types.
+        """
+        im = IdentityManager()
+        config_std = {"val": 10, "arr": [1, 2]}
+        config_np = {"val": np.int64(10), "arr": np.array([1, 2])}
+
+        hash_std = im.compute_config_hash(config_std)
+        hash_np = im.compute_config_hash(config_np)
+
+        assert hash_std == hash_np
+
+
+class TestInputHashing:
+    """Tests the `compute_input_hash` method of `IdentityManager`."""
+
+    def test_provenance_based_inputs(self):
+        """
+        Tests that inputs with known provenance (run_id) are hashed by ID,
+        and that order does not matter.
+        """
+        im = IdentityManager()
+
+        art1 = Artifact(key="a1", container_uri="x", driver="x", run_id="run_123")
+        art2 = Artifact(key="a2", container_uri="y", driver="y", run_id="run_456")
+
+        hash_a = im.compute_input_hash([art1, art2])
+        hash_b = im.compute_input_hash([art2, art1])
+
+        assert hash_a == hash_b
+
+        # Changing source run_id should change hash
+        art3 = Artifact(key="a1", container_uri="x", driver="x", run_id="run_999")
+        hash_c = im.compute_input_hash([art3, art2])
+        assert hash_a != hash_c
+
+    def test_action_v2_reuses_attested_content_under_the_same_named_role(self):
+        digest = "a" * 64
+        first = Artifact(
+            key="upstream_one",
+            container_uri="archive://one.csv",
+            driver="csv",
+            hash=digest,
+            run_id="producer_one",
+            meta={
+                "hash_semantics": {
+                    "version": 1,
+                    "algorithm": "sha256",
+                    "kind": "file",
+                    "digest_contract": "raw_file_bytes",
+                    "source": "computed_full",
+                }
+            },
+        )
+        second = Artifact(
+            key="upstream_two",
+            container_uri="archive://two.csv",
+            driver="csv",
+            hash=digest,
+            run_id="producer_two",
+            meta=dict(first.meta),
+        )
+        roles = [InputBindingRole(kind="named", role="data", input_index=0)]
+        code_identity = {"version": 1, "mode": "repo_git", "digest": "abc"}
+
+        first_action = IdentityManager().compute_action_input_identity(
+            inputs=[first], binding_roles=roles, code_identity=code_identity
+        )
+        second_action = IdentityManager().compute_action_input_identity(
+            inputs=[second], binding_roles=roles, code_identity=code_identity
+        )
+
+        assert first_action.value.startswith("sha256:action-v2:")
+        assert first_action.value == second_action.value
+        assert first_action.bindings[0].mode == "content-v1"
+
+    def test_action_v2_distinguishes_swapped_named_roles(self):
+        def artifact(key: str, digest: str) -> Artifact:
+            return Artifact(
+                key=key,
+                container_uri=f"archive://{key}.csv",
+                driver="csv",
+                hash=digest,
+                run_id=f"producer_{key}",
+                meta={
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "sha256",
+                        "kind": "file",
+                        "digest_contract": "raw_file_bytes",
+                        "source": "computed_full",
+                    }
+                },
+            )
+
+        left = artifact("left", "a" * 64)
+        right = artifact("right", "b" * 64)
+        roles = [
+            InputBindingRole(kind="named", role="left", input_index=0),
+            InputBindingRole(kind="named", role="right", input_index=1),
+        ]
+        identity = IdentityManager()
+        code_identity = {"version": 1, "mode": "callable_module", "digest": "abc"}
+
+        ordered = identity.compute_action_input_identity(
+            inputs=[left, right], binding_roles=roles, code_identity=code_identity
+        )
+        swapped = identity.compute_action_input_identity(
+            inputs=[right, left], binding_roles=roles, code_identity=code_identity
+        )
+
+        assert ordered.value != swapped.value
+
+    def test_action_v2_separates_code_identity_modes(self):
+        artifact = Artifact(
+            key="data",
+            container_uri="archive://data.csv",
+            driver="csv",
+            hash="a" * 64,
+            run_id="producer",
+            meta={
+                "hash_semantics": {
+                    "version": 1,
+                    "algorithm": "sha256",
+                    "kind": "file",
+                    "digest_contract": "raw_file_bytes",
+                    "source": "computed_full",
+                }
+            },
+        )
+        roles = [InputBindingRole(kind="named", role="data", input_index=0)]
+        identity = IdentityManager()
+
+        repo = identity.compute_action_input_identity(
+            inputs=[artifact],
+            binding_roles=roles,
+            code_identity={"version": 1, "mode": "repo_git", "digest": "same"},
+        )
+        callable_module = identity.compute_action_input_identity(
+            inputs=[artifact],
+            binding_roles=roles,
+            code_identity={
+                "version": 1,
+                "mode": "callable_module",
+                "digest": "same",
+            },
+        )
+
+        assert repo.value != callable_module.value
+
+    @pytest.mark.parametrize(
+        ("meta", "expected_mode", "expected_reason"),
+        [
+            (
+                {
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "sha256",
+                        "kind": "file",
+                        "digest_contract": "file_metadata",
+                        "source": "computed_fast",
+                    }
+                },
+                "legacy-provenance-v1",
+                "fast_file_observation",
+            ),
+            (
+                {
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "sha256",
+                        "kind": "directory",
+                        "digest_contract": "legacy_directory_metadata",
+                        "source": "computed_fast_directory",
+                    }
+                },
+                "legacy-provenance-v1",
+                "fast_directory_observation",
+            ),
+            (
+                {
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "unknown",
+                        "kind": "unknown",
+                        "digest_contract": "unknown",
+                        "source": "caller_supplied",
+                    }
+                },
+                "legacy-provenance-v1",
+                "caller_supplied_hash",
+            ),
+            (
+                {
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "sha256",
+                        "kind": "directory",
+                        "digest_contract": "legacy_directory_content",
+                        "source": "computed_full_directory",
+                    }
+                },
+                "legacy-provenance-v1",
+                "directory_without_manifest",
+            ),
+            (
+                {
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "sha1",
+                        "kind": "file",
+                        "digest_contract": "raw_file_bytes",
+                        "source": "computed_full",
+                    }
+                },
+                "legacy-provenance-v1",
+                "untrusted_hash_semantics",
+            ),
+            ({}, "legacy-provenance-v1", "missing_hash_semantics"),
+            (
+                {
+                    "hash_semantics": {
+                        "version": 1,
+                        "algorithm": "sha256",
+                        "kind": "file",
+                        "digest_contract": "raw_file_bytes",
+                        "source": "computed_full",
+                    }
+                },
+                "content-v1",
+                None,
+            ),
+        ],
+        ids=[
+            "fast-file",
+            "fast-directory",
+            "caller-supplied",
+            "directory-without-manifest",
+            "untrusted-semantics",
+            "missing-semantics",
+            "trusted-content",
+        ],
+    )
+    def test_action_v2_records_nonhashed_binding_evidence(
+        self, meta, expected_mode, expected_reason
+    ):
+        artifact = Artifact(
+            key="data",
+            container_uri="archive://data",
+            driver="unknown",
+            hash="a" * 64,
+            run_id="producer",
+            meta=meta,
+        )
+
+        binding = (
+            IdentityManager()
+            .compute_action_input_identity(
+                inputs=[artifact],
+                binding_roles=[
+                    InputBindingRole(kind="named", role="data", input_index=0)
+                ],
+                code_identity={"version": 1, "mode": "repo_git", "digest": "abc"},
+            )
+            .bindings[0]
+        )
+
+        assert binding.mode == expected_mode
+        assert binding.as_evidence_payload() == {
+            "identity_strength": expected_mode,
+            **(
+                {"fallback_reason": expected_reason}
+                if expected_reason is not None
+                else {}
+            ),
+        }
+        assert binding.as_payload() == {
+            "kind": "named",
+            "role": "data",
+            "mode": expected_mode,
+            "value": binding.value,
+        }
+
+    def test_action_v2_fallback_evidence_does_not_change_digest_payload(self):
+        artifact = Artifact(
+            key="data",
+            container_uri="archive://data",
+            driver="csv",
+            hash="a" * 64,
+            run_id="producer",
+            meta={
+                "hash_semantics": {
+                    "version": 1,
+                    "algorithm": "sha256",
+                    "kind": "file",
+                    "digest_contract": "file_metadata",
+                    "source": "computed_fast",
+                }
+            },
+        )
+
+        identity = IdentityManager().compute_action_input_identity(
+            inputs=[artifact],
+            binding_roles=[InputBindingRole(kind="named", role="data", input_index=0)],
+            code_identity={"version": 1, "mode": "repo_git", "digest": "abc"},
+        )
+        expected_payload = {
+            "version": 2,
+            "code": {"version": 1, "mode": "repo_git", "digest": "abc"},
+            "bindings": [
+                {
+                    "kind": "named",
+                    "role": "data",
+                    "mode": "legacy-provenance-v1",
+                    "value": "driver:csv|key:data|run:producer|hash:" + "a" * 64,
+                    "selector": {
+                        "driver": "csv",
+                        "table_path": None,
+                        "array_path": None,
+                    },
+                }
+            ],
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                expected_payload,
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        assert identity.value == f"sha256:action-v2:{expected_digest}"
+        assert identity.bindings[0].as_evidence_payload() == {
+            "identity_strength": "legacy-provenance-v1",
+            "fallback_reason": "fast_file_observation",
+        }
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            {
+                "hash_semantics": {
+                    "version": 1,
+                    "algorithm": "sha256",
+                    "kind": "file",
+                    "digest_contract": "file_stat",
+                    "source": "observed_fast",
+                }
+            },
+            {},
+        ],
+        ids=["fast-observation", "missing-semantics"],
+    )
+    def test_action_v2_keeps_weak_managed_inputs_provenance_sensitive(self, meta):
+        def artifact(run_id: str) -> Artifact:
+            return Artifact(
+                key="data",
+                container_uri="archive://data.csv",
+                driver="csv",
+                hash="a" * 64,
+                run_id=run_id,
+                meta=meta,
+            )
+
+        roles = [InputBindingRole(kind="named", role="data", input_index=0)]
+        identity = IdentityManager()
+        first = identity.compute_action_input_identity(
+            inputs=[artifact("producer_one")],
+            binding_roles=roles,
+            code_identity={"version": 1, "mode": "repo_git", "digest": "abc"},
+            signature_lookup=lambda run_id: f"signature:{run_id}",
+        )
+        second = identity.compute_action_input_identity(
+            inputs=[artifact("producer_two")],
+            binding_roles=roles,
+            code_identity={"version": 1, "mode": "repo_git", "digest": "abc"},
+            signature_lookup=lambda run_id: f"signature:{run_id}",
+        )
+
+        assert first.bindings[0].mode == "legacy-provenance-v1"
+        assert second.bindings[0].mode == "legacy-provenance-v1"
+        assert first.value != second.value
+
+    def test_raw_file_inputs(self):
+        """
+        Tests hashing for raw file inputs (no run_id) using a path resolver.
+        """
+        im = IdentityManager()
+
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
+            f.write(b"hello world")
+            fname = f.name
+
+        try:
+            art = Artifact(
+                key="raw", container_uri="inputs://file.txt", driver="txt", run_id=None
+            )
+
+            def resolver(uri: str) -> str:
+                return fname
+
+            hash_val = im.compute_input_hash([art], path_resolver=resolver)
+
+            # Expected: SHA256 of "hello world"
+            expected_file_hash = hashlib.sha256(b"hello world").hexdigest()
+            expected_composite = hashlib.sha256(
+                f"driver:txt|container_uri:inputs://file.txt|file:{expected_file_hash}".encode()
+            ).hexdigest()
+
+            assert hash_val == expected_composite
+
+        finally:
+            if os.path.exists(fname):
+                os.remove(fname)
+
+    def test_table_path_affects_identity(self):
+        im = IdentityManager()
+        art_a = Artifact(
+            key="a",
+            container_uri="inputs://file.h5",
+            driver="h5_table",
+            run_id="run_shared",
+            table_path="/tables/a",
+        )
+        art_b = Artifact(
+            key="b",
+            container_uri="inputs://file.h5",
+            driver="h5_table",
+            run_id="run_shared",
+            table_path="/tables/b",
+        )
+        hash_a = im.compute_input_hash([art_a])
+        hash_b = im.compute_input_hash([art_b])
+        assert hash_a != hash_b
+
+    def test_array_path_affects_identity(self):
+        im = IdentityManager()
+        art_a = Artifact(
+            key="a",
+            container_uri="inputs://array.zarr",
+            driver="zarr",
+            run_id="run_shared",
+            array_path="/group/a",
+        )
+        art_b = Artifact(
+            key="b",
+            container_uri="inputs://array.zarr",
+            driver="zarr",
+            run_id="run_shared",
+            array_path="/group/b",
+        )
+        hash_a = im.compute_input_hash([art_a])
+        hash_b = im.compute_input_hash([art_b])
+        assert hash_a != hash_b
+
+    def test_run_id_inputs_ignore_container_uri(self):
+        im = IdentityManager()
+        art_a = Artifact(
+            key="output_a",
+            container_uri="inputs://a.parquet",
+            driver="parquet",
+            run_id="run_shared",
+        )
+        art_b = Artifact(
+            key="output_a",
+            container_uri="workspace://a.parquet",
+            driver="parquet",
+            run_id="run_shared",
+        )
+        hash_a = im.compute_input_hash([art_a])
+        hash_b = im.compute_input_hash([art_b])
+        assert hash_a == hash_b
+
+    def test_fast_vs_full_hashing(self):
+        """
+        Tests the difference between "full" (content) and "fast" (metadata) hashing.
+        """
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
+            f.write(b"hello")
+            fname = f.name
+
+        try:
+            art = Artifact(
+                key="raw", container_uri="inputs://x", driver="x", run_id=None
+            )
+
+            def resolver(uri: str) -> str:
+                return fname
+
+            im_full = IdentityManager(hashing_strategy="full")
+            hash_full_1 = im_full.compute_input_hash([art], resolver)
+
+            im_fast = IdentityManager(hashing_strategy="fast")
+            hash_fast_1 = im_fast.compute_input_hash([art], resolver)
+
+            # Modify only metadata (touch)
+            time.sleep(0.01)
+            Path(fname).touch()
+
+            hash_full_2 = im_full.compute_input_hash([art], resolver)
+            hash_fast_2 = im_fast.compute_input_hash([art], resolver)
+
+            assert hash_full_1 == hash_full_2  # Content same
+            assert hash_fast_1 != hash_fast_2  # Metadata changed
+
+        finally:
+            os.remove(fname)
+
+    def test_full_file_checksum_reads_all_chunks(self, tmp_path):
+        source = tmp_path / "large-input.bin"
+        payload = b"a" * 65536 + b"trailing-bytes"
+        source.write_bytes(payload)
+
+        assert (
+            IdentityManager(hashing_strategy="full").compute_file_checksum(source)
+            == hashlib.sha256(payload).hexdigest()
+        )
+
+    def test_digest_path_hashing_strategy_override_uses_content_hashing(self, tmp_path):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        settings = config_dir / "settings.yaml"
+        settings.write_text("sample_rate: 0.25\n", encoding="utf-8")
+
+        identity = IdentityManager(project_root=str(tmp_path), hashing_strategy="fast")
+        digest_a = identity.digest_path(config_dir, hashing_strategy_override="full")
+        original_strategy = identity.hashing_strategy
+
+        time.sleep(0.01)
+        settings.touch()
+        digest_b = identity.digest_path(config_dir, hashing_strategy_override="full")
+
+        assert digest_a == digest_b
+        assert identity.hashing_strategy == original_strategy
+
+
+class TestZarrHashing:
+    """Tests Zarr-aware hashing behavior for directory inputs."""
+
+    def test_fast_hash_ignores_chunk_content_when_metadata_stable(self, tmp_path):
+        store = tmp_path / "skims.zarr"
+        store.mkdir()
+        metadata = store / ".zmetadata"
+        metadata.write_text('{"zarr_consolidated_format":1}', encoding="utf-8")
+        chunk = store / "0.0.0"
+        chunk.write_bytes(b"aaaa")
+
+        im_fast = IdentityManager(hashing_strategy="fast")
+        im_full = IdentityManager(hashing_strategy="full")
+
+        hash_fast_1 = im_fast.compute_file_checksum(store)
+        hash_full_1 = im_full.compute_file_checksum(store)
+
+        original_stat = chunk.stat()
+        chunk.write_bytes(b"bbbb")
+        os.utime(chunk, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        hash_fast_2 = im_fast.compute_file_checksum(store)
+        hash_full_2 = im_full.compute_file_checksum(store)
+
+        assert hash_fast_1 == hash_fast_2
+        assert hash_full_1 != hash_full_2
+
+    def test_fast_hash_changes_on_metadata_update(self, tmp_path):
+        store = tmp_path / "skims.zarr"
+        store.mkdir()
+        metadata = store / ".zmetadata"
+        metadata.write_text('{"metadata":"v1"}', encoding="utf-8")
+        chunk = store / "0.0.0"
+        chunk.write_bytes(b"aaaa")
+
+        im_fast = IdentityManager(hashing_strategy="fast")
+        hash_fast_1 = im_fast.compute_file_checksum(store)
+
+        metadata.write_text('{"metadata":"v2"}', encoding="utf-8")
+        hash_fast_2 = im_fast.compute_file_checksum(store)
+
+        assert hash_fast_1 != hash_fast_2
+
+    def test_fast_directory_observation_includes_relative_paths(self, tmp_path):
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        (first / "north").mkdir(parents=True)
+        (second / "south").mkdir(parents=True)
+        first_file = first / "north" / "duplicate.bin"
+        second_file = second / "south" / "duplicate.bin"
+        first_file.write_bytes(b"same")
+        second_file.write_bytes(b"same")
+        shared_mtime = 1_700_000_000_000_000_000
+        os.utime(first_file, ns=(shared_mtime, shared_mtime))
+        os.utime(second_file, ns=(shared_mtime, shared_mtime))
+
+        identity = IdentityManager(hashing_strategy="fast")
+
+        assert identity.compute_file_checksum(first) == identity.compute_file_checksum(
+            second
+        )
+        assert identity.compute_fast_directory_observation(
+            first
+        ) != identity.compute_fast_directory_observation(second)
+
+
+class TestCallableHashing:
+    """
+    Tests the new `compute_callable_hash` method in `IdentityManager`.
+
+    Verifies the "Tiered Code Identity" approach:
+    1. 'source': Hash only the function body.
+    2. 'module': Hash the file containing the function.
+    3. 'extra_deps': Hash external files declared as dependencies.
+    """
+
+    def test_strategy_source(self):
+        """
+        Tests 'source' strategy: Hashes rely on the function definition itself.
+        """
+        im = IdentityManager()
+
+        def func_v1():
+            return "version 1"
+
+        def func_v2():
+            return "version 2"
+
+        # 1. Different bodies -> Different hashes
+        h1 = im.compute_callable_hash(func_v1, strategy="source")
+        h2 = im.compute_callable_hash(func_v2, strategy="source")
+        assert h1 != h2
+
+        # 2. Same body (logic) -> Same hash
+        # Note: inspect.getsource includes the definition line (def x():).
+        # To test 'same body' effectively with anonymous functions or redefinitions:
+        def func_v1_redefined():
+            return "version 1"
+
+        # The function NAME is part of the source line "def func_name...",
+        # so these will actually differ if the names differ.
+        # Ideally, we verify that identical code produces identical hashes.
+        h1_redux = im.compute_callable_hash(func_v1, strategy="source")
+        assert h1 == h1_redux
+
+    def test_strategy_module(self, tmp_path):
+        """
+        Tests 'module' strategy: Hashes the file on disk containing the function.
+
+        This validates that:
+        1. Changes to the file (even comments outside the function) change the hash.
+        2. The hash reflects the file content, even if the in-memory object is stale.
+        """
+        im = IdentityManager(project_root=str(tmp_path))
+
+        # 1. Create a python module file
+        module_path = tmp_path / "my_module.py"
+        module_path.write_text("def my_func():\n    return 42\n")
+
+        # 2. Load the module dynamically
+        spec = importlib.util.spec_from_file_location("my_module", module_path)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        func = module.my_func
+
+        # 3. Compute initial hash
+        hash_v1 = im.compute_callable_hash(func, strategy="module")
+
+        # 4. Modify the file on disk (add a comment or constant)
+        # Note: We do NOT need to reload the module. The strategy checks the file on disk.
+        module_path.write_text("def my_func():\n    return 42\n\n# New Comment\n")
+
+        # 5. Compute new hash
+        hash_v2 = im.compute_callable_hash(func, strategy="module")
+
+        assert hash_v1 != hash_v2
+
+    def test_extra_deps(self, tmp_path):
+        """
+        Tests explicit dependency tracking via `extra_deps`.
+        """
+        im = IdentityManager(project_root=str(tmp_path))
+
+        # Define a function (strategy doesn't matter for this test, use source)
+        def my_func():
+            pass
+
+        # Create a config file
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("param: 100")
+
+        # 1. Compute hash with dependency
+        # extra_deps expects paths relative to project_root
+        h1 = im.compute_callable_hash(
+            my_func, strategy="source", extra_deps=["config.yaml"]
+        )
+
+        # 2. Modify dependency
+        config_path.write_text("param: 200")
+
+        # 3. Compute hash again
+        h2 = im.compute_callable_hash(
+            my_func, strategy="source", extra_deps=["config.yaml"]
+        )
+
+        assert h1 != h2
+
+    def test_missing_extra_dep(self, tmp_path):
+        """
+        Tests that a missing dependency results in a distinct hash but doesn't crash.
+        """
+        im = IdentityManager(project_root=str(tmp_path))
+
+        def my_func():
+            pass
+
+        # Dep doesn't exist
+        h_missing = im.compute_callable_hash(my_func, extra_deps=["ghost.txt"])
+
+        # Create it
+        (tmp_path / "ghost.txt").write_text("boo")
+
+        h_exists = im.compute_callable_hash(my_func, extra_deps=["ghost.txt"])
+
+        assert h_missing != h_exists
+
+
+class TestCodeVersion:
+    """Tests the `get_code_version` method of `IdentityManager`."""
+
+    @patch("consist.core.identity.git")
+    def test_clean_repo(self, mock_git: MagicMock):
+        """Verifies clean repo returns exact SHA."""
+        im = IdentityManager()
+
+        mock_repo = MagicMock()
+        mock_repo.is_dirty.return_value = False
+        mock_repo.head.object.hexsha = "abc12345"
+        mock_git.Repo.return_value = mock_repo
+
+        assert im.get_code_version() == "abc12345"
+
+    @patch("consist.core.identity.git")
+    def test_clean_repo_code_version_cached_per_manager(self, mock_git: MagicMock):
+        """Repeated repo Git identity lookups reuse the manager-local cache."""
+        im = IdentityManager()
+
+        first_repo = MagicMock()
+        first_repo.is_dirty.return_value = False
+        first_repo.head.object.hexsha = "abc12345"
+        second_repo = MagicMock()
+        second_repo.is_dirty.return_value = False
+        second_repo.head.object.hexsha = "def67890"
+        mock_git.Repo.side_effect = [first_repo, second_repo]
+
+        assert im.get_code_version() == "abc12345"
+        assert im.get_code_version() == "abc12345"
+        assert mock_git.Repo.call_count == 1
+
+    @patch("consist.core.identity.git")
+    def test_clear_code_version_cache_forces_repo_refresh(self, mock_git: MagicMock):
+        """Explicit invalidation refreshes repo Git identity on the next lookup."""
+        im = IdentityManager()
+
+        first_repo = MagicMock()
+        first_repo.is_dirty.return_value = False
+        first_repo.head.object.hexsha = "abc12345"
+        second_repo = MagicMock()
+        second_repo.is_dirty.return_value = False
+        second_repo.head.object.hexsha = "def67890"
+        mock_git.Repo.side_effect = [first_repo, second_repo]
+
+        assert im.get_code_version() == "abc12345"
+        im.clear_code_version_cache()
+        assert im.get_code_version() == "def67890"
+        assert mock_git.Repo.call_count == 2
+
+    @patch("consist.core.identity.git")
+    def test_clean_repo_head_change_invalidates_code_version_cache(
+        self, mock_git: MagicMock
+    ):
+        """Long-lived managers refresh repo identity when HEAD changes."""
+        im = IdentityManager()
+
+        mock_repo = MagicMock()
+        mock_repo.is_dirty.return_value = False
+        mock_repo.head.object.hexsha = "abc12345"
+        mock_git.Repo.return_value = mock_repo
+
+        assert im.get_code_version() == "abc12345"
+
+        mock_repo.head.object.hexsha = "def67890"
+
+        assert im.get_code_version() == "def67890"
+        assert mock_git.Repo.call_count == 1
+
+    @patch("consist.core.identity.git")
+    def test_dirty_repo(self, mock_git: MagicMock):
+        """Verifies dirty repo appends nonce."""
+        im = IdentityManager()
+
+        mock_repo = MagicMock()
+        mock_repo.is_dirty.return_value = True
+        mock_repo.head.object.hexsha = "abc12345"
+        mock_git.Repo.return_value = mock_repo
+
+        version = im.get_code_version()
+        assert version.startswith("abc12345-dirty-")
+        assert len(version) > len("abc12345-dirty-")
+
+    @patch("consist.core.identity.git")
+    def test_dirty_repo_code_version_cached_per_manager(self, mock_git: MagicMock):
+        """Dirty repo identity is cached until explicitly invalidated."""
+        im = IdentityManager()
+
+        mock_repo = MagicMock()
+        mock_repo.is_dirty.return_value = True
+        mock_repo.head.object.hexsha = "abc12345"
+        mock_repo.git.diff.return_value = "print('changed')"
+        mock_git.Repo.return_value = mock_repo
+
+        first = im.get_code_version()
+        second = im.get_code_version()
+
+        assert first == second
+        assert first.startswith("abc12345-dirty-")
+        assert mock_git.Repo.call_count == 1
+
+    @patch("consist.core.identity.git")
+    def test_dirty_python_diff_change_invalidates_code_version_cache(
+        self, mock_git: MagicMock
+    ):
+        """Long-lived managers refresh repo identity when tracked Python diffs change."""
+        im = IdentityManager()
+
+        diff_state = {"head": "print('first')", "cached": ""}
+
+        def diff(*args: str) -> str:
+            if "--cached" in args:
+                return diff_state["cached"]
+            return diff_state["head"]
+
+        mock_repo = MagicMock()
+        mock_repo.is_dirty.return_value = True
+        mock_repo.head.object.hexsha = "abc12345"
+        mock_repo.git.diff.side_effect = diff
+        mock_git.Repo.return_value = mock_repo
+
+        first = im.get_code_version()
+
+        diff_state["head"] = "print('second')"
+        second = im.get_code_version()
+
+        assert first != second
+        assert first.startswith("abc12345-dirty-")
+        assert second.startswith("abc12345-dirty-")
+        assert mock_git.Repo.call_count == 1
+
+    @patch("consist.core.identity.git")
+    def test_git_error_handling(self, mock_git: MagicMock):
+        """
+        Git lookup failures must not become reusable sentinel identities.
+        """
+        im = IdentityManager()
+
+        # Simulate InvalidGitRepositoryError
+        # Note: We need to set the side_effect on the Repo constructor
+        mock_git.InvalidGitRepositoryError = Exception  # mocking the exception class
+        mock_git.NoSuchPathError = Exception
+
+        mock_git.Repo.side_effect = mock_git.InvalidGitRepositoryError("Bad repo")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            im.get_code_version()
+
+        assert type(exc_info.value).__name__ == "CodeIdentityUnavailableError"
+
+    def test_git_missing_module(self):
+        """
+        Missing Git must fail closed rather than return a stable sentinel.
+        """
+        with patch("consist.core.identity.git", None):
+            im = IdentityManager()
+            with pytest.raises(RuntimeError) as exc_info:
+                im.get_code_version()
+
+        assert type(exc_info.value).__name__ == "CodeIdentityUnavailableError"
+        assert 'pip install "consist[git]"' in str(exc_info.value)
+        assert "at least one commit" in str(exc_info.value)
+
+    @patch("consist.core.identity.git")
+    def test_git_repository_failure_explains_commit_requirement(
+        self, mock_git: MagicMock, tmp_path: Path
+    ):
+        mock_git.Repo.side_effect = RuntimeError("not a repository")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            IdentityManager(project_root=tmp_path).get_code_version()
+
+        assert type(exc_info.value).__name__ == "CodeIdentityUnavailableError"
+        message = str(exc_info.value)
+        assert "Could not resolve a Git commit" in message
+        assert f"project root {tmp_path}" in message
+        assert "not a repository" in message
+        assert "at least one commit" in message
+
+    def test_repo_git_falls_back_to_callable_module_when_git_is_unavailable(self):
+        def sample_func():
+            return "value"
+
+        with patch("consist.core.identity.git", None):
+            resolution = IdentityManager().resolve_code_identity(
+                mode="repo_git", func=sample_func
+            )
+
+        assert resolution.mode == "callable_module"
+        assert resolution.digest
+
+    @pytest.mark.parametrize(
+        ("mode", "inspection_method"),
+        [
+            ("callable_module", "getfile"),
+            ("callable_source", "getsource"),
+        ],
+    )
+    def test_explicit_callable_identity_does_not_retry_repo_git(
+        self, mode, inspection_method
+    ):
+        def sample_func():
+            return "value"
+
+        with patch(
+            f"consist.core.identity.inspect.{inspection_method}",
+            side_effect=OSError("callable source unavailable"),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                IdentityManager().resolve_code_identity(mode=mode, func=sample_func)
+
+        assert type(exc_info.value).__name__ == "CodeIdentityUnavailableError"
+
+    def test_callable_identity_failure_does_not_use_timestamp_fallback(self):
+        def sample_func():
+            return "value"
+
+        with patch(
+            "consist.core.identity.inspect.getfile",
+            side_effect=OSError("callable source unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="Code identity"):
+                IdentityManager().compute_callable_hash(sample_func)
+
+    @patch("consist.core.identity.git")
+    def test_callable_code_identity_does_not_use_repo_git_cache(
+        self, mock_git: MagicMock
+    ):
+        """Callable-scoped modes bypass get_code_version and its repo Git cache."""
+        im = IdentityManager()
+
+        mock_repo = MagicMock()
+        mock_repo.is_dirty.return_value = False
+        mock_repo.head.object.hexsha = "abc12345"
+        mock_git.Repo.return_value = mock_repo
+
+        assert im.get_code_version() == "abc12345"
+
+        def sample_func():
+            return "value"
+
+        callable_hash = im.resolve_code_version(
+            mode="callable_source", func=sample_func
+        )
+
+        assert callable_hash != "abc12345"
+        assert mock_git.Repo.call_count == 1
+
+    @patch("consist.core.identity.git")
+    def test_string_code_version_helper_returns_fallback_digest(
+        self, mock_git: MagicMock
+    ):
+        mock_git.Repo.side_effect = RuntimeError("not a repository")
+
+        def sample_func():
+            return "value"
+
+        digest = IdentityManager().resolve_code_version(
+            mode="repo_git", func=sample_func
+        )
+
+        assert digest
+        assert digest != "unknown_code_version"

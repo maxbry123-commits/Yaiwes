@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "sourceMap": true,
+    "declaration": true,
+    "noImplicitAny": true,
+    "noEmitOnError": true,
+    "noUnusedLocals": true,
+    "strictNullChecks": true,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "es6",
+    "lib": [
+      "es6",
+      "dom",
+      "dom.iterable",
+      "webworker.importscripts",
+      "scripthost",
+      "es2018.asynciterable"
+    ],
+    "outDir": "../../../noworkflow/now/vis/static/dist/",
+    "types": []
+  },
+  "include": ["src/*"]
+}

@@ -1,0 +1,63 @@
+! exec cue cmd ref
+! stdout .
+cmp stderr cmd_badfields.out
+
+# A file.Read task whose contents field fails to evaluate must surface
+# that error rather than filling in the contents regardless.
+! exec cue cmd badread
+stderr 'error in call to encoding/json.Marshal'
+
+# A cli.Ask task whose response field fails to evaluate must surface
+# that error rather than reading a response and discarding it.
+! exec cue cmd badask
+stderr 'error in call to encoding/json.Marshal'
+
+-- cmd_badfields.out --
+command.ref.task.display.contents: invalid bytes argument: non-concrete value (string|bytes):
+    ./task_tool.cue:6:8
+    tool/file:20:2
+command.ref.task.display.filename: invalid string argument: non-concrete value string:
+    ./task_tool.cue:6:8
+    ./task_tool.cue:7:9
+    tool/file:18:2
+    tool/file:18:15
+-- task_tool.cue --
+package home
+
+import "tool/file"
+
+command: ref: {
+	task: display: file.Create & {
+        filename: filename
+	}
+}
+-- read_tool.cue --
+package home
+
+import (
+	"encoding/json"
+	"tool/file"
+)
+
+command: badread: {
+	read: file.Read & {
+		filename: "data.txt"
+		contents: json.Marshal({a!: int})
+	}
+}
+-- ask_tool.cue --
+package home
+
+import (
+	"encoding/json"
+	"tool/cli"
+)
+
+command: badask: {
+	ask: cli.Ask & {
+		prompt:   "What is your name?"
+		response: json.Marshal({a!: int})
+	}
+}
+-- data.txt --
+hello

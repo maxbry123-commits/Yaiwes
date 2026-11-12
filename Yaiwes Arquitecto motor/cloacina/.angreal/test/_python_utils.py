@@ -1,0 +1,638 @@
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+import angreal  #type: ignore
+from angreal.integrations.venv import VirtualEnv  # type: ignore
+
+# CLOACI-I-0140: EMPTY by design — keep it that way.
+#
+# This allowlist (born as T-0622) once xfail'd scenarios 30/32/33 for an
+# "intermittent PyO3<->tokio GIL hang". I-0140 root-caused the whole rotating
+# flake class: it was never the GIL — swallowed/unretried DB writes on the
+# execution path left task rows Running forever (hangs) or failed tasks that
+# succeeded (assertions), fixed in rounds 1-3 (retry_transient on every
+# terminal/entry write); the separate teardown segfault class was structurally
+# derisked in round 4 (atexit joins all runtime threads before interpreter
+# finalization). Verified: 500/500 + 300/300 + 800/800 local stress runs and a
+# fully-clean nightly with zero rescue markers across all four legs.
+#
+# A scenario hang/crash is now a REAL regression — do not re-add entries here
+# to make CI green; find the unretried write or teardown race instead (the
+# I-0140 initiative doc is the playbook, .angreal/gil_stress.py the harness).
+KNOWN_FLAKY_HANG: set = set()
+
+
+def _looks_like_crash(returncode, stdout, stderr) -> bool:
+    """True when a non-zero result is a NATIVE crash (segfault / killing signal)
+    rather than a normal pytest assertion failure (rc 1) — the crash form of the
+    T-0622 flaky PyO3 hang."""
+    if returncode is not None and (returncode < 0 or returncode in (134, 139)):
+        return True
+    blob = (stdout or "") + (stderr or "")
+    return any(
+        m in blob for m in ("Segmentation fault", "SIGSEGV", "SIGABRT", "Fatal Python error")
+    )
+
+
+def run_pytest_scenarios(
+    venv,
+    project_root: Path,
+    backend_name: str,
+    aggregator: "TestAggregator",
+    filter: str | None = None,
+    file: str | None = None,
+) -> bool:
+    """Run all (or filtered) tests/python/test_scenario_*.py against an already-built wheel.
+
+    Caller is responsible for:
+      - Building/installing the cloaca wheel into `venv` (use _build_and_install_cloaca_unified).
+      - Bringing up the database for `backend_name` (Docker postgres or local sqlite).
+
+    For postgres, this resets the schema between scenario files via smart_postgres_reset
+    (falling back to docker restart). For sqlite, it deletes lingering *.db files.
+
+    Returns True if all scenarios passed, False otherwise. Per-file results are added
+    to `aggregator`.
+    """
+    import os
+    import time
+
+    from utils import (  # local import to avoid making this module depend on top-level utils at import time
+        check_postgres_container_health,
+        docker_down,
+        docker_up,
+        smart_postgres_reset,
+    )
+
+    test_dir = project_root / "tests" / "python"
+    if file:
+        test_file_path = test_dir / file
+        if not test_file_path.exists():
+            print(f"Error: Test file {file} not found in {test_dir}")
+            return False
+        test_files = [test_file_path]
+    else:
+        test_files = sorted(test_dir.glob("test_*.py"))
+        if filter:
+            test_files = [f for f in test_files if filter in f.name]
+
+    print(f"Found {len(test_files)} python scenario files to run for {backend_name}")
+
+    pytest_exe = venv.path / "bin" / "pytest"
+    env = os.environ.copy()
+    env["CLOACA_BACKEND"] = backend_name
+
+    all_passed = True
+    file_results = []
+
+    for test_file in test_files:
+        print(f"\n--- pytest {test_file.name} ({backend_name}) ---", flush=True)
+
+        if backend_name == "postgres":
+            if smart_postgres_reset():
+                print("PostgreSQL state reset")
+            else:
+                print("Fast reset failed, restarting Docker...")
+                docker_down(remove_volumes=True)
+                docker_up()
+                time.sleep(10)
+                if not check_postgres_container_health():
+                    print(f"PostgreSQL unhealthy for {test_file.name}")
+                    file_results.append((test_file.name, False))
+                    all_passed = False
+                    continue
+        elif backend_name == "sqlite":
+            for db_file in project_root.glob("*.db*"):
+                try:
+                    db_file.unlink()
+                except FileNotFoundError:
+                    pass
+
+        cmd = [str(pytest_exe), "--timeout=10", str(test_file), "-v"]
+        if filter:
+            cmd.extend(["-k", filter])
+
+        # Per-scenario subprocess timeout (CLOACI-T-0622): pytest's own
+        # `--timeout=10` cannot interrupt a deadlock inside a blocking
+        # PyO3 call into Rust. Without this, a hung scenario consumes
+        # the entire workflow budget (6h on the nightly job). 180s is
+        # well above any legitimate scenario runtime while still failing
+        # fast on a hang.
+        scenario_timeout_secs = 180
+        # CLOACI-T-0622: retry ONLY on timeout (the flaky sqlite/PyO3 hang).
+        # A non-zero return code is a real test failure and fails fast — no
+        # retry — so this does NOT mask genuine regressions; it only gives a
+        # transient hang another chance. A scenario that hangs on every attempt
+        # (a deterministic deadlock) still fails the lane.
+        max_attempts = 3
+        result = None
+        last_timeout = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=scenario_timeout_secs,
+                    check=False,
+                )
+                last_timeout = None
+                break  # completed (pass OR real failure) — never retry a real result
+            except subprocess.TimeoutExpired as e:
+                last_timeout = e
+                if attempt < max_attempts:
+                    print(
+                        f"TIMEOUT: {test_file.name} exceeded {scenario_timeout_secs}s "
+                        f"(attempt {attempt}/{max_attempts}) — retrying flaky hang (CLOACI-T-0622).",
+                        flush=True,
+                    )
+
+        if last_timeout is not None:
+            # Hung on every attempt. For the known T-0622 flaky-hang scenarios
+            # this is XFAIL (non-blocking) so a transient infra hang doesn't block
+            # CI/releases; every other scenario is a real failure.
+            e = last_timeout
+            stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+            xfail = test_file.name in KNOWN_FLAKY_HANG
+            aggregator.add_result(
+                TestResult(
+                    file_name=test_file.name,
+                    backend=backend_name,
+                    passed=xfail,
+                    stdout=stdout,
+                    stderr=stderr
+                    + f"\n[CLOACI-T-0622] scenario subprocess hung past {scenario_timeout_secs}s "
+                    + f"on all {max_attempts} attempts and was killed"
+                    + (" — XFAIL (known flaky, non-blocking).\n" if xfail else ".\n"),
+                    return_code=124,
+                )
+            )
+            if xfail:
+                print(
+                    f"XFAIL: {test_file.name} hung past {scenario_timeout_secs}s on all "
+                    f"{max_attempts} attempts — known flaky (CLOACI-T-0622), not blocking.",
+                    flush=True,
+                )
+                file_results.append((test_file.name, True))
+            else:
+                print(
+                    f"TIMEOUT: {test_file.name} exceeded {scenario_timeout_secs}s on all "
+                    f"{max_attempts} attempts — killed.",
+                    flush=True,
+                )
+                file_results.append((test_file.name, False))
+                all_passed = False
+            continue
+
+        passed = result.returncode == 0
+        xfail_crash = (
+            not passed
+            and test_file.name in KNOWN_FLAKY_HANG
+            and _looks_like_crash(result.returncode, result.stdout, result.stderr)
+        )
+        aggregator.add_result(
+            TestResult(
+                file_name=test_file.name,
+                backend=backend_name,
+                passed=passed or xfail_crash,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                return_code=result.returncode,
+            )
+        )
+        if passed:
+            print(f"PASSED: {test_file.name}")
+            file_results.append((test_file.name, True))
+        elif xfail_crash:
+            print(
+                f"XFAIL: {test_file.name} crashed (rc={result.returncode}, segfault/signal) — "
+                f"known flaky (CLOACI-T-0622), not blocking.",
+                flush=True,
+            )
+            file_results.append((test_file.name, True))
+        else:
+            print(f"FAILED: {test_file.name}")
+            print("\n--- PYTEST OUTPUT ---")
+            print(result.stdout)
+            if result.stderr:
+                print("\n--- STDERR ---")
+                print(result.stderr)
+            print("--- END OUTPUT ---\n")
+            file_results.append((test_file.name, False))
+            all_passed = False
+
+    passed = [n for n, ok in file_results if ok]
+    failed = [n for n, ok in file_results if not ok]
+    print(f"\nPython {backend_name} scenarios: {len(passed)} passed, {len(failed)} failed")
+    return all_passed
+
+
+def scrub_python_artifacts(deep: bool = False) -> int:
+    """Clean Python build artifacts and test environments.
+
+    Used by `cloacina purge` (deep=True). Removes:
+    - test venvs (smoke-test-*, test-env-*, debug-env-*, tutorial-*)
+    - __pycache__ directories
+    - SQLite *.db files (project root + /tmp/cloacina_*.db)
+    Optionally runs `cargo clean` when deep=True.
+
+    Returns 0 on success, non-zero on failure.
+    """
+    try:
+        project_root = Path(angreal.get_root()).parent
+
+        envs_cleaned = 0
+        for env_pattern in ["smoke-test-*", "test-env-*", "debug-env-*", "tutorial-*"]:
+            for env_dir in project_root.glob(env_pattern):
+                if env_dir.is_dir():
+                    shutil.rmtree(env_dir)
+                    envs_cleaned += 1
+        if envs_cleaned:
+            print(f"Cleaned {envs_cleaned} test environments")
+
+        caches_cleaned = 0
+        for cache_dir in project_root.rglob("__pycache__"):
+            shutil.rmtree(cache_dir)
+            caches_cleaned += 1
+        if caches_cleaned:
+            print(f"Cleaned {caches_cleaned} __pycache__ directories")
+
+        db_files_cleaned = 0
+        for db_file in project_root.glob("*.db*"):
+            db_file.unlink()
+            db_files_cleaned += 1
+        for tmp_db in ["/tmp/cloacina_demo.db", "/tmp/cloacina_debug.db"]:
+            p = Path(tmp_db)
+            if p.exists():
+                p.unlink()
+                db_files_cleaned += 1
+        if db_files_cleaned:
+            print(f"Cleaned {db_files_cleaned} database files")
+
+        if deep:
+            print("Running cargo clean...")
+            result = subprocess.run(
+                ["cargo", "clean"], cwd=str(project_root), capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                print(f"cargo clean warning: {result.stderr}")
+
+        return 0
+    except Exception as e:
+        print(f"Python scrub failed: {e}")
+        return 1
+
+
+
+@dataclass
+class TestResult:
+    """Represents the result of running a test file."""
+    file_name: str
+    backend: str
+    passed: bool
+    stdout: str = ""
+    stderr: str = ""
+    return_code: int | None = None
+
+    def get_failure_summary(self) -> str:
+        """Extract a concise failure summary from pytest output."""
+        if self.passed:
+            return ""
+
+        lines = []
+
+        # Look for FAILED lines in stdout
+        for line in self.stdout.split('\n'):
+            if 'FAILED' in line or 'ERROR' in line or 'AssertionError' in line or 'assert ' in line or 'Error:' in line or 'Exception:' in line:
+                lines.append(line.strip())
+
+        # Also check stderr
+        for line in self.stderr.split('\n'):
+            if 'Error' in line or 'Exception' in line:
+                lines.append(line.strip())
+
+        return '\n'.join(lines[:10]) if lines else "No specific error extracted"
+
+    def get_short_failures(self) -> str:
+        """Extract the pytest short test summary from output."""
+        if self.passed:
+            return ""
+
+        # Find the short test summary section
+        in_summary = False
+        summary_lines = []
+
+        for line in self.stdout.split('\n'):
+            if '= short test summary info =' in line or '= FAILURES =' in line:
+                in_summary = True
+                continue
+            if in_summary:
+                if line.startswith('=') and '=' in line[1:]:
+                    break
+                if line.strip():
+                    summary_lines.append(line)
+
+        return '\n'.join(summary_lines[:20]) if summary_lines else ""
+
+
+class TestAggregator:
+    """Aggregates test results across all backends."""
+
+    def __init__(self):
+        self.results: list[TestResult] = []
+
+    def add_result(self, result: TestResult):
+        self.results.append(result)
+
+    def get_failed_results(self) -> list[TestResult]:
+        return [r for r in self.results if not r.passed]
+
+    def get_summary(self) -> dict:
+        total = len(self.results)
+        failed = len(self.get_failed_results())
+        passed = total - failed
+
+        backends = {}
+        for result in self.results:
+            if result.backend not in backends:
+                backends[result.backend] = {"passed": 0, "failed": 0}
+            if result.passed:
+                backends[result.backend]["passed"] += 1
+            else:
+                backends[result.backend]["failed"] += 1
+
+        return {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "backends": backends
+        }
+
+    def print_failure_report(self):
+        """Print a detailed report of all failures."""
+        failed = self.get_failed_results()
+        if not failed:
+            return
+
+        print(f"\n{'='*60}")
+        print("DETAILED FAILURE REPORT")
+        print(f"{'='*60}")
+
+        for i, result in enumerate(failed, 1):
+            print(f"\n[{i}/{len(failed)}] {result.file_name} ({result.backend})")
+            print("-" * 50)
+
+            # Print the short test summary (most useful)
+            short_failures = result.get_short_failures()
+            if short_failures:
+                print("PYTEST FAILURES:")
+                print(short_failures)
+            else:
+                # Fall back to extracted error lines
+                failure_summary = result.get_failure_summary()
+                if failure_summary:
+                    print("ERROR SUMMARY:")
+                    print(failure_summary)
+
+            # Print return code
+            print(f"\nReturn code: {result.return_code}")
+
+            # Offer to show full output
+            print(f"\nFull stdout length: {len(result.stdout)} chars")
+            print(f"Full stderr length: {len(result.stderr)} chars")
+
+        print(f"\n{'='*60}")
+
+
+def write_file_safe(path: Path, content: str, encoding: str = "utf-8", backup: bool = False):
+    """Safely write a file with error handling.
+
+    Args:
+        path: File path to write
+        content: Content to write
+        encoding: File encoding
+        backup: Whether to backup existing file
+
+    Returns:
+        Path to backup file if backup=True and file existed, None otherwise
+
+    Raises:
+        Exception: If any error occurs during file operations
+    """
+    try:
+        backup_path = None
+
+        if backup and path.exists():
+            backup_path = path.with_suffix(path.suffix + ".backup")
+            shutil.copy2(path, backup_path)
+
+        # Ensure parent directory exists
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_text(content, encoding=encoding)
+        return backup_path
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to write file {path}: {e}")
+
+def normalize_version_for_python(cargo_version: str) -> str:
+    """Convert Cargo SemVer to PEP 440 compliant version.
+
+    Args:
+        cargo_version: Version string from Cargo.toml (e.g., "0.2.0-alpha.4")
+
+    Returns:
+        PEP 440 compliant version string (e.g., "0.2.0a4")
+
+    Examples:
+        >>> normalize_version_for_python("0.2.0-alpha.4")
+        "0.2.0a4"
+        >>> normalize_version_for_python("0.2.0-beta.3")
+        "0.2.0b3"
+        >>> normalize_version_for_python("1.0.0")
+        "1.0.0"
+    """
+    # Convert alpha pre-releases: 0.2.0-alpha.4 -> 0.2.0a4
+    version = re.sub(r'-alpha\.(\d+)', r'a\1', cargo_version)
+
+    # Convert beta pre-releases: 0.2.0-beta.3 -> 0.2.0b3
+    version = re.sub(r'-beta\.(\d+)', r'b\1', version)
+
+    return version
+
+
+def get_workspace_version() -> str:
+    """Extract version from workspace Cargo.toml.
+
+    Returns:
+        Version string from workspace configuration
+
+    Raises:
+        ValueError: If version cannot be found in workspace Cargo.toml
+    """
+    project_root = Path(angreal.get_root()).parent
+    cargo_toml = project_root / "Cargo.toml"
+
+    if not cargo_toml.exists():
+        raise FileNotFoundError(f"Workspace Cargo.toml not found at {cargo_toml}")
+
+    content = cargo_toml.read_text()
+    match = re.search(r'\[workspace\.package\].*?version\s*=\s*"([^"]+)"', content, re.DOTALL)
+
+    if match:
+        return match.group(1)
+
+    raise ValueError("Could not find version in workspace Cargo.toml")
+
+
+def _build_and_install_cloaca_unified(venv_name, cargo_features=None):
+    """Build unified cloaca wheel and install it in a test environment.
+
+    By default the wheel is built with the cloacina-python crate's default
+    features (postgres+sqlite+macros). Pass ``cargo_features`` (e.g.
+    ``"sqlite,macros"``) to scope the wheel to a specific backend — required
+    on the sqlite-only CI lane where libpq has been removed from the runner.
+    Returns the VirtualEnv object and paths to executables.
+    """
+    project_root = Path(angreal.get_root()).parent
+    venv_path = project_root / venv_name
+
+    # Create test environment
+    print("[DEBUG] Step 1: Creating test environment...", flush=True)
+    venv = VirtualEnv(path=str(venv_path), now=True)
+    print(f"[DEBUG] Step 1 complete: venv at {venv.path}", flush=True)
+
+    python_exe = venv.path / "bin" / "python"
+    pip_exe = venv.path / "bin" / "pip3"
+
+    # Install pip and dependencies
+    print("[DEBUG] Step 2: Installing pip via ensurepip...", flush=True)
+    subprocess.run([str(python_exe), "-m", "ensurepip"], check=True, capture_output=True)
+    print("[DEBUG] Step 2 complete", flush=True)
+
+    # Base dependencies for all backends
+    print("[DEBUG] Step 3: Installing dependencies...", flush=True)
+    deps = ["maturin", "pytest", "pytest-asyncio", "pytest-timeout", "psycopg2-binary"]
+    subprocess.run([str(pip_exe), "install"] + deps, check=True, capture_output=True)
+    print("[DEBUG] Step 3 complete", flush=True)
+
+    # Build and install unified wheel from cloacina-python
+    # (pyproject.toml moved there in CLOACI-T-0529 so the Python bindings
+    # stop dragging pyo3 through cloacina core).
+    print("[DEBUG] Step 4: Building cloaca wheel from cloacina-python...", flush=True)
+    crate_dir = project_root / "crates" / "cloacina-python"
+
+    # Build wheel using maturin (pyproject.toml is in crates/cloacina-python/)
+    maturin_exe = venv.path / "bin" / "maturin"
+    maturin_cmd = [
+        str(maturin_exe), "build",
+        "--release",
+        "--manylinux", "off",  # skip auditwheel repair (avoids libpq.so resolution)
+        # Build against the interpreter that will actually LOAD the wheel.
+        #
+        # Without this, maturin has no VIRTUAL_ENV (we invoke its binary
+        # directly rather than activating the venv) and falls back to
+        # discovering a system interpreter. On macOS that is the
+        # CommandLineTools Python 3.9 framework, so the extension linked
+        # `@rpath/Python3.framework/Versions/3.9/Python3` while the venv ran a
+        # different CPython. Two Python runtimes then coexist in one process
+        # and the first pyo3 call into the wrong one aborts the interpreter:
+        #
+        #   Fatal Python error: PyInterpreterState_Get: the function must be
+        #   called with the GIL held, but the GIL is released (the current
+        #   Python thread state is NULL)
+        #
+        # Every Python scenario was unrunnable locally as a result. CI never
+        # saw it: on Linux the extension resolves Python symbols dynamically
+        # from the host interpreter rather than linking a framework, so the
+        # mismatch is invisible there. This is the venv's own interpreter, not
+        # a pinned version — it follows whatever Python the venv was created
+        # with.
+        "--interpreter", str(python_exe),
+    ]
+    if cargo_features:
+        # Scope the wheel to a specific backend (e.g. sqlite-only lane).
+        maturin_cmd += ["--no-default-features", "--features", cargo_features]
+
+    print(f"[DEBUG] Running: {' '.join(maturin_cmd)} in {crate_dir}", flush=True)
+    result = subprocess.run(
+        maturin_cmd,
+        cwd=str(crate_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(f"[DEBUG] Maturin STDERR: {result.stderr}", flush=True)
+        print(f"[DEBUG] Maturin STDOUT: {result.stdout}", flush=True)
+        raise subprocess.CalledProcessError(result.returncode, maturin_cmd)
+    print("[DEBUG] Step 4 complete: wheel built", flush=True)
+
+    # Find and install the wheel
+    print("[DEBUG] Step 5: Finding and installing wheel...", flush=True)
+    wheel_pattern = "cloaca-*.whl"
+    # Maturin puts wheels in the workspace target, not the crate target
+    wheel_dir = project_root / "target" / "wheels"
+    wheel_files = list(wheel_dir.glob(wheel_pattern))
+
+    if not wheel_files:
+        raise FileNotFoundError(f"No wheel found matching {wheel_pattern} in {wheel_dir}")
+
+    # Newest by mtime, not glob order: a backend-scoped run
+    # (`--backend sqlite` builds `--no-default-features --features sqlite`)
+    # can leave an older wheel here, and glob order is arbitrary.
+    wheel_file = max(wheel_files, key=lambda p: p.stat().st_mtime)
+    print(f"[DEBUG] Installing wheel: {wheel_file.name}", flush=True)
+    # --force-reinstall is REQUIRED, not defensive: the version never changes
+    # between builds, so plain `pip install` sees `cloaca 0.10.0` already
+    # present and no-ops ("already satisfied") — silently keeping whatever
+    # feature scope the previous run installed. The venv persists at the repo
+    # root, so a `--backend sqlite` run followed by a postgres run left a
+    # sqlite-only wheel in place and every postgres scenario died with
+    # "postgres feature not enabled" while the harness reported a successful
+    # build. CI never saw this: its runners are fresh and each backend is a
+    # separate job, so the venv is always empty. --no-deps because the wheel's
+    # deps are already installed above and we only want the wheel replaced.
+    subprocess.run(
+        [str(pip_exe), "install", "--force-reinstall", "--no-deps", str(wheel_file)],
+        check=True,
+        capture_output=True,
+    )
+    print("[DEBUG] Step 5 complete: wheel installed (forced)", flush=True)
+
+    # Postcondition: prove the INSTALLED module has the backend the caller
+    # asked for. Without this, a feature-scope mismatch surfaces much later as
+    # a pile of scenario failures blaming the database URL ("Unable to detect
+    # database backend ... postgres feature not enabled") while every build
+    # step reported success. `DatabaseAdmin` is postgres-gated in the bindings,
+    # so its presence is a reliable proxy for the postgres feature.
+    wants_postgres = cargo_features is None or "postgres" in cargo_features
+    probe = subprocess.run(
+        [str(python_exe), "-c", "import cloaca; print(hasattr(cloaca, 'DatabaseAdmin'))"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            f"installed cloaca wheel is not importable: {probe.stderr.strip()}"
+        )
+    has_postgres = probe.stdout.strip() == "True"
+    if has_postgres != wants_postgres:
+        raise RuntimeError(
+            "installed cloaca wheel has the wrong feature scope: expected "
+            f"postgres={wants_postgres}, got postgres={has_postgres}. The venv at "
+            f"{venv.path} likely holds a wheel from a differently-scoped run — "
+            "remove it and re-run."
+        )
+    print(
+        f"[DEBUG] Step 5 verified: installed wheel has postgres={has_postgres}",
+        flush=True,
+    )
+
+    return venv, python_exe, pip_exe

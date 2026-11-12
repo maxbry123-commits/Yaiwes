@@ -1,0 +1,141 @@
+# MCP Facade Action Reference
+
+> **AUTO-GENERATED — do not edit by hand.** Regenerate with `uv run python scripts/generate_facade_actions_doc.py`.
+> Drift-gated by `tests/unit/docs/test_facade_actions_doc_drift.py` (regenerates in-memory and diffs).
+
+The MCP server exposes **8 facade tools** routing **86 actions** via the `action` parameter. This reference is generated from the live facade registry (`tree_sitter_analyzer/mcp/_tool_registry.py`) and each inner tool's `inputSchema` — the same schema the runtime strict-parameter guard enforces, so a wrong param guess in this table would fail at runtime too (and vice versa).
+
+Reading the tables:
+
+Runtime discovery: call a facade with `action=help` for its business action list and `agent-core/v1` profile, or add `target_action=<name>` to receive that direct action's executable `action_schema`. `help` is a discovery control and is excluded from the business-action count above.
+
+- **Params** — accepted top-level parameters; `*` marks required ones. Facades mechanically alias the canonical `symbol` onto inner `function_name`/`class_name` params (noted inline). Every facade also accepts `action` (required) itself.
+- **Response keys** — the statically declared `ToolResponse` envelope (`get_output_schema()`); `*` marks guaranteed keys. `error` appears on failures. "+ action payload" means the action layers its own result keys on top (`additionalProperties: true`); payload shapes are not statically declared, so they are not listed here — see the facade description for per-action semantics.
+- **CLI twin** — the CLI flag (or console script) covering the same capability, from the CLI-parity contract. 4 actions have no authoritative CLI mapping and show — (honest gap, not an omission).
+- *Bespoke routes* (closures with hand-rolled arg handling, e.g. `nav action=test_map`) have their params pinned in the generator with source provenance; the generator fails if the live route set drifts from those pins.
+
+## `search` — 11 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `chain` | `query`*, `compact`, `include_code`, `max_files`, `max_symbols`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-query` |
+| `query` | `file_path`, `filter`, `find_references`, `language`, `max_count`, `output_file`, `output_format`, `query_key`, `query_string`, `result_format`, `suppress_output`, `symbol`, `symbol_type` — requires `file_path` or `symbol`; file-scoped queries take exactly one of `query_key`/`query_string` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--query-key` |
+| `select` | `selector`*, `max_results`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | — |
+| `semantic` | `query`*, `kind`, `language`, `min_similarity`, `top_k`, `use_combined_score` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--semantic-neighbors` |
+| `subscribe` | `selector`*, `min_interval`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | — |
+| `symbol` | `query`*, `kind`, `language`, `limit`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--symbol-search` |
+| `text` | `query`*, `case_mode`, `exclude_globs`, `include_globs`, `limit`, `output_format`, `root`, `word_match` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--text-search` |
+| `tql_execute` | `selector`*, `max_results` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--tql` |
+| `tql_schema` | (none) | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--tql-schema` |
+| `unsubscribe` | `output_format`, `selector`, `sub_id` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | — |
+| `uql` | `query`*, `cursor`, `detail`, `limit`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--uql` |
+
+## `nav` — 16 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `call_path` | `source_function`*, `target_function`*, `direction`, `max_depth`, `max_paths`, `output_format`, `source_file`, `target_file` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--call-path` |
+| `callee_tree` | `symbol`*, `file_path`, `max_depth`, `max_nodes`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--callee-tree` |
+| `callees` | `function_name`* (or `symbol` as alias), `scope` (point\|graph, default point), `file_path`, `limit` (scope=point), `depth` (scope=graph), `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--call-graph` |
+| `caller_tree` | `symbol`*, `file_path`, `max_depth`, `max_nodes`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--caller-tree` |
+| `callers` | `function_name`* (or `symbol` as alias), `scope` (point\|graph, default point), `file_path`, `limit` (scope=point), `depth` (scope=graph), `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--call-graph` |
+| `co_change` | `symbol` or `file_path` (one required), `max_commits` (default 500), `min_shared` (default 3), `max_results` (default 20), `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--co-change` |
+| `context` | `task`* (or `symbol`/`query` as alias), `max_nodes`, `max_code_blocks`, `include_graph`, `access_mode`, `snapshot_id`, `source_generation`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-context` |
+| `impact` | `mode`*, `depth`, `file_path`, `function_name` (`symbol` aliases `function_name`), `function_names`, `include_tests`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-impact` |
+| `lineage` | `symbol`*, `file_paths`, `max_depth`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--symbol-lineage` |
+| `navigate` | `symbol`*, `depth`, `file_path`, `limit`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-navigate` |
+| `pulse` | `file`*, `symbol`*, `format`, `max_callees`, `max_callers`, `max_comments`, `max_siblings`, `token_budget` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--pulse` |
+| `pulse_batch` | `targets`*, `format`, `max_symbols`, `token_budget_per_symbol` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--pulse-batch` |
+| `resolve` | `symbol`*, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--symbol-resolve` |
+| `test_map` | `symbol`* (or `function_name` as alias), `file_path`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--test-map` |
+| `trace` | `symbol`*, `case_sensitive`, `exclude_patterns`, `file_path`, `max_results`, `project_root`, `word_match` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--trace-impact` |
+| `xref` | `file_path`, `include_callees`, `include_callers`, `include_file_deps`, `include_imports`, `mode`, `output_format`, `symbol` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-xref` |
+
+## `structure` — 9 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `analyze` | `file_path`*, `format_type`, `language`, `output_file`, `output_format`, `suppress_output` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--structure` |
+| `ast_path` | `file_path`*, `language`, `line`, `max_depth`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--ast-path` |
+| `class_detail` | `class_name`* (or `query`/`symbol` as alias), `language`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--class-inspect` |
+| `class_tree` | `class_name` (`symbol` aliases `class_name`), `max_depth`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--class-hierarchy` |
+| `explore` | `includeCode`, `maxFiles`, `maxSymbols`, `output_format`, `query`, `symbol`, `symbols` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-explore` |
+| `outline` | `file_path`*, `include_fields`, `include_imports`, `language`, `listed_cap`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--outline` |
+| `read` | single: `file_path`* + `start_line`* [+ `end_line`, `start_column`, `end_column`, `format`, `output_file`, `suppress_output`, `output_format`, `allow_truncate`, `fail_fast`]; batch: `requests`* | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--partial-read` |
+| `signatures` | `file_path`*, `language`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--table` |
+| `sitemap` | `directory`, `language`, `max_files`, `max_symbols`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-sitemap` |
+
+## `health` — 16 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `dead` | `include_test_files`, `max_dead`, `max_imports`, `max_variables`, `mode`, `output_format`, `path` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--dead-code` |
+| `deps` | `file_path`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--dependencies` |
+| `file` | `file_path`*, `language`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--file-health` |
+| `heatmap` | `directory`, `file_path`, `function_name` (`symbol` aliases `function_name`), `language`, `max_files`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-complexity-heatmap` |
+| `imports` | `file_path`, `max_depth`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--import-graph` |
+| `matrix` | `mode`*, `file_path`, `output_format`, `threshold`, `top_k` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--dependency-matrix` |
+| `middleware` | `framework`, `mode`, `output_format`, `url_prefix` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--detect-middleware` |
+| `overview` | `max_coupled_files`, `max_dead`, `max_entry_points`, `max_hubs`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-overview` |
+| `patterns` | `file_path`*, `categories`, `output_format`, `severity_threshold` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--code-patterns` |
+| `project` | `max_files`, `min_grade`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--project-health` |
+| `refactor_queue` | `output_format`, `top_n` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--refactor-queue` |
+| `routes` | `file_path`, `framework`, `mode`, `output_format`, `url_pattern` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--detect-routes` |
+| `scale` | `file_path`, `file_paths`, `include_complexity`, `include_details`, `include_guidance`, `language`, `metrics_only`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--metrics-only` |
+| `self` | `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--self-health` |
+| `test_gap` | `coverage_json`, `file_path`, `include_covered`, `language`, `max_files`, `max_gaps`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--test-gap` |
+| `unreachable` | `file_path`, `include_test_files`, `max_files`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--unreachable-code` |
+
+## `edit` — 13 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `ast_diff` | `access_mode`, `diff_snapshot_id`, `file_path`, `include_node_bodies`, `language`, `mode`, `new_file`, `new_ref`, `new_source`, `old_file`, `old_ref`, `old_source`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--ast-diff` |
+| `classify` | `access_mode`, `diff_snapshot_id`, `file_path`, `hunk_cap`, `include_ast_nodes`, `language`, `mode`, `new_ref`, `new_source`, `old_ref`, `old_source`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--semantic-classify` |
+| `constraints` | `access_mode`, `diff_snapshot_id`, `output_format`, `path_filter`, `persist`, `scope_paths`, `severity_min`, `snapshot_id`, `source_generation` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--check-constraints` |
+| `guard` | `modification_type`*, `symbol`*, `file_path` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--modification-guard` |
+| `impact` | `access_mode`, `agent_summary_only`, `capture_diff_snapshot`, `include_details`, `include_tests`, `mode`, `output_format`, `pr_url`, `resource_profile`, `scope_mode`, `scope_paths` — `capture_diff_snapshot` is an explicit legacy producer available only to same-process POSIX consumers and is forbidden whenever `access_mode` is present | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--change-impact` |
+| `mutation_probe` | `code_location`*, `test_node_id`*, `output_format`, `timeout` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--mutation-probe` |
+| `plan_rename` | `new_name`*, `symbol`*, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--plan-rename` |
+| `pr` | `include_call_graph`, `mode`, `output_format`, `pr_url` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--pr-review` |
+| `refactor` | `file_path`*, `include_extractions`, `include_skeleton`, `language`, `max_suggestions`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--refactor` |
+| `release_snapshot` | `diff_snapshot_id`*, `route_lease_id`*, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | — |
+| `rename` | `new_name`*, `symbol`*, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--rename` |
+| `safe` | `file_path`*, `access_mode`, `edit_type`, `output_format`, `snapshot_id`, `source_generation` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--safe-to-edit` |
+| `verify` | `request`*, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--verify-plan` |
+
+## `project` — 9 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `card` | `force_refresh`, `format`, `include_notes`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--project-card` |
+| `doc_sync` | `doc_patterns`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--doc-sync` |
+| `journal` | `alternatives`, `id`, `limit`, `mode`, `new_id`, `output_format`, `path_scope`, `query`, `rationale`, `related_symbols`, `scope_paths`, `tags`, `title`, `verdict`, `verdict_filter` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--decision-journal` |
+| `metrics` | `output_format`, `sections` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-metrics` |
+| `overview` | `include_health`, `max_depth`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--overview` |
+| `parser` | `include_supported`, `language`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--parser-readiness` |
+| `skills` | `output_format`, `skills_root` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--agent-skills` |
+| `smart` | `file_path`*, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--smart-context` |
+| `workflow` | `output_format`, `target_path` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--agent-workflow` |
+
+## `index` — 8 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `auto` | `max_files`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--autoindex` |
+| `build` | `add_notes`, `roots` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--build-project-index` |
+| `cache` | `backend`, `file_path`, `force`, `include_activation`, `include_details`, `language`, `limit`, `max_files`, `mode`, `poll_interval`, `query`, `symbol` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--ast-cache` |
+| `full` | `exclude_patterns`, `include_activation`, `max_files`, `mode`, `no_default_excludes`, `output_format`, `resolve_synapse` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--full-index` |
+| `knowledge` | `backend`, `include_docs`, `max_edges`, `max_files`, `max_nodes`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--knowledge-graph-index` |
+| `schema` | (none) | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--project-schema` |
+| `status` | `access_mode`, `include_lag`, `output_format` — `access_mode` accepts only `read_existing` (default); it is rejected for every mutating index action | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-status` |
+| `sync` | `max_files`, `mode`, `output_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--incremental-sync` |
+
+## `viz` — 4 actions
+
+| Action | Params (required `*`) | Response keys (top-level) | CLI twin |
+| --- | --- | --- | --- |
+| `graph` | `depth`, `direction`, `file_path`, `function`, `max_edges`, `mode`, `output_format`, `visualization_format` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--codegraph-visualize` |
+| `knowledge` | `export_format`, `focus`, `lod`, `max_edges`, `max_nodes`, `output_format`, `uml_kind` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--knowledge-graph-export` |
+| `similarity` | `include_bodies`, `max_groups`, `min_group_size`, `min_lines`, `mode`, `output_format`, `path_filter`, `use_cache` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--code-similarity` |
+| `uml` | `class_name` (`symbol` aliases `class_name`), `diagram`, `file_path`, `function_name` (`symbol` aliases `function_name`), `include_external_bases`, `include_tests`, `max_depth`, `max_edges`, `max_nodes`, `max_paths`, `output_format`, `package_depth`, `source`, `target` | `success`*, `verdict`*, `agent_summary`, `error` + action payload | `--uml` |

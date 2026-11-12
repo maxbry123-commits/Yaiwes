@@ -1,0 +1,22 @@
+#houseStyle: true
+
+# Blank line before doc-commented field after package clause
+# (a non-field decl) is always inserted by the heuristic,
+# even without RelPos. The blank line is supplied by
+# format.ASTStyle.Apply (A4 + A1), so this test enables the
+# house-style pre-pass (#houseStyle).
+-- in --
+package foo
+
+// a comment
+x: 1
+-- out/relpos --
+package foo
+
+// a comment
+x: 1
+-- out/norelpos --
+package foo
+
+// a comment
+x: 1

@@ -1,0 +1,77 @@
+# CLOACI-I-0139 / T-0906 — `cloacina-provider-kafka`, the flagship NATIVE
+# stream-accumulator provider.
+#
+# Ships `rdkafka` INSIDE the provider (acceptance: rdkafka lives ONLY here, the
+# provider has NO dependency on core `cloacina`). The single member
+# `kafka_source` is a `#[constructor(kind = accumulator, mode = stream)]`: its
+# `source()` owns a blocking rdkafka `BaseConsumer` poll loop, safe because
+# fidius pumps a native stream on a dedicated OS thread (never the tokio
+# executor). Built to a HOST cdylib and packaged with
+# `cloacinactl constructor package --native`; the cloacina loader drives it via
+# `call_streaming` → `ChunkStream` → the accumulator boundary channel (T-0904).
+#
+# Standalone crate (empty [workspace], under examples/*, excluded from the
+# cloacina workspace). Ship-form version deps (crates.io); published to
+# crates.io by the provider release wave (CLOACI-T-0872).
+[workspace]
+
+[package]
+# The certify/ harness (T-0872 wave certification) is a sibling dev tool,
+# never part of the published crate.
+exclude = ["certify"]
+name = "cloacina-provider-kafka"
+version = "0.1.1"
+description = "Kafka event-source provider for cloacina — kafka_source native stream-accumulator constructor (rdkafka lives here, not in core)."
+license = "Apache-2.0"
+repository = "https://github.com/colliery-io/cloacina"
+edition = "2024"
+rust-version = "1.99"
+
+# CLOACI-T-0907: tells the provider BUNDLER (compiler `pack_providers` /
+# `bundle_providers`) to build this provider as a NATIVE host cdylib —
+# librdkafka is C and cannot target wasm32-wasip2. Native = trusted,
+# unsandboxed (grants advisory); the loader dlopen's it in-process.
+
+# Used by macro output, which cargo-machete cannot see.
+[package.metadata.cargo-machete]
+ignored = ["cloacina-constructor-contract", "fidius-core", "fidius-macro", "serde"]
+
+[package.metadata.cloacina]
+runtime = "native"
+
+[lib]
+# cdylib → the host plugin the loader dlopen's; rlib → so `emit_manifest`
+# (host bin) can link `__provider_manifest()`.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "emit_manifest"
+path = "src/bin/emit_manifest.rs"
+
+[features]
+# Opts the crate into the native provider shell emission (the `constructor_provider!`
+# native glue is gated on this). On by default — this provider IS native-only:
+# rdkafka (C librdkafka) cannot target wasm32-wasip2.
+default = ["native"]
+native = []
+
+[dependencies]
+# The `#[constructor]` / `constructor_provider!` authoring macros (crates.io version dep).
+cloacina-macros = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Shared, language-neutral contract types (serde-only → host-safe).
+cloacina-constructor-contract = "0.10"
+
+# fidius HOST SDK — the native suite shell is emitted with `crate = fidius_core`.
+fidius-core = "0.5.6"
+fidius-macro = "0.5.6"
+
+# The whole point of this provider: the Kafka consumer lives HERE, not in core.
+# Plain (non-tokio) rdkafka — `source()` is a synchronous poll-loop iterator on
+# fidius's dedicated pump thread, so the sync `BaseConsumer` is the right shape.
+rdkafka = "0.39"
+
+[profile.release]
+opt-level = "s"
+strip = true

@@ -1,0 +1,49 @@
+// Issue #729
+-- in.cue --
+ifScalar: {
+	_#cond: true
+
+	if _#cond {5}
+}
+
+ifScalarConflict: {
+	_#cond: true
+
+	if _#cond {5}
+
+	"soo"
+}
+
+ifScalarNested: {
+	_#cond: true
+
+	if _#cond {{{5}}}
+
+}
+-- out/compile --
+--- in.cue
+{
+  ifScalar: {
+    _#cond: true
+    if 〈0;_#cond〉 {
+      5
+    }
+  }
+  ifScalarConflict: {
+    _#cond: true
+    if 〈0;_#cond〉 {
+      5
+    }
+    "soo"
+  }
+  ifScalarNested: {
+    _#cond: true
+    if 〈0;_#cond〉 {
+      {
+        {
+          5
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,6354 @@
+/*
+ *  Copyright 2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Cloacina HTTP API server library.
+//!
+//! Extracted from `cloacinactl serve` into its own crate (T-0510). Exposes a
+//! single `run()` entrypoint that boots the axum HTTP server with auth, tenant
+//! management, workflow upload, and execution APIs.
+
+pub mod actuator;
+pub mod agent_registry;
+pub mod autoscaler;
+pub mod delivery_sink;
+pub mod fleet_coordinator;
+pub mod fleet_executor;
+pub mod fleet_graph_executor;
+pub mod identity;
+pub mod oidc;
+pub mod openapi;
+pub mod ops_metrics;
+pub mod routes;
+pub mod secrets;
+pub mod tenant_runner_cache;
+
+/// CORS configuration (CLOACI-T-0643 / REQ-009). Disabled unless at least
+/// one allowed origin is configured — browser consumers (the TS SDK / UI)
+/// require an explicit operator opt-in.
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    /// Exact origins allowed (e.g. `https://ops.example.com`), or `*` for any.
+    pub allowed_origins: Vec<String>,
+    /// HTTP methods allowed in preflight. Empty = GET, POST, DELETE, OPTIONS.
+    pub allowed_methods: Vec<String>,
+    /// Request headers allowed in preflight. Empty = authorization, content-type.
+    pub allowed_headers: Vec<String>,
+}
+
+impl CorsConfig {
+    /// Build the tower-http layer, or `None` when CORS is disabled.
+    /// Invalid origin/method/header values fail fast at boot.
+    pub fn layer(&self) -> Result<Option<tower_http::cors::CorsLayer>> {
+        use tower_http::cors::{AllowOrigin, CorsLayer};
+
+        if self.allowed_origins.is_empty() {
+            return Ok(None);
+        }
+
+        let origins = if self.allowed_origins.iter().any(|o| o == "*") {
+            AllowOrigin::any()
+        } else {
+            let parsed: Vec<axum::http::HeaderValue> = self
+                .allowed_origins
+                .iter()
+                .map(|o| {
+                    o.parse()
+                        .with_context(|| format!("invalid CORS origin: {o}"))
+                })
+                .collect::<Result<_>>()?;
+            AllowOrigin::list(parsed)
+        };
+
+        let methods: Vec<axum::http::Method> = if self.allowed_methods.is_empty() {
+            vec![
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ]
+        } else {
+            self.allowed_methods
+                .iter()
+                .map(|m| {
+                    m.to_uppercase()
+                        .parse()
+                        .with_context(|| format!("invalid CORS method: {m}"))
+                })
+                .collect::<Result<_>>()?
+        };
+
+        let headers: Vec<axum::http::HeaderName> = if self.allowed_headers.is_empty() {
+            vec![
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+            ]
+        } else {
+            self.allowed_headers
+                .iter()
+                .map(|h| {
+                    h.parse()
+                        .with_context(|| format!("invalid CORS header: {h}"))
+                })
+                .collect::<Result<_>>()?
+        };
+
+        Ok(Some(
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(methods)
+                .allow_headers(headers),
+        ))
+    }
+}
+
+use anyhow::{Context, Result};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tracing::{info, warn};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+use cloacina::computation_graph::registry::EndpointRegistry;
+use cloacina::computation_graph::scheduler::ComputationGraphScheduler;
+use cloacina::database::Database;
+use cloacina::runner::{DefaultRunner, DefaultRunnerConfig};
+use cloacina::security::SecurityConfig;
+
+/// How often the reactor-ownership watchdog re-asserts this replica's locks
+/// (CLOACI-T-0851 / ADR CLOACI-A-0012 Amendment 1).
+const REACTOR_OWNERSHIP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Consecutive unverifiable checks tolerated before ownership is PRESUMED LOST
+/// and the affected reactors are halted.
+///
+/// The product of these two constants is the worst-case window in which a
+/// replica that has silently lost its locks could still be running a reactor
+/// another replica now owns (~15s). Lowering the tolerance shortens that window
+/// but makes ordinary transient database errors stop healthy reactors; raising
+/// it does the reverse. Change them together and with that trade in mind.
+const REACTOR_OWNERSHIP_INDETERMINATE_TOLERANCE: u32 = 3;
+
+/// Cached per-tenant database connections for schema isolation.
+///
+/// Each tenant gets a small connection pool scoped to their PostgreSQL schema.
+/// Lazily populated on first request for a given tenant.
+pub struct TenantDatabaseCache {
+    databases: tokio::sync::RwLock<std::collections::HashMap<String, Database>>,
+    database_url: String,
+}
+
+impl TenantDatabaseCache {
+    pub fn new(database_url: String) -> Self {
+        Self {
+            databases: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            database_url,
+        }
+    }
+
+    /// Get or create a schema-scoped Database for the given tenant.
+    ///
+    /// Returns the admin (public schema) database if tenant_id is "public".
+    pub async fn resolve(
+        &self,
+        tenant_id: &str,
+        admin_db: &Database,
+    ) -> Result<Database, cloacina::database::connection::DatabaseError> {
+        if tenant_id == "public" {
+            return Ok(admin_db.clone());
+        }
+
+        // Fast path: check read lock
+        {
+            let cache = self.databases.read().await;
+            if let Some(db) = cache.get(tenant_id) {
+                return Ok(db.clone());
+            }
+        }
+
+        // Slow path: create and cache
+        let db = Database::try_new_with_schema(
+            &self.database_url,
+            "cloacina",
+            2, // small pool per tenant
+            Some(tenant_id),
+        )?;
+
+        let mut cache = self.databases.write().await;
+        // Double-check after acquiring write lock
+        if let Some(existing) = cache.get(tenant_id) {
+            return Ok(existing.clone());
+        }
+        cache.insert(tenant_id.to_string(), db.clone());
+        Ok(db)
+    }
+
+    /// CLOACI-T-0581: drop the cached `Database` for a tenant. Used by
+    /// tenant teardown — once the schema is dropped, the cached
+    /// connection pool is stale and must not be reused. Returns `true`
+    /// if an entry was evicted.
+    pub async fn evict(&self, tenant_id: &str) -> bool {
+        let mut cache = self.databases.write().await;
+        cache.remove(tenant_id).is_some()
+    }
+}
+
+/// Shared application state accessible from all route handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub database: Database,
+    pub runner: Arc<DefaultRunner>,
+    pub key_cache: Arc<crate::routes::auth::KeyCache>,
+    pub endpoint_registry: EndpointRegistry,
+    pub graph_scheduler: Arc<ComputationGraphScheduler>,
+    /// Substrate (CLOACI-I-0115): in-process registry of currently-connected
+    /// WS recipients. Plugged into the per-replica `DeliveryRelay` as its sink.
+    pub delivery_sink: Arc<crate::delivery_sink::WsDeliverySink>,
+    /// Substrate (CLOACI-I-0115): wake handle for the local `DeliveryRelay`.
+    /// Producers (CLI/agent handlers) wake this after enqueue / on reconnect
+    /// resync, bypassing the LISTEN/NOTIFY round-trip for same-replica work.
+    pub delivery_wake: cloacina::delivery::WakeHandle,
+    /// Execution-agent fleet roster (CLOACI-I-0114 / T-0631). CLOACI-T-0916:
+    /// DB-backed (`fleet_agents` table) so registration/heartbeats/selection/
+    /// reclaim are multi-replica correct; consulted by the `FleetExecutor`
+    /// (T-0633) for capacity-aware selection. Holds the replica-local one-time
+    /// secret-key pools (D-5).
+    pub agent_registry: Arc<crate::agent_registry::AgentRegistry>,
+    /// Fleet (CLOACI-T-0633): rendezvous between the `FleetExecutor` and the
+    /// agent's `POST /v1/agent/result` route. The executor registers a oneshot
+    /// before enqueueing a work packet; `report_result` forwards the incoming
+    /// `AgentResultRequest` to the waiting executor.
+    pub fleet_coordinator: Arc<crate::fleet_coordinator::FleetCoordinator>,
+    pub security_config: SecurityConfig,
+    /// Short-lived WebSocket auth tickets (single-use, TTL-based).
+    /// CLOACI-T-0916: DB-backed — redeemable on any replica.
+    pub ws_tickets: Arc<crate::routes::auth::WsTicketStore>,
+    /// Prometheus metrics handle for rendering /metrics endpoint.
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// Per-tenant database connection cache for schema isolation.
+    pub tenant_databases: Arc<TenantDatabaseCache>,
+    /// CLOACI-T-0580: per-tenant `DefaultRunner` cache for tenant-scoped
+    /// workflow execution. Each cached runner shares the same inventory
+    /// `Runtime` via `Arc`; per-tenant runners differ only in their
+    /// underlying `Database` (schema scope) and lifecycle state.
+    pub tenant_runners: Arc<crate::tenant_runner_cache::TenantRunnerCache>,
+    /// CLOACI-T-0581: max wall-clock for the tenant-teardown runner-evict
+    /// step. Past this, the runner is hard-dropped from the cache without
+    /// awaiting graceful shutdown completion — any task that ignored
+    /// cooperative cancellation will error on its next DB write once the
+    /// schema is dropped.
+    pub tenant_deletion_drain_timeout: std::time::Duration,
+    /// CLOACI-T-0639: heartbeat interval (seconds) advertised to fleet agents
+    /// on register. Agents heartbeat at this rate; the liveness sweeper uses the
+    /// same value as its tick + dead-after basis. Operator-configurable via
+    /// `--agent-heartbeat-interval-s`.
+    pub agent_heartbeat_interval_seconds: u32,
+    /// CLOACI-T-0808: platform-wide default agent-capacity limit — the ceiling a
+    /// tenant's provisioning/autoscaling clamps to, absent a per-tenant exception
+    /// in `agent_capacity_limits`. Operator-configurable via
+    /// `CLOACINA_DEFAULT_MAX_AGENTS` (default 4).
+    pub default_max_agents: u32,
+    /// CLOACI-T-0812: number of agent(s) to auto-provision when a tenant is
+    /// created. On tenant create the handler sets the new tenant's
+    /// `desired_count` to `min(initial_agents, default_max_agents)` (best-effort);
+    /// the T-0811 control loop + T-0810 actuator then bring the agents up.
+    /// Operator-configurable via `CLOACINA_INITIAL_AGENTS` (default 1); `0`
+    /// disables auto-provision.
+    pub initial_agents: u32,
+    /// CLOACI-T-0783: declarative `(method, path) -> Access` authorization
+    /// table, consulted by `authz_mw`. Built once at startup; fail-closed —
+    /// a matched route absent from this map is denied.
+    pub authz_table: Arc<crate::routes::authz::AuthzTable>,
+    /// CLOACI-T-0789/0790: the OIDC relying party, if an issuer is configured
+    /// (`CLOACINA_OIDC_*`) and discovery succeeded; `None` → OIDC login is off.
+    pub oidc: Option<Arc<crate::oidc::OidcProvider>>,
+    /// CLOACI-T-0791: the god-owned allowlist mapping OIDC claims → tenant/role.
+    pub oidc_policy: Arc<crate::oidc::MappingPolicy>,
+    /// CLOACI-T-0790: short-lived in-flight OIDC login state (state/nonce/PKCE).
+    pub oidc_login: Arc<crate::oidc::LoginFlowStore>,
+    /// CLOACI-T-0923: brute-force throttle settings for `/v1/auth/local/login`
+    /// (I-0118 OQ-13). Resolved once from the environment at startup; the
+    /// counters themselves live in the DB so a lockout holds across replicas.
+    pub login_throttle: crate::routes::local_auth::LoginThrottleConfig,
+    /// CLOACI-T-0810: fleet actuator that reconciles each tenant's running agent
+    /// count toward its `desired_count`. Selected by `CLOACINA_FLEET_ACTUATOR`
+    /// and validated fail-closed at boot by the substrate guard. `NoopActuator`
+    /// (kind `"none"`) when actuation is off — in which case the reconcile loop
+    /// does not run.
+    pub fleet_actuator: Arc<dyn crate::actuator::FleetActuator>,
+}
+
+/// CLOACI-T-0580: build the base `DefaultRunnerConfig` used by every
+/// per-tenant runner in `TenantRunnerCache`. Mirrors the admin runner
+/// config (`registry_storage_backend` is the same; reconcile interval
+/// honors the operator override).
+fn runner_config_for_tenant_cache(
+    reconcile_interval: Option<std::time::Duration>,
+    default_executor: &str,
+) -> cloacina::DefaultRunnerConfig {
+    let mut builder = cloacina::DefaultRunnerConfig::builder();
+    builder = builder.registry_storage_backend("database");
+    if let Some(interval) = reconcile_interval {
+        builder = builder.registry_reconcile_interval(interval);
+    }
+    // CLOACI-T-0640: carry the configured default executor onto per-tenant
+    // runners so their dispatcher sends tenant tasks to the same executor (and
+    // a dispatcher exists at all, which `register_executor` requires).
+    builder = builder.default_executor(default_executor);
+    builder
+        .build()
+        .expect("default tenant runner config builds cleanly")
+}
+
+/// Validate security-related CLI args at server boot.
+///
+/// Extracted from `run()` so it's unit-testable without spinning up the
+/// full server. Currently enforces: `--require-signatures` is only meaningful
+/// paired with `--verification-org-id`; reject the combo at boot rather than
+/// surface a 403 on first upload (CLOACI-I-0103 / T-0567).
+fn validate_security_args(
+    require_signatures: bool,
+    verification_org_id: Option<&uuid::Uuid>,
+) -> Result<()> {
+    if require_signatures && verification_org_id.is_none() {
+        anyhow::bail!(
+            "--require-signatures requires --verification-org-id <UUID> \
+             (or set CLOACINA_VERIFICATION_ORG_ID env var). Without a trusted \
+             org_id the server has no way to verify uploaded signatures."
+        );
+    }
+    Ok(())
+}
+
+/// Run the API server.
+///
+/// Argument count is over clippy's default threshold; the right long-term fix
+/// is a `RunConfig` struct, tracked as a follow-up. T-0567 added the
+/// `verification_org_id` parameter and pushed us to 8.
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    home: std::path::PathBuf,
+    bind: SocketAddr,
+    database_url: String,
+    verbose: bool,
+    bootstrap_key: Option<String>,
+    require_signatures: bool,
+    verification_org_id: Option<uuid::Uuid>,
+    reconcile_interval: Option<std::time::Duration>,
+    tenant_runner_cache_size: usize,
+    tenant_deletion_drain_timeout: std::time::Duration,
+    log_retention_days: u64,
+    // Executor every task is dispatched to (CLOACI-T-0640). `"default"` runs all
+    // work on the in-process thread executor; `"fleet"` sends it to the
+    // execution-agent fleet. Validated against the registered executor keys at
+    // boot — an unknown key fails fast.
+    default_executor: String,
+    // Fleet agent liveness tuning (CLOACI-T-0639). `agent_heartbeat_interval_s`
+    // is advertised to agents (their heartbeat cadence) and is the sweeper's
+    // tick rate; the sweeper marks an agent dead after `agent_liveness_misses`
+    // missed beats (dead-after = interval × misses). Defaults (15, 3) reproduce
+    // the prior hardcoded 15s/45s.
+    agent_heartbeat_interval_s: u32,
+    agent_liveness_misses: u32,
+    // CORS opt-in (CLOACI-T-0643 / REQ-009). Disabled unless at least one
+    // allowed origin is configured.
+    cors: CorsConfig,
+) -> Result<()> {
+    // Validate CORS config before any heavy startup work.
+    let cors_layer = cors.layer()?;
+    // Fail fast at boot rather than 403 at first upload (CLOACI-I-0103 / T-0567).
+    validate_security_args(require_signatures, verification_org_id.as_ref())?;
+
+    // CLOACI-T-0582: enable strict search_path checking on the server.
+    // Adds a `current_schema()` round-trip on every tenant-scoped
+    // connection acquire, catching silent search_path drift. The daemon
+    // (single-tenant per ADR-0005) leaves this off to avoid the cost.
+    cloacina::database::connection::set_strict_search_path(true);
+
+    // Register the Python runtime in cloacina core's dispatch slot so the
+    // reconciler can load uploaded Python-language packages. The compiler
+    // service deliberately never does this — it has no business touching
+    // Python. See CLOACI-T-0529.
+    cloacina_python::install();
+
+    // Set up logging (file + stderr, same as daemon)
+    std::fs::create_dir_all(&home)
+        .with_context(|| format!("Failed to create home: {}", home.display()))?;
+
+    let logs_dir = home.join("logs");
+    std::fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("Failed to create logs dir: {}", logs_dir.display()))?;
+
+    let filter = if verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+
+    // Daily-rotated file appender with optional retention via
+    // `max_log_files`. `log_retention_days == 0` disables pruning per
+    // operator opt-out; otherwise the appender keeps the most recent N
+    // files. CLOACI-T-0592.
+    let mut log_builder = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("cloacina-server")
+        .filename_suffix("log");
+    if log_retention_days > 0 {
+        log_builder = log_builder.max_log_files(log_retention_days as usize);
+    }
+    let file_appender = log_builder.build(&logs_dir).with_context(|| {
+        format!(
+            "Failed to build rolling log appender in {}",
+            logs_dir.display()
+        )
+    })?;
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Build the base subscriber with stderr + file layers
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().json().with_writer(non_blocking));
+
+    // Conditionally add OpenTelemetry tracing layer
+    #[cfg(feature = "telemetry")]
+    {
+        if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+            use opentelemetry::trace::TracerProvider;
+
+            let service_name =
+                std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "cloacina".to_string());
+
+            let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .build()
+                .context("Failed to create OTLP exporter")?;
+
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(otlp_exporter)
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder()
+                        .with_service_name(service_name)
+                        .build(),
+                )
+                .build();
+
+            let tracer = provider.tracer("cloacina");
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+            subscriber.with(otel_layer).init();
+            // Provider is kept alive by the global registry
+            opentelemetry::global::set_tracer_provider(provider);
+        } else {
+            subscriber.init();
+        }
+    }
+
+    #[cfg(not(feature = "telemetry"))]
+    {
+        subscriber.init();
+    }
+
+    info!("Starting API server");
+    info!("  Bind:     {}", bind);
+    info!("  Database: {}", mask_db_url(&database_url));
+    info!("  Home:     {}", home.display());
+    warn!(
+        "Server running without TLS -- use a TLS-terminating reverse proxy (nginx, Caddy, Envoy) in production"
+    );
+
+    // Initialize Prometheus metrics recorder
+    let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let metrics_handle = metrics_builder
+        .install_recorder()
+        .context("Failed to install Prometheus metrics recorder")?;
+
+    // Register metric descriptions
+    metrics::describe_counter!(
+        "cloacina_workflows_total",
+        "Total workflow executions by status and reason. \
+         reason is `ok` on success, or a bounded failure category \
+         (currently `dependency_failed`) on failure."
+    );
+    metrics::describe_counter!(
+        "cloacina_tasks_total",
+        "Total task executions by status and reason. \
+         reason is `ok` on success, or one of the bounded failure categories: \
+         `task_error`, `timeout`, `validation_failed`, `infrastructure`, \
+         `task_not_found`, `claim_lost`, `unknown`."
+    );
+    metrics::describe_counter!(
+        "cloacina_api_requests_total",
+        "Total API requests by HTTP method and response status code"
+    );
+    metrics::describe_counter!(
+        "cloacina_auth_login_attempts_total",
+        "Total local-login attempts (CLOACI-T-0923). `outcome` is bounded: \
+         `ok` (password verified, key minted), `denied` (unknown user, wrong \
+         password, or disabled account — deliberately indistinguishable), or \
+         `throttled` (refused before the password check because a throttle key \
+         was locked). A sustained `denied` rate is the credential-stuffing \
+         signal; `throttled` shows the defense engaging."
+    );
+    metrics::describe_counter!(
+        "cloacina_auth_login_lockouts_total",
+        "Total local-login lockouts, counted once on the lock edge rather than \
+         once per refused attempt (CLOACI-T-0923). `scope` is bounded to \
+         `username` | `ip`. Pairs with the `auth.login.lockout` audit event."
+    );
+    metrics::describe_histogram!(
+        "cloacina_api_request_duration_seconds",
+        "API request handler duration by HTTP method and response status code"
+    );
+    metrics::describe_histogram!(
+        "cloacina_workflow_duration_seconds",
+        "Workflow execution duration"
+    );
+    metrics::describe_histogram!("cloacina_task_duration_seconds", "Task execution duration");
+    metrics::describe_gauge!("cloacina_active_workflows", "Currently active workflows");
+    metrics::describe_gauge!("cloacina_active_tasks", "Currently active tasks");
+    metrics::describe_counter!(
+        "cloacina_scheduler_claim_attempts_total",
+        "Total task claim attempts by the executor. outcome is `claimed` (claim succeeded), \
+         `contended` (another runner already held the claim), or `empty` (scheduler tick \
+         found no ready tasks to dispatch)."
+    );
+    metrics::describe_counter!(
+        "cloacina_scheduler_heartbeat_writes_total",
+        "Total successful heartbeat writes by the executor's per-task heartbeat loop. \
+         Failed heartbeats are recorded only in logs."
+    );
+    metrics::describe_counter!(
+        "cloacina_scheduler_stale_claims_swept_total",
+        "Total stale claims released by the stale-claim sweeper. Each increment \
+         corresponds to one task whose runner heartbeat had expired and was reset to Ready."
+    );
+    metrics::describe_counter!(
+        "cloacina_supervisor_restarts_total",
+        "Total computation-graph supervisor restarts. Labels: graph (graph name), \
+         component (`reactor` or accumulator name), reason \
+         (`panic` | `error` | `shutdown_timeout`). `shutdown_timeout` is emitted \
+         from the graceful-shutdown path; the supervision loop only observes \
+         `panic` (JoinError::is_panic) and `error` (any other terminated handle)."
+    );
+    metrics::describe_gauge!(
+        "cloacina_component_health",
+        "Current computation-graph component health, expressed as a one-of \
+         indicator. For each (graph, component) tuple the gauge is `1` on the \
+         component's current state and `0` on every other state. State label is \
+         bounded: `healthy | degraded | starting | stopped | crashed`. \
+         Re-emitted every supervisor tick from the existing ReactorHealth / \
+         AccumulatorHealth watch channels (projected via `as_state_label()`)."
+    );
+    metrics::describe_counter!(
+        "cloacina_accumulator_events_total",
+        "Total events processed by computation-graph accumulators. \
+         `kind` is bounded to `passthrough | stream | polling | batch`; \
+         `graph` is the deployed graph name (or `embedded` for runtimes \
+         without a DAL); `accumulator` is the declared accumulator name."
+    );
+    metrics::describe_histogram!(
+        "cloacina_accumulator_emit_duration_seconds",
+        "End-to-end emit latency for each accumulator event: time from the \
+         event arriving on the merge channel through `process()` + boundary \
+         send + checkpoint persistence."
+    );
+    metrics::describe_gauge!(
+        "cloacina_accumulator_buffer_depth",
+        "Current internal buffer size for buffered accumulators. Meaningful \
+         for `batch` and stateful `stream` kinds; `passthrough` and `polling` \
+         emit `0` from runtime startup so dashboards see a stable series \
+         per (graph, accumulator)."
+    );
+    metrics::describe_counter!(
+        "cloacina_accumulator_checkpoint_writes_total",
+        "Total successful checkpoint writes via `CheckpointHandle::save` or \
+         `persist_boundary`. Failed writes are recorded in logs and do not \
+         increment this counter."
+    );
+    metrics::describe_counter!(
+        "cloacina_reactor_fires_total",
+        "Total reactor fires (graph executions). `strategy` ∈ \
+         `when_any | when_all | sequential` — projects the two-axis \
+         (criteria × input_strategy) design onto a single bounded label."
+    );
+    metrics::describe_counter!(
+        "cloacina_reactor_firings_total",
+        "Total `reactor_firings` rows written by the reactor on each \
+         fire (CLOACI-I-0100 / T-0599). One row per fire feeds the \
+         subscription poller; this counter mirrors successful row \
+         writes only — DAL failures land in logs."
+    );
+    metrics::describe_counter!(
+        "cloacina_reactor_firings_pruned_total",
+        "Total `reactor_firings` rows deleted by the unified scheduler's \
+         TTL prune sweep (CLOACI-I-0100 / T-0601). Unlabeled — single \
+         global counter is sufficient."
+    );
+    metrics::describe_histogram!(
+        "cloacina_reactor_fire_duration_seconds",
+        "Wall-clock duration of the user's compiled graph body (the time \
+         inside `(graph)(snapshot).await`). Excludes cache lookup and \
+         persistence overhead."
+    );
+    metrics::describe_gauge!(
+        "cloacina_reactor_cache_age_seconds",
+        "Age in seconds of the most-recent emission per source held in the \
+         reactor's input cache. Refreshed on every boundary arrival (every \
+         known source is re-emitted, so sources that fall silent show \
+         increasing staleness). Sources that have never emitted are absent \
+         from the gauge until their first boundary."
+    );
+    metrics::describe_counter!(
+        "cloacina_reactor_deduped_events_total",
+        "Total boundary events the reactor rejected as duplicates of an \
+         already-seen emission sequence. Reserved for the reactor-side dedup \
+         path that follows T-0413's persistence work — see I-0099 / T-0587 \
+         for the rollout plan."
+    );
+    metrics::describe_gauge!(
+        "cloacina_ws_connections_active",
+        "Currently open WebSocket connections by endpoint. `endpoint` is \
+         bounded `{accumulator, reactor}`. RAII-guarded so a panic inside a \
+         handler still decrements on Drop — defends against the leak shape \
+         that motivated T-0534."
+    );
+    metrics::describe_counter!(
+        "cloacina_ws_messages_total",
+        "Total WebSocket messages by `endpoint` (`accumulator` | `reactor`) \
+         and `direction` (`in` | `out`). Counts framed messages — ping/pong \
+         heartbeats handled by axum are excluded."
+    );
+    metrics::describe_counter!(
+        "cloacina_ws_auth_failures_total",
+        "Total rejected WebSocket upgrade requests by bounded `reason`: \
+         `ticket_expired`, `invalid_signature`, `tenant_mismatch`, \
+         `not_authorized`."
+    );
+    // Delivery substrate (CLOACI-I-0115 / T-0628). Backstop sweeper signals.
+    metrics::describe_counter!(
+        "cloacina_delivery_outbox_sweep_runs_total",
+        "Total delivery-outbox sweep ticks. Sustained zero (with non-zero \
+         outbox depth) means the sweeper is wedged; sustained high cadence is \
+         expected and cheap (one scan per `sweep_interval`)."
+    );
+    metrics::describe_counter!(
+        "cloacina_delivery_outbox_sweep_redeliveries_total",
+        "Rows the sweeper reset from `delivered` back to `pending` because \
+         their ack didn't arrive within `stuck_threshold` — i.e. rows the \
+         relay had to retry via the backstop, not the normal NOTIFY path. \
+         Sustained non-zero means recipients are disconnecting before \
+         acking, or NOTIFY is being missed; chase via outbox-depth and the \
+         WS connection metric."
+    );
+    metrics::describe_gauge!(
+        "cloacina_delivery_outbox_open",
+        "Current count of non-`acked` rows in `delivery_outbox` (sum of \
+         `pending` + `delivered`). Sustained growth means delivery is wedged \
+         — the analog of the compiler `sweep_resets_total` signal."
+    );
+    // Execution-agent fleet (CLOACI-I-0114 / T-0634).
+    metrics::describe_counter!(
+        "cloacina_fleet_agents_evicted_total",
+        "Agents removed by the fleet heartbeat sweeper after their heartbeat \
+         went stale (older than 3× the advertised interval). Sustained \
+         non-zero means agents are dying or losing connectivity."
+    );
+    metrics::describe_counter!(
+        "cloacina_fleet_work_reassigned_total",
+        "In-flight delivery_outbox rows re-targeted from an evicted (dead) \
+         agent to a live agent by the heartbeat sweeper's reclaim path \
+         (CLOACI-T-0634). Tracks how much work crashed agents shed onto the \
+         rest of the fleet."
+    );
+    metrics::describe_counter!(
+        "cloacina_reactor_persist_failures_total",
+        "Total `persist_reactor_state` failures, broken down by branch. \
+         `kind` ∈ `cache_serialize`, `dirty_serialize`, `seq_serialize`, \
+         `save`. The reactor downgrades to `ReactorHealth::Degraded` after \
+         5 consecutive failures (any kind) and recovers on the next success. \
+         See CLOACI-I-0108 / T-0590."
+    );
+    metrics::describe_counter!(
+        "cloacina_accumulator_persist_failures_total",
+        "Total accumulator persist failures, broken down by call site. \
+         `kind` ∈ `checkpoint` (polling-accumulator save), `boundary` \
+         (persist_boundary), `batch_buffer` (batch accumulator buffer save). \
+         Replaces the silent `let _ = persist_*` patterns flagged as OPS-15."
+    );
+    metrics::describe_counter!(
+        "cloacina_context_merge_failures_total",
+        "Total failures merging dependency contexts into a task's input \
+         context. `kind` ∈ `parse` (dependency context JSON failed to \
+         deserialize — fails the task as `ContextLoadFailed`), `merge` \
+         (Context API rejected an insert/update — counted but does not \
+         fail the task). Closes COR-11."
+    );
+
+    // Connect to Postgres with DB-backed registry (so uploaded packages get compiled + loaded)
+    let mut runner_builder = DefaultRunnerConfig::builder();
+    runner_builder = runner_builder.registry_storage_backend("database");
+    if let Some(interval) = reconcile_interval {
+        runner_builder = runner_builder.registry_reconcile_interval(interval);
+    }
+    // CLOACI-T-0571: forward the verification config into the runner so the
+    // reconciler's defense-in-depth signature-existence check fires even
+    // when packages reach `workflow_packages` via paths other than the
+    // upload route.
+    runner_builder = runner_builder
+        .require_signatures(require_signatures)
+        .verification_org_id(verification_org_id.map(cloacina::UniversalUuid::from));
+    // Default executor (CLOACI-T-0640): every task dispatches to this one
+    // executor key. `"default"` keeps all work on the in-process thread
+    // executor; `"fleet"` sends it to the execution-agent fleet. Applied to BOTH
+    // the global runner and every per-tenant runner — tenant workflows execute
+    // on per-tenant runners (TenantRunnerCache, T-0580), so the setting must
+    // reach them too or fleet dispatch never fires for tenant tasks (the only
+    // kind the server runs). The key is validated against the registered
+    // executors after registration below.
+    let use_fleet = default_executor == "fleet";
+    info!(default_executor = %default_executor, "Default executor configured");
+    runner_builder = runner_builder.default_executor(default_executor.clone());
+    let runner_config = runner_builder
+        .build()
+        .context("Invalid runner configuration")?;
+
+    // Construct the database explicitly (rather than via `with_config`) so the
+    // public tenant's secret resolver can be built against it and threaded onto
+    // the runner's in-process executor (CLOACI-T-0890): a locally-executed task
+    // can then resolve `{"$secret": …}` bindings via `context.secret(...)`.
+    // Without `CLOACINA_SECRET_KEK` the resolver is None and secret resolution
+    // fails closed with a clear error.
+    let admin_database =
+        cloacina::Database::new(&database_url, "cloacina", runner_config.db_pool_size());
+    admin_database
+        .run_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run migrations: {e}"))?;
+    let public_secret_resolver = secrets::runner_secret_resolver("public", &admin_database);
+    let runner = DefaultRunner::with_database_secrets(
+        admin_database,
+        runner_config,
+        None,
+        public_secret_resolver,
+    )
+    .await
+    .context("Failed to connect to database")?;
+
+    info!("Connected to Postgres, migrations applied");
+
+    let endpoint_registry = EndpointRegistry::new();
+    let unified_dal = cloacina::dal::unified::DAL::new(runner.database().clone());
+    let mut graph_scheduler_inner =
+        ComputationGraphScheduler::with_dal(endpoint_registry.clone(), unified_dal.clone());
+
+    // CLOACI-T-0851 / ADR CLOACI-A-0012: install cross-replica reactor
+    // ownership. Every server replica takes ONE dedicated pooled connection —
+    // the "ownership session" — which carries all of this replica's reactor
+    // advisory locks. Operators sizing the pool must account for that one
+    // reserved connection per replica.
+    //
+    // Installed unconditionally on Postgres, not only when multi-replica:
+    // with a single replica every claim simply succeeds locally and the
+    // watchdog always confirms, so behaviour is unchanged. There is no reliable
+    // way for a replica to know how many peers exist, and a coordination
+    // mechanism that is only switched on when someone remembers to is one that
+    // will be off during the incident.
+    //
+    // A failure here FAILS STARTUP rather than degrading quietly. Running the
+    // reactive layer without coordination is precisely the split-brain this
+    // exists to prevent, and it is invisible from the outside — a replica would
+    // happily process a stream that another replica also owns. Refusing to
+    // start is loud, recoverable, and honest about what is wrong.
+    #[cfg(feature = "postgres")]
+    {
+        use cloacina::computation_graph::reactor_ownership::{OwnershipSession, PostgresOwnership};
+
+        let session = OwnershipSession::connect(runner.database())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to establish the reactor-ownership session: {e}. This connection \
+                     carries this replica's reactor advisory locks; without it the reactive \
+                     layer cannot guarantee that only one replica runs a given reactor, so \
+                     the server refuses to start rather than risk two replicas processing \
+                     the same stream."
+                )
+            })?;
+        // A-0012 Amendment 3: publish this replica's address on every won
+        // claim so injects landing on other replicas can be steered here.
+        // CLOACINA_ADVERTISED_ADDRESS is injected by the Helm chart when
+        // `reactorAffinity.enabled`; absent (compose, bare-metal, chart flag
+        // off) publication is skipped and misses use the outbox fallback —
+        // correct, just not hot.
+        let ownership = match std::env::var("CLOACINA_ADVERTISED_ADDRESS") {
+            Ok(addr) if !addr.is_empty() => {
+                info!(address = %addr, "reactor owner-address publication enabled");
+                PostgresOwnership::new(session).with_publication(
+                    cloacina::computation_graph::reactor_ownership::AddressPublication {
+                        dal: unified_dal.clone(),
+                        advertised_address: addr,
+                    },
+                )
+            }
+            _ => {
+                info!(
+                    "no CLOACINA_ADVERTISED_ADDRESS; owner addresses will not be published \
+                     (injects that miss fall back to the delivery outbox)"
+                );
+                PostgresOwnership::new(session)
+            }
+        };
+        graph_scheduler_inner.set_ownership(Arc::new(ownership));
+        info!("reactor ownership session established (one pooled connection reserved)");
+    }
+
+    let graph_scheduler = Arc::new(graph_scheduler_inner);
+
+    // Substrate startup (CLOACI-I-0115, tasks T-0626/T-0627): construct the
+    // WS delivery sink and the per-replica DeliveryRelay; spawn the relay's
+    // event-driven drain loop and (on Postgres) the LISTEN task that forwards
+    // NOTIFYs to the relay's wake handle. The `_substrate_shutdown_tx` is
+    // held for the lifetime of `run()`; when it drops on shutdown, the spawned
+    // tasks observe the receiver-side error and exit cleanly.
+    let delivery_sink = Arc::new(crate::delivery_sink::WsDeliverySink::new());
+    // CLOACI-T-0851: reactive events addressed to accumulators are drained by
+    // the same relay. Each replica's accumulator sink delivers only what it
+    // actually hosts and answers NoRoute otherwise, so an event injected on any
+    // replica reaches the one that owns the reactor without either sink needing
+    // to know about the other.
+    let accumulator_sink = Arc::new(
+        cloacina::computation_graph::reactor_routing::AccumulatorDeliverySink::new(
+            endpoint_registry.clone(),
+        ),
+    );
+    let composite_sink = Arc::new(cloacina::delivery::CompositeDeliverySink::new(vec![
+        delivery_sink.clone(),
+        accumulator_sink,
+    ]));
+    let delivery_relay =
+        cloacina::delivery::DeliveryRelay::new(unified_dal.clone(), composite_sink);
+    let delivery_wake = delivery_relay.wake_handle();
+    let (_substrate_shutdown_tx, substrate_shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(delivery_relay.run(substrate_shutdown_rx.clone()));
+    #[cfg(feature = "postgres")]
+    tokio::spawn(cloacina::delivery::run_pg_listener(
+        database_url.clone(),
+        "delivery_outbox".to_string(),
+        delivery_wake.clone(),
+        substrate_shutdown_rx.clone(),
+    ));
+    // Safety-net sweeper (CLOACI-T-0628): periodic backstop for missed NOTIFYs,
+    // disconnects, and replica crashes between commit and ack. Default
+    // 30s/60s cadence/threshold; backend-agnostic.
+    let delivery_sweeper =
+        cloacina::delivery::DeliverySweeper::new(unified_dal.clone(), delivery_wake.clone());
+    tokio::spawn(delivery_sweeper.run(substrate_shutdown_rx.clone()));
+
+    // CLOACI-T-0851 / A-0012 Amendment 1: reactor-ownership watchdog.
+    //
+    // Advisory locks auto-release when a replica DIES, which handles failover.
+    // They do not help when the ownership connection drops while the replica
+    // keeps running: Postgres frees the locks, another replica claims the
+    // reactor, and this one would carry on running it unaware. This loop
+    // re-asserts what we believe we own and halts anything we have lost.
+    //
+    // Cadence: with the default tolerance of 3 consecutive unverifiable checks,
+    // a total loss of database contact is acted on after roughly
+    // REACTOR_OWNERSHIP_CHECK_INTERVAL * 3. Short enough to bound
+    // double-processing, long enough that an ordinary blip does not stop
+    // healthy reactors — a reactive workload that flaps on every transient
+    // error is worse than one that takes ~15s to notice a real partition.
+    if graph_scheduler.has_ownership_coordination() {
+        let scheduler_for_watchdog = graph_scheduler.clone();
+        let mut watchdog_shutdown = substrate_shutdown_rx.clone();
+        tokio::spawn(async move {
+            use cloacina::computation_graph::reactor_ownership::OwnershipWatchdog;
+            let mut watchdog = OwnershipWatchdog::new(REACTOR_OWNERSHIP_INDETERMINATE_TOLERANCE);
+            let mut ticker = tokio::time::interval(REACTOR_OWNERSHIP_CHECK_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let halted = scheduler_for_watchdog
+                            .ownership_watchdog_tick(&mut watchdog)
+                            .await;
+                        if !halted.is_empty() {
+                            warn!(
+                                count = halted.len(),
+                                "reactor-ownership watchdog halted reactors this replica no \
+                                 longer owns"
+                            );
+                        }
+                    }
+                    _ = watchdog_shutdown.changed() => {
+                        info!("reactor-ownership watchdog shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Wire graph scheduler into the runner so the reconciler can route CG packages
+    runner.set_graph_scheduler(graph_scheduler.clone()).await;
+
+    // Fleet (CLOACI-I-0114 / T-0633): shared roster + result-rendezvous so the
+    // FleetExecutor (registered on the runner's dispatcher below) and the agent
+    // HTTP routes (which read the same AppState) operate on one instance each.
+    // CLOACI-T-0916: the roster is DB-backed (`fleet_agents`, admin schema) so
+    // registration/heartbeats/selection/reclaim are correct across replicas;
+    // "live" = heartbeat within interval × allowed misses (T-0639). Only the
+    // one-time secret-key pools stay replica-local (see agent_registry.rs).
+    let agent_liveness_window = std::time::Duration::from_secs(
+        agent_heartbeat_interval_s.max(1) as u64 * agent_liveness_misses.max(1) as u64,
+    );
+    let agent_registry = Arc::new(crate::agent_registry::AgentRegistry::new(
+        runner.database().clone(),
+        agent_liveness_window,
+    ));
+    let fleet_coordinator = Arc::new(crate::fleet_coordinator::FleetCoordinator::new());
+
+    // CLOACI-T-0862: the per-tenant schema-scoped `Database` cache. Hoisted here
+    // (was inline in the AppState literal) so BOTH the routes (via AppState) and
+    // the fleet secret resolver factory share ONE instance — they must resolve
+    // the same tenant schemas so a secret written over HTTP is the one a fleet
+    // task resolves.
+    let tenant_database_cache = Arc::new(TenantDatabaseCache::new(database_url.clone()));
+
+    // CLOACI-T-0862 / T-0861 handoff: the concrete fleet secret resolver factory.
+    // Activates the `FleetExecutor` secret seam so a `$secret`-referencing fleet
+    // task actually resolves (it failed closed while the factory was `None`).
+    // Built once and shared by the global + per-tenant fleet executors.
+    let secret_resolver_factory: Arc<dyn crate::fleet_executor::FleetSecretResolverFactory> =
+        Arc::new(crate::secrets::ServerFleetSecretResolverFactory::new(
+            runner.database().clone(),
+            tenant_database_cache.clone(),
+        ));
+
+    // CLOACI-T-0634: per-tenant runner cache. Build it here (rather than inline
+    // in the struct literal) so we can attach a fleet registrar — each per-tenant
+    // runner needs its OWN FleetExecutor on its OWN dispatcher (tenant workflows
+    // run on per-tenant runners, not the global one). The registrar builds a
+    // tenant-scoped DAL + result handler (so status/context writes hit the
+    // tenant's schema) and shares the process-global roster/coordinator/wake.
+    let tenant_runner_cache = {
+        let cache = crate::tenant_runner_cache::TenantRunnerCache::new(
+            std::num::NonZeroUsize::new(tenant_runner_cache_size.max(1))
+                .expect("max(1) is non-zero"),
+            runner_config_for_tenant_cache(reconcile_interval, &default_executor),
+        )
+        // CLOACI-T-0581 follow-up: per-tenant runners share the global graph
+        // scheduler so their reconcilers can route packaged CGs. The scheduler
+        // stores tenant_id per graph (T-0579), so health-endpoint filtering
+        // still works.
+        .with_graph_scheduler(graph_scheduler.clone());
+        if use_fleet {
+            let reg_registry = agent_registry.clone();
+            let reg_coordinator = fleet_coordinator.clone();
+            let reg_wake = delivery_wake.clone();
+            // CLOACI-T-0781: the admin (public-schema) DAL for the global delivery
+            // outbox — a tenant runner's WorkPackets enqueue here so the global
+            // relay drains them and they reach the agents.
+            let reg_outbox_dal = unified_dal.clone();
+            let reg_secret_factory = secret_resolver_factory.clone();
+            let registrar: crate::tenant_runner_cache::FleetRegistrar =
+                Arc::new(move |runner: &cloacina::DefaultRunner| {
+                    let dal = cloacina::dal::unified::DAL::new(runner.database().clone());
+                    let result_handler = cloacina::executor::TaskResultHandler::new(
+                        dal.clone(),
+                        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        None,
+                    );
+                    let fleet_executor = crate::fleet_executor::FleetExecutor::new(
+                        dal,
+                        reg_outbox_dal.clone(),
+                        reg_registry.clone(),
+                        reg_coordinator.clone(),
+                        reg_wake.clone(),
+                        result_handler,
+                        runner.runtime(),
+                    )
+                    .with_secret_resolver_factory(reg_secret_factory.clone());
+                    if runner.register_executor("fleet", Arc::new(fleet_executor)) {
+                        info!("Fleet executor registered on per-tenant runner dispatcher");
+                    } else {
+                        warn!(
+                            "per-tenant runner has no dispatcher — fleet routing will \
+                             not fire for this tenant"
+                        );
+                    }
+                });
+            cache.with_fleet_registrar(registrar)
+        } else {
+            cache
+        }
+    };
+
+    // CLOACI-T-0789/0790: discover the OIDC issuer at startup if configured.
+    // Discovery failure (e.g. issuer unreachable) disables OIDC login rather
+    // than failing the whole server — API-key + local auth still work.
+    let oidc_provider = match crate::oidc::OidcConfig::from_env() {
+        Some(cfg) => match crate::oidc::OidcProvider::discover(cfg).await {
+            Ok(p) => {
+                info!("OIDC relying party configured and discovered");
+                Some(p)
+            }
+            Err(e) => {
+                warn!("OIDC configured but discovery failed ({e}); OIDC login disabled");
+                None
+            }
+        },
+        None => None,
+    };
+    let oidc_policy = Arc::new(crate::oidc::MappingPolicy::from_env());
+    // CLOACI-T-0801: Postgres-backed login-flow state (multi-replica safe).
+    let oidc_login = Arc::new(crate::oidc::LoginFlowStore::with_db(
+        runner.database().clone(),
+        std::time::Duration::from_secs(600),
+    ));
+
+    // CLOACI-T-0808: platform-wide default agent-capacity limit. Per-tenant
+    // exceptions live in `agent_capacity_limits`; this is the fallback. Default 4.
+    let default_max_agents = std::env::var("CLOACINA_DEFAULT_MAX_AGENTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(4);
+
+    // CLOACI-T-0812: initial agent(s) auto-provisioned on tenant create. The
+    // create-tenant handler clamps this to `default_max_agents` and writes the
+    // result as the new tenant's `desired_count` (best-effort). Default 1; `0`
+    // disables auto-provision.
+    let initial_agents = std::env::var("CLOACINA_INITIAL_AGENTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+
+    // CLOACI-T-0810: build the fleet actuator, FAIL CLOSED (REQ-008). A
+    // misconfigured/unsafe actuator must refuse to start the server — never
+    // silently scale the wrong substrate. `CLOACINA_FLEET_ACTUATOR` selects it
+    // (default `none` = actuation off); the substrate guard validates the choice
+    // against the detected host (refuses Docker-on-Kubernetes, refuses with no
+    // Docker socket).
+    let actuator_kind = crate::actuator::guard::actuator_kind_from_env();
+    let fleet_actuator = crate::actuator::guard::build_actuator(
+        &actuator_kind,
+        &crate::actuator::guard::HostSubstrate,
+        runner.database().clone(),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "FATAL: fleet actuator (CLOACINA_FLEET_ACTUATOR={actuator_kind}) refused to start \
+             — {e}. Set CLOACINA_FLEET_ACTUATOR to a valid, safe value (none | docker | kubernetes) or fix \
+             the substrate. The server will not start with a misconfigured actuator."
+        )
+    })?;
+    info!(
+        actuator = %fleet_actuator.kind(),
+        "fleet actuator initialized"
+    );
+
+    let admin_database = runner.database().clone();
+    let state = AppState {
+        database: admin_database.clone(),
+        default_max_agents,
+        initial_agents,
+        runner: Arc::new(runner),
+        key_cache: Arc::new(crate::routes::auth::KeyCache::default_cache()),
+        endpoint_registry,
+        graph_scheduler: graph_scheduler.clone(),
+        delivery_sink: delivery_sink.clone(),
+        delivery_wake: delivery_wake.clone(),
+        agent_registry: agent_registry.clone(),
+        fleet_coordinator: fleet_coordinator.clone(),
+        security_config: SecurityConfig {
+            require_signatures,
+            verification_org_id: verification_org_id.map(cloacina::UniversalUuid::from),
+            ..SecurityConfig::default()
+        },
+        // CLOACI-T-0916: DB-backed tickets — minted on any replica, redeemable
+        // on any replica (single-use via atomic CAS). No session affinity.
+        ws_tickets: Arc::new(crate::routes::auth::WsTicketStore::with_db(
+            admin_database,
+            std::time::Duration::from_secs(60),
+        )),
+        metrics_handle,
+        tenant_databases: tenant_database_cache.clone(),
+        // CLOACI-T-0580: per-tenant runner cache. Capacity is operator-
+        // tunable; 256 default. If the configured cap is zero we fall
+        // back to 1 (LruCache requires NonZeroUsize) so misconfiguration
+        // doesn't panic the server at boot.
+        tenant_runners: Arc::new(tenant_runner_cache),
+        tenant_deletion_drain_timeout,
+        // Clamp to >=1 so the advertised interval matches the sweeper's
+        // clamped cadence (the agent also clamps, but keep server-side parity).
+        agent_heartbeat_interval_seconds: agent_heartbeat_interval_s.max(1),
+        authz_table: Arc::new(crate::routes::authz::build_authz_table()),
+        oidc: oidc_provider,
+        oidc_policy,
+        oidc_login,
+        // CLOACI-T-0923: local-login brute-force throttle (I-0118 OQ-13).
+        // Read once here; the counters themselves are DB rows, so a lockout is
+        // enforced by every replica.
+        login_throttle: crate::routes::local_auth::LoginThrottleConfig::from_env(),
+        fleet_actuator: fleet_actuator.clone(),
+    };
+
+    // Bootstrap: create initial admin key if none exist
+    bootstrap_admin_key(&state, &home, bootstrap_key.as_deref()).await?;
+
+    // CLOACI-T-0779: demo-only — seed deterministic tenant-SCOPED keys so the
+    // demo can show tenant isolation (each key 403s the other tenant). Gated by
+    // CLOACINA_DEMO_TENANT_KEYS; a no-op in normal deployments.
+    bootstrap_demo_tenant_keys(&state).await?;
+
+    // Operational-metrics publisher (CLOACI-T-0718): pushes server/compiler/
+    // fleet/reconciler snapshots to a subscribed Operations UI over the WS
+    // substrate (direct sink push, not the durable outbox). No-op when nothing
+    // is subscribed.
+    crate::ops_metrics::spawn(state.clone(), substrate_shutdown_rx.clone());
+
+    // Fleet executor registration (CLOACI-I-0114 / T-0633, T-0640). Only wired
+    // up when the operator opts into the fleet via `--default-executor fleet`;
+    // otherwise all work stays on the in-process thread executor and there's no
+    // reason to build it. Build the FleetExecutor over the shared roster +
+    // coordinator + substrate wake, and register it on the runner's dispatcher
+    // under the "fleet" key. Result reconciliation flows through the shared
+    // TaskResultHandler so a fleet-run task's status/retry/context writes are
+    // identical to a thread run. `runner_id = None`: the fleet relies on
+    // substrate at-least-once + reconciliation for dedup rather than the thread
+    // executor's per-task runner claim.
+    if use_fleet {
+        let fleet_result_handler = cloacina::executor::TaskResultHandler::new(
+            unified_dal.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        );
+        let fleet_executor = crate::fleet_executor::FleetExecutor::new(
+            unified_dal.clone(),
+            // Global runner: outbox == its own (admin) DAL (CLOACI-T-0781).
+            unified_dal.clone(),
+            agent_registry.clone(),
+            fleet_coordinator.clone(),
+            delivery_wake.clone(),
+            fleet_result_handler,
+            state.runner.runtime(),
+        )
+        // CLOACI-T-0862: activate the secret resolver seam on the global executor.
+        .with_secret_resolver_factory(secret_resolver_factory.clone());
+        if state
+            .runner
+            .register_executor("fleet", Arc::new(fleet_executor))
+        {
+            info!("Fleet executor registered on dispatcher under key 'fleet'");
+        } else {
+            warn!(
+                "Fleet executor NOT registered — runner has no dispatcher \
+                 (push-based execution disabled); fleet dispatch will not fire"
+            );
+        }
+
+        // CLOACI-T-0722: computation-graph firings also dispatch to the fleet.
+        // The scheduler's default in-process executor is swapped for the fleet
+        // one; every fire event still carries the compiled closure, so
+        // undispatched graphs (embedded, Python, no agent) fall back in-process.
+        let storage =
+            cloacina::dal::unified::workflow_registry_storage::UnifiedRegistryStorage::new(
+                state.database.clone(),
+            );
+        match cloacina::registry::workflow_registry::WorkflowRegistryImpl::new(
+            storage,
+            state.database.clone(),
+        ) {
+            Ok(registry) => {
+                let graph_fleet = crate::fleet_graph_executor::FleetGraphExecutor::new(
+                    unified_dal.clone(),
+                    unified_dal.clone(),
+                    agent_registry.clone(),
+                    fleet_coordinator.clone(),
+                    delivery_wake.clone(),
+                    registry,
+                );
+                state
+                    .graph_scheduler
+                    .set_graph_executor(Arc::new(graph_fleet))
+                    .await;
+                info!("Fleet GRAPH executor installed on the CG scheduler (CLOACI-T-0722)");
+            }
+            Err(e) => warn!(
+                "Fleet graph executor NOT installed (registry init failed: {}); \
+                 CG firings stay in-process",
+                e
+            ),
+        }
+    }
+
+    // CLOACI-T-0640: hard-match the configured default executor against the
+    // registered executor keys. The thread runner always registers "default";
+    // "fleet" is registered just above only when opted in. A typo'd key would
+    // otherwise silently send ALL work to a nonexistent executor — every task
+    // would dispatch-error and the server would look hung — so fail fast at boot
+    // instead.
+    if !state.runner.has_executor(&default_executor) {
+        let mut available = vec!["default"];
+        if use_fleet && state.runner.has_executor("fleet") {
+            available.push("fleet");
+        }
+        anyhow::bail!(
+            "--default-executor '{default_executor}' is not a registered executor \
+             (available: {}). Set a valid key via --default-executor / \
+             CLOACINA_DEFAULT_EXECUTOR, or [server].default_executor in config.toml. \
+             Use 'fleet' only with the execution-agent fleet deployed.",
+            available.join(", ")
+        );
+    }
+
+    // Fleet heartbeat sweeper (CLOACI-I-0114 / T-0634). Periodically evicts
+    // agents whose heartbeat has gone stale (so selection + `has_capacity()`
+    // stop counting dead agents) AND reclaims their in-flight work by
+    // re-targeting its delivery_outbox rows to a live agent (otherwise the
+    // rows stay pinned to a dead recipient and spin on NoRoute). Shares the
+    // substrate shutdown channel.
+    //
+    // CLOACI-T-0916: eviction is a compare-and-set DELETE against the shared
+    // `fleet_agents` table, so when several replicas sweep concurrently each
+    // dead agent's reclaim is owned by exactly one of them; the reclaim
+    // target is chosen from the DB-read live roster (any replica's agents are
+    // eligible). Each tick also refreshes this replica's cached snapshot for
+    // the sync `has_capacity()`/`metrics()` path.
+    {
+        let sweep_registry = agent_registry.clone();
+        let sweep_dal = unified_dal.clone();
+        let sweep_wake = delivery_wake.clone();
+        let mut sweep_shutdown = substrate_shutdown_rx.clone();
+        // Heartbeat interval the server advertises to agents = sweep cadence;
+        // the eviction window (interval × misses, CLOACI-T-0639) is baked into
+        // the registry's liveness timeout. Clamped to >=1 so a 0 from the CLI
+        // can't wedge the ticker.
+        let beat = std::time::Duration::from_secs(agent_heartbeat_interval_s.max(1) as u64);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(beat);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let dead = match sweep_registry.sweep_dead().await {
+                            Ok(dead) => dead,
+                            Err(e) => {
+                                warn!(error = %e, "fleet: heartbeat sweep failed");
+                                continue;
+                            }
+                        };
+                        if !dead.is_empty() {
+                            info!(
+                                evicted = ?dead,
+                                "fleet: heartbeat sweeper evicted stale agent(s)"
+                            );
+                            metrics::counter!("cloacina_fleet_agents_evicted_total")
+                                .increment(dead.len() as u64);
+
+                            // Dead-agent reclaim (CLOACI-T-0634): re-target each
+                            // dead agent's in-flight work to a live agent so it
+                            // isn't pinned to a recipient whose connection is
+                            // gone (which would spin on NoRoute). The work keeps
+                            // its task_execution_id, so the FleetExecutor's
+                            // awaiting rendezvous receives the new agent's result
+                            // unchanged. If no live agent exists, the rows stay
+                            // put and the FleetExecutor's timeout → retry path
+                            // still recovers the task (degraded, not lost).
+                            for dead_rec in &dead {
+                                let dead_id = &dead_rec.agent_id;
+                                // CLOACI-T-0916: the reclaim target comes from
+                                // the DB-read live roster — an agent connected
+                                // to ANY replica is eligible (the reassigned
+                                // outbox rows are delivered by whichever
+                                // replica holds its socket).
+                                let snap = match sweep_registry.live_agents().await {
+                                    Ok(snap) => snap,
+                                    Err(e) => {
+                                        warn!(
+                                            dead_agent = %dead_id,
+                                            error = %e,
+                                            "fleet: reclaim roster read failed"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                // Reclaim only to a live agent in the SAME tenant
+                                // as the dead one (REQ-008 tenant isolation),
+                                // greedy on most-free-capacity.
+                                let target = snap
+                                    .iter()
+                                    .filter(|a| {
+                                        a.available_capacity > 0
+                                            && a.tenant_id == dead_rec.tenant_id
+                                    })
+                                    .max_by_key(|a| a.available_capacity);
+                                match target {
+                                    Some(t) => {
+                                        match sweep_dal
+                                            .delivery_outbox()
+                                            .reassign_open_rows(
+                                                &format!("agent:{dead_id}"),
+                                                &format!("agent:{}", t.agent_id),
+                                            )
+                                            .await
+                                        {
+                                            Ok(n) if n > 0 => {
+                                                info!(
+                                                    dead_agent = %dead_id,
+                                                    target_agent = %t.agent_id,
+                                                    reassigned = n,
+                                                    "fleet: reclaimed dead agent's in-flight work"
+                                                );
+                                                metrics::counter!(
+                                                    "cloacina_fleet_work_reassigned_total"
+                                                )
+                                                .increment(n as u64);
+                                                sweep_wake.wake();
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => warn!(
+                                                dead_agent = %dead_id,
+                                                error = %e,
+                                                "fleet: reclaim reassign failed"
+                                            ),
+                                        }
+                                    }
+                                    None => warn!(
+                                        dead_agent = %dead_id,
+                                        "fleet: no live agent to reclaim work; \
+                                         FleetExecutor timeout will retry"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    res = sweep_shutdown.changed() => {
+                        if res.is_err() || *sweep_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Fleet control loop (CLOACI-T-0811). ONE leader-gated loop that does both
+    // (a) back-pressure autoscaling — adjust each tenant's `desired_count` from
+    // fleet utilization, clamped to `[floor, effective_limit]` — and (b)
+    // reconciliation — drive actual→desired via the actuator. This SUPERSEDES the
+    // standalone T-0810 reconcile loop (and resolves its leader-election TODO):
+    // both steps now run behind a single Postgres advisory lock so two replicas
+    // never scale/actuate concurrently (NFR-003).
+    //
+    // Spawned ONLY when an actuator is active (kind != "none"); the NoopActuator
+    // path leaves it off entirely. Every replica runs the loop, but the whole
+    // body executes only on the leader for each tick (the rest skip). Cadence is
+    // `CLOACINA_AUTOSCALE_INTERVAL_S` (default 30); the old
+    // `CLOACINA_RECONCILE_INTERVAL_S` no longer applies.
+    //
+    // `CLOACINA_AUTOSCALE` (default on when an actuator is active) is a
+    // kill-switch for ONLY the autoscale step — reconciliation keeps running so
+    // operators can drive `desired_count` by hand (provision API) while the
+    // autoscaler is disabled.
+    if fleet_actuator.kind() != "none" {
+        let loop_actuator = fleet_actuator.clone();
+        let loop_dal = unified_dal.clone();
+        let loop_db = state.database.clone();
+        let loop_registry = agent_registry.clone();
+        let mut loop_shutdown = substrate_shutdown_rx.clone();
+        let scale_cfg = crate::autoscaler::ScaleConfig::from_env();
+        let autoscale_enabled = std::env::var("CLOACINA_AUTOSCALE")
+            .ok()
+            .map(|v| {
+                !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true);
+        let default_max = default_max_agents;
+        let tick = scale_cfg.interval;
+        info!(
+            actuator = %fleet_actuator.kind(),
+            interval_s = tick.as_secs(),
+            autoscale_enabled,
+            up_threshold = scale_cfg.up_threshold,
+            down_threshold = scale_cfg.down_threshold,
+            cooldown_s = scale_cfg.cooldown.as_secs(),
+            floor = scale_cfg.floor,
+            "fleet control loop started (leader-gated)"
+        );
+        tokio::spawn(async move {
+            use crate::autoscaler::{ScaleAction, decide, should_act_at, tenant_utilizations};
+            // Cooldown state lives in the DB (`agent_desired_counts.last_autoscaled_at`),
+            // not in a per-replica in-memory map: leadership rotates per tick, so an
+            // in-memory cooldown could be bypassed by a later-leading replica. Reading
+            // the wall-clock timestamp back each tick honors the cooldown regardless of
+            // which replica leads (CLOACI-A-0008 refinement).
+            let mut ticker = tokio::time::interval(tick);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // Whole body is leader-gated: only the replica holding the
+                        // advisory lock runs it; others skip this tick.
+                        crate::autoscaler::leader::with_fleet_leadership(&loop_db, || async {
+                            // (a) AUTOSCALE — adjust desired_count from utilization.
+                            if autoscale_enabled {
+                                // CLOACI-T-0916: utilization from the DB-backed live
+                                // roster — the WHOLE fleet, not this replica's slice.
+                                let live = match loop_registry.live_agents().await {
+                                    Ok(live) => live,
+                                    Err(e) => {
+                                        warn!(error = %e, "fleet autoscale: roster read failed; skipping autoscale step");
+                                        Vec::new()
+                                    }
+                                };
+                                let utils = tenant_utilizations(&live);
+                                // Tenant set = everyone with a desired_count row
+                                // PLUS any tenant with live registered agents.
+                                // `list_all_with_last` also carries each tenant's
+                                // last_autoscaled_at (DB wall-clock) for the cooldown gate.
+                                let desired_rows = match loop_dal.agent_desired().list_all_with_last().await {
+                                    Ok(rows) => rows,
+                                    Err(e) => {
+                                        warn!(error = %e, "fleet autoscale: failed to read desired counts; skipping autoscale step");
+                                        Vec::new()
+                                    }
+                                };
+                                let mut tenants: std::collections::HashSet<String> =
+                                    desired_rows.iter().map(|(t, _, _)| t.clone()).collect();
+                                tenants.extend(utils.keys().cloned());
+                                let desired_map: std::collections::HashMap<String, u32> =
+                                    desired_rows.iter().map(|(t, d, _)| (t.clone(), *d)).collect();
+                                let last_autoscaled_map: std::collections::HashMap<String, chrono::NaiveDateTime> =
+                                    desired_rows
+                                        .into_iter()
+                                        .filter_map(|(t, _, last)| last.map(|l| (t, l)))
+                                        .collect();
+
+                                let now = chrono::Utc::now().naive_utc();
+                                for tenant in tenants {
+                                    let util = utils.get(&tenant).copied().unwrap_or(0.0);
+                                    let desired = desired_map.get(&tenant).copied().unwrap_or(0);
+                                    let effective_limit = match loop_dal
+                                        .agent_limits()
+                                        .effective_limit(&tenant, default_max)
+                                        .await
+                                    {
+                                        Ok(l) => l,
+                                        Err(e) => {
+                                            warn!(tenant = %tenant, error = %e, "fleet autoscale: effective_limit read failed; skipping tenant");
+                                            continue;
+                                        }
+                                    };
+                                    let action = decide(util, desired, effective_limit, scale_cfg.floor, &scale_cfg);
+                                    if matches!(action, ScaleAction::Hold) {
+                                        continue;
+                                    }
+                                    if !should_act_at(last_autoscaled_map.get(&tenant).copied(), now, scale_cfg.cooldown) {
+                                        continue; // within cooldown (DB wall-clock, cross-replica)
+                                    }
+                                    let new_desired = match action {
+                                        ScaleAction::Up => (desired + 1).min(effective_limit),
+                                        ScaleAction::Down => desired.saturating_sub(1).max(scale_cfg.floor),
+                                        ScaleAction::Hold => desired,
+                                    };
+                                    if new_desired == desired {
+                                        continue;
+                                    }
+                                    match loop_dal.agent_desired().set_desired_autoscaled(&tenant, new_desired).await {
+                                        Ok(()) => {
+                                            info!(
+                                                tenant = %tenant,
+                                                util,
+                                                from = desired,
+                                                to = new_desired,
+                                                effective_limit,
+                                                action = ?action,
+                                                "fleet autoscale: adjusted desired_count"
+                                            );
+                                        }
+                                        Err(e) => warn!(tenant = %tenant, error = %e, "fleet autoscale: set_desired failed"),
+                                    }
+                                }
+                            }
+
+                            // (b) RECONCILE — drive actual→desired for each tenant.
+                            let desired = match loop_dal.agent_desired().list_all().await {
+                                Ok(rows) => rows,
+                                Err(e) => {
+                                    warn!(error = %e, "fleet reconcile: failed to read desired counts; skipping reconcile step");
+                                    return;
+                                }
+                            };
+                            for (tenant, want) in desired {
+                                match loop_actuator.reconcile(&tenant, want).await {
+                                    Ok(out) if out.spawned > 0 || out.stopped > 0 => {
+                                        info!(
+                                            tenant = %tenant,
+                                            desired = want,
+                                            spawned = out.spawned,
+                                            stopped = out.stopped,
+                                            running = out.running,
+                                            "fleet reconcile: actuated tenant"
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => warn!(
+                                        tenant = %tenant,
+                                        desired = want,
+                                        error = %e,
+                                        "fleet reconcile: tenant reconcile failed"
+                                    ),
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    res = loop_shutdown.changed() => {
+                        if res.is_err() || *loop_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Keep references for shutdown
+    let scheduler_for_shutdown = state.graph_scheduler.clone();
+    let runner_for_shutdown = state.runner.clone();
+    let tenant_runners_for_shutdown = state.tenant_runners.clone();
+
+    // Build router; CORS (when enabled) wraps everything, including
+    // preflight OPTIONS for the /v1 nest.
+    let app = build_router(state);
+    let app = match cors_layer {
+        Some(layer) => {
+            info!("CORS enabled for origins: {:?}", cors.allowed_origins);
+            app.layer(layer)
+        }
+        None => app,
+    };
+
+    // Start server with graceful shutdown
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("Failed to bind to {}", bind))?;
+
+    info!("");
+    info!("API server is running on http://{}", bind);
+    info!("  GET  /health     — liveness check");
+    info!("  GET  /ready      — readiness check");
+    info!("  GET  /metrics    — Prometheus metrics");
+    info!("  POST /v1/auth/keys      — create API key (auth required)");
+    info!("  GET  /v1/auth/keys      — list API keys (auth required)");
+    info!("  DEL  /v1/auth/keys/:id  — revoke key (auth required)");
+    info!("");
+
+    // Shared shutdown signal — used by supervision loop and graceful shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Start supervision loop — auto-restart crashed accumulator/reactor tasks
+    let _supervision_handle = scheduler_for_shutdown
+        .start_supervision(shutdown_rx.clone(), std::time::Duration::from_secs(5));
+
+    let scheduler_handle = {
+        let scheduler = scheduler_for_shutdown.clone();
+        let mut rx = shutdown_rx; // move, not clone — only consumer
+        tokio::spawn(async move {
+            let _ = rx.changed().await;
+            info!("Shutting down graph scheduler...");
+            scheduler.shutdown_all().await;
+            info!("Computation graph scheduler shutdown complete");
+        })
+    };
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // Signal the graph scheduler to shut down first
+        let _ = shutdown_tx.send(true);
+        // Wait for graph scheduler to finish flushing/persisting
+        let _ = scheduler_handle.await;
+        // Shut down the workflow runner (scheduler loop, executor, stale claim sweeper)
+        info!("Shutting down workflow runner...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            runner_for_shutdown.shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => info!("Workflow runner shutdown complete"),
+            Ok(Err(e)) => warn!("Workflow runner shutdown error: {}", e),
+            Err(_) => warn!("Workflow runner shutdown timed out after 30s"),
+        }
+        // CLOACI-T-0580: shut down every cached per-tenant runner.
+        info!("Shutting down tenant runner cache...");
+        let results = tenant_runners_for_shutdown.shutdown_all().await;
+        let total = results.len();
+        let failed = results.values().filter(|r| r.is_err()).count();
+        if failed == 0 {
+            info!(
+                tenant_runners = total,
+                "Tenant runner cache shutdown complete"
+            );
+        } else {
+            warn!(
+                tenant_runners = total,
+                failed, "Tenant runner cache shutdown completed with errors"
+            );
+            for (tenant, result) in results {
+                if let Err(e) = result {
+                    warn!(tenant_id = %tenant, error = %e, "tenant runner shutdown failed");
+                }
+            }
+        }
+    })
+    .await
+    .context("Server error")?;
+
+    info!("API server shutdown complete");
+    Ok(())
+}
+
+/// Middleware that generates a UUID request ID, creates a tracing span,
+/// and adds the X-Request-Id response header.
+async fn request_id_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = uuid::Uuid::new_v4().to_string();
+
+    // CLOACI-T-0578: pre-declare auth-derived fields as Empty so the auth
+    // middleware can `record(...)` them onto this span after extraction.
+    // `tracing::field::Empty` reserves the field; a recording call later
+    // attaches the actual value, and the JSON/OTLP subscriber renders it
+    // in every event nested under this span (handler logs, audit emits).
+    let span = tracing::info_span!(
+        "request",
+        request_id = %id,
+        method = %request.method(),
+        path = %request.uri().path(),
+        tenant_id = tracing::field::Empty,
+        key_id = tracing::field::Empty,
+        role = tracing::field::Empty,
+    );
+    let mut response = {
+        use tracing::Instrument;
+        next.run(request).instrument(span).await
+    };
+    if let Ok(val) = id.parse() {
+        response.headers_mut().insert("x-request-id", val);
+    }
+    response
+}
+
+/// CLOACI-I-0130 (T-0847): the embedded Leptos UI, served from this
+/// binary under the `embedded-ui` feature. One origin — engine, REST API,
+/// and control plane — no Nginx container, no CORS for the bundled UI.
+#[cfg(feature = "embedded-ui")]
+mod embedded_ui {
+    use axum::http::{StatusCode, Uri, header};
+
+    /// Content type by extension for the embedded UI bundle — vendored in
+    /// place of `mime_guess` (T-0942): trunk emits a small, known set of
+    /// asset types, and unknown extensions fall back exactly as
+    /// `first_or_octet_stream` did.
+    fn asset_content_type(path: &str) -> &'static str {
+        match path.rsplit('.').next() {
+            Some("html") => "text/html",
+            Some("js") | Some("mjs") => "text/javascript",
+            Some("wasm") => "application/wasm",
+            Some("css") => "text/css",
+            Some("json") => "application/json",
+            Some("png") => "image/png",
+            Some("svg") => "image/svg+xml",
+            Some("ico") => "image/x-icon",
+            Some("txt") => "text/plain",
+            Some("woff2") => "font/woff2",
+            _ => "application/octet-stream",
+        }
+    }
+    use axum::response::{IntoResponse, Response};
+
+    #[derive(rust_embed::RustEmbed)]
+    #[folder = "../../ui/dist"]
+    pub(crate) struct UiAssets;
+
+    /// Path prefixes that must NEVER fall through to the SPA — unknown API
+    /// paths keep their JSON 404 shape.
+    const API_PREFIXES: &[&str] = &["/v1", "/health", "/ready", "/metrics", "/openapi.json"];
+
+    pub(crate) async fn ui_fallback(uri: Uri) -> Response {
+        let path = uri.path();
+        if API_PREFIXES.iter().any(|p| path.starts_with(p)) {
+            return super::fallback_404().await.into_response();
+        }
+
+        let asset_path = path.trim_start_matches('/');
+        // Exact asset hit (hashed /assets/* etc.) → long-lived immutable cache.
+        if !asset_path.is_empty() && asset_path != "index.html" {
+            if let Some(file) = UiAssets::get(asset_path) {
+                let mime = asset_content_type(asset_path);
+                return (
+                    [
+                        (header::CONTENT_TYPE, mime.to_string()),
+                        (
+                            header::CACHE_CONTROL,
+                            "public, max-age=31536000, immutable".to_string(),
+                        ),
+                    ],
+                    file.data,
+                )
+                    .into_response();
+            }
+        }
+
+        // SPA fallback: any other (client-routed) path serves index.html,
+        // never cached so deploys take effect immediately.
+        match UiAssets::get("index.html") {
+            Some(index) => (
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                index.data,
+            )
+                .into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                "embedded UI bundle missing index.html",
+            )
+                .into_response(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "embedded-ui"))]
+mod embedded_ui_tests {
+    use axum::http::{StatusCode, Uri, header};
+    use axum::response::IntoResponse;
+
+    /// CLOACI-I-0130 (T-0850): the fallback's three contracts — SPA paths
+    /// serve index.html (no-store), real assets serve immutable, API
+    /// prefixes keep the JSON 404 (never the SPA).
+    #[tokio::test]
+    async fn ui_fallback_contracts() {
+        // Deep client route → index.html, no-store.
+        let resp = super::embedded_ui::ui_fallback(Uri::from_static("/executions/abc"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+
+        // Root → index.html too.
+        let resp = super::embedded_ui::ui_fallback(Uri::from_static("/"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Unknown API path → JSON 404, NOT the SPA.
+        let resp = super::embedded_ui::ui_fallback(Uri::from_static("/v1/nope"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or("").contains("json"))
+                .unwrap_or(false)
+        );
+
+        // A real hashed asset → immutable cache. Find one from the bundle.
+        let asset = <super::embedded_ui::UiAssets as rust_embed::RustEmbed>::iter()
+            .find(|p| p.starts_with("assets/"))
+            .expect("bundle has hashed assets");
+        let uri: Uri = format!("/{}", asset).parse().unwrap();
+        let resp = super::embedded_ui::ui_fallback(uri).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+}
+
+fn build_router(state: AppState) -> Router {
+    use axum::{
+        extract::DefaultBodyLimit, middleware, routing::delete, routing::post, routing::put,
+    };
+
+    // Authenticated routes — behind auth middleware
+    let auth_routes = Router::new()
+        // Key management
+        .route("/auth/keys", post(crate::routes::keys::create_key))
+        .route("/auth/keys", get(crate::routes::keys::list_keys))
+        .route(
+            "/auth/keys/{key_id}",
+            delete(crate::routes::keys::revoke_key),
+        )
+        // WebSocket ticket exchange (single-use, short-lived)
+        .route(
+            "/auth/ws-ticket",
+            post(crate::routes::keys::create_ws_ticket),
+        )
+        // CLOACI-T-0794: login-session lifecycle (authenticated — caller's own key).
+        .route("/auth/refresh", post(crate::routes::session::refresh))
+        .route("/auth/logout", post(crate::routes::session::logout))
+        // CLOACI-T-0803: the caller's own role, so the UI can gate write/admin controls.
+        .route("/auth/whoami", get(crate::routes::session::whoami))
+        // Execution-agent fleet roster (admin, operator-facing) — CLOACI-I-0124
+        .route("/agents", get(crate::routes::agent::list_agents))
+        // Compiler / build-pipeline status (admin) — CLOACI-I-0124
+        .route(
+            "/compiler/status",
+            get(crate::routes::compiler::compiler_status),
+        )
+        // Tenant management
+        .route("/tenants", post(crate::routes::tenants::create_tenant))
+        .route("/tenants", get(crate::routes::tenants::list_tenants))
+        .route(
+            "/tenants/{schema_name}",
+            delete(crate::routes::tenants::remove_tenant),
+        )
+        // Tenant-scoped key creation (admin-only)
+        .route(
+            "/tenants/{tenant_id}/keys",
+            post(crate::routes::keys::create_tenant_key),
+        )
+        // CLOACI-T-0784: tenant-admin key self-service (list + revoke own-tenant).
+        .route(
+            "/tenants/{tenant_id}/keys",
+            get(crate::routes::keys::list_tenant_keys),
+        )
+        .route(
+            "/tenants/{tenant_id}/keys/{key_id}",
+            delete(crate::routes::keys::revoke_tenant_key),
+        )
+        // CLOACI-T-0797: tenant-admin local-account management.
+        .route(
+            "/tenants/{tenant_id}/accounts",
+            post(crate::routes::local_auth::create_account),
+        )
+        .route(
+            "/tenants/{tenant_id}/accounts",
+            get(crate::routes::local_auth::list_accounts),
+        )
+        .route(
+            "/tenants/{tenant_id}/accounts/{account_id}",
+            delete(crate::routes::local_auth::disable_account),
+        )
+        .route(
+            "/tenants/{tenant_id}/accounts/{account_id}/password",
+            post(crate::routes::local_auth::reset_password),
+        )
+        // CLOACI-T-0862: tenant secrets CRUD (metadata-only reads). Values are
+        // write-only (create/rotate body); list/get never return a value.
+        .route(
+            "/tenants/{tenant_id}/secrets",
+            post(crate::routes::secrets::create_secret),
+        )
+        .route(
+            "/tenants/{tenant_id}/secrets",
+            get(crate::routes::secrets::list_secrets),
+        )
+        .route(
+            "/tenants/{tenant_id}/secrets/{name}",
+            get(crate::routes::secrets::get_secret),
+        )
+        .route(
+            "/tenants/{tenant_id}/secrets/{name}",
+            put(crate::routes::secrets::rotate_secret),
+        )
+        .route(
+            "/tenants/{tenant_id}/secrets/{name}",
+            delete(crate::routes::secrets::delete_secret),
+        )
+        // CLOACI-T-0808: agent-capacity limits (admin default + per-tenant exceptions).
+        .route(
+            "/tenants/{tenant_id}/limits",
+            post(crate::routes::limits::set_tenant_limit),
+        )
+        .route(
+            "/tenants/{tenant_id}/limits",
+            get(crate::routes::limits::get_tenant_limit),
+        )
+        .route(
+            "/tenants/{tenant_id}/limits",
+            delete(crate::routes::limits::clear_tenant_limit),
+        )
+        // CLOACI-T-0809: per-tenant fleet scaling (desired-count provisioning).
+        .route(
+            "/tenants/{tenant_id}/fleet",
+            get(crate::routes::fleet::get_fleet),
+        )
+        .route(
+            "/tenants/{tenant_id}/fleet/provision",
+            post(crate::routes::fleet::provision),
+        )
+        .route(
+            "/tenants/{tenant_id}/fleet/deprovision",
+            post(crate::routes::fleet::deprovision),
+        )
+        // Workflow packages (tenant-scoped)
+        .route(
+            "/tenants/{tenant_id}/workflows",
+            post(crate::routes::workflows::upload_workflow),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows",
+            get(crate::routes::workflows::list_workflows),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}",
+            get(crate::routes::workflows::get_workflow),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/source",
+            get(crate::routes::workflows::get_workflow_source),
+        )
+        // Pause / resume a workflow (block new executions) — CLOACI-T-0749.
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/pause",
+            post(crate::routes::workflows::pause_workflow),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/resume",
+            post(crate::routes::workflows::resume_workflow),
+        )
+        // Named workflow instances (CLOACI-T-0894). Declared BEFORE the
+        // `{version}` delete so the static `instances` segment is never
+        // shadowed by the version wildcard.
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/instances",
+            post(crate::routes::instances::create_instance),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/instances",
+            get(crate::routes::instances::list_instances),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/instances/{instance}",
+            get(crate::routes::instances::get_instance),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/instances/{instance}",
+            delete(crate::routes::instances::delete_instance),
+        )
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/{version}",
+            delete(crate::routes::workflows::delete_workflow),
+        )
+        // Trigger schedules (tenant-scoped, read-only)
+        .route(
+            "/tenants/{tenant_id}/triggers",
+            get(crate::routes::triggers::list_triggers),
+        )
+        .route(
+            "/tenants/{tenant_id}/triggers/{name}",
+            get(crate::routes::triggers::get_trigger),
+        )
+        // Pause / resume a schedule (cron or trigger) — CLOACI-T-0749.
+        .route(
+            "/tenants/{tenant_id}/triggers/{name}/pause",
+            post(crate::routes::triggers::pause_trigger),
+        )
+        .route(
+            "/tenants/{tenant_id}/triggers/{name}/resume",
+            post(crate::routes::triggers::resume_trigger),
+        )
+        .route(
+            "/tenants/{tenant_id}/triggers/{name}/fire",
+            post(crate::routes::triggers::fire_trigger),
+        )
+        .route(
+            "/tenants/{tenant_id}/triggers/{name}/interface",
+            get(crate::routes::triggers::get_trigger_interface),
+        )
+        // Executions (tenant-scoped)
+        .route(
+            "/tenants/{tenant_id}/workflows/{name}/execute",
+            post(crate::routes::executions::execute_workflow),
+        )
+        .route(
+            "/tenants/{tenant_id}/executions",
+            get(crate::routes::executions::list_executions),
+        )
+        .route(
+            "/tenants/{tenant_id}/executions/{exec_id}",
+            get(crate::routes::executions::get_execution),
+        )
+        .route(
+            "/tenants/{tenant_id}/executions/{exec_id}/events",
+            get(crate::routes::executions::get_execution_events),
+        )
+        .route(
+            "/tenants/{tenant_id}/executions/{exec_id}/tasks",
+            get(crate::routes::executions::get_execution_tasks),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::routes::authz::authz_mw,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::routes::auth::require_auth,
+        ));
+
+    // Computation graph health routes — behind auth.
+    // CLOACI-T-0595 / API-08: paths are relative to the `/v1` nest below
+    // (previously these used absolute `/v1/...` and were merged at the
+    // top level, bypassing the `/v1` nest's middleware contract).
+    let graph_health_routes = Router::new()
+        .route(
+            "/health/accumulators",
+            get(crate::routes::health_graphs::list_accumulators),
+        )
+        .route(
+            "/health/reactors",
+            get(crate::routes::health_graphs::list_reactors),
+        )
+        // Operator manual reactor fire (CLOACI-T-0751) — REST surface over the
+        // existing reactor ForceFire/FireWith mechanics. Per-op authZ + audit
+        // live in the handler; the route-layer auth below supplies the key.
+        .route(
+            "/health/reactors/{name}/fire",
+            post(crate::routes::health_graphs::fire_reactor),
+        )
+        // Observable fires (CLOACI-T-0766): recent fires + per-minute cadence.
+        .route(
+            "/health/reactors/{name}/fires",
+            get(crate::routes::health_graphs::list_reactor_fires),
+        )
+        .route(
+            "/health/reactors/{name}/fires/timeseries",
+            get(crate::routes::health_graphs::reactor_fire_timeseries),
+        )
+        // Operator manual accumulator inject (CLOACI-T-0753) — REST analogue of
+        // the WS accumulator-push path; typed JSON event, server-side encoding.
+        .route(
+            "/health/accumulators/{name}/inject",
+            post(crate::routes::health_graphs::inject_accumulator),
+        )
+        // Declared input-interface discovery (CLOACI-I-0128 / T-0758) — the typed
+        // slots an operator supplies to fire/inject; backs UI typed forms.
+        .route(
+            "/health/reactors/{name}/interface",
+            get(crate::routes::health_graphs::get_reactor_interface),
+        )
+        .route(
+            "/health/accumulators/{name}/interface",
+            get(crate::routes::health_graphs::get_accumulator_interface),
+        )
+        .route(
+            "/health/graphs",
+            get(crate::routes::health_graphs::list_graphs),
+        )
+        .route(
+            "/health/graphs/{name}",
+            get(crate::routes::health_graphs::get_graph),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::routes::authz::authz_mw,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::routes::auth::require_auth,
+        ));
+
+    // WebSocket routes — auth handled in the handler (before upgrade).
+    // Relative paths so they nest cleanly under `/v1` per API-08.
+    let ws_routes = Router::new()
+        .route(
+            "/ws/accumulator/{name}",
+            get(crate::routes::ws::accumulator_ws),
+        )
+        .route("/ws/reactor/{name}", get(crate::routes::ws::reactor_ws))
+        // Substrate delivery (CLOACI-I-0115 / T-0627). Auth handled in the
+        // handler (header bearer or single-use ticket); tenant inferred from
+        // the authenticated key and enforced against delivery_outbox.tenant_id.
+        .route(
+            "/ws/delivery/{recipient}",
+            get(crate::routes::delivery_ws::delivery_ws),
+        );
+
+    // Execution-agent fleet (CLOACI-I-0114 / T-0631). All endpoints share
+    // the standard authed-route middleware; tenant + admin checks live in
+    // each handler. Register/heartbeat persist to the DB-backed roster
+    // (CLOACI-T-0916); result rendezvouses with the FleetExecutor (T-0633).
+    let agent_routes = axum::routing::Router::new()
+        .route(
+            "/agent/register",
+            axum::routing::post(crate::routes::agent::register_agent),
+        )
+        .route(
+            "/agent/heartbeat",
+            axum::routing::post(crate::routes::agent::heartbeat_agent),
+        )
+        .route(
+            "/agent/keys",
+            axum::routing::post(crate::routes::agent::replenish_keys),
+        )
+        .route(
+            "/agent/result",
+            axum::routing::post(crate::routes::agent::report_result),
+        )
+        .route(
+            "/agent/artifact/{digest}",
+            axum::routing::get(crate::routes::agent::fetch_artifact),
+        )
+        .route(
+            "/agent/source/{digest}",
+            axum::routing::get(crate::routes::agent::fetch_source),
+        )
+        .route(
+            "/agent/providers/{digest}",
+            axum::routing::get(crate::routes::agent::fetch_providers),
+        )
+        // All four agent endpoints authenticate with an API key (bearer) and
+        // extract `Extension<AuthenticatedKey>`. The layer MUST be attached
+        // here, before the merge into `auth_routes` below: `.route_layer` only
+        // covers routes already in the router, so `auth_routes`' own layer does
+        // NOT reach these merged routes. Without this, `register_agent` panics
+        // on the missing extension → 500 → the agent exits on register. The
+        // delivery WS (ws_routes) is deliberately NOT key-authed — it uses a
+        // single-use ws-ticket — so auth stays per-sub-router, not nest-wide.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::routes::authz::authz_mw,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::routes::auth::require_auth,
+        ));
+
+    // All of v1 in a single nest — API-08 invariant: anything served
+    // under `/v1/*` shares the same middleware stack.
+    let v1 = auth_routes
+        .merge(graph_health_routes)
+        .merge(ws_routes)
+        .merge(agent_routes)
+        // Public auth entry points (caller has no bearer key yet — NOT behind
+        // require_auth / authz_mw; they mint the key). CLOACI-T-0796/0790.
+        .merge(
+            Router::new()
+                .route(
+                    "/auth/local/login",
+                    post(crate::routes::local_auth::local_login),
+                )
+                .route(
+                    "/auth/oidc/login",
+                    get(crate::routes::oidc_auth::oidc_login),
+                )
+                .route(
+                    "/auth/callback",
+                    get(crate::routes::oidc_auth::oidc_callback),
+                ),
+        );
+
+    // Public routes — no auth
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        // Machine-readable API contract (CLOACI-T-0643 / REQ-001). Same
+        // document the `emit-openapi` subcommand writes to disk.
+        .route(
+            "/openapi.json",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    crate::openapi::openapi_json(),
+                )
+            }),
+        )
+        // All v1 routes (auth + graph health + ws) under one nest.
+        .nest("/v1", v1)
+        // CLOACI-I-0130: with the UI embedded, unmatched non-API paths serve
+        // the SPA (assets immutable, index.html no-store); API prefixes keep
+        // the JSON 404. Feature-off = today's JSON 404 for everything.
+        .fallback({
+            #[cfg(feature = "embedded-ui")]
+            {
+                embedded_ui::ui_fallback
+            }
+            #[cfg(not(feature = "embedded-ui"))]
+            {
+                fallback_404
+            }
+        })
+        // Body size limit: 100MB (matches PackageValidator)
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        // API request metrics (counts by method and status)
+        .layer(middleware::from_fn(api_request_metrics))
+        // Request ID + tracing span (outermost — wraps everything)
+        .layer(middleware::from_fn(request_id_middleware))
+        .with_state(state)
+}
+
+/// Middleware that counts API requests by method and status code, and records
+/// handler duration as a histogram.
+async fn api_request_metrics(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().to_string();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let elapsed = started.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+    metrics::counter!(
+        "cloacina_api_requests_total",
+        "method" => method.clone(),
+        "status" => status.clone(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "cloacina_api_request_duration_seconds",
+        "method" => method,
+        "status" => status,
+    )
+    .record(elapsed);
+    response
+}
+
+/// GET /health — liveness check (no auth, no DB)
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "operational",
+    responses((status = 200, description = "Server process is alive — `{\"status\": \"ok\"}`"))
+)]
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+/// GET /ready — readiness check, scoped to PLATFORM health only (DB
+/// reachable, embedded Python interpreter usable). CLOACI-T-0916:
+/// tenant-workload health is deliberately NOT part of readiness — one crashed
+/// computation graph used to flip `/ready` false on EVERY replica
+/// simultaneously, letting a single bad package eject the whole server fleet
+/// from the load-balancer pool. Crashed graphs remain visible via
+/// `GET /v1/health/graphs` (state `stopped`/`crashed`) and metrics.
+///
+/// CLOACI-T-0919 adds one more PLATFORM predicate: a wedged Python runtime.
+/// There is exactly one embedded CPython per process, so an uninterruptible
+/// module-scope hang disables Python package loading process-wide until
+/// restart. That is this replica being broken — not a tenant workload
+/// misbehaving — so it belongs in readiness, and it is replica-local (the
+/// wedge is set by THIS process's own import thread), which is precisely the
+/// property #231 required.
+#[utoipa::path(
+    get,
+    path = "/ready",
+    tag = "operational",
+    responses(
+        (status = 200, description = "Ready — DB reachable and the embedded Python runtime is usable. Tenant-workload health (e.g. crashed computation graphs) does NOT affect readiness; see /v1/health/graphs."),
+        (status = 503, description = "Not ready — `reason` field explains (database unreachable, or the embedded Python runtime is wedged by a package import hang and this process must be restarted)"),
+    )
+)]
+async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    // Verify we can acquire a connection from the pool
+    let db_ready = state.database.get_postgres_connection().await.is_ok();
+
+    if !db_ready {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not ready", "reason": "database unreachable"})),
+        );
+    }
+
+    // PLATFORM predicate, not workload: this process's embedded interpreter is
+    // unusable and only a restart fixes it (CLOACI-T-0919).
+    if let Some(reason) = cloacina::python_runtime::python_runtime_wedged_reason() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not ready", "reason": reason})),
+        );
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ready"})))
+}
+
+/// GET /metrics — Prometheus metrics rendered from the recorder installed at startup.
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.metrics_handle.render();
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+/// Fallback for unmatched routes — returns the canonical `ApiError`
+/// envelope (CLOACI-T-0595 / API-06) so every server error matches the
+/// same shape regardless of which handler (or no handler) produced it.
+async fn fallback_404() -> impl IntoResponse {
+    crate::routes::error::ApiError::not_found("not_found", "no route matches this request")
+}
+
+/// Wait for shutdown signal (SIGINT or SIGTERM)
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for ctrl+c");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to listen for SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received SIGINT — shutting down"),
+        _ = terminate => info!("Received SIGTERM — shutting down"),
+    }
+}
+
+/// Bootstrap: create an admin API key on first startup if none exist.
+///
+/// Writes the plaintext key to `~/.cloacina/bootstrap-key` with mode 0600.
+/// The key is never logged.
+async fn bootstrap_admin_key(
+    state: &AppState,
+    home: &std::path::Path,
+    provided_key: Option<&str>,
+) -> Result<()> {
+    let dal = cloacina::dal::DAL::new(state.database.clone());
+    let has_keys = dal.api_keys().has_any_keys().await.unwrap_or(false);
+
+    if has_keys {
+        info!("API keys exist — skipping bootstrap");
+        return Ok(());
+    }
+
+    info!("No API keys found — creating bootstrap admin key");
+
+    let (plaintext, hash) = if let Some(key) = provided_key {
+        // Use provided key
+        let hash = cloacina::security::api_keys::hash_api_key(key);
+        (key.to_string(), hash)
+    } else {
+        // Auto-generate
+        cloacina::security::api_keys::generate_api_key()
+    };
+
+    dal.api_keys()
+        .create_key(&hash, "bootstrap-admin", None, true, "admin")
+        .await
+        .context("Failed to create bootstrap admin key")?;
+
+    // Write plaintext to file (never log it)
+    let key_path = home.join("bootstrap-key");
+    std::fs::write(&key_path, &plaintext)
+        .with_context(|| format!("Failed to write bootstrap key to {}", key_path.display()))?;
+
+    // Set file permissions to owner-only (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
+    }
+
+    info!(
+        "Bootstrap admin key written to {} (mode 0600)",
+        key_path.display()
+    );
+
+    Ok(())
+}
+
+/// CLOACI-T-0779 — demo-only: seed deterministic tenant-SCOPED API keys from the
+/// `CLOACINA_DEMO_TENANT_KEYS` env so the demo can demonstrate tenant isolation
+/// with known keys (like the bootstrap admin key). Format: comma-separated
+/// `tenant:key[:role]` entries, e.g. `acme:clk_demo_acme_key_0002:admin`. Each
+/// becomes a non-admin key scoped to that tenant (`tenant_id` is a plain column,
+/// no FK, so the tenant's schema need not exist yet — it's created on first
+/// access/seed). Idempotent: a duplicate hash on restart is ignored. No-op when
+/// the env is unset, so production deployments are unaffected.
+async fn bootstrap_demo_tenant_keys(state: &AppState) -> Result<()> {
+    let spec = std::env::var("CLOACINA_DEMO_TENANT_KEYS").unwrap_or_default();
+    if spec.trim().is_empty() {
+        return Ok(());
+    }
+
+    let dal = cloacina::dal::DAL::new(state.database.clone());
+    for entry in spec.split(',').filter(|e| !e.trim().is_empty()) {
+        let parts: Vec<&str> = entry.split(':').map(|s| s.trim()).collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            warn!(
+                "CLOACINA_DEMO_TENANT_KEYS: skipping malformed entry '{}'",
+                entry
+            );
+            continue;
+        }
+        let (tenant, key) = (parts[0], parts[1]);
+        let role = parts
+            .get(2)
+            .copied()
+            .filter(|r| !r.is_empty())
+            .unwrap_or("admin");
+        let hash = cloacina::security::api_keys::hash_api_key(key);
+        match dal
+            .api_keys()
+            .create_key(
+                &hash,
+                &format!("demo-{tenant}-scoped"),
+                Some(tenant),
+                false,
+                role,
+            )
+            .await
+        {
+            Ok(_) => info!(
+                "CLOACI-T-0779: seeded demo tenant-scoped key for '{}' (role {})",
+                tenant, role
+            ),
+            Err(e) => tracing::debug!(
+                "CLOACI-T-0779: demo tenant key for '{}' not created (likely already exists): {}",
+                tenant,
+                e
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// Mask password in database URL for logging
+/// Re-export from cloacina::logging for backward compat in tests.
+fn mask_db_url(url: &str) -> String {
+    cloacina::logging::mask_db_url(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use serial_test::serial;
+    use std::io::Write;
+    use tower::ServiceExt;
+
+    const TEST_DB_URL: &str = "postgres://cloacina:cloacina@localhost:15432/cloacina";
+
+    /// One Prometheus recorder per test process, shared by every `test_state()`.
+    ///
+    /// `install_recorder()` installs the GLOBAL recorder and only succeeds once
+    /// per process. The metric macros (`metrics::counter!`, etc.) always emit to
+    /// that global recorder, so a test that scrapes a *different* handle sees
+    /// nothing. Previously each `test_state()` tried to install and, after the
+    /// first, fell back to a fresh unconnected handle — so every metrics test
+    /// that didn't run first failed. Installing once and handing out clones of
+    /// the same global handle keeps emit + scrape on the same recorder.
+    fn shared_test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+        static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+            std::sync::OnceLock::new();
+        HANDLE
+            .get_or_init(|| {
+                metrics_exporter_prometheus::PrometheusBuilder::new()
+                    .install_recorder()
+                    .expect("install global test Prometheus recorder")
+            })
+            .clone()
+    }
+
+    /// One shared `DefaultRunner` (+ its connection pool) for the whole test
+    /// process. Each `test_state()` previously built its own runner via
+    /// `with_config`, which opens a connection pool plus background services
+    /// that are never torn down — so ~90 serial tests accumulated ~90 pools and
+    /// exhausted postgres `max_connections` ("too many clients") on hosts with a
+    /// modest cap (macos default ~100; the docker postgres bumps it to 500).
+    /// Every test already targets the same `TEST_DB_URL` database with no
+    /// per-test reset, so sharing the runner changes only the connection count,
+    /// not isolation (and tests are `#[serial]`). CLOACI-T-0639 follow-up.
+    async fn shared_test_runner() -> Arc<cloacina::runner::DefaultRunner> {
+        static RUNNER: tokio::sync::OnceCell<Arc<cloacina::runner::DefaultRunner>> =
+            tokio::sync::OnceCell::const_new();
+        RUNNER
+            .get_or_init(|| async {
+                let runner_config = cloacina::runner::DefaultRunnerConfig::builder()
+                    .registry_storage_backend("database")
+                    .build()
+                    .expect("test config must be valid");
+                Arc::new(
+                    cloacina::runner::DefaultRunner::with_config(TEST_DB_URL, runner_config)
+                        .await
+                        .expect("Failed to connect to test database"),
+                )
+            })
+            .await
+            .clone()
+    }
+
+    /// Create a test AppState with a real Postgres connection.
+    async fn test_state() -> AppState {
+        let runner = shared_test_runner().await;
+
+        // Share the one globally-installed recorder so emitted metrics are
+        // visible when this state's `/metrics` handle is scraped.
+        let test_metrics_handle = shared_test_metrics_handle();
+
+        // Substrate components for the test AppState. Spawned tasks are
+        // intentionally omitted here — test fixtures that exercise delivery
+        // construct their own relay if needed; the sink and a wake handle are
+        // enough for handler-side code to compile and run.
+        let _test_delivery_sink = Arc::new(crate::delivery_sink::WsDeliverySink::new());
+        let _test_delivery_relay = cloacina::delivery::DeliveryRelay::new(
+            cloacina::dal::unified::DAL::new(runner.database().clone()),
+            _test_delivery_sink.clone(),
+        );
+        let _test_delivery_wake = _test_delivery_relay.wake_handle();
+        let database = runner.database().clone();
+        AppState {
+            database: database.clone(),
+            runner,
+            key_cache: Arc::new(crate::routes::auth::KeyCache::default_cache()),
+            endpoint_registry: EndpointRegistry::new(),
+            graph_scheduler: Arc::new(ComputationGraphScheduler::new(EndpointRegistry::new())),
+            delivery_sink: _test_delivery_sink,
+            delivery_wake: _test_delivery_wake,
+            agent_registry: Arc::new(crate::agent_registry::AgentRegistry::new(
+                database.clone(),
+                std::time::Duration::from_secs(90),
+            )),
+            fleet_coordinator: Arc::new(crate::fleet_coordinator::FleetCoordinator::new()),
+            security_config: SecurityConfig::default(),
+            // CLOACI-T-0916: DB-backed, as in production — cross-replica
+            // ticket tests rely on it.
+            ws_tickets: Arc::new(crate::routes::auth::WsTicketStore::with_db(
+                database,
+                std::time::Duration::from_secs(60),
+            )),
+            metrics_handle: test_metrics_handle,
+            tenant_databases: Arc::new(TenantDatabaseCache::new(TEST_DB_URL.to_string())),
+            tenant_runners: Arc::new(crate::tenant_runner_cache::TenantRunnerCache::new(
+                std::num::NonZeroUsize::new(8).expect("test cap"),
+                runner_config_for_tenant_cache(None, "default"),
+            )),
+            tenant_deletion_drain_timeout: std::time::Duration::from_secs(5),
+            agent_heartbeat_interval_seconds: cloacina::fleet::DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+            default_max_agents: 4,
+            initial_agents: 1,
+            authz_table: Arc::new(crate::routes::authz::build_authz_table()),
+            oidc: None,
+            oidc_policy: Arc::new(crate::oidc::MappingPolicy::default()),
+            oidc_login: Arc::new(crate::oidc::LoginFlowStore::new(
+                std::time::Duration::from_secs(600),
+            )),
+            // CLOACI-T-0923: production defaults. Tests that exercise lockout
+            // override this field with a fast-expiring policy.
+            login_throttle: crate::routes::local_auth::LoginThrottleConfig::default(),
+            // CLOACI-T-0810: tests don't actuate — a Noop actuator keeps handlers
+            // that read `fleet_actuator` constructible without a Docker daemon.
+            fleet_actuator: Arc::new(crate::actuator::NoopActuator),
+        }
+    }
+
+    /// Create a test AppState with `require_signatures = true` and a known
+    /// `verification_org_id`. Used by the T-0570 signature-contract tests
+    /// to drive the upload route through its verification gate.
+    async fn test_state_with_signature_required(
+        verification_org_id: cloacina::UniversalUuid,
+    ) -> AppState {
+        let mut state = test_state().await;
+        state.security_config = SecurityConfig {
+            require_signatures: true,
+            verification_org_id: Some(verification_org_id),
+            ..SecurityConfig::default()
+        };
+        state
+    }
+
+    /// Create a bootstrap API key and return the plaintext token.
+    async fn create_test_api_key(state: &AppState) -> String {
+        let (plaintext, hash) = cloacina::security::api_keys::generate_api_key();
+        let dal = cloacina::dal::DAL::new(state.database.clone());
+        dal.api_keys()
+            .create_key(&hash, "test-key", None, true, "admin")
+            .await
+            .expect("Failed to create test API key");
+        plaintext
+    }
+
+    // CLOACI-T-0862: the fleet secret resolver factory (T-0861 activation).
+    // Proves it yields a WORKING, tenant-scoped resolver over a secret written
+    // the way the CRUD route writes it — and fails closed with no KEK.
+    #[tokio::test]
+    #[serial]
+    async fn secret_factory_resolves_stored_secret_end_to_end() {
+        use crate::fleet_executor::FleetSecretResolverFactory;
+        use crate::secrets::{ServerFleetSecretResolverFactory, tenant_org_id};
+        use base64::Engine;
+        use cloacina::security::{KEK_ENV_VAR, SecretStore};
+
+        let state = test_state().await;
+        let kek_bytes = [5u8; 32];
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                KEK_ENV_VAR,
+                base64::engine::general_purpose::STANDARD.encode(kek_bytes),
+            )
+        };
+
+        // Write a secret into the public tenant the way create_secret does.
+        let store = SecretStore::new(cloacina::dal::DAL::new(state.database.clone()));
+        let name = format!("factory_test_{}", uuid::Uuid::new_v4().simple());
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("password".to_string(), "fleet-e2e-secret".to_string());
+        store
+            .create_secret(tenant_org_id("public"), &name, &fields, &kek_bytes)
+            .await
+            .expect("create secret");
+
+        let factory = ServerFleetSecretResolverFactory::new(
+            state.database.clone(),
+            state.tenant_databases.clone(),
+        );
+
+        // The factory yields a resolver that resolves the granted-tenant secret.
+        let resolver = factory
+            .resolver_for("public", "any_pkg")
+            .await
+            .expect("factory yields a resolver when the KEK is configured");
+        let resolved = resolver.resolve(&name).await.expect("resolve");
+        assert_eq!(resolved.get("password").unwrap(), "fleet-e2e-secret");
+
+        // An absent name is NotFound (never a silent empty).
+        assert!(matches!(
+            resolver.resolve("does_not_exist").await.unwrap_err(),
+            cloacina::SecretResolverError::NotFound(_)
+        ));
+
+        // Fail closed: with the KEK unset the factory yields NO resolver, so a
+        // secret-referencing dispatch cannot proceed (never a plaintext leak).
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(KEK_ENV_VAR) };
+        assert!(
+            factory.resolver_for("public", "any_pkg").await.is_none(),
+            "factory must fail closed (None) when CLOACINA_SECRET_KEK is unset"
+        );
+
+        // Cleanup.
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                KEK_ENV_VAR,
+                base64::engine::general_purpose::STANDARD.encode(kek_bytes),
+            )
+        };
+        store
+            .delete_secret(tenant_org_id("public"), &name)
+            .await
+            .expect("cleanup delete");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(KEK_ENV_VAR) };
+    }
+
+    /// Create a tenant-scoped (non-admin) API key and return the plaintext
+    /// token. `role` is the key's permission string ("read"/"write"/"admin");
+    /// the key is bound to `tenant` and is NOT a platform admin, so it can only
+    /// reach its own tenant's tenant-scoped routes.
+    async fn create_tenant_api_key(state: &AppState, tenant: &str, role: &str) -> String {
+        let (plaintext, hash) = cloacina::security::api_keys::generate_api_key();
+        let dal = cloacina::dal::DAL::new(state.database.clone());
+        dal.api_keys()
+            .create_key(&hash, "tenant-test-key", Some(tenant), false, role)
+            .await
+            .expect("Failed to create tenant API key");
+        plaintext
+    }
+
+    /// Send a request to the router and return (status, body as serde_json::Value).
+    async fn send_request(
+        app: Router,
+        request: axum::http::Request<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app.oneshot(request).await.expect("request failed");
+        let status = response.status();
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}));
+        (status, body)
+    }
+
+    // ── Request ID middleware ─────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_request_id_header_present() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers().get("x-request-id");
+        assert!(
+            request_id.is_some(),
+            "Response should include X-Request-Id header"
+        );
+        let id_str = request_id.unwrap().to_str().unwrap();
+        assert!(
+            uuid::Uuid::parse_str(id_str).is_ok(),
+            "X-Request-Id should be a valid UUID, got: {}",
+            id_str
+        );
+    }
+
+    // ── Health / Ready / Metrics ──────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_health_returns_200() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ready_returns_200_with_db() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+    }
+
+    /// CLOACI-T-0919: a wedged embedded Python interpreter is PLATFORM health —
+    /// this replica can no longer load any Python package and only a restart
+    /// fixes it — so `/ready` must fail with the wedging package named. This
+    /// does NOT reopen the #231 hole: the wedge is set by this process's own
+    /// import thread, so it cannot fan out across the fleet the way a shared
+    /// tenant workload could.
+    #[tokio::test]
+    #[serial]
+    async fn ready_reports_503_when_python_runtime_is_wedged() {
+        let state = test_state().await;
+
+        // Healthy first — proves the 503 below comes from the wedge.
+        cloacina::python_runtime::reset_python_runtime_wedged_for_tests();
+        let req = axum::http::Request::builder()
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(build_router(state.clone()), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        cloacina::python_runtime::mark_python_runtime_wedged(
+            "python runtime wedged by package hostile-loop import hang",
+        );
+
+        let req = axum::http::Request::builder()
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(build_router(state), req).await;
+
+        // Restore before any assertion can unwind the test — the flag is
+        // process-global and latching in production.
+        cloacina::python_runtime::reset_python_runtime_wedged_for_tests();
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a wedged python runtime must fail readiness (body: {body})"
+        );
+        assert_eq!(body["status"], "not ready");
+        assert_eq!(
+            body["reason"], "python runtime wedged by package hostile-loop import hang",
+            "the reason must name the package that wedged the interpreter"
+        );
+    }
+
+    // ── CLOACI-T-0916: multi-replica truthfulness ─────────────────────────
+    //
+    // "Two replicas" are simulated as two independent `Database` handles (two
+    // connection pools) against the one shared Postgres — exactly the state
+    // two server processes behind a load balancer would be in.
+
+    fn second_replica_db() -> cloacina::database::Database {
+        cloacina::database::Database::new(TEST_DB_URL, "cloacina", 2)
+    }
+
+    /// A WS ticket minted "on replica A" must redeem "on replica B" — and only
+    /// once, on either replica.
+    #[tokio::test]
+    #[serial]
+    async fn ws_ticket_minted_on_one_replica_redeems_on_another_once() {
+        let state = test_state().await;
+        let store_a = crate::routes::auth::WsTicketStore::with_db(
+            state.database.clone(),
+            std::time::Duration::from_secs(60),
+        );
+        let store_b = crate::routes::auth::WsTicketStore::with_db(
+            second_replica_db(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let auth = crate::routes::auth::AuthenticatedKey {
+            key_id: uuid::Uuid::new_v4(),
+            name: "cross-replica-ticket".to_string(),
+            permissions: "read".to_string(),
+            tenant_id: Some("acme".to_string()),
+            is_admin: false,
+        };
+        let ticket = store_a.issue(auth).await;
+
+        let redeemed = store_b
+            .consume(&ticket)
+            .await
+            .expect("ticket minted on replica A must redeem on replica B");
+        assert_eq!(redeemed.name, "cross-replica-ticket");
+        assert_eq!(redeemed.tenant_id.as_deref(), Some("acme"));
+        assert!(!redeemed.is_admin);
+
+        // Single-use: replays fail on BOTH replicas.
+        assert!(store_a.consume(&ticket).await.is_none());
+        assert!(store_b.consume(&ticket).await.is_none());
+    }
+
+    /// Single-use must hold under CONCURRENT redemption attempts spread across
+    /// both replicas: exactly one wins the atomic CAS.
+    #[tokio::test]
+    #[serial]
+    async fn ws_ticket_single_use_under_concurrent_cross_replica_redeems() {
+        let state = test_state().await;
+        let store_a = Arc::new(crate::routes::auth::WsTicketStore::with_db(
+            state.database.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let store_b = Arc::new(crate::routes::auth::WsTicketStore::with_db(
+            second_replica_db(),
+            std::time::Duration::from_secs(60),
+        ));
+
+        let auth = crate::routes::auth::AuthenticatedKey {
+            key_id: uuid::Uuid::new_v4(),
+            name: "contended-ticket".to_string(),
+            permissions: "read".to_string(),
+            tenant_id: None,
+            is_admin: false,
+        };
+        let ticket = store_a.issue(auth).await;
+
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let store = if i % 2 == 0 {
+                store_a.clone()
+            } else {
+                store_b.clone()
+            };
+            let ticket = ticket.clone();
+            handles.push(tokio::spawn(async move {
+                store.consume(&ticket).await.is_some()
+            }));
+        }
+        let mut successes = 0;
+        for h in handles {
+            if h.await.expect("redeem task must not panic") {
+                successes += 1;
+            }
+        }
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent redeemer may win the single-use CAS"
+        );
+    }
+
+    /// Roster reads (selection eligibility, tenant guard, heartbeats) must see
+    /// an agent that registered + heartbeats via a DIFFERENT replica; the
+    /// dead-agent sweep must likewise evict cross-replica, exactly once.
+    #[tokio::test]
+    #[serial]
+    async fn agent_roster_selection_and_reclaim_see_other_replicas_agents() {
+        let state = test_state().await;
+        let registry_a = crate::agent_registry::AgentRegistry::new(
+            state.database.clone(),
+            std::time::Duration::from_secs(60),
+        );
+        let registry_b = crate::agent_registry::AgentRegistry::new(
+            second_replica_db(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let agent_id = format!("t0916-agent-{}", uuid::Uuid::new_v4().simple());
+        let tenant = format!("t0916-tenant-{}", uuid::Uuid::new_v4().simple());
+        registry_a
+            .register(
+                cloacina::dal::unified::FleetAgentRegistration {
+                    agent_id: agent_id.clone(),
+                    tenant_id: Some(tenant.clone()),
+                    target_triple: "aarch64-apple-darwin".to_string(),
+                    capabilities: vec![],
+                    max_concurrency: 4,
+                },
+                cloacina::security::ServerKeyPool::new(),
+            )
+            .await
+            .expect("registration must persist");
+
+        // Replica B sees the agent as live, with the right tenant.
+        let live_b = registry_b.live_agents().await.expect("roster read");
+        let seen = live_b
+            .iter()
+            .find(|a| a.agent_id == agent_id)
+            .expect("agent registered via replica A must be live on replica B");
+        assert_eq!(seen.tenant_id.as_deref(), Some(tenant.as_str()));
+        assert_eq!(
+            registry_b.agent_tenant(&agent_id).await.expect("lookup"),
+            Some(Some(tenant.clone())),
+            "cross-tenant guard must resolve the tenant on any replica"
+        );
+
+        // Same-tenant selection on replica B picks it.
+        let chosen =
+            crate::agent_registry::select_fleet_agent(&live_b, &Some(tenant.clone()), &None)
+                .expect("selection must see the other replica's agent");
+        assert_eq!(chosen.agent_id, agent_id);
+
+        // A heartbeat landing on replica B does NOT flap ("not registered").
+        assert!(
+            registry_b
+                .record_heartbeat(&agent_id, 2, 2)
+                .await
+                .expect("heartbeat persist"),
+            "heartbeat must succeed on a replica the agent did not register with"
+        );
+
+        // Dead-agent sweep: with a min (1s) liveness window on replica B, the
+        // agent goes stale after ~1s and the sweep — running on B — evicts the
+        // agent registered via A, exactly once.
+        let sweeper_b = crate::agent_registry::AgentRegistry::new(
+            second_replica_db(),
+            std::time::Duration::from_secs(1),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        let dead = sweeper_b.sweep_dead().await.expect("sweep");
+        assert!(
+            dead.iter().any(|a| a.agent_id == agent_id),
+            "sweep on replica B must evict the stale agent registered via A"
+        );
+        // Exactly once: a second sweep owns nothing for this agent.
+        let dead_again = sweeper_b.sweep_dead().await.expect("sweep");
+        assert!(
+            !dead_again.iter().any(|a| a.agent_id == agent_id),
+            "an evicted agent must not be reclaimable twice"
+        );
+        // And it is gone from every replica's live view.
+        let live_a = registry_a.live_agents().await.expect("roster read");
+        assert!(!live_a.iter().any(|a| a.agent_id == agent_id));
+    }
+
+    /// CLOACI-T-0916 acceptance: a crashed computation graph must NOT fail
+    /// `/ready` (previously one bad package ejected every replica from the LB
+    /// pool at once). The crash stays visible via `GET /v1/health/graphs`.
+    #[tokio::test]
+    #[serial]
+    async fn ready_stays_200_with_crashed_graph_visible_in_health_routes() {
+        use cloacina::computation_graph::accumulator::{
+            Accumulator, AccumulatorContext, AccumulatorRuntimeConfig, BoundarySender,
+            CheckpointHandle, accumulator_runtime,
+        };
+        use cloacina::computation_graph::reactor::{
+            CompiledGraphFn, InputStrategy, ReactionCriteria,
+        };
+        use cloacina::computation_graph::scheduler::{
+            AccumulatorDeclaration, AccumulatorFactory, AccumulatorSpawnConfig,
+            ComputationGraphDeclaration, ReactorDeclaration,
+        };
+        use cloacina::computation_graph::types::GraphResult;
+        use cloacina::computation_graph::{InputCache, SourceName};
+        use tokio::sync::{mpsc, watch};
+
+        /// Passthrough accumulator (mirrors the scheduler's own test factory).
+        struct PassthroughFactory;
+        impl AccumulatorFactory for PassthroughFactory {
+            fn spawn(
+                &self,
+                name: String,
+                boundary_tx: mpsc::Sender<(SourceName, Vec<u8>)>,
+                shutdown_rx: watch::Receiver<bool>,
+                config: AccumulatorSpawnConfig,
+            ) -> (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<()>) {
+                let (socket_tx, socket_rx) = mpsc::channel(64);
+
+                struct Passthrough;
+                #[async_trait::async_trait]
+                impl Accumulator for Passthrough {
+                    type Output = serde_json::Value;
+                    fn process(&mut self, event: Vec<u8>) -> Option<serde_json::Value> {
+                        serde_json::from_slice(&event).ok()
+                    }
+                }
+
+                let checkpoint = config
+                    .dal
+                    .map(|dal| CheckpointHandle::new(dal, config.graph_name.clone(), name.clone()));
+                let sender = BoundarySender::with_freshness(
+                    boundary_tx,
+                    SourceName::new(&name),
+                    config.freshness.clone(),
+                );
+                let ctx = AccumulatorContext {
+                    output: sender,
+                    name: name.clone(),
+                    shutdown: shutdown_rx,
+                    checkpoint,
+                    health: config.health_tx,
+                };
+                let handle = tokio::spawn(accumulator_runtime(
+                    Passthrough,
+                    ctx,
+                    socket_rx,
+                    AccumulatorRuntimeConfig::default(),
+                ));
+                (socket_tx, handle)
+            }
+        }
+
+        // Share ONE endpoint registry between the routes and the scheduler so
+        // both the event push and the health API see the same graph.
+        let mut state = test_state().await;
+        let registry = EndpointRegistry::new();
+        state.endpoint_registry = registry.clone();
+        state.graph_scheduler = Arc::new(ComputationGraphScheduler::new(registry.clone()));
+
+        // A graph whose compiled fn PANICS on fire — the reactor task dies,
+        // which is exactly the "crashed CG" condition that used to flip
+        // /ready false replica-wide.
+        let graph_fn: CompiledGraphFn = Arc::new(|_cache: InputCache| {
+            Box::pin(async {
+                panic!("t0916: deliberate graph crash");
+                #[allow(unreachable_code)]
+                GraphResult::completed(vec![])
+            })
+        });
+        let decl = ComputationGraphDeclaration {
+            name: "t0916_crash_graph".to_string(),
+            accumulators: vec![AccumulatorDeclaration {
+                name: "t0916_alpha".to_string(),
+                factory: Arc::new(PassthroughFactory),
+            }],
+            reactor: ReactorDeclaration {
+                criteria: ReactionCriteria::WhenAny,
+                strategy: InputStrategy::Latest,
+                graph_fn,
+                constructor: None,
+            },
+            tenant_id: None,
+            reactor_name: None,
+            topology: None,
+        };
+        state
+            .graph_scheduler
+            .load_graph(decl)
+            .await
+            .expect("graph loads");
+
+        // Fire it: push one event, then wait for the reactor task to die.
+        registry
+            .send_to_accumulator(
+                "t0916_alpha",
+                cloacina::computation_graph::registry::EndpointScope::untenanted(),
+                b"{\"v\":1}".to_vec(),
+            )
+            .await
+            .expect("event push");
+        let mut crashed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let graphs = state.graph_scheduler.list_graphs().await;
+            if graphs
+                .iter()
+                .any(|g| g.name == "t0916_crash_graph" && !g.running)
+            {
+                crashed = true;
+                break;
+            }
+        }
+        assert!(crashed, "the deliberately-panicking graph must crash");
+
+        let admin_key = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        // /ready stays 200 — platform (DB) health only, not tenant workloads.
+        let (status, body) = send_request(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a crashed CG must not fail /ready (got body: {body})"
+        );
+        assert_eq!(body["status"], "ready");
+
+        // ... while the crash IS visible via the graph-health route.
+        let (status, body) = send_request(
+            app,
+            axum::http::Request::builder()
+                .uri("/v1/health/graphs")
+                .header("Authorization", format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"].as_array().expect("items array");
+        assert!(
+            items.iter().any(|g| g["name"] == "t0916_crash_graph"),
+            "the crashed graph must remain visible via /v1/health/graphs: {body}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_metrics_returns_prometheus_format() {
+        let state = test_state().await;
+
+        // Record some test metrics so the output isn't empty
+        metrics::counter!(
+            "cloacina_workflows_total",
+            "status" => "completed",
+            "reason" => "ok",
+        )
+        .increment(3);
+        metrics::counter!(
+            "cloacina_tasks_total",
+            "status" => "completed",
+            "reason" => "ok",
+        )
+        .increment(10);
+        metrics::counter!(
+            "cloacina_tasks_total",
+            "status" => "failed",
+            "reason" => "task_error",
+        )
+        .increment(2);
+
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/plain"),
+            "Content-Type should be text/plain for Prometheus, got: {}",
+            content_type
+        );
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        // Verify Prometheus text format: HELP, TYPE, and metric lines
+        assert!(
+            text.contains("cloacina_workflows_total"),
+            "Metrics should contain workflow counters. Got:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_tasks_total"),
+            "Metrics should contain task counters. Got:\n{}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scheduler_loop_metrics_emit() {
+        let state = test_state().await;
+
+        // Emit each new scheduler-loop metric exactly as the production code does.
+        // Mirrors:
+        //   - executor/thread_task_executor.rs claim_for_runner → {claimed, contended}
+        //   - execution_planner/scheduler_loop.rs dispatch_ready_tasks (no work) → empty
+        //   - executor/thread_task_executor.rs heartbeat loop on Ok
+        //   - execution_planner/stale_claim_sweeper.rs after mark_ready succeeds
+        metrics::counter!(
+            "cloacina_scheduler_claim_attempts_total",
+            "outcome" => "claimed",
+        )
+        .increment(1);
+        metrics::counter!(
+            "cloacina_scheduler_claim_attempts_total",
+            "outcome" => "contended",
+        )
+        .increment(1);
+        metrics::counter!(
+            "cloacina_scheduler_claim_attempts_total",
+            "outcome" => "empty",
+        )
+        .increment(1);
+        metrics::counter!("cloacina_scheduler_heartbeat_writes_total").increment(1);
+        metrics::counter!("cloacina_scheduler_stale_claims_swept_total").increment(1);
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        // Each new metric registered with describe_counter! and emitted at least once
+        // must appear in the exposition output.
+        assert!(
+            text.contains("cloacina_scheduler_claim_attempts_total"),
+            "Missing claim_attempts_total in /metrics output:\n{}",
+            text
+        );
+        // All three outcome label values must be present.
+        for outcome in ["claimed", "contended", "empty"] {
+            assert!(
+                text.contains(&format!(
+                    "cloacina_scheduler_claim_attempts_total{{outcome=\"{}\"}}",
+                    outcome
+                )),
+                "Missing outcome={} label in claim_attempts_total. Got:\n{}",
+                outcome,
+                text
+            );
+        }
+        assert!(
+            text.contains("cloacina_scheduler_heartbeat_writes_total"),
+            "Missing heartbeat_writes_total in /metrics output:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_scheduler_stale_claims_swept_total"),
+            "Missing stale_claims_swept_total in /metrics output:\n{}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_supervisor_health_metrics_emit() {
+        let state = test_state().await;
+
+        // Emit each new supervisor / health metric exactly as the production
+        // code does. Mirrors:
+        //   - computation_graph/scheduler.rs check_and_restart_failed →
+        //     supervisor_restarts_total at reactor + accumulator restart paths
+        //   - computation_graph/scheduler.rs emit_health_metrics →
+        //     component_health gauge from supervision tick
+        metrics::counter!(
+            "cloacina_supervisor_restarts_total",
+            "graph" => "test_graph",
+            "component" => "reactor",
+            "reason" => "panic",
+        )
+        .increment(1);
+        metrics::counter!(
+            "cloacina_supervisor_restarts_total",
+            "graph" => "test_graph",
+            "component" => "acc_a",
+            "reason" => "error",
+        )
+        .increment(1);
+
+        for state_label in ["healthy", "degraded", "starting", "stopped", "crashed"] {
+            let value = if state_label == "healthy" { 1.0 } else { 0.0 };
+            metrics::gauge!(
+                "cloacina_component_health",
+                "graph" => "test_graph",
+                "component" => "reactor",
+                "state" => state_label,
+            )
+            .set(value);
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        assert!(
+            text.contains("cloacina_supervisor_restarts_total"),
+            "Missing supervisor_restarts_total in /metrics output:\n{}",
+            text
+        );
+        // Both bounded reasons must round-trip through the exporter.
+        for reason in ["panic", "error"] {
+            assert!(
+                text.contains(&format!("reason=\"{}\"", reason)),
+                "Missing reason={} in supervisor restarts. Got:\n{}",
+                reason,
+                text
+            );
+        }
+        assert!(
+            text.contains("cloacina_component_health"),
+            "Missing component_health gauge in /metrics output:\n{}",
+            text
+        );
+        // Exactly one state==1 invariant: assert all five state values appear
+        // (one as 1, four as 0).
+        for state_label in ["healthy", "degraded", "starting", "stopped", "crashed"] {
+            assert!(
+                text.contains(&format!("state=\"{}\"", state_label)),
+                "Missing state={} in component_health. Got:\n{}",
+                state_label,
+                text
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_accumulator_metrics_emit() {
+        let state = test_state().await;
+
+        // Emit each accumulator metric exactly as the production runtimes do.
+        for kind in ["passthrough", "stream", "polling", "batch"] {
+            metrics::counter!(
+                "cloacina_accumulator_events_total",
+                "graph" => "test_graph",
+                "accumulator" => format!("acc_{}", kind),
+                "kind" => kind,
+            )
+            .increment(1);
+            metrics::histogram!(
+                "cloacina_accumulator_emit_duration_seconds",
+                "graph" => "test_graph",
+                "accumulator" => format!("acc_{}", kind),
+            )
+            .record(0.001);
+        }
+        metrics::gauge!(
+            "cloacina_accumulator_buffer_depth",
+            "graph" => "test_graph",
+            "accumulator" => "acc_batch",
+        )
+        .set(42.0);
+        metrics::counter!(
+            "cloacina_accumulator_checkpoint_writes_total",
+            "graph" => "test_graph",
+            "accumulator" => "acc_passthrough",
+        )
+        .increment(1);
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        // All four kind label values must round-trip
+        for kind in ["passthrough", "stream", "polling", "batch"] {
+            assert!(
+                text.contains(&format!("kind=\"{}\"", kind)),
+                "Missing kind={} in accumulator_events_total. Got:\n{}",
+                kind,
+                text
+            );
+        }
+        assert!(
+            text.contains("cloacina_accumulator_emit_duration_seconds"),
+            "Missing emit_duration histogram in /metrics output:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_accumulator_buffer_depth"),
+            "Missing buffer_depth gauge in /metrics output:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_accumulator_checkpoint_writes_total"),
+            "Missing checkpoint_writes_total in /metrics output:\n{}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_reactor_metrics_emit() {
+        let state = test_state().await;
+
+        for strategy in ["when_any", "when_all", "sequential"] {
+            metrics::counter!(
+                "cloacina_reactor_fires_total",
+                "graph" => "test_graph",
+                "reactor" => "test_reactor",
+                "strategy" => strategy,
+            )
+            .increment(1);
+        }
+        metrics::histogram!(
+            "cloacina_reactor_fire_duration_seconds",
+            "graph" => "test_graph",
+            "reactor" => "test_reactor",
+        )
+        .record(0.002);
+        for source in ["src_a", "src_b"] {
+            metrics::gauge!(
+                "cloacina_reactor_cache_age_seconds",
+                "graph" => "test_graph",
+                "reactor" => "test_reactor",
+                "source" => source,
+            )
+            .set(1.5);
+        }
+        metrics::counter!(
+            "cloacina_reactor_deduped_events_total",
+            "graph" => "test_graph",
+            "reactor" => "test_reactor",
+            "source" => "src_a",
+        )
+        .increment(1);
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        for strategy in ["when_any", "when_all", "sequential"] {
+            assert!(
+                text.contains(&format!("strategy=\"{}\"", strategy)),
+                "Missing strategy={} in reactor_fires_total. Got:\n{}",
+                strategy,
+                text
+            );
+        }
+        assert!(
+            text.contains("cloacina_reactor_fire_duration_seconds"),
+            "Missing fire_duration histogram in /metrics output:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_reactor_cache_age_seconds"),
+            "Missing cache_age gauge in /metrics output:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_reactor_deduped_events_total"),
+            "Missing deduped_events counter in /metrics output:\n{}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ws_metrics_emit() {
+        let state = test_state().await;
+
+        for endpoint in ["accumulator", "reactor"] {
+            metrics::gauge!(
+                "cloacina_ws_connections_active",
+                "endpoint" => endpoint,
+            )
+            .set(1.0);
+            for direction in ["in", "out"] {
+                metrics::counter!(
+                    "cloacina_ws_messages_total",
+                    "endpoint" => endpoint,
+                    "direction" => direction,
+                )
+                .increment(1);
+            }
+        }
+        for reason in [
+            "ticket_expired",
+            "invalid_signature",
+            "tenant_mismatch",
+            "not_authorized",
+        ] {
+            metrics::counter!(
+                "cloacina_ws_auth_failures_total",
+                "reason" => reason,
+            )
+            .increment(1);
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        for endpoint in ["accumulator", "reactor"] {
+            assert!(
+                text.contains(&format!("endpoint=\"{}\"", endpoint)),
+                "Missing endpoint={} label. Got:\n{}",
+                endpoint,
+                text
+            );
+        }
+        for direction in ["in", "out"] {
+            assert!(
+                text.contains(&format!("direction=\"{}\"", direction)),
+                "Missing direction={} label in ws_messages_total. Got:\n{}",
+                direction,
+                text
+            );
+        }
+        for reason in [
+            "ticket_expired",
+            "invalid_signature",
+            "tenant_mismatch",
+            "not_authorized",
+        ] {
+            assert!(
+                text.contains(&format!("reason=\"{}\"", reason)),
+                "Missing reason={} in ws_auth_failures_total. Got:\n{}",
+                reason,
+                text
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_persist_failure_metrics_emit() {
+        let state = test_state().await;
+
+        for kind in [
+            "cache_serialize",
+            "dirty_serialize",
+            "seq_serialize",
+            "save",
+        ] {
+            metrics::counter!(
+                "cloacina_reactor_persist_failures_total",
+                "graph" => "test_graph",
+                "reactor" => "test_reactor",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+        for kind in ["checkpoint", "boundary", "batch_buffer"] {
+            metrics::counter!(
+                "cloacina_accumulator_persist_failures_total",
+                "graph" => "test_graph",
+                "accumulator" => "acc0",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        for kind in [
+            "cache_serialize",
+            "dirty_serialize",
+            "seq_serialize",
+            "save",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "cloacina_reactor_persist_failures_total{{graph=\"test_graph\",kind=\"{}\"",
+                    kind
+                )) || text.contains(&format!("kind=\"{}\"", kind)),
+                "Missing kind={} in reactor_persist_failures_total. Got:\n{}",
+                kind,
+                text
+            );
+        }
+        for kind in ["checkpoint", "boundary", "batch_buffer"] {
+            assert!(
+                text.contains(&format!("kind=\"{}\"", kind)),
+                "Missing kind={} in accumulator_persist_failures_total. Got:\n{}",
+                kind,
+                text
+            );
+        }
+    }
+
+    /// I-0099 cardinality guard — assert that every `cloacina_*` metric
+    /// introduced by the initiative stays under a fixed series ceiling.
+    ///
+    /// Emits each metric exactly as the production code does, scrapes
+    /// `/metrics`, then groups all exposition lines by metric name and
+    /// asserts each metric's distinct label-set count is below the
+    /// documented limit. Caught here, this protects against the
+    /// "someone added `tenant_id` as a label" failure mode that motivates
+    /// the cardinality discipline in I-0099.
+    #[tokio::test]
+    #[serial]
+    async fn test_i0099_cardinality_within_ceiling() {
+        use std::collections::HashMap;
+
+        let state = test_state().await;
+
+        // Exercise every I-0099 metric at least once across the full label
+        // domain so /metrics reflects realistic cardinality.
+        for outcome in ["claimed", "contended", "empty"] {
+            metrics::counter!(
+                "cloacina_scheduler_claim_attempts_total",
+                "outcome" => outcome,
+            )
+            .increment(1);
+        }
+        metrics::counter!("cloacina_scheduler_heartbeat_writes_total").increment(1);
+        metrics::counter!("cloacina_scheduler_stale_claims_swept_total").increment(1);
+
+        for reason in ["panic", "error", "shutdown_timeout"] {
+            metrics::counter!(
+                "cloacina_supervisor_restarts_total",
+                "graph" => "g0",
+                "component" => "reactor",
+                "reason" => reason,
+            )
+            .increment(1);
+        }
+        for state_label in ["healthy", "degraded", "starting", "stopped", "crashed"] {
+            metrics::gauge!(
+                "cloacina_component_health",
+                "graph" => "g0",
+                "component" => "reactor",
+                "state" => state_label,
+            )
+            .set(if state_label == "healthy" { 1.0 } else { 0.0 });
+        }
+
+        for kind in ["passthrough", "stream", "polling", "batch"] {
+            metrics::counter!(
+                "cloacina_accumulator_events_total",
+                "graph" => "g0",
+                "accumulator" => "acc0",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+        metrics::histogram!(
+            "cloacina_accumulator_emit_duration_seconds",
+            "graph" => "g0",
+            "accumulator" => "acc0",
+        )
+        .record(0.001);
+        metrics::gauge!(
+            "cloacina_accumulator_buffer_depth",
+            "graph" => "g0",
+            "accumulator" => "acc0",
+        )
+        .set(0.0);
+        metrics::counter!(
+            "cloacina_accumulator_checkpoint_writes_total",
+            "graph" => "g0",
+            "accumulator" => "acc0",
+        )
+        .increment(1);
+
+        for strategy in ["when_any", "when_all", "sequential"] {
+            metrics::counter!(
+                "cloacina_reactor_fires_total",
+                "graph" => "g0",
+                "reactor" => "r0",
+                "strategy" => strategy,
+            )
+            .increment(1);
+        }
+        metrics::histogram!(
+            "cloacina_reactor_fire_duration_seconds",
+            "graph" => "g0",
+            "reactor" => "r0",
+        )
+        .record(0.001);
+        metrics::gauge!(
+            "cloacina_reactor_cache_age_seconds",
+            "graph" => "g0",
+            "reactor" => "r0",
+            "source" => "src_a",
+        )
+        .set(1.0);
+        metrics::counter!(
+            "cloacina_reactor_deduped_events_total",
+            "graph" => "g0",
+            "reactor" => "r0",
+            "source" => "src_a",
+        )
+        .increment(1);
+
+        for endpoint in ["accumulator", "reactor"] {
+            metrics::gauge!(
+                "cloacina_ws_connections_active",
+                "endpoint" => endpoint,
+            )
+            .set(1.0);
+            for direction in ["in", "out"] {
+                metrics::counter!(
+                    "cloacina_ws_messages_total",
+                    "endpoint" => endpoint,
+                    "direction" => direction,
+                )
+                .increment(1);
+            }
+        }
+        for reason in [
+            "ticket_expired",
+            "invalid_signature",
+            "tenant_mismatch",
+            "not_authorized",
+        ] {
+            metrics::counter!(
+                "cloacina_ws_auth_failures_total",
+                "reason" => reason,
+            )
+            .increment(1);
+        }
+
+        // I-0108 persist-failure counters — included so the cardinality
+        // guard covers them as well.
+        for kind in [
+            "cache_serialize",
+            "dirty_serialize",
+            "seq_serialize",
+            "save",
+        ] {
+            metrics::counter!(
+                "cloacina_reactor_persist_failures_total",
+                "graph" => "g0",
+                "reactor" => "r0",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+        for kind in ["checkpoint", "boundary", "batch_buffer"] {
+            metrics::counter!(
+                "cloacina_accumulator_persist_failures_total",
+                "graph" => "g0",
+                "accumulator" => "acc0",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+        // I-0110 / COR-11: context-merge failure counter — bounded
+        // `kind ∈ parse | merge`. Included in the cardinality guard so
+        // future additions don't sneak in an unbounded label.
+        for kind in ["parse", "merge"] {
+            metrics::counter!(
+                "cloacina_context_merge_failures_total",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+        // I-0100 / T-0599: reactor firings counter — labels are
+        // `graph | reactor` (typically the same value, derived from the
+        // package's reactor name). Bounded by the loaded reactor set,
+        // not by request-time data.
+        metrics::counter!(
+            "cloacina_reactor_firings_total",
+            "graph" => "g0",
+            "reactor" => "r0",
+        )
+        .increment(1);
+        // I-0100 / T-0601: TTL prune counter — unlabeled.
+        metrics::counter!("cloacina_reactor_firings_pruned_total").increment(1);
+
+        // Scrape and parse
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        // Documented ceilings — per-metric distinct label-set count.
+        // Derived from the bounded enum products in I-0099:
+        //   scheduler_claim_attempts_total = 3 outcomes
+        //   scheduler_heartbeat_writes_total = 1
+        //   scheduler_stale_claims_swept_total = 1
+        //   supervisor_restarts_total ≤ 3 reasons × small graph/component fan-out
+        //   component_health = 5 states × small graph/component fan-out
+        //   accumulator_events_total ≤ 4 kinds × small graph/accumulator fan-out
+        //   reactor_fires_total ≤ 3 strategies × small graph/reactor fan-out
+        //   ws_connections_active = 2 endpoints
+        //   ws_messages_total = 2 endpoints × 2 directions = 4
+        //   ws_auth_failures_total = 4 reasons
+        //
+        // The ceiling below accommodates the per-test cardinality (one
+        // graph/reactor/accumulator name) plus a safety margin. Inflated
+        // labels (e.g., tenant_id, event keys) would push any of these
+        // metrics far above the ceiling.
+        // Count DISTINCT LABEL SETS per canonical metric — not raw series.
+        // A histogram emits one `_bucket` series per `le` boundary plus `_sum`
+        // and `_count`; those are a fixed Prometheus artifact, not cardinality
+        // risk. Collapsing the `le` label so all buckets of one label set count
+        // once measures the thing the guard actually cares about (unbounded
+        // labels like tenant_id / raw paths still blow up the distinct-set
+        // count). This also keeps the count stable when many tests share one
+        // process-wide recorder (e.g. the request-duration histogram, which the
+        // middleware feeds on every test request).
+        let mut label_sets: HashMap<&str, std::collections::HashSet<String>> = HashMap::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            // Capture metric name up to '{' or whitespace.
+            let name_end = line
+                .find('{')
+                .or_else(|| line.find(' '))
+                .unwrap_or(line.len());
+            let name = &line[..name_end];
+            // Strip Prometheus histogram suffixes so all buckets of one
+            // histogram count as the same metric for our purposes.
+            let canonical: &str = if let Some(stripped) = name.strip_suffix("_bucket") {
+                stripped
+            } else if let Some(stripped) = name.strip_suffix("_sum") {
+                stripped
+            } else if let Some(stripped) = name.strip_suffix("_count") {
+                stripped
+            } else {
+                name
+            };
+            if !canonical.starts_with("cloacina_") {
+                continue;
+            }
+            // Extract the label block between `{` and `}`, dropping the
+            // histogram `le` bucket boundary so buckets collapse to one set.
+            let labels = match (line.find('{'), line.rfind('}')) {
+                (Some(a), Some(b)) if b > a => &line[a + 1..b],
+                _ => "",
+            };
+            let canonical_labels: Vec<&str> = labels
+                .split(',')
+                .map(|kv| kv.trim())
+                .filter(|kv| !kv.is_empty() && !kv.starts_with("le="))
+                .collect();
+            label_sets
+                .entry(canonical)
+                .or_default()
+                .insert(canonical_labels.join(","));
+        }
+        let series_count: HashMap<&str, usize> =
+            label_sets.iter().map(|(k, v)| (*k, v.len())).collect();
+
+        // Per-metric ceilings. The default stays deliberately tight — most
+        // I-0099 metrics carry a handful of enum-bounded labels and sit far
+        // below it, so an unbounded label (tenant_id, event keys, raw paths)
+        // trips the guard loudly. The two API metrics are labelled only by
+        // (method, status): both bounded, but their product across the full
+        // route surface legitimately exceeds the tight default, so they get a
+        // higher (still bounded) ceiling that an unbounded label would blow
+        // straight past. CLOACI-I-0127.
+        for (metric, count) in &series_count {
+            let ceiling = match *metric {
+                "cloacina_api_request_duration_seconds" | "cloacina_api_requests_total" => 256usize,
+                _ => 64usize,
+            };
+            assert!(
+                *count <= ceiling,
+                "I-0099 cardinality guard: {} has {} distinct label sets, \
+                 exceeds ceiling {}. A new label may be unbounded — check \
+                 docs/operations/metrics.md and ensure all labels are \
+                 enum-bounded or derived from package metadata.",
+                metric,
+                count,
+                ceiling
+            );
+        }
+
+        // Sanity: every I-0099 metric we just emitted should appear in the
+        // scrape — if a metric is missing the cardinality assertion was
+        // vacuous for it.
+        for expected in [
+            "cloacina_scheduler_claim_attempts_total",
+            "cloacina_scheduler_heartbeat_writes_total",
+            "cloacina_scheduler_stale_claims_swept_total",
+            "cloacina_supervisor_restarts_total",
+            "cloacina_component_health",
+            "cloacina_accumulator_events_total",
+            "cloacina_accumulator_emit_duration_seconds",
+            "cloacina_accumulator_buffer_depth",
+            "cloacina_accumulator_checkpoint_writes_total",
+            "cloacina_reactor_fires_total",
+            "cloacina_reactor_fire_duration_seconds",
+            "cloacina_reactor_cache_age_seconds",
+            "cloacina_reactor_deduped_events_total",
+            "cloacina_ws_connections_active",
+            "cloacina_ws_messages_total",
+            "cloacina_ws_auth_failures_total",
+            "cloacina_reactor_persist_failures_total",
+            "cloacina_accumulator_persist_failures_total",
+            "cloacina_context_merge_failures_total",
+            "cloacina_reactor_firings_total",
+            "cloacina_reactor_firings_pruned_total",
+        ] {
+            assert!(
+                series_count.contains_key(expected),
+                "I-0099 metric {} missing from /metrics scrape — \
+                 cardinality assertion was vacuous for it. \
+                 Series found: {:?}",
+                expected,
+                series_count.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_api_request_duration_histogram_emitted() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        // Fire a request through the middleware stack so the histogram records.
+        let _ = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("failed to read body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body_bytes);
+
+        assert!(
+            text.contains("cloacina_api_request_duration_seconds"),
+            "Metrics output should include the API request duration histogram. Got:\n{}",
+            text
+        );
+        assert!(
+            text.contains("cloacina_api_requests_total"),
+            "Metrics output should include the API request counter. Got:\n{}",
+            text
+        );
+    }
+
+    // ── Routing guard ─────────────────────────────────────────────────
+
+    /// Regression for T-0557 Bug 1: T-0449 nested every authenticated
+    /// route under `/v1/`, but the test suite kept hitting bare paths
+    /// for ~7 months without anyone noticing because the suite was
+    /// silently failing on a missing Postgres connection. This test
+    /// asserts the `/v1/` prefix is mandatory — a request to the
+    /// unprefixed path must hit the 404 fallback, not be silently
+    /// fall-through-routed somewhere else.
+    #[tokio::test]
+    #[serial]
+    async fn test_unprefixed_auth_route_returns_404() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/auth/keys")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "/auth/keys (without /v1/ prefix) must 404 — production paths are /v1/-prefixed"
+        );
+    }
+
+    // ── Auth middleware ───────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_no_token_returns_401() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/auth/keys")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body["error"].as_str().unwrap().contains("Authorization"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_invalid_token_returns_401() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/auth/keys")
+            .header("Authorization", "Bearer clk_totally_invalid_key_12345678")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body["error"].as_str().unwrap().contains("invalid"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_valid_token_passes() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/auth/keys")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_malformed_header_returns_401() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        // "Basic" instead of "Bearer"
+        let req = axum::http::Request::builder()
+            .uri("/v1/auth/keys")
+            .header("Authorization", "Basic abc123")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Key management ───────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_key_returns_201() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/auth/keys")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"name": "new-test-key"}"#))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(body["key"].as_str().unwrap().starts_with("clk_"));
+        assert_eq!(body["name"], "new-test-key");
+        assert!(body["id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_key_missing_name_returns_422() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/auth/keys")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        // axum returns 422 for deserialization failures
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_keys_returns_list() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/auth/keys")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["items"].as_array().is_some());
+        assert!(!body["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_revoke_key_valid() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        // Create a second key to revoke
+        let (_, hash2) = cloacina::security::api_keys::generate_api_key();
+        let dal = cloacina::dal::DAL::new(state.database.clone());
+        let info2 = dal
+            .api_keys()
+            .create_key(&hash2, "to-revoke", None, false, "admin")
+            .await
+            .expect("create key");
+
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/auth/keys/{}", info2.id))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "revoked");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_revoke_key_nonexistent_returns_404() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let fake_id = uuid::Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/auth/keys/{}", fake_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_revoke_key_invalid_uuid_returns_400() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/v1/auth/keys/not-a-uuid")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Tenants ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_tenant_returns_201() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let name = format!(
+            "test_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        // CLOACI-T-0594 / API-01: request body now uses `{name, description?, password?}`.
+        let body_json = serde_json::json!({
+            "name": name,
+            "description": "integration test tenant",
+            "password": "testpass123",
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_string(&body_json).unwrap()))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {:?}", body);
+        // Response keys reflect the new shape — `name` (the canonical
+        // identifier) replaces `schema_name`.
+        assert_eq!(body["name"], name);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_tenants() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        // CLOACI-T-0594 / API-03: unified `{items, total}` envelope.
+        assert!(
+            body["items"].as_array().is_some(),
+            "list_tenants must return items envelope; got {:?}",
+            body
+        );
+        assert!(body["total"].as_u64().is_some());
+    }
+
+    // ── Agent-capacity limits (CLOACI-T-0808) ────────────────────────
+
+    /// god POST sets a tenant exception → 200 with override + effective.
+    #[tokio::test]
+    #[serial]
+    async fn test_set_agent_limit_god_returns_200() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"max_agents": 6}"#))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["effective_limit"], 6);
+        assert_eq!(body["tenant_override"], 6);
+        assert_eq!(body["default_max_agents"], 4);
+    }
+
+    /// god GET reads back the override just set → effective == override.
+    #[tokio::test]
+    #[serial]
+    async fn test_get_agent_limit_god_reflects_override() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state.clone());
+
+        // Seed an override.
+        let post = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"max_agents": 6}"#))
+            .unwrap();
+        let (status, _) = send_request(app, post).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let app = build_router(state);
+        let get = axum::http::Request::builder()
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(app, get).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["effective_limit"], 6);
+    }
+
+    /// god GET on a tenant with no override → effective == default, override null.
+    #[tokio::test]
+    #[serial]
+    async fn test_get_agent_limit_no_override_uses_default() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/otherco/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["effective_limit"], 4);
+        assert!(body["tenant_override"].is_null());
+    }
+
+    /// A tenant-scoped key may read its OWN tenant's limit → 200.
+    #[tokio::test]
+    #[serial]
+    async fn test_get_agent_limit_own_tenant_key_allowed() {
+        let state = test_state().await;
+        let token = create_tenant_api_key(&state, "acme", "read").await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        // Own-tenant read is permitted (200). The exact effective value is not
+        // asserted here: server lib tests share one Postgres DB with no
+        // per-test reset, so a prior test may have left an `acme` override.
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert!(body["effective_limit"].is_number(), "body: {:?}", body);
+    }
+
+    /// A tenant-scoped key may NOT read another tenant's limit → 403.
+    #[tokio::test]
+    #[serial]
+    async fn test_get_agent_limit_cross_tenant_key_denied() {
+        let state = test_state().await;
+        let token = create_tenant_api_key(&state, "acme", "read").await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/otherco/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// Setting an exception is god-only — a tenant key (even on its own
+    /// tenant) is denied → 403.
+    #[tokio::test]
+    #[serial]
+    async fn test_set_agent_limit_tenant_key_denied() {
+        let state = test_state().await;
+        let token = create_tenant_api_key(&state, "acme", "admin").await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"max_agents": 6}"#))
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// god DELETE clears the exception → 200 and effective reverts to default.
+    #[tokio::test]
+    #[serial]
+    async fn test_delete_agent_limit_god_reverts_to_default() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        // Seed an override first.
+        let app = build_router(state.clone());
+        let post = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"max_agents": 6}"#))
+            .unwrap();
+        let (status, _) = send_request(app, post).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let app = build_router(state);
+        let del = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/v1/tenants/acme/limits")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(app, del).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["effective_limit"], 4);
+        assert!(body["tenant_override"].is_null());
+    }
+
+    /// No Authorization header → 401 before authz runs.
+    #[tokio::test]
+    #[serial]
+    async fn test_get_agent_limit_no_auth_returns_401() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/acme/limits")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Fleet scaling (desired-count provisioning, CLOACI-T-0809) ─────
+    //
+    // The server lib tests share one Postgres DB with no per-test reset, so each
+    // test below uses a UNIQUE tenant name (fresh desired_count == 0) and seeds
+    // its own effective limit via `agent_limits().set_tenant_limit`.
+
+    /// A tenant-admin key provisions its OWN tenant → 200, desired_count +1.
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_provision_tenant_admin_increments() {
+        let state = test_state().await;
+        let tenant = "fleet-self-0809";
+        // Seed a generous limit so provisioning is under capacity.
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_limits()
+            .set_tenant_limit(tenant, 5)
+            .await
+            .expect("seed limit");
+        // Start from a known baseline.
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_desired()
+            .set_desired(tenant, 0)
+            .await
+            .expect("seed desired");
+        let token = create_tenant_api_key(&state, tenant, "admin").await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/tenants/{}/fleet/provision", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["desired_count"], 1);
+        assert_eq!(body["effective_limit"], 5);
+        assert_eq!(body["actual_count"], 0);
+        assert_eq!(body["default_max_agents"], 4);
+    }
+
+    /// Provisioning past the effective limit → 409 "at capacity".
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_provision_at_capacity_returns_409() {
+        let state = test_state().await;
+        let tenant = "fleet-cap-0809";
+        // Low limit of 1 so a single provision saturates capacity.
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_limits()
+            .set_tenant_limit(tenant, 1)
+            .await
+            .expect("seed limit");
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_desired()
+            .set_desired(tenant, 0)
+            .await
+            .expect("seed desired");
+        let token = create_test_api_key(&state).await; // god
+        let app = build_router(state.clone());
+
+        // First provision: 0 → 1 (200, now at limit).
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/tenants/{}/fleet/provision", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["desired_count"], 1);
+
+        // Second provision: at the limit → 409.
+        let app = build_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/tenants/{}/fleet/provision", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// Deprovision decrements, and floors at 0.
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_deprovision_decrements_and_floors() {
+        let state = test_state().await;
+        let tenant = "fleet-deprov-0809";
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_limits()
+            .set_tenant_limit(tenant, 5)
+            .await
+            .expect("seed limit");
+        // Start at 1 so the first deprovision lands on 0.
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_desired()
+            .set_desired(tenant, 1)
+            .await
+            .expect("seed desired");
+        let token = create_test_api_key(&state).await; // god
+        let app = build_router(state.clone());
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/tenants/{}/fleet/deprovision", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["desired_count"], 0);
+
+        // Deprovision again: already 0, floors at 0 (still 200).
+        let app = build_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/tenants/{}/fleet/deprovision", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["desired_count"], 0);
+    }
+
+    /// GET fleet returns the full scaling view → 200 with all fields.
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_get_returns_fields() {
+        let state = test_state().await;
+        let tenant = "fleet-get-0809";
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_desired()
+            .set_desired(tenant, 2)
+            .await
+            .expect("seed desired");
+        let token = create_tenant_api_key(&state, tenant, "read").await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/tenants/{}/fleet", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["tenant_id"], tenant);
+        assert_eq!(body["desired_count"], 2);
+        assert_eq!(body["effective_limit"], 4); // no override → default
+        assert!(body["actual_count"].is_number());
+        assert_eq!(body["default_max_agents"], 4);
+    }
+
+    /// A tenant-admin key may NOT provision another tenant's fleet → 403.
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_provision_cross_tenant_denied() {
+        let state = test_state().await;
+        let token = create_tenant_api_key(&state, "acme", "admin").await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/otherco/fleet/provision")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A god key may provision any tenant's fleet → 200.
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_provision_god_any_tenant() {
+        let state = test_state().await;
+        let tenant = "fleet-god-0809";
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_limits()
+            .set_tenant_limit(tenant, 5)
+            .await
+            .expect("seed limit");
+        cloacina::dal::DAL::new(state.database.clone())
+            .agent_desired()
+            .set_desired(tenant, 0)
+            .await
+            .expect("seed desired");
+        let token = create_test_api_key(&state).await; // god
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/tenants/{}/fleet/provision", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+        assert_eq!(body["desired_count"], 1);
+    }
+
+    /// No Authorization header → 401 before authz runs.
+    #[tokio::test]
+    #[serial]
+    async fn test_fleet_no_auth_returns_401() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/acme/fleet/provision")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Auto-provision on tenant create (CLOACI-T-0812) ───────────────
+
+    /// The clamp/0-disable logic: effective initial =
+    /// `min(initial_agents, default_max_agents)`.
+    #[test]
+    fn test_initial_desired_count_clamp() {
+        use crate::routes::tenants::initial_desired_count;
+        // initial under the limit → initial.
+        assert_eq!(initial_desired_count(1, 4), 1);
+        assert_eq!(initial_desired_count(3, 4), 3);
+        // initial over the limit → clamped to the limit.
+        assert_eq!(initial_desired_count(10, 4), 4);
+        // 0 initial → 0 (auto-provision disabled).
+        assert_eq!(initial_desired_count(0, 4), 0);
+        // 0 limit → 0 even with a positive initial.
+        assert_eq!(initial_desired_count(2, 0), 0);
+    }
+
+    /// Creating a tenant auto-provisions its initial `desired_count`:
+    /// `POST /v1/tenants` then `GET /v1/tenants/{t}/fleet` shows
+    /// `desired_count == min(initial_agents, default_max_agents)`. With the
+    /// test state's defaults (initial_agents=1, default_max_agents=4) that's 1.
+    /// Requires Postgres (creates a real tenant schema); unique name + DELETE
+    /// cleanup since the lib tests share one DB with no per-test reset.
+    #[tokio::test]
+    #[serial]
+    async fn test_create_tenant_auto_provisions_initial_desired() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await; // god
+
+        let tenant = format!(
+            "test_0812_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+
+        // Create the tenant.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": tenant,
+                    "password": "testpass123",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, body) = send_request(build_router(state.clone()), req).await;
+        assert_eq!(status, StatusCode::CREATED, "create tenant: {:?}", body);
+
+        // GET fleet → desired_count auto-provisioned to the clamped initial (1).
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/tenants/{}/fleet", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(build_router(state.clone()), req).await;
+        assert_eq!(status, StatusCode::OK, "get fleet: {:?}", body);
+        assert_eq!(
+            body["desired_count"],
+            crate::routes::tenants::initial_desired_count(
+                state.initial_agents,
+                state.default_max_agents
+            ),
+            "fleet view: {:?}",
+            body
+        );
+
+        // Cleanup: drop schema + user.
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/tenants/{}", tenant))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let _ = send_request(build_router(state.clone()), req).await;
+    }
+
+    /// CLOACI-T-0580: LRU eviction. With a cache cap of 2, cycling
+    /// through 3 tenant runners must evict the least-recently-used.
+    /// Requires Postgres (creates real tenant schemas + runners).
+    ///
+    /// Uses a freshly-built `TenantRunnerCache` with cap=2 rather than
+    /// the default test cap of 8.
+    #[tokio::test]
+    #[serial]
+    async fn test_tenant_runner_cache_lru_evicts_oldest() {
+        let mut state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        // Override the cache with a small cap for this test.
+        state.tenant_runners = Arc::new(crate::tenant_runner_cache::TenantRunnerCache::new(
+            std::num::NonZeroUsize::new(2).expect("cap=2"),
+            runner_config_for_tenant_cache(None, "default"),
+        ));
+
+        let schema_a = format!(
+            "test_lru_a_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        let schema_b = format!(
+            "test_lru_b_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        let schema_c = format!(
+            "test_lru_c_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        for s in [&schema_a, &schema_b, &schema_c] {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/tenants")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": s,
+                        "password": "testpass123",
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let (status, _) = send_request(build_router(state.clone()), req).await;
+            assert_eq!(status, StatusCode::CREATED, "create tenant {}", s);
+        }
+
+        // Acquire A, then B → cache full (cap=2).
+        let db_a = state
+            .tenant_databases
+            .resolve(&schema_a, &state.database)
+            .await
+            .expect("resolve A");
+        let _ = state
+            .tenant_runners
+            .get_or_create(&schema_a, db_a)
+            .await
+            .expect("A");
+        let db_b = state
+            .tenant_databases
+            .resolve(&schema_b, &state.database)
+            .await
+            .expect("resolve B");
+        let _ = state
+            .tenant_runners
+            .get_or_create(&schema_b, db_b)
+            .await
+            .expect("B");
+        assert_eq!(state.tenant_runners.len().await, 2);
+
+        // Acquire C → evicts A (least recently used).
+        let db_c = state
+            .tenant_databases
+            .resolve(&schema_c, &state.database)
+            .await
+            .expect("resolve C");
+        let _ = state
+            .tenant_runners
+            .get_or_create(&schema_c, db_c)
+            .await
+            .expect("C");
+        assert_eq!(
+            state.tenant_runners.len().await,
+            2,
+            "cache must stay bounded at cap=2"
+        );
+
+        // Cleanup.
+        for s in [&schema_a, &schema_b, &schema_c] {
+            let req = axum::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/tenants/{}", s))
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap();
+            let _ = send_request(build_router(state.clone()), req).await;
+        }
+    }
+
+    /// CLOACI-T-0581: re-running `remove_tenant` on the same tenant is
+    /// idempotent. First call drops the schema; second call sees no
+    /// runner/DB to evict and `DROP SCHEMA IF EXISTS` is a no-op.
+    /// Returns success both times.
+    #[tokio::test]
+    #[serial]
+    async fn test_remove_tenant_idempotent_retry() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        let schema = format!(
+            "test_idem_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+
+        // Create.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": schema,
+                    "password": "testpass123",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, _) = send_request(build_router(state.clone()), req).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // First delete.
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/tenants/{}", schema))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status_1, body_1) = send_request(build_router(state.clone()), req).await;
+        assert_eq!(status_1, StatusCode::OK);
+        assert_eq!(body_1["status"], "removed");
+
+        // Second delete (idempotent).
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/tenants/{}", schema))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status_2, body_2) = send_request(build_router(state.clone()), req).await;
+        assert_eq!(
+            status_2,
+            StatusCode::OK,
+            "idempotent retry must succeed: {body_2:?}"
+        );
+        assert_eq!(body_2["status"], "removed");
+        // Step counts: no runner, no cached DB.
+        assert_eq!(body_2["runner_evicted"], false);
+        assert_eq!(body_2["db_cache_evicted"], false);
+    }
+
+    /// CLOACI-T-0580: two per-tenant runners constructed through the
+    /// `TenantRunnerCache` share the same `Arc<Runtime>` allocation —
+    /// inventory isn't duplicated per tenant. Requires a live Postgres
+    /// (admin schema + per-tenant schemas created via `create_tenant`).
+    #[tokio::test]
+    #[serial]
+    async fn test_tenant_runners_share_inventory_arc() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        // Create two distinct tenant schemas.
+        let schema_a = format!(
+            "test_arc_a_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        let schema_b = format!(
+            "test_arc_b_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        for s in [&schema_a, &schema_b] {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/tenants")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": s,
+                        "password": "testpass123",
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let (status, _body) = send_request(build_router(state.clone()), req).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "create tenant {} should succeed",
+                s
+            );
+        }
+
+        // Construct runners for both tenants via the cache.
+        let db_a = state
+            .tenant_databases
+            .resolve(&schema_a, &state.database)
+            .await
+            .expect("resolve A");
+        let db_b = state
+            .tenant_databases
+            .resolve(&schema_b, &state.database)
+            .await
+            .expect("resolve B");
+        let runner_a = state
+            .tenant_runners
+            .get_or_create(&schema_a, db_a)
+            .await
+            .expect("runner A");
+        let runner_b = state
+            .tenant_runners
+            .get_or_create(&schema_b, db_b)
+            .await
+            .expect("runner B");
+
+        // Each runner's `Runtime` handle must be a VIEW over the cache's
+        // shared registries — same allocation underneath, so inventory is not
+        // duplicated per tenant. CLOACI-T-0924: it is no longer the same
+        // `Arc<Runtime>`, because each runner binds the handle to its own
+        // tenant; `shares_registries_with` is the honest identity check.
+        let cache_rt = state.tenant_runners.shared_runtime();
+        assert!(
+            cache_rt.shares_registries_with(&runner_a.runtime()),
+            "runner A's Runtime must share the cache's shared_runtime registries"
+        );
+        assert!(
+            cache_rt.shares_registries_with(&runner_b.runtime()),
+            "runner B's Runtime must share the cache's shared_runtime registries"
+        );
+        // Transitively, both runners share one registry allocation…
+        assert!(
+            runner_a
+                .runtime()
+                .shares_registries_with(&runner_b.runtime()),
+            "two tenant runners must share the same Runtime registries (inventory not duplicated)"
+        );
+        // …but are scoped to DIFFERENT tenants, which is what stops two
+        // tenants' same-named workflows/graphs/reactors colliding in-process
+        // (CLOACI-T-0924).
+        assert_eq!(runner_a.runtime().tenant_id(), Some(schema_a.as_str()));
+        assert_eq!(runner_b.runtime().tenant_id(), Some(schema_b.as_str()));
+        assert_ne!(
+            runner_a.runtime().tenant_id(),
+            runner_b.runtime().tenant_id()
+        );
+
+        // Clean up: drop both tenants.
+        for s in [&schema_a, &schema_b] {
+            let req = axum::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/tenants/{}", s))
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap();
+            let _ = send_request(build_router(state.clone()), req).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_remove_tenant_nonexistent_succeeds() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/v1/tenants/nonexistent_schema_xyz")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        // DROP SCHEMA IF EXISTS is idempotent — succeeds even if schema doesn't exist
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_then_delete_tenant() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        let schema = format!(
+            "test_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        let body_json = serde_json::json!({
+            "name": schema,
+            "password": "testpass123",
+        });
+
+        // Create
+        let app = build_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_string(&body_json).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Delete
+        let app = build_router(state);
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/tenants/{}", schema))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_tenant_missing_fields_returns_422() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        // Missing required schema_name and username
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ── Workflows ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_workflows_returns_list() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["items"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_workflow_nonexistent_returns_404() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/workflows/nonexistent_workflow")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_workflow_empty_file_returns_400() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        // Build a multipart body with an empty file
+        let boundary = "----testboundary";
+        let multipart_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.cloacina\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--{boundary}--\r\n"
+        );
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(multipart_body))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {:?}", body);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_workflow_no_file_field_returns_400() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        // Multipart body with wrong field name
+        let boundary = "----testboundary";
+        let multipart_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"data\"; filename=\"test.txt\"\r\nContent-Type: application/octet-stream\r\n\r\nsome data\r\n--{boundary}--\r\n"
+        );
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(multipart_body))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {:?}", body);
+    }
+
+    /// Path to test fixture directory (relative to workspace root).
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        std::path::PathBuf::from(manifest_dir)
+            .join("test-fixtures")
+            .join(name)
+    }
+
+    /// Build a multipart request body with a file field.
+    fn multipart_file_body(data: &[u8]) -> (String, Vec<u8>) {
+        let boundary = "----TestBoundary9876543210";
+        let mut body = Vec::new();
+        write!(
+            body,
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"pkg.cloacina\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .unwrap();
+        body.extend_from_slice(data);
+        write!(body, "\r\n--{boundary}--\r\n").unwrap();
+        (boundary.to_string(), body)
+    }
+
+    /// Delete a workflow by name/version if it exists (cleanup for idempotent tests).
+    async fn delete_workflow_if_exists(state: &AppState, token: &str, name: &str, version: &str) {
+        let app = build_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/tenants/public/workflows/{}/{}", name, version))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        // Ignore result — may 404 on first run
+        let _ = app.oneshot(req).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_valid_python_workflow_returns_201() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        // Clean up from any prior run
+        delete_workflow_if_exists(&state, &token, "test-fixture-python", "1.0.0").await;
+
+        let app = build_router(state);
+        let package_data = std::fs::read(fixture_path("python-workflow.cloacina"))
+            .expect("fixture file not found");
+        let (boundary, body_bytes) = multipart_file_body(&package_data);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {:?}", body);
+        assert!(body["package_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_valid_rust_workflow_returns_201() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+
+        // Clean up from any prior run
+        delete_workflow_if_exists(&state, &token, "test-fixture-rust", "1.0.0").await;
+
+        let app = build_router(state);
+        let package_data =
+            std::fs::read(fixture_path("rust-workflow.cloacina")).expect("fixture file not found");
+        let (boundary, body_bytes) = multipart_file_body(&package_data);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {:?}", body);
+        assert!(body["package_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_corrupt_package_returns_400() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let (boundary, body_bytes) = multipart_file_body(b"this is not a valid bzip2 archive");
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {:?}", body);
+    }
+
+    // ── Executions ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_executions_returns_list() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/executions")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["items"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_execution_invalid_uuid_returns_400() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/executions/not-a-uuid")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_execution_nonexistent_returns_404() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let fake_id = uuid::Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/tenants/public/executions/{}", fake_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_execution_events_invalid_uuid_returns_400() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/executions/not-a-uuid/events")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_nonexistent_workflow_returns_error() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows/nonexistent_wf/execute")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"context": {}}"#))
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_execution_events_valid_uuid_no_events() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        // Valid UUID format but no matching execution — should return
+        // an empty events list (the DAL returns Ok([]) for missing executions)
+        let fake_id = uuid::Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/tenants/public/executions/{}/events", fake_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["events"].as_array().is_some());
+        assert!(body["events"].as_array().unwrap().is_empty());
+    }
+
+    // ── Triggers ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_triggers_returns_list() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/triggers")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["items"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_trigger_nonexistent_returns_404() {
+        let state = test_state().await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/tenants/public/triggers/nonexistent_trigger")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── Fallback / 404 ──────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_unknown_route_returns_404() {
+        let state = test_state().await;
+        let app = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/nonexistent/route")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "no route matches this request");
+    }
+
+    // ── Signature contract tests (CLOACI-I-0103 / T-0570) ─────────────────
+    //
+    // These exercise the full upload-route verification gate end-to-end:
+    // a signed payload must pass the gate; an unsigned payload must be
+    // rejected with `signature_not_found`. They depend on TEST_DB_URL
+    // being reachable (same constraint as the rest of this test module)
+    // and use random per-test org_ids to stay isolated.
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_unsigned_with_require_signatures_returns_403() {
+        let org_id = cloacina::UniversalUuid::new_v4();
+        let state = test_state_with_signature_required(org_id).await;
+        let token = create_test_api_key(&state).await;
+        let app = build_router(state);
+
+        let pkg_bytes = b"unsigned bogus package bytes";
+        let (boundary, body) = multipart_file_body(pkg_bytes);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "expected 403 from verification gate; body: {:?}",
+            body
+        );
+        let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(
+            code, "signature_not_found",
+            "expected signature_not_found code; got: {} body: {:?}",
+            code, body
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_upload_signed_with_require_signatures_passes_verification() {
+        use cloacina::dal::DAL;
+        use cloacina::security::{DbKeyManager, DbPackageSigner, KeyManager, PackageSigner};
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let org_id = cloacina::UniversalUuid::new_v4();
+        let state = test_state_with_signature_required(org_id).await;
+        let token = create_test_api_key(&state).await;
+
+        // Provision a signing key for the test org and self-trust it so the
+        // verifier accepts signatures from this key.
+        let dal = DAL::new(state.database.clone());
+        let km = DbKeyManager::new(dal.clone());
+        let signer = DbPackageSigner::new(dal);
+        let master_key = [0u8; 32];
+
+        let key_info = km
+            .create_signing_key(org_id, "contract-test-key", &master_key)
+            .await
+            .expect("create_signing_key");
+        km.trust_public_key(org_id, &key_info.public_key, Some("self"))
+            .await
+            .expect("trust_public_key");
+
+        // Sign the bytes and store the `package_signatures` row before upload.
+        // Make the payload unique per test run so prior runs' signatures don't
+        // collide on package_hash (the test DB persists across runs and
+        // `find_signature(hash)` returns one row — picking up a stale row from
+        // a previous run yields `untrusted_signer` because the old key
+        // fingerprint isn't trusted for *this* run's random org_id).
+        let pkg_bytes = format!(
+            "signed contract-test payload {}",
+            cloacina::UniversalUuid::new_v4()
+        )
+        .into_bytes();
+        let pkg_bytes = pkg_bytes.as_slice();
+        let tf = NamedTempFile::new().unwrap();
+        tf.as_file()
+            .write_all(pkg_bytes)
+            .expect("write tempfile bytes");
+        signer
+            .sign_package_with_db_key(
+                tf.path(),
+                key_info.id,
+                &master_key,
+                /* store_signature= */ true,
+            )
+            .await
+            .expect("sign_package_with_db_key");
+
+        // Upload the same bytes through the HTTP handler.
+        let app = build_router(state);
+        let (boundary, body) = multipart_file_body(pkg_bytes);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/public/workflows")
+            .header("Authorization", format!("Bearer {}", token))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body))
+            .unwrap();
+
+        let (status, body) = send_request(app, req).await;
+
+        // Contract: a valid signature must pass the verification gate.
+        // The bytes aren't a real .cloacina archive so the request will fail
+        // at the registration step downstream — that's fine; we're asserting
+        // verification specifically. If the response is 403, it must NOT be
+        // from a verification-related code.
+        if status == StatusCode::FORBIDDEN {
+            let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let verification_codes = [
+                "signature_not_found",
+                "package_tampered",
+                "untrusted_signer",
+                "invalid_signature",
+                "signature_verification_unconfigured",
+                "signature_verification_error",
+            ];
+            assert!(
+                !verification_codes.contains(&code),
+                "expected verification to pass; got 403 with verification code: {} body: {:?}",
+                code,
+                body
+            );
+        }
+        // If status is anything other than 403, the verification gate already
+        // accepted it (failure further downstream is out of scope here).
+    }
+
+    // ── Security args validation (CLOACI-I-0103 / T-0567) ─────────────────
+
+    #[test]
+    fn validate_security_args_default_passes() {
+        // Default config: no signature requirement, no org_id. Most common deployment.
+        assert!(validate_security_args(false, None).is_ok());
+    }
+
+    #[test]
+    fn validate_security_args_org_without_require_passes() {
+        // Configuring an org_id without enabling require_signatures is allowed
+        // (operator may want it pre-staged before flipping the flag).
+        let uuid = uuid::Uuid::new_v4();
+        assert!(validate_security_args(false, Some(&uuid)).is_ok());
+    }
+
+    #[test]
+    fn validate_security_args_require_with_org_passes() {
+        // The fully-configured opt-in posture.
+        let uuid = uuid::Uuid::new_v4();
+        assert!(validate_security_args(true, Some(&uuid)).is_ok());
+    }
+
+    #[test]
+    fn validate_security_args_require_without_org_fails() {
+        // The bad combo we want to catch at boot, not at first upload.
+        let result = validate_security_args(true, None);
+        let err = result.expect_err("expected validation failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verification-org-id"),
+            "error must name the missing flag for the operator; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("CLOACINA_VERIFICATION_ORG_ID"),
+            "error must also name the env var alternative; got: {}",
+            msg
+        );
+    }
+
+    /// CLOACI-T-0811: leader election via a Postgres advisory lock.
+    ///
+    /// Placed here (a `#[serial]` server lib test over `test_state()`'s real
+    /// Postgres `Database`) rather than in `crates/cloacina/tests/integration/`
+    /// because the unit under test — `with_fleet_leadership` — lives in
+    /// `cloacina-server` and needs a live `Database` with a multi-connection
+    /// pool. The shared test runner's pool (size 10) gives us the ≥2 distinct
+    /// sessions the test needs: while the "leader" closure holds the lock on one
+    /// pooled connection, a concurrent attempt draws a *different* connection and
+    /// must observe the lock as taken.
+    #[tokio::test]
+    #[serial]
+    async fn fleet_leadership_is_mutually_exclusive() {
+        use crate::autoscaler::leader::with_fleet_leadership;
+
+        let db = test_state().await.database;
+
+        // Defensively release the key in case a prior aborted run left it held on
+        // a pooled session this process might reuse.
+        if let Ok(conn) = db.get_postgres_connection().await {
+            let _ = conn
+                .interact(|conn| {
+                    use diesel::RunQueryDsl;
+                    diesel::sql_query("SELECT pg_advisory_unlock_all()").execute(conn)
+                })
+                .await;
+        }
+
+        // Gate: the leader closure signals once it holds the lock, then blocks
+        // until we release it — keeping leadership open while a second caller
+        // tries to acquire it.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let leader_db = db.clone();
+        let leader = tokio::spawn(async move {
+            with_fleet_leadership(&leader_db, || async move {
+                entered_tx.send(()).expect("signal leadership entered");
+                release_rx.await.expect("await release");
+                42u32
+            })
+            .await
+        });
+
+        // Wait until the leader is holding the lock.
+        entered_rx.await.expect("leader should enter");
+
+        // A second attempt, while the leader holds the lock, must NOT acquire it.
+        let blocked = with_fleet_leadership(&db, || async { 99u32 }).await;
+        assert_eq!(
+            blocked, None,
+            "second caller must not win leadership while the lock is held"
+        );
+
+        // Release the leader; it runs `work` and unlocks.
+        release_tx.send(()).expect("release leader");
+        let leader_out = leader.await.expect("leader task joins");
+        assert_eq!(
+            leader_out,
+            Some(42),
+            "leader should have run work and returned its output"
+        );
+
+        // After unlock, leadership is acquirable again.
+        let after = with_fleet_leadership(&db, || async { 7u32 }).await;
+        assert_eq!(
+            after,
+            Some(7),
+            "leadership must be re-acquirable once the lock is released"
+        );
+    }
+
+    // ── Auth lifecycle: OIDC refresh + login throttle (CLOACI-T-0923) ──────
+
+    use crate::identity::{ResolvedPrincipal, mint_for_principal};
+    use crate::routes::local_auth::LoginThrottleConfig;
+    use cloacina::dal::unified::login_throttle::ThrottlePolicy;
+
+    const TEST_ISSUER: &str = "https://idp.test/realms/cloacina";
+
+    /// Mint a key the way an OIDC callback does, and open its login session.
+    /// Returns `(plaintext_key, key_id)`.
+    async fn mint_oidc_session(
+        state: &AppState,
+        tenant: Option<&str>,
+        role: &str,
+        key_ttl: std::time::Duration,
+        session_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> (String, uuid::Uuid) {
+        let principal = ResolvedPrincipal {
+            tenant: tenant.map(str::to_string),
+            role: role.to_string(),
+            provenance: format!("oidc:{TEST_ISSUER}:sub-{}", uuid::Uuid::new_v4()),
+        };
+        let (plaintext, info) = mint_for_principal(state, &principal, key_ttl)
+            .await
+            .expect("mint minted-login key");
+        cloacina::dal::DAL::new(state.database.clone())
+            .oidc_sessions()
+            .create_session(info.id, TEST_ISSUER, session_deadline)
+            .await
+            .expect("open oidc session");
+        (plaintext, info.id)
+    }
+
+    fn refresh_request(token: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/auth/refresh")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// UC2 happy path: an OIDC login refreshes without another trip through the
+    /// IdP, keeps EXACTLY its tenant + role, never gains god mode, and the old
+    /// key is rotated out.
+    #[tokio::test]
+    #[serial]
+    async fn oidc_refresh_preserves_scope_and_rotates_the_old_key() {
+        let state = test_state().await;
+        let (token, old_key_id) = mint_oidc_session(
+            &state,
+            Some("public"),
+            "write",
+            std::time::Duration::from_secs(900),
+            chrono::Utc::now() + chrono::Duration::hours(8),
+        )
+        .await;
+
+        let (status, body) =
+            send_request(build_router(state.clone()), refresh_request(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "OIDC refresh must no longer be 501: {body}"
+        );
+
+        // Scope is preserved verbatim — refresh is not a re-authorization.
+        assert_eq!(body["tenant_id"], "public");
+        assert_eq!(body["role"], "write");
+        let new_token = body["key"]
+            .as_str()
+            .expect("refresh returns a key")
+            .to_string();
+        assert_ne!(new_token, token, "refresh must issue a NEW key");
+
+        // The new key is real, still scoped, and is NOT admin. `whoami` reads
+        // straight off the authenticated key, so this asserts the persisted
+        // grant rather than the response body echoing itself.
+        let (status, who) = send_request(
+            build_router(state.clone()),
+            axum::http::Request::builder()
+                .uri("/v1/auth/whoami")
+                .header("Authorization", format!("Bearer {new_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "refreshed key must authenticate");
+        assert_eq!(who["tenant_id"], "public");
+        assert_eq!(who["role"], "write");
+        assert_eq!(
+            who["is_admin"], false,
+            "a refreshed key must never acquire god mode"
+        );
+
+        // The old key is revoked, so a stolen pre-refresh key is dead.
+        state.key_cache.clear().await;
+        let (status, _) = send_request(build_router(state.clone()), refresh_request(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the pre-refresh key must be revoked"
+        );
+
+        // ...and the session row followed the new key rather than being orphaned.
+        let dal = cloacina::dal::DAL::new(state.database.clone());
+        assert!(
+            dal.oidc_sessions()
+                .get_session(old_key_id)
+                .await
+                .expect("session lookup")
+                .is_none(),
+            "the session must not still point at the rotated-out key"
+        );
+    }
+
+    /// Refresh can extend the key but never the session: past the absolute
+    /// deadline the user is pushed back through the full OIDC flow, and the
+    /// key they were holding is revoked rather than left alive for its TTL.
+    #[tokio::test]
+    #[serial]
+    async fn oidc_refresh_stops_at_the_absolute_session_deadline() {
+        let state = test_state().await;
+        let (token, _) = mint_oidc_session(
+            &state,
+            Some("public"),
+            "read",
+            std::time::Duration::from_secs(900),
+            chrono::Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await;
+
+        let (status, _) = send_request(build_router(state.clone()), refresh_request(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a session past its deadline must not refresh"
+        );
+
+        state.key_cache.clear().await;
+        let (status, _) = send_request(
+            build_router(state.clone()),
+            axum::http::Request::builder()
+                .uri("/v1/auth/whoami")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the key must be revoked when its session ends, not left to lapse"
+        );
+    }
+
+    /// A key whose 15-minute TTL already lapsed cannot refresh: `require_auth`
+    /// rejects it before the handler runs. Sane, and the documented reason the
+    /// SPA must refresh on a timer rather than on demand after idling.
+    #[tokio::test]
+    #[serial]
+    async fn refresh_after_the_key_expired_is_rejected_not_resurrected() {
+        let state = test_state().await;
+        // TTL of zero → `expires_at == now`, which `validate_hash` treats as
+        // expired (it requires `expires_at > now`).
+        let (token, _) = mint_oidc_session(
+            &state,
+            Some("public"),
+            "read",
+            std::time::Duration::from_secs(0),
+            chrono::Utc::now() + chrono::Duration::hours(8),
+        )
+        .await;
+
+        let (status, _) = send_request(build_router(state.clone()), refresh_request(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an expired key must not be refreshable even inside a live session"
+        );
+    }
+
+    /// A minted key with no session row (never opened, or logged out) is not
+    /// refreshable — logout must be final.
+    #[tokio::test]
+    #[serial]
+    async fn oidc_refresh_denied_without_a_session_row() {
+        let state = test_state().await;
+        let principal = ResolvedPrincipal {
+            tenant: Some("public".into()),
+            role: "read".into(),
+            provenance: format!("oidc:{TEST_ISSUER}:sub-{}", uuid::Uuid::new_v4()),
+        };
+        let (token, _) =
+            mint_for_principal(&state, &principal, std::time::Duration::from_secs(900))
+                .await
+                .expect("mint");
+
+        let (status, _) = send_request(build_router(state.clone()), refresh_request(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "no session row ⇒ no refresh"
+        );
+    }
+
+    // ── Login throttle (I-0118 OQ-13) ─────────────────────────────────────
+
+    /// A state whose throttle locks fast and forgets fast, with the IP scope
+    /// off (every test request shares one `unknown` peer, so an IP counter
+    /// would leak between tests).
+    fn with_fast_throttle(state: &mut AppState, threshold: i32, lock: chrono::Duration) {
+        state.login_throttle = LoginThrottleConfig {
+            username: ThrottlePolicy {
+                threshold,
+                base_lock: lock,
+                max_lock: lock,
+                decay: chrono::Duration::minutes(15),
+            },
+            ip: None,
+            trust_proxy_headers: false,
+        };
+    }
+
+    /// Create a local account with a unique username (the test DB persists
+    /// across runs). Returns the username.
+    async fn create_local_account(state: &AppState, password: &str) -> String {
+        let username = format!("t0923-{}", uuid::Uuid::new_v4().simple());
+        cloacina::dal::DAL::new(state.database.clone())
+            .local_accounts()
+            .create(&username, password, Some("public"), "read")
+            .await
+            .expect("create local account");
+        username
+    }
+
+    fn login_request(username: &str, password: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/auth/local/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "username": username,
+                    "password": password,
+                    "tenant": "public",
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// The core OQ-13 contract: repeated failures lock the account's *login*,
+    /// the lock refuses even the CORRECT password while it holds, and it
+    /// expires on its own without operator intervention.
+    #[tokio::test]
+    #[serial]
+    async fn login_lockout_triggers_blocks_the_right_password_then_expires() {
+        let mut state = test_state().await;
+        with_fast_throttle(&mut state, 3, chrono::Duration::milliseconds(600));
+        let password = "correct-horse-battery-staple";
+        let username = create_local_account(&state, password).await;
+
+        // Up to the threshold: ordinary 401s.
+        for i in 0..3 {
+            let (status, _) = send_request(
+                build_router(state.clone()),
+                login_request(&username, "wrong"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should be 401"
+            );
+        }
+
+        // The crossing attempt locks the key.
+        let response = build_router(state.clone())
+            .oneshot(login_request(&username, "wrong"))
+            .await
+            .expect("request");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a throttled response must tell the client when to come back"
+        );
+
+        // The whole point: while locked, even the right password is refused.
+        // Without this the lock would only slow an attacker down, not stop one
+        // who guesses correctly on the next try.
+        let (status, _) = send_request(
+            build_router(state.clone()),
+            login_request(&username, password),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a live lock must gate the password check, not follow it"
+        );
+
+        // ...and it lifts by itself.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let (status, body) = send_request(
+            build_router(state.clone()),
+            login_request(&username, password),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the lock must expire without an admin unlocking anything: {body}"
+        );
+    }
+
+    /// A legitimate user who eventually remembers their password must not be
+    /// left one strike from a lockout.
+    #[tokio::test]
+    #[serial]
+    async fn successful_login_clears_the_failure_counter() {
+        let mut state = test_state().await;
+        with_fast_throttle(&mut state, 3, chrono::Duration::seconds(60));
+        let password = "right-password-eventually";
+        let username = create_local_account(&state, password).await;
+
+        for _ in 0..3 {
+            send_request(
+                build_router(state.clone()),
+                login_request(&username, "nope"),
+            )
+            .await;
+        }
+        let (status, _) = send_request(
+            build_router(state.clone()),
+            login_request(&username, password),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "3 failures is at, not over, the threshold"
+        );
+
+        // If the counter had carried over, the very next failure would lock.
+        for i in 0..3 {
+            let (status, _) = send_request(
+                build_router(state.clone()),
+                login_request(&username, "nope"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "post-success failure {i} must be counted from zero"
+            );
+        }
+    }
+
+    /// Multi-replica correctness (the T-0916 lesson): two independently built
+    /// server states over the same database must share throttle state — a
+    /// lockout earned on one is enforced by the other, and clearing it on one
+    /// releases the other.
+    #[tokio::test]
+    #[serial]
+    async fn throttle_state_is_shared_across_two_server_handles() {
+        let mut state_a = test_state().await;
+        with_fast_throttle(&mut state_a, 3, chrono::Duration::seconds(60));
+        let mut state_b = test_state().await;
+        with_fast_throttle(&mut state_b, 3, chrono::Duration::seconds(60));
+
+        let password = "shared-state-password";
+        let username = create_local_account(&state_a, password).await;
+
+        // Replica A absorbs two failures, replica B the next two.
+        for _ in 0..2 {
+            send_request(build_router(state_a.clone()), login_request(&username, "x")).await;
+        }
+        let (status, _) =
+            send_request(build_router(state_b.clone()), login_request(&username, "x")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "B must continue A's count, not start its own"
+        );
+        let (status, _) =
+            send_request(build_router(state_b.clone()), login_request(&username, "x")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "4th failure locks");
+
+        // The lock decided on B is enforced on A — the whole reason this state
+        // is a DB row and not a per-replica map.
+        let (status, _) = send_request(
+            build_router(state_a.clone()),
+            login_request(&username, password),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a lockout must not be escapable by hitting a different replica"
+        );
+    }
+
+    /// An unknown username throttles exactly like a real one, so the 429 is not
+    /// a user-enumeration oracle.
+    #[tokio::test]
+    #[serial]
+    async fn unknown_usernames_throttle_identically_to_real_ones() {
+        let mut state = test_state().await;
+        with_fast_throttle(&mut state, 2, chrono::Duration::seconds(60));
+        let ghost = format!("t0923-ghost-{}", uuid::Uuid::new_v4().simple());
+
+        for _ in 0..2 {
+            let (status, _) =
+                send_request(build_router(state.clone()), login_request(&ghost, "x")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, _) =
+            send_request(build_router(state.clone()), login_request(&ghost, "x")).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a nonexistent account must reach the same 429 a real one does"
+        );
+    }
+
+    /// The source-IP scope catches a single host spraying many DIFFERENT
+    /// usernames — none of which alone crosses the username threshold.
+    #[tokio::test]
+    #[serial]
+    async fn ip_scope_catches_a_username_spray() {
+        let mut state = test_state().await;
+        // Trust XFF so the test can present a distinct client address; without
+        // it every test request shares one peer and the counters would bleed.
+        state.login_throttle = LoginThrottleConfig {
+            username: ThrottlePolicy {
+                threshold: 100,
+                base_lock: chrono::Duration::seconds(60),
+                max_lock: chrono::Duration::seconds(60),
+                decay: chrono::Duration::minutes(15),
+            },
+            ip: Some(ThrottlePolicy {
+                threshold: 3,
+                base_lock: chrono::Duration::seconds(60),
+                max_lock: chrono::Duration::seconds(60),
+                decay: chrono::Duration::minutes(15),
+            }),
+            trust_proxy_headers: true,
+        };
+        let attacker_ip = format!("198.51.100.{}", (uuid::Uuid::new_v4().as_u128() % 250) + 1);
+
+        let spray = |user: String| {
+            let mut req = login_request(&user, "x");
+            req.headers_mut().insert(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_str(&attacker_ip).unwrap(),
+            );
+            req
+        };
+
+        for _ in 0..3 {
+            let user = format!("t0923-spray-{}", uuid::Uuid::new_v4().simple());
+            let (status, _) = send_request(build_router(state.clone()), spray(user)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "no single username is anywhere near its own threshold"
+            );
+        }
+        let user = format!("t0923-spray-{}", uuid::Uuid::new_v4().simple());
+        let (status, _) = send_request(build_router(state.clone()), spray(user)).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the source-IP counter must catch what the username counter cannot"
+        );
+    }
+}

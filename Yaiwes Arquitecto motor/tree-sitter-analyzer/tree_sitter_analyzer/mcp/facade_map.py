@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Single source of truth for the 8-facade MCP surface (Wave C2 cutover).
+
+This module is the canonical crosswalk used by THREE consumers so they can
+never drift apart:
+
+1. ``server.call_tool`` / ``server_utils.tool_registration`` — the β legacy-name
+   shim that forwards a deprecated 1.x tool name to ``facade.execute({action: ...})``.
+2. ``tests/contracts/test_mcp_cli_parity_contract.py`` and
+   ``tests/contracts/test_mcp_surface_metadata_contract.py`` — the re-keyed
+   parity / codemap / skill contracts and the new discovery + delegation tests.
+3. Future docs/skill generators (Wave D) that need old→new mappings.
+
+Design (PRD §0 F3/F5, §2, §4, §6):
+
+* ``FACADE_NAMES`` — the exactly-8 eager MCP tool names. Every name composed as
+  ``tree-sitter-analyzer__<facade>`` must stay ≤38 chars (Cursor 60-char limit
+  minus the 22-char ``tree-sitter-analyzer__`` prefix; see §8 success metric).
+* ``LEGACY_TOOL_MAP`` — ``{old_tool_name: (facade, action)}`` covering all 62
+  registry tools. ``set_project_path`` is NOT here: it stays a standalone
+  infrastructure entry (see ``SET_PROJECT_PATH_TOOL_NAME``) because it mutates
+  server-level state (analysis_engine / security_validator / rebind loop) that
+  no inner tool can reach.
+* ``FACADE_ACTION_TO_INNER`` — ``{(facade, action): inner_registry_name}`` — the
+  delegation contract. ``codegraph_call_graph`` is reachable via the
+  scope=graph branch of ``nav.callers``/``nav.callees`` (R4), so it maps to
+  whichever inner the *default* (point) scope resolves to for the contract, and
+  the graph branch is asserted separately.
+
+F3 (LOCKED): ``query_code`` (tree-sitter .scm DSL) and ``codegraph_symbol_search``
+(BM25 FTS) are DISTINCT actions (``search.query`` vs ``search.symbol``). They are
+NOT merged — folding them would silently delete the tree-sitter query capability.
+"""
+
+from __future__ import annotations
+
+# The standalone infrastructure entry that is NOT a facade and NOT shimmed.
+SET_PROJECT_PATH_TOOL_NAME = "set_project_path"
+
+# The exactly-8 eager facade tool names (public MCP surface).
+FACADE_NAMES: tuple[str, ...] = (
+    "search",
+    "nav",
+    "structure",
+    "health",
+    "edit",
+    "project",
+    "index",
+    "viz",
+)
+
+# 破坏性删除不会写入 LEGACY_TOOL_MAP，也不存在可用路由。这里保留标识符，
+# 让契约测试能够识别仍然引导代理调用已删除能力的 ``next_step``。
+# 来源：CHANGELOG 1.30.0 与 RFC-0033。只列出可能作为词法标记出现的形式。
+REMOVED_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "search_content",
+        "find_and_grep",
+        "batch_search",
+        "list_files",
+        "check_tools",
+    }
+)
+
+# ---------------------------------------------------------------------------
+# legacy old-tool-name -> (facade, action) crosswalk (β shim source of truth)
+#
+# Covers all 62 registry tool names. ``set_project_path`` is intentionally
+# excluded (standalone infra entry). The order groups by facade for review.
+# ---------------------------------------------------------------------------
+LEGACY_TOOL_MAP: dict[str, tuple[str, str]] = {
+    # -- search ------------------------------------------------------------
+    "codegraph_symbol_search": ("search", "symbol"),
+    "query_code": ("search", "query"),  # F3: tree-sitter .scm DSL (NOT symbol)
+    "codegraph_query": ("search", "chain"),
+    # -- nav ---------------------------------------------------------------
+    "codegraph_navigate": ("nav", "navigate"),
+    "codegraph_call_path": ("nav", "call_path"),
+    "codegraph_xref": ("nav", "xref"),
+    "codegraph_resolve": ("nav", "resolve"),
+    "symbol_lineage": ("nav", "lineage"),
+    "codegraph_impact": ("nav", "impact"),
+    "trace_impact": ("nav", "trace"),
+    "codegraph_context": ("nav", "context"),
+    "codegraph_callers": ("nav", "callers"),  # scope=point default
+    "codegraph_callees": ("nav", "callees"),  # scope=point default
+    # Tree primitives (mycelium RFC-0020/0021 parity): one call → nested tree.
+    "codegraph_callee_tree": ("nav", "callee_tree"),
+    "codegraph_caller_tree": ("nav", "caller_tree"),
+    # R4: the call-graph tool is reachable via scope=graph on callers/callees.
+    # The shim forwards the legacy name to callers scope=graph (mode=callers is
+    # the historical default behaviour of codegraph_call_graph for an agent
+    # asking "the call graph").
+    "codegraph_call_graph": ("nav", "callers"),
+    # -- structure ---------------------------------------------------------
+    "get_code_outline": ("structure", "outline"),
+    "analyze_code_structure": ("structure", "analyze"),
+    "codegraph_ast_path": ("structure", "ast_path"),
+    "codegraph_sitemap": ("structure", "sitemap"),
+    "codegraph_class_hierarchy": ("structure", "class_tree"),
+    "codegraph_class_inspect": ("structure", "class_detail"),
+    "codegraph_explore": ("structure", "explore"),
+    "extract_code_section": ("structure", "read"),
+    # -- health ------------------------------------------------------------
+    "check_project_health": ("health", "project"),
+    "check_file_health": ("health", "file"),
+    "check_code_scale": ("health", "scale"),
+    "code_patterns": ("health", "patterns"),
+    "codegraph_complexity_heatmap": ("health", "heatmap"),
+    "codegraph_import_graph": ("health", "imports"),
+    "codegraph_dependency_matrix": ("health", "matrix"),
+    "codegraph_dead_code": ("health", "dead"),
+    "detect_routes": ("health", "routes"),
+    "codegraph_overview": ("health", "overview"),
+    "analyze_dependencies": ("health", "deps"),
+    "codegraph_test_gap": ("health", "test_gap"),
+    # -- edit --------------------------------------------------------------
+    "safe_to_edit": ("edit", "safe"),
+    "modification_guard": ("edit", "guard"),
+    "analyze_change_impact": ("edit", "impact"),
+    "refactoring_suggestions": ("edit", "refactor"),
+    "check_constraints": ("edit", "constraints"),
+    "codegraph_pr_review": ("edit", "pr"),
+    "semantic_classify": ("edit", "classify"),
+    "ast_diff": ("edit", "ast_diff"),
+    # -- project -----------------------------------------------------------
+    "get_project_overview": ("project", "overview"),
+    "smart_context": ("project", "smart"),
+    "advise_parser_readiness": ("project", "parser"),
+    "codegraph_metrics": ("project", "metrics"),
+    "list_agent_skills": ("project", "skills"),
+    "get_agent_workflow": ("project", "workflow"),
+    "decision_journal": ("project", "journal"),
+    "doc_sync": ("project", "doc_sync"),
+    # RFC-0027 §L7: ``get_project_summary`` was a real v1.x tool name that
+    # survived the facade cutover with no route — built, tested, reachable
+    # from nothing, and emitted as a ``next_step`` that resolved nowhere.
+    # It is a legacy name like any other now that ``project action=card``
+    # exists (RFC-0028 §3.1's "wire" disposition).
+    "get_project_summary": ("project", "card"),
+    # -- index -------------------------------------------------------------
+    "codegraph_status": ("index", "status"),
+    "ast_cache": ("index", "cache"),
+    "build_project_index": ("index", "build"),
+    "codegraph_full_index": ("index", "full"),
+    "codegraph_autoindex": ("index", "auto"),
+    "codegraph_incremental_sync": ("index", "sync"),
+    # -- viz ---------------------------------------------------------------
+    "codegraph_uml": ("viz", "uml"),
+    "codegraph_visualize": ("viz", "graph"),
+    "codegraph_similarity": ("viz", "similarity"),
+}
+
+
+def legacy_to_facade(name: str) -> tuple[str, str] | None:
+    """Return ``(facade, action)`` for a legacy tool name, else ``None``."""
+    return LEGACY_TOOL_MAP.get(name)
+
+
+def is_facade_name(name: str) -> bool:
+    """True if ``name`` is one of the 8 live facade names."""
+    return name in FACADE_NAMES
+
+
+def is_legacy_name(name: str) -> bool:
+    """True if ``name`` is a deprecated v1.x tool name shimmed by LEGACY_TOOL_MAP.
+
+    Intentionally returns ``False`` for new-only action names such as
+    ``test_map`` that never had a v1.x identity — those live in
+    ``NEW_ACTION_PARITY`` without the legacy/deprecation machinery.
+    """
+    return name in LEGACY_TOOL_MAP
+
+
+# ---------------------------------------------------------------------------
+# New-only (facade, action) pairs that need CLI parity coverage but have NO
+# v1.x legacy name — they were born into the facade surface and were NEVER
+# shimmed through dispatch_legacy. The MCP contract tests use this for parity
+# assertions WITHOUT triggering false deprecation envelopes.
+#
+# Shape: {capability_key: (facade, action, cli_flag)}
+#   capability_key — a stable human label (not a legacy tool name)
+#   (facade, action) — live facade route
+#   cli_flag — ``--test-map`` style flag for CLI parity assertion
+# ---------------------------------------------------------------------------
+NEW_ACTION_PARITY: dict[str, tuple[str, str, str]] = {
+    # RFC-0014 Phase B: test_map is new; it was never a registered v1.x tool.
+    "nav_test_map": ("nav", "test_map", "--test-map"),
+    # RFC-0014 Phase C: co_change is new; it was never a registered v1.x tool.
+    "nav_co_change": ("nav", "co_change", "--co-change"),
+    "edit_verify": ("edit", "verify", "--verify-plan"),
+    "edit_rename": ("edit", "rename", "--rename"),
+    "health_unreachable": ("health", "unreachable", "--unreachable-code"),
+    "health_middleware": ("health", "middleware", "--detect-middleware"),
+    "structure_signatures": ("structure", "signatures", "--table"),
+    "index_knowledge": ("index", "knowledge", "--knowledge-graph-index"),
+    "viz_knowledge": ("viz", "knowledge", "--knowledge-graph-export"),
+    # RFC-0025 Layer 5: self-proprioception is new; never a v1.x tool.
+    "health_self": ("health", "self", "--self-health"),
+    # RFC-0027 §L8: plan_rename is a NEW action name. The inner tool's v1.x
+    # identity was ``codegraph_refactor``, which named a preview-OR-apply
+    # capability; deliberately not re-shimmed, because the registered surface
+    # is preview-only and a legacy alias would imply the apply half exists.
+    "edit_plan_rename": ("edit", "plan_rename", "--plan-rename"),
+    # RFC-0027 §L8: the refactor queue is new; it only ever lived in a skill.
+    "health_refactor_queue": ("health", "refactor_queue", "--refactor-queue"),
+    # RFC-0029: mutation probe is new; it was never a registered v1.x tool.
+    "edit_mutation_probe": ("edit", "mutation_probe", "--mutation-probe"),
+    # Nervous-system PR: pulse/pulse_batch (nav), schema (index),
+    # tql_schema/tql_execute/semantic (search) were briefly registered as
+    # new top-level MCP tools; re-wired as facade actions with CLI parity.
+    "nav_pulse": ("nav", "pulse", "--pulse"),
+    "nav_pulse_batch": ("nav", "pulse_batch", "--pulse-batch"),
+    "index_schema": ("index", "schema", "--project-schema"),
+    "search_tql_schema": ("search", "tql_schema", "--tql-schema"),
+    "search_tql_execute": ("search", "tql_execute", "--tql"),
+    "search_semantic": ("search", "semantic", "--semantic-neighbors"),
+    # RFC-0037：实时字面量检索从诞生起就是 facade action。
+    "search_text": ("search", "text", "--text-search"),
+    # RFC-0041：统一查询语言从诞生起就是 facade action。
+    "search_uql": ("search", "uql", "--uql"),
+}
+
+# 保留兼容导入；本次补全的三个动作均已有 CLI 路由。
+MCP_ONLY_ACTIONS: dict[str, tuple[str, str]] = {}

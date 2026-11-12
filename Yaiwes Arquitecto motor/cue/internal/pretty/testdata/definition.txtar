@@ -1,0 +1,10 @@
+-- in --
+{
+#Foo: {      bar: string}
+}
+-- out/relpos --
+{
+	#Foo: {bar: string}
+}
+-- out/norelpos --
+{#Foo: {bar: string}}

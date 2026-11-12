@@ -1,0 +1,128 @@
+-- in.cue --
+// Basic usage of __closeAll - makes structs recursively closed
+a: __closeAll({
+	field1: 1
+	nested: {
+		field2: "hello"
+	}
+}) @test(eq, {field1: 1, nested: {field2: "hello"}})
+
+// Test that extra fields are not allowed (should error)
+b: {
+	err: a & {extra: "not allowed"}
+	@test(err, at=err.extra, code=eval, contains="field not allowed", pos=[1:12])
+}
+
+// Test that nested extra fields are not allowed (should error)
+c: {
+	err: a & {
+		field1: 1
+		nested: {
+			field2: "hello"
+			extra: "not allowed"
+		}
+	}
+	@test(err, at=err.nested.extra, code=eval, contains="field not allowed", pos=[5:4])
+}
+
+// Test with non-struct should error
+d: {
+	err: __closeAll("not a struct") @test(err, code=eval, contains="argument must be a struct or list literal", pos=[0:7])
+}
+
+// Test with empty struct
+e: __closeAll({}) @test(eq, {})
+f: {
+	err: e & {extra: "not allowed"}  // should error
+	@test(err, at=err.extra, code=eval, contains="field not allowed", pos=[1:12])
+}
+
+
+#A: a: int
+g: {
+	err: __closeAll(#A) @test(err, code=eval, contains="argument must be a struct or list literal", pos=[0:7])
+}
+
+// The closing applies to each disjunct of a struct which embeds a
+// disjunction.
+embeddedDisjunction: {
+	#A: {a: 1}
+	#B: {b: 1}
+	v: __closeAll({(#A | #B)..., c: 2})
+	t1: v & {a: 1} @test(eq, {a: 1, c: 2})
+	t2: v & {d: 3} @test(err, code=eval, contains="field not allowed", pos=[0:11])
+}
+
+// The recursive closing applies to the fields a spread brings in, whether
+// the spread value is open or closed by close.
+spreadClosed: {
+	foo: close({b: {}})
+	bar: {b: {}}
+	closed: __closeAll({foo...})
+	open:   __closeAll({bar...})
+	t1: closed & {b: c: 1} @test(err, at=b.c, code=eval, contains="field not allowed", pos=[0:19])
+	t2: open & {b: c: 1}   @test(err, at=b.c, code=eval, contains="field not allowed", pos=[0:17])
+}
+
+// close around a __closeAll literal, as the explicitopen rewrite emits for
+// a close call around a struct embedding a definition, keeps the recursive
+// closing, and a comprehension in the literal reads the fields unified
+// with the call.
+closeWrapsCloseAll: {
+	#D: {x: y: int}
+	foo: close({b: {}})
+	a: close(__closeAll({#D..., foo...}))
+	t1: err: a & {x: z: 1} @test(err, code=eval, path=x.z, contains="field not allowed", pos=[0:19])
+	t2: err: a & {b: c: 1} @test(err, code=eval, path=b.c, contains="field not allowed", pos=[0:19])
+	t3: ok:  a & {x: y: 5} @test(eq, {x: {y: 5}, b: {}})
+	guard: close(__closeAll({#D..., k: int, if k == 1 {y: 1}})) & {k: 1} @test(eq, {x: {y: int}, k: 1, y: 1})
+}
+
+// issue4535: a comprehension at the top level of the closed struct reads a
+// field as unified where the call appears, as it does for close.
+// https://cuelang.org/issue/4535
+issue4535: {
+	#D: {k: int, y?: int}
+	s: __closeAll({#D, k: _, if k == 1 {y: 1}})
+	t: s & {k: 1} @test(eq, {k: 1, y: 1})
+	denied: s & {k: 1, z: 2} @test(err, at=z, code=eval, contains="field not allowed", pos=[0:21])
+}
+-- out/errors.txt --
+[eval] b.err.extra: field not allowed:
+    ./in.cue:11:12
+[eval] c.err.nested.extra: field not allowed:
+    ./in.cue:21:4
+[eval] d.err: error in call to __closeAll: argument must be a struct or list literal:
+    ./in.cue:29:7
+[eval] f.err.extra: field not allowed:
+    ./in.cue:35:12
+[eval] g.err: error in call to __closeAll: argument must be a struct or list literal:
+    ./in.cue:42:7
+[eval] embeddedDisjunction.t2.d: field not allowed:
+    ./in.cue:52:11
+[eval] spreadClosed.t1.b.c: field not allowed:
+    ./in.cue:62:19
+[eval] spreadClosed.t2.b.c: field not allowed:
+    ./in.cue:63:17
+[eval] closeWrapsCloseAll.t1.err.x.z: field not allowed:
+    ./in.cue:74:19
+[eval] closeWrapsCloseAll.t2.err.b.c: field not allowed:
+    ./in.cue:75:19
+[incomplete] issue4535.s: non-concrete value int in operand to ==:
+    ./in.cue:85:30
+    ./in.cue:84:10
+    ./in.cue:85:24
+[eval] issue4535.denied.z: field not allowed:
+    ./in.cue:87:21
+-- out/eval/stats --
+Leaks:  3
+Freed:  90
+Reused: 63
+Allocs: 30
+Retain: 0
+
+Unifications: 65
+Conjuncts:    120
+Disjuncts:    12
+
+NumCloseIDs: 34

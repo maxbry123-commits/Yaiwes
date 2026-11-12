@@ -1,0 +1,74 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! # Task Executor
+//!
+//! The Task Executor provides task execution via the dispatcher architecture.
+//! The scheduler pushes task-ready events to executors, which handle execution
+//! with automatic context loading and state management.
+//!
+//! ## Key Features
+//!
+//! - **Push-Based Execution**: Scheduler dispatches tasks directly to executors
+//! - **Atomic Task Claiming**: Thread-safe task claiming with database locking
+//! - **Lazy Context Loading**: Automatic dependency context loading at execution time
+//! - **Simple Conflict Resolution**: Latest task wins for key conflicts
+//! - **Concurrency Management**: Configurable limits with semaphore-based control
+//! - **Timeout Handling**: Per-task execution timeout with cancellation
+//!
+//! ## Components
+//!
+//! - `ThreadTaskExecutor`: Default executor implementing the `TaskExecutor` trait
+//! - `WorkflowExecutor`: Handles workflow execution results and status tracking
+//!
+//! ## Configuration
+//!
+//! The executor can be configured using `ExecutorConfig`:
+//! - Concurrency limits (`max_concurrent_tasks`)
+//! - Execution timeouts (`task_timeout`)
+//!
+//! ## Thread Safety
+//!
+//! All components are thread-safe and can be used in concurrent environments.
+
+pub mod context_builder;
+/// Slot access for packaged tasks that defer (CLOACI-T-0897).
+pub(crate) mod deferral_registry;
+/// The engine's `CloacinaHost` implementation — services packaged
+/// `defer_until` callbacks (CLOACI-T-0897).
+pub mod host_impl;
+pub mod result_handler;
+pub mod slot_token;
+pub mod task_handle;
+pub mod thread_task_executor;
+pub mod types;
+pub mod workflow_executor;
+
+pub use context_builder::TaskContextBuilder;
+pub use result_handler::TaskResultHandler;
+
+pub use host_impl::EngineHost;
+pub use slot_token::SlotToken;
+pub use task_handle::{
+    TaskHandle, current_task_execution_id, return_task_handle, take_task_handle,
+    with_task_execution_id, with_task_handle,
+};
+pub use thread_task_executor::ThreadTaskExecutor;
+pub use types::{ClaimedTask, DependencyLoader, ExecutorConfig};
+pub use workflow_executor::{
+    StatusCallback, TaskResult, WorkflowExecution, WorkflowExecutionError, WorkflowExecutionResult,
+    WorkflowExecutor, WorkflowStatus,
+};

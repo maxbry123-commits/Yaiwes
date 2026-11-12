@@ -1,0 +1,1475 @@
+#!/usr/bin/env python3
+"""One-call code graph context tool.
+Graph-first answer for broad questions such as "how does request routing work" or
+focused traces such as "trace handle_request to get_user". It deliberately stays
+self-contained: one MCP call gathers symbol search, call graph expansion, and source
+snippets, so agents avoid chaining search, callers, callees, and raw file reads.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+from typing import Any
+
+from ... import read_existing_access as read_access
+from ...cache.query import fts_search as _conn_fts_search
+from ...cache.query import fts_search_ranked as _conn_fts_search_ranked
+from ...cache.search import search_symbols_cascade as _conn_search_symbols_cascade
+from ...index_symbol_projection import sqlite_compile_supports_fts5
+from ...test_gap_analyzer import _NON_PROD_DIRS as _SHARED_NON_PROD_DIRS
+from ...utils.test_detection import is_test_file as _shared_is_test_file
+from ...utils.test_detection import query_wants_tests as _task_wants_tests
+from ...wire_owner import NAV_CONTEXT_ACTION_VERSION
+from ._codegraph_explore_helpers import extract_snippet_from_lines, read_file_lines
+from .base_tool import BaseMCPTool
+
+_STOP_WORDS = frozenset(
+    "a an and are as at by call calls does flow for from how in into is of on "
+    "or through to trace what when where which why with work works "
+    # RFC-0009 C (dogfood-discovered): common English connectives a natural-language
+    # task carries ("how does X dispatch LIKE the Java resolver"). They are not
+    # symbol names but SUBSTRING-match real ones (``like`` -> ``_looks_like_*`` /
+    # ``_like_rows``), spending entry-point slots on noise. Pure function words only
+    # — never legitimate code identifiers (``get``/``make``/``run`` are NOT here).
+    "like the per this that via than then such these those be been also just "
+    "only about after before between within "
+    # Issue #441: generic nouns that appear in natural-language task phrasing
+    # ("how does the MCP SERVER route a TOOL CALL to the RIGHT FACADE ACTION")
+    # but are NOT plausible symbol names — they match hundreds of unrelated
+    # symbols and waste every entry-point slot. Kept to an explicit small set:
+    # never add words that are legitimate identifiers in common frameworks.
+    "server client action call right tool type item node list data code file "
+    "request response result output input value kind line".split()
+)
+
+# RFC-0009 C: generic single-word verbs that frequently appear in trace questions
+# ("how does X dispatch / handle a request") but ALSO name many unrelated symbols
+# (event dispatchers, request handlers). When the task carries a more specific
+# candidate (a snake_case / CamelCase / quoted symbol), these BARE verbs are
+# dropped — they only spend entry-point slots on wrong symbols. They are KEPT
+# when they are the only signal in the task, so "find the dispatch function"
+# still works. Conservative: precision over recall on entry-point selection.
+# Note: snake_case/CamelCase names like ``resolve_callee`` are NOT affected —
+# only bare lowercase verb tokens match this set.
+_GENERIC_VERBS = frozenset(
+    "dispatch dispatcher handle handler process processor run runner execute "
+    "executor get set send receive emit notify invoke route resolve register "
+    "lookup parse load store update fetch".split()
+)
+
+# RFC-0009 C: a file path mentioned to SCOPE a task ("find dispatch in
+# src/parser/utils.py", "tree_sitter_analyzer/mcp_tools.py") is location, NOT a
+# symbol request — but its components ("parser", "tree_sitter_analyzer",
+# "UserService") otherwise look like specific anchors and wrongly trigger the
+# generic-verb filter, dropping the user's real bare verb (Codex #333 6th/7th/8th
+# rounds). This matches a whitespace token that contains a path separator (``/``
+# OR Windows ``\``) or ends in a code file extension; its components are excluded
+# from anchor detection.
+_CODE_FILE_EXT = (
+    "py|pyi|js|jsx|ts|tsx|go|rs|java|kt|kts|c|h|hpp|cpp|cc|cs|rb|php|swift|"
+    "scala|m|mm|sh|sql|lua|dart|ex|exs|clj|hs|ml"
+)
+_PATH_FRAGMENT_RE = re.compile(
+    rf"[\w.\-]*[\\/][\w.\\/\-]*|\b[\w\-]+\.(?:{_CODE_FILE_EXT})\b",
+    re.IGNORECASE,
+)
+# Separators a path fragment is split into components on: ``/`` ``\`` ``.`` ``:``
+# (drive letters) and ``-``.
+_PATH_COMPONENT_SPLIT = re.compile(r"[\\/.:\-]+")
+
+# Inline-body cap per code block for TANGENTIAL nodes (pulled in by call-graph
+# expansion, not the task's named symbols). These get signature + head; the agent
+# rarely needs their full body, so RFC-0006's thrift is preserved where it costs
+# no turn.
+_MAX_BLOCK_LINES = 16
+
+# RFC-0009: ENTRY-POINT / task-relevant symbols get their FULL body inlined up to
+# this budget so the agent answers in ONE call instead of a follow-up Read. The
+# blanket 16-line cap was net-negative — it traded a smaller first response for
+# extra turns, and turns dominate end-to-end cost. 160 covers the motivating
+# target (resolve_java_callee, 127 lines) with headroom; tuned against the
+# turn-count measurement in RFC-0009's acceptance criteria.
+_MAX_ENTRY_BODY_LINES = 160
+
+# Cap on edges echoed in the response. Edges are graph wiring for visualization;
+# an answering agent rarely needs the full adjacency list, and 60+ raw edge
+# tuples were a large fraction of the response. The full set is still used to
+# RANK code blocks before the cap is applied.
+_MAX_INLINE_EDGES = 12
+
+# Cap on nodes echoed in the response. The full expanded node set (used for
+# call-graph ranking + code-block selection) does not all need to be echoed —
+# the agent answers from entry_points + code_blocks, and a long flat node dump
+# was a large fraction of the payload vs peers that return a compact related-
+# symbol list.
+_MAX_INLINE_NODES = 12
+
+# Cap on entry_points echoed. They overlap the node set; a focused handful of
+# the best-ranked entry points is enough to orient the agent.
+_MAX_INLINE_ENTRY_POINTS = 6
+
+
+class CodeGraphContextTool(BaseMCPTool):
+    """MCP tool for one-call architecture context and trace expansion."""
+
+    def __init__(self, project_root: str | None = None) -> None:
+        self._cache: Any = None
+        self._call_graph: Any = None
+        self._edge_store: Any = None
+        self._bound_index_identity: tuple[Any, ...] | None = None
+        super().__init__(project_root)
+
+    def _on_project_root_changed(self, project_root: str | None) -> None:
+        self._cache = None
+        self._call_graph = None
+        self._edge_store = None
+        self._bound_index_identity = None
+
+    def _rebind_to_index_identity(self) -> None:
+        """#1608：缓存的 ASTCache / EdgeStore / 调用图绑定索引身份。
+
+        刷新索引会发布新 generation；ASTCache 换绑时关闭旧连接，而缓存的
+        EdgeStore 仍持有该已关闭连接。沿用 #1564 的 ``index_identity``：
+        身份变化即关闭旧缓存并全部丢弃，下次访问时按新 generation 重新打开，
+        绝不继续持有已退役 generation 的连接。
+        """
+        if not self.project_root:
+            return
+        from .relation_freshness import index_identity
+
+        identity = index_identity(self.project_root)
+        if identity == self._bound_index_identity:
+            return
+        stale_cache = self._cache
+        self._cache = None
+        self._call_graph = None
+        self._edge_store = None
+        self._bound_index_identity = identity
+        if stale_cache is not None and hasattr(stale_cache, "close"):
+            stale_cache.close()
+
+    def _get_cache(self) -> Any:
+        if self._cache is None:
+            if not self.project_root:
+                raise ValueError("Project root not set. Call set_project_path first.")
+            from ...ast_cache import ASTCache
+
+            self._cache = ASTCache(self.project_root)
+        return self._cache
+
+    def _get_edge_store(self) -> Any:
+        if self._edge_store is None:
+            if not self.project_root:
+                raise ValueError("Project root not set. Call set_project_path first.")
+            from ...graph.edge_store import EdgeStore
+
+            cache = self._get_cache()
+            conn = cache.get_conn() if hasattr(cache, "get_conn") else None
+            if conn is not None:
+                self._edge_store = EdgeStore(conn, ensure_schema=False)
+        return self._edge_store
+
+    def _get_call_graph(self) -> Any:
+        if self._call_graph is None:
+            if not self.project_root:
+                raise ValueError("Project root not set. Call set_project_path first.")
+            try:
+                from ...graph.edge_store import EdgeKind
+
+                store = self._get_edge_store()
+                if store is not None and store.has_edges(EdgeKind.CALLS):
+                    self._call_graph = store
+                    return self._call_graph
+            except Exception:
+                pass
+            from ...call_graph import CachedCallGraph
+
+            cache = self._get_cache()
+            graph = CachedCallGraph(self.project_root, cache=cache, fallback=False)
+            graph.build()
+            self._call_graph = graph
+        return self._call_graph
+
+    def get_tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": "codegraph_context",
+            "description": (
+                "PRIMARY for understanding an area or tracing a flow. One call "
+                "returns entry points, a compact related-symbols list, and source "
+                "code blocks from a natural-language task (default lean mode). "
+                "Add include_graph=true to also get the full nodes/edges adjacency "
+                "graph for visualization or impact analysis. Use before chaining "
+                "codegraph_symbol_search, callers, callees, and file reads."
+            ),
+            "inputSchema": self.get_tool_schema(),
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        }
+
+    def get_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "Natural-language task, for example "
+                        "'how does request routing work' or "
+                        "'trace handle_request to get_user'"
+                    ),
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "description": "Maximum graph nodes to return (default: 30)",
+                    "default": 30,
+                },
+                "max_code_blocks": {
+                    "type": "integer",
+                    "description": "Maximum source snippets to return (default: 5)",
+                    "default": 5,
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["json"],
+                    "description": ("Output format: JSON"),
+                    "default": "json",
+                },
+                "include_graph": {
+                    "type": "boolean",
+                    "description": (
+                        "When false (default) return a compact related-symbols list "
+                        "instead of the full nodes/edges graph — ~60% smaller payload. "
+                        "Set true to get the complete nodes + edges adjacency graph "
+                        "for visualization or detailed impact analysis. "
+                        "stats.nodes_total and stats.edges_total are always reported "
+                        "so you know the full graph is available."
+                    ),
+                    "default": False,
+                },
+                **read_access.index_capability_schema_properties(),
+            },
+            "required": ["task"],
+            "additionalProperties": False,
+        }
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> bool:
+        if not str(arguments.get("task", "")).strip():
+            raise ValueError("task is required")
+        read_access.validate_required_index_access(self, arguments)
+        return True
+
+    async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.validate_arguments(arguments)
+        if "access_mode" in arguments:
+            return await self._execute_read_existing(arguments)
+        started = time.perf_counter()
+        self._rebind_to_index_identity()
+
+        task = str(arguments["task"]).strip()
+        max_nodes = _bounded_int(arguments.get("max_nodes", 30), 1, 100)
+        max_code_blocks = _bounded_int(arguments.get("max_code_blocks", 5), 0, 25)
+        output_format = arguments.get("output_format", "json")
+        # RFC-0006: progressive disclosure. Default lean (no nodes/edges in
+        # response); full graph available via include_graph=true. Coerce
+        # JS-style string booleans so include_graph="false"/"0" stays lean.
+        include_graph = _coerce_bool(arguments.get("include_graph", False))
+
+        candidates = _extract_symbol_candidates(task)
+        wants_tests = _task_wants_tests(task)
+        entry_points = self._resolve_entry_points(
+            candidates, max(5, max_nodes // 3), wants_tests
+        )
+        nodes = _nodes_from_hits(entry_points, max_nodes)
+        edges: list[dict[str, Any]] = []
+
+        if nodes:
+            nodes = self._expand_nodes(nodes, task, max_nodes)
+            edges = self._build_edges(nodes)
+
+        code_blocks = _build_code_blocks(
+            nodes=nodes,
+            edges=edges,
+            max_code_blocks=max_code_blocks,
+            project_root=self.project_root or "",
+        )
+        related_files = _unique_files(nodes)
+
+        # Compact related-symbols list (RFC-0006): always built, tiny cost.
+        # Groups the full node set by file as "name:line" entries — mirrors
+        # CG's Related Symbols format without the heavy per-node dict.
+        related_symbols = _build_related_symbols(nodes)
+
+        verdict = "INFO" if entry_points else "NOT_FOUND"
+
+        result = _compose_context_result(
+            verdict=verdict,
+            task=task,
+            candidates=candidates,
+            entry_points=entry_points,
+            nodes=nodes,
+            edges=edges,
+            related_symbols=related_symbols,
+            code_blocks=code_blocks,
+            related_files=related_files,
+            include_graph=include_graph,
+            max_nodes=max_nodes,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+        if not entry_points:
+            from ..utils.auto_index_guard import empty_index_diagnostic
+
+            result.update(empty_index_diagnostic(self._get_cache()))
+        # #1594：与 callers 相同，答案须声明其所依据的索引是否已落后于源码。
+        from .relation_freshness import apply_source_evidence, relation_source_evidence
+
+        evidence, stale_files = relation_source_evidence(
+            self._get_cache(), self.project_root, related_files, absence=not nodes
+        )
+        apply_source_evidence(result, evidence, stale_files)
+
+        from ..utils.format_helper import apply_output_format_to_response
+
+        return apply_output_format_to_response(result, output_format)
+
+    async def _execute_read_existing(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """RFC-0022 P0.4: serve context from the certified index snapshot.
+
+        The platform gate runs FIRST: non-certified axes keep the stable
+        UNCERTIFIED envelope even when the project root is unbound (the
+        backend never runs there). On the certified axis an unbound root
+        fails closed with the stable MISSING_PROJECT_ROOT error, then the
+        graph/symbol data is read exclusively from the acquired snapshot
+        connection (never the live ASTCache) and the after-read source
+        recapture gates the whole result; source snippets are only served
+        once that recapture certifies the live source still matches the
+        snapshot generation.
+        """
+        if not read_access.read_existing_platform_supported():
+            # access_mode is present here (this route only runs for explicit
+            # read_existing calls), so the envelope is never None.
+            unavailable = read_access.format_read_existing_unavailable(
+                arguments,
+                action_version=NAV_CONTEXT_ACTION_VERSION,
+            )
+            assert unavailable is not None  # access_mode is present -> our route
+            return unavailable
+        # Unbound root on the certified axis is classified by the consumer
+        # seam (MISSING_PROJECT_ROOT envelope with evidence + action_version);
+        # on non-certified axes the UNCERTIFIED stub above already returned.
+
+        def reader(snapshot: Any, conn: Any) -> dict[str, Any]:
+            task = str(arguments["task"]).strip()
+            max_nodes = _bounded_int(arguments.get("max_nodes", 30), 1, 100)
+            max_code_blocks = _bounded_int(arguments.get("max_code_blocks", 5), 0, 25)
+            include_graph = _coerce_bool(arguments.get("include_graph", False))
+            started = time.perf_counter()
+            # Codex-review P3 (#1297-followup): live-file reads (code blocks)
+            # must use the ACQUIRED snapshot's root, never the shared tool
+            # root (a concurrent set_project_path could re-point it mid-read).
+            reader_root = snapshot.canonical_root or self.project_root or ""
+            # Zero-write: the private snapshot connection is the ONLY symbol /
+            # edge authority here — ASTCache is never constructed (it would
+            # mkdir + open the live index read-write).
+            cache = _snapshot_search_surface(conn)
+            from ...graph.edge_store import EdgeStore
+
+            edge_store = EdgeStore(conn, ensure_schema=False)
+            candidates = _extract_symbol_candidates(task)
+            wants_tests = _task_wants_tests(task)
+            entry_points = self._resolve_entry_points(
+                candidates,
+                max(5, max_nodes // 3),
+                wants_tests,
+                cache=cache,
+            )
+            nodes = _nodes_from_hits(entry_points, max_nodes)
+            edges: list[dict[str, Any]] = []
+
+            if nodes:
+                nodes = self._expand_nodes(
+                    nodes,
+                    task,
+                    max_nodes,
+                    graph=edge_store,
+                    certified=True,
+                )
+                # Codex P1 (#1299 round-6/7): graph expansion can surface node
+                # paths that are absolute or contain '..' (encoded in edge
+                # metadata), or that resolve through an in-project symlink to
+                # an outside directory, or that name an excluded-but-existing
+                # file — none of those are generation-certified. Drop them
+                # before any code-block read so no out-of-inventory file
+                # bytes are served.
+                nodes = [
+                    n
+                    for n in nodes
+                    if _snapshot_certified_node_file(n.get("file"), reader_root, conn)
+                ]
+                # Codex P2 (#1299 round-13, C59): cross-file callee nodes
+                # carry the CALL-SITE line; re-resolve the definition line
+                # from ast_symbol_rows so code blocks serve the certified
+                # definition context, never unrelated call-site lines.
+                nodes = _snapshot_definition_lines(nodes, conn)
+                edges = self._build_edges(nodes, graph=edge_store)
+
+            code_blocks = _build_code_blocks(
+                nodes=nodes,
+                edges=edges,
+                max_code_blocks=max_code_blocks,
+                project_root=reader_root,
+            )
+            related_files = _unique_files(nodes)
+            related_symbols = _build_related_symbols(nodes)
+            verdict = "INFO" if entry_points else "NOT_FOUND"
+            payload = _compose_context_result(
+                verdict=verdict,
+                task=task,
+                candidates=candidates,
+                entry_points=entry_points,
+                nodes=nodes,
+                edges=edges,
+                related_symbols=related_symbols,
+                code_blocks=code_blocks,
+                related_files=related_files,
+                include_graph=include_graph,
+                max_nodes=max_nodes,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
+            # Codex P2 (#1299 round-10/12, C46/C51): RFC-0022's input-only
+            # contract forbids echoing raw task text from routed adapters —
+            # tasks may carry credentials / absolute host paths. Drop the
+            # task AND the task-derived candidate tokens (which copy task
+            # words verbatim) from the primitive wire response.
+            payload.pop("task", None)
+            payload.pop("candidates", None)
+            return payload
+
+        result = read_access.read_existing_index_consumer(
+            self,
+            arguments,
+            reader=reader,
+            action_version=NAV_CONTEXT_ACTION_VERSION,
+        )
+        assert result is not None  # access_mode is present -> our route
+        return result
+
+    def _resolve_entry_points(
+        self,
+        candidates: list[str],
+        limit: int,
+        wants_tests: bool = False,
+        *,
+        cache: Any = None,
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        if cache is None:
+            try:
+                cache = self._get_cache()
+            except Exception:
+                return []
+
+        # Aggregate hits across ALL candidates before ranking. A symbol that
+        # matches more task words (e.g. ``applyIndexOperationOnPrimary`` for
+        # task "IndexShard apply index operation") must outrank one matching a
+        # single generic word (``ScriptedSimilarityProvider.apply``). The old
+        # code broke out of the candidate loop once ``limit`` raw hits were
+        # collected and ranked by file name, so generic same-name symbols won
+        # on alphabetical tie-break — the root cause of the dogfood loss.
+        fetch = max(limit * 3, limit)
+        agg: dict[tuple[str, str, int], dict[str, Any]] = {}
+
+        def _absorb(raw_hits: list[Any]) -> int:
+            """Merge raw hits into ``agg``; return the count of USABLE hits.
+
+            A usable hit is one that is not skipped (non-empty name, not an
+            ``import``). The count drives the cascade fallback below: raw FTS
+            rows may be non-empty yet entirely unusable (e.g. only import-path
+            rows), which would otherwise suppress the substring fallback and
+            still yield NOT_FOUND.
+            """
+            usable = 0
+            for bm25_rank, raw in enumerate(raw_hits):
+                hit = _normalise_hit(raw)
+                if not hit["name"] or hit["kind"] == "import":
+                    continue
+                usable += 1
+                key = (hit["name"], hit["file"], hit["line"])
+                entry = agg.get(key)
+                if entry is None:
+                    agg[key] = {
+                        "hit": hit,
+                        "matches": 1,
+                        "best_rank": bm25_rank,
+                    }
+                else:
+                    entry["matches"] += 1
+                    if bm25_rank < entry["best_rank"]:
+                        entry["best_rank"] = bm25_rank
+            return usable
+
+        cascade = getattr(cache, "search_symbols_cascade", None)
+
+        # Single-word recall: FTS5 BM25 over each task word. When a word yields
+        # no USABLE hits, fall back to the substring cascade. This is the cost
+        # root cause: FTS5 tokenizes camelCase/compound identifiers as ONE
+        # token, so a natural-language word like ``route`` matches neither
+        # ``addRoute`` nor ``updateRouteTree``. Without this fallback the whole
+        # query returns NOT_FOUND and the agent abandons the index to Read raw
+        # files (the gin file_r=5-vs-2 gap). The substring cascade resolves
+        # ``route`` -> {addRoute, updateRouteTree, NoRoute, Routes}, so a
+        # conceptual query still returns inline source from the index.
+        #
+        # The fallback is gated on USABLE hits, not raw FTS rows (Codex P2 on
+        # #288): FTS can return only ``kind == "import"`` rows that ``_absorb``
+        # discards — a non-empty-but-useless result that must NOT suppress the
+        # cascade.
+        for candidate in candidates[:10]:
+            try:
+                raw_hits = cache.fts_search_ranked(candidate, limit=fetch) or []
+            except Exception:
+                try:
+                    raw_hits = cache.fts_search(candidate, limit=fetch) or []
+                except Exception:
+                    raw_hits = []
+            if _absorb(raw_hits) == 0 and callable(cascade):
+                try:
+                    cascade_hits = cascade(candidate, limit=fetch) or []
+                except Exception:
+                    cascade_hits = []
+                _absorb(cascade_hits)
+
+        # Compound recall: camelCase word pairs (applyIndex, indexOperation)
+        # reach multi-word methods that single-word FTS tokenization misses —
+        # the cascade substring tier resolves them. This is the fix for the
+        # dogfood loss where 'apply' only matched generic same-name methods.
+        if callable(cascade):
+            for compound in _compound_candidates(candidates):
+                try:
+                    raw_hits = cascade(compound, limit=limit) or []
+                except Exception:
+                    raw_hits = []
+                _absorb(raw_hits)
+
+        ranked = sorted(
+            agg.values(),
+            key=lambda e: _entry_rank_v2(e, candidates, wants_tests),
+        )
+        return [e["hit"] for e in ranked[:limit]]
+
+    def _expand_nodes(
+        self,
+        seed_nodes: list[dict[str, Any]],
+        task: str,
+        max_nodes: int,
+        *,
+        graph: Any = None,
+        certified: bool = False,
+    ) -> list[dict[str, Any]]:
+        if graph is None:
+            try:
+                graph = self._get_call_graph()
+            except Exception:
+                return seed_nodes
+
+        nodes = list(seed_nodes)
+        seen = {(n["name"], n.get("file", "")) for n in nodes}
+        trace_mode = _looks_like_trace(task)
+        is_edge_store = hasattr(graph, "query_callees")
+
+        def add_ref(ref: dict[str, Any]) -> None:
+            if len(nodes) >= max_nodes:
+                return
+            node = _node_from_ref(ref)
+            if not node["name"]:
+                return
+            key = (node["name"], node.get("file", ""))
+            if key in seen:
+                return
+            seen.add(key)
+            nodes.append(node)
+
+        def _edge_store_callees(
+            name: str, file_path: str | None, depth: int = 1
+        ) -> list[dict[str, Any]]:
+            try:
+                return graph.query_callees(name, file_path, max_depth=depth) or []
+            except Exception:
+                # Codex P2 (#1299 round-10, C45): on the certified route a
+                # malformed edge row means a corrupt snapshot — propagate so
+                # the consumer classifies CORRUPT_INDEX instead of serving
+                # an incomplete graph. The live path keeps its tolerance.
+                if certified:
+                    raise
+                return []
+
+        def _edge_store_callers(
+            name: str, file_path: str | None
+        ) -> list[dict[str, Any]]:
+            try:
+                return graph.query_callers(name, file_path) or []
+            except Exception:
+                if certified:
+                    raise
+                return []
+
+        for node in list(seed_nodes):
+            if len(nodes) >= max_nodes:
+                break
+            name = node["name"]
+            file_path = node.get("file") or None
+            if is_edge_store:
+                depth = 4 if trace_mode else 1
+                for ref in _edge_store_callees(name, file_path, depth)[:10]:
+                    add_ref(_callee_ref_to_hit(ref))
+                for ref in _edge_store_callers(name, file_path)[:10]:
+                    add_ref(_caller_ref_to_hit(ref))
+            else:
+                for ref in _safe_refs(graph.callees_of, name, file_path)[:10]:
+                    add_ref(ref)
+                for ref in _safe_refs(graph.callers_of, name, file_path)[:10]:
+                    add_ref(ref)
+                if trace_mode:
+                    for hop in _safe_chain(graph, name, file_path, depth=4):
+                        callee = hop.get("callee")
+                        if isinstance(callee, dict):
+                            add_ref(callee)
+
+        return nodes[:max_nodes]
+
+    def _build_edges(
+        self, nodes: list[dict[str, Any]], *, graph: Any = None
+    ) -> list[dict[str, Any]]:
+        if graph is None:
+            try:
+                graph = self._get_call_graph()
+            except Exception:
+                return []
+
+        by_key = {(n["name"], n.get("file", "")): n for n in nodes}
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for node in nodes:
+            by_name.setdefault(node["name"], []).append(node)
+
+        edges: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for node in nodes:
+            is_edge_store = hasattr(graph, "query_callees")
+            if is_edge_store:
+                callees = (
+                    graph.query_callees(node["name"], node.get("file") or None) or []
+                )
+                for ref in callees:
+                    callee = _callee_ref_to_hit(ref)
+                    target = by_key.get((callee["name"], callee["file"]))
+                    if target is None:
+                        target_matches = by_name.get(callee["name"], [])
+                        target = target_matches[0] if target_matches else None
+                    if target is None or target["id"] == node["id"]:
+                        continue
+                    edge_key = (node["id"], target["id"])
+                    if edge_key in seen:
+                        continue
+                    seen.add(edge_key)
+                    edges.append(
+                        {
+                            "source": node["id"],
+                            "target": target["id"],
+                            "kind": "calls",
+                            "line": ref.get("callee_line", 0),
+                        }
+                    )
+            else:
+                for ref in _safe_refs(
+                    graph.callees_of, node["name"], node.get("file") or None
+                ):
+                    callee = _normalise_hit(ref)
+                    target = by_key.get((callee["name"], callee["file"]))
+                    if target is None:
+                        target_matches = by_name.get(callee["name"], [])
+                        target = target_matches[0] if target_matches else None
+                    if target is None or target["id"] == node["id"]:
+                        continue
+                    edge_key = (node["id"], target["id"])
+                    if edge_key in seen:
+                        continue
+                    seen.add(edge_key)
+                    edges.append(
+                        {
+                            "source": node["id"],
+                            "target": target["id"],
+                            "kind": "calls",
+                            "line": node.get("line", 0),
+                        }
+                    )
+        return edges
+
+
+def _snapshot_search_surface(conn: Any) -> Any:
+    """Wrap one snapshot connection with the ASTCache search surface.
+
+    RFC-0022 P0.4 zero-write: nav.context's live path searches through
+    ``ASTCache`` (which mkdirs the cache dirs and opens the live index
+    read-write). The read_existing route instead binds the same method
+    names to the pure connection-based search helpers over the immutable
+    snapshot connection. ``fts5_available`` comes from the connection, not
+    from ASTCache state.
+    """
+    fts5 = sqlite_compile_supports_fts5(conn)
+
+    class _Surface:
+        def fts_search(self, query: str, limit: int = 100) -> list[dict[str, Any]]:
+            if not fts5:
+                return []
+            return _conn_fts_search(conn, query, None, limit)
+
+        def fts_search_ranked(
+            self, query: str, limit: int = 100
+        ) -> list[dict[str, Any]]:
+            return _conn_fts_search_ranked(conn, query, None, limit)
+
+        def search_symbols_cascade(
+            self, query: str, limit: int = 100
+        ) -> list[dict[str, Any]]:
+            return _conn_search_symbols_cascade(conn, query, None, limit, bool(fts5))
+
+    return _Surface()
+
+
+def _compose_context_result(
+    *,
+    verdict: str,
+    task: str,
+    candidates: list[str],
+    entry_points: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    related_symbols: list[dict[str, Any]],
+    code_blocks: list[dict[str, Any]],
+    related_files: list[str],
+    include_graph: bool,
+    max_nodes: int,
+    elapsed_ms: int,
+) -> dict[str, Any]:
+    """Compose the nav.context success envelope (shared by live + snapshot).
+
+    Totals are always computed from the FULL sets before any echo capping so
+    the agent knows how much graph is available even in lean mode. Entry
+    points are capped for echo at :data:`_MAX_INLINE_ENTRY_POINTS`.
+    """
+    total_nodes = len(nodes)
+    total_edges = len(edges)
+    total_entry_points = len(entry_points)
+    entry_points = entry_points[:_MAX_INLINE_ENTRY_POINTS]
+
+    if include_graph:
+        # Full graph path — identical to old default behaviour.
+        # The inline caps scale with max_nodes so agents that request more
+        # nodes actually receive them. _MAX_INLINE_NODES / _MAX_INLINE_EDGES
+        # are the floor defaults; larger max_nodes raises the cap
+        # proportionally.
+        inline_node_cap = max(_MAX_INLINE_NODES, max_nodes)
+        inline_edge_cap = max(_MAX_INLINE_EDGES, max_nodes * 2)
+        inline_nodes = nodes[:inline_node_cap]
+        _echoed_ids = {n.get("id") for n in inline_nodes}
+        inline_edges = [
+            e
+            for e in edges
+            if e.get("source") in _echoed_ids and e.get("target") in _echoed_ids
+        ][:inline_edge_cap]
+        return {
+            "success": True,
+            "verdict": verdict,
+            "action_version": NAV_CONTEXT_ACTION_VERSION,
+            "task": task,
+            "candidates": candidates,
+            "entry_points": entry_points,
+            "nodes": inline_nodes,
+            "edges": inline_edges,
+            "related_symbols": related_symbols,
+            "code_blocks": code_blocks,
+            "related_files": related_files,
+            "stats": {
+                "entry_points": len(entry_points),
+                "entry_points_total": total_entry_points,
+                "nodes": len(inline_nodes),
+                "nodes_total": total_nodes,
+                "edges": len(inline_edges),
+                "edges_total": total_edges,
+                "code_blocks": len(code_blocks),
+            },
+            "agent_summary": {
+                "summary_line": (
+                    f"codegraph_context: {len(entry_points)} entry points, "
+                    f"{len(inline_nodes)} nodes, {len(inline_edges)} edges, "
+                    f"{len(code_blocks)} code blocks"
+                ),
+                "verdict": verdict,
+                "next_step": _next_step(bool(code_blocks), bool(entry_points)),
+            },
+            "elapsed_ms": elapsed_ms,
+        }
+    # Lean path (default, RFC-0006): omit nodes/edges, expose totals.
+    # ~60% smaller payload — matches CG's compact related-symbols
+    # format. The agent answers from entry_points + code_blocks; the
+    # full graph is available on re-request with include_graph=true.
+    return {
+        "success": True,
+        "verdict": verdict,
+        "action_version": NAV_CONTEXT_ACTION_VERSION,
+        "task": task,
+        "candidates": candidates,
+        "entry_points": entry_points,
+        "related_symbols": related_symbols,
+        "code_blocks": code_blocks,
+        "related_files": related_files,
+        "stats": {
+            "entry_points": len(entry_points),
+            "entry_points_total": total_entry_points,
+            "nodes_total": total_nodes,
+            "edges_total": total_edges,
+            "code_blocks": len(code_blocks),
+        },
+        "agent_summary": {
+            "summary_line": (
+                f"codegraph_context: {len(entry_points)} entry points, "
+                f"{total_nodes} symbols, "
+                f"{len(code_blocks)} code blocks"
+            ),
+            "verdict": verdict,
+            "next_step": _next_step_lean(
+                bool(code_blocks), bool(entry_points), entry_points
+            ),
+        },
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _bounded_int(value: Any, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = minimum
+    return max(minimum, min(maximum, parsed))
+
+
+_FALSEY_STRINGS = frozenset({"false", "0", "no", "off", "none", "null", ""})
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Coerce an MCP/CLI argument to bool, honouring JS-style string booleans.
+    Agents and the chain DSL may pass ``include_graph`` as ``"false"`` / ``"0"``;
+    unlike ``bool("false")``, recognised falsey tokens map to ``False``. Other
+    non-empty strings are truthy, while real bools pass through unchanged.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSEY_STRINGS
+    return bool(value)
+
+
+def _extract_symbol_candidates(task: str) -> list[str]:
+    tokens = re.findall(
+        r"`[^`]+`|\"[^\"]+\"|'[^']+'|[A-Za-z_][A-Za-z0-9_.]*",
+        task,
+    )
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in tokens:
+        # Quoted/backticked tokens are EXPLICIT symbol references — a stop
+        # word filter must never eat `Request` / "server" (Codex P1 on #487).
+        was_quoted = raw[:1] in "`\"'"
+        raw = raw.strip("`\"'")
+        for part in re.split(r"[.:\->]+", raw):
+            token = part.strip("_.,;:!?()[]{}")
+            if not token:
+                continue
+            lowered = token.lower()
+            # Capitalised (Server) or non-lowercase (HTTPServer, snake_case
+            # with caps) tokens are symbol-shaped, not prose — keep them.
+            is_plain_prose = token == lowered and not was_quoted
+            if (lowered in _STOP_WORDS and is_plain_prose) or len(token) < 3:
+                continue
+            if not (
+                "_" in token or any(ch.isupper() for ch in token) or len(token) >= 4
+            ):
+                continue
+            if token not in seen:
+                seen.add(token)
+                out.append(token)
+
+    # RFC-0009 C: when the task names a specific symbol (snake_case / CamelCase),
+    # drop bare generic-verb candidates ("dispatch", "handle") — they only match
+    # unrelated event dispatchers / handlers and waste entry-point slots. Keep
+    # them when they are the ONLY signal, OR when the user named one EXPLICITLY in
+    # the task — quoted (`` `dispatch` ``), qualified (``Foo.handle``, ``C::handle``,
+    # ``obj->fetch``), or called (``dispatch(``). We check the original task text
+    # rather than the fragmented tokens because the tokeniser regex already splits
+    # on ``::`` / ``->`` (Codex P2 #333, three rounds: quoted, dot-qualified, then
+    # ``::`` / ``->`` qualified — one robust check now covers all qualifier syntaxes).
+    def _is_specific(tok: str) -> bool:
+        return "_" in tok or any(ch.isupper() for ch in tok)
+
+    def _named_explicitly(verb: str) -> bool:
+        # A generic verb is "named explicitly" (and kept) when it is preceded by a
+        # quote or an unambiguous symbol-member operator — ``.`` (Foo.handle),
+        # ``::`` (C++/Rust Parser::parse), ``->`` (obj->fetch) — or when it is
+        # called (``verb(``). NOTE: ``/`` is deliberately NOT a qualifier here.
+        # It was tried (Codex #333 4th round, for Go-style pkg/parser/parse) but
+        # ``/`` is dominantly a FILE-PATH separator in real tasks, so it made an
+        # ordinary path like ``src/parser/utils.py`` anchor the filter and wrongly
+        # drop the user's actual bare verb in e.g. "find the dispatch function in
+        # src/parser/utils.py" (Codex #333 6th round — the common case wins over
+        # the rare package-qualified-symbol case).
+        pattern = (
+            r"(?:[`'\"]|\.|::|->)\s*"
+            + re.escape(verb)
+            + r"\b|\b"
+            + re.escape(verb)
+            + r"\s*\("
+        )
+        return bool(re.search(pattern, task, re.IGNORECASE))
+
+    # Components of any file PATH mentioned to scope the task are location, not
+    # symbol anchors (Codex #333 6th/7th rounds) — exclude them so a path like
+    # ``src/UserService.py`` or ``tree_sitter_analyzer/mcp_tools.py`` does not make
+    # the filter run and drop the user's real bare verb.
+    path_tokens: set[str] = set()
+    for match in _PATH_FRAGMENT_RE.finditer(task):
+        for part in _PATH_COMPONENT_SPLIT.split(match.group(0)):
+            cleaned = part.strip("_")
+            if cleaned:
+                path_tokens.add(part)
+                path_tokens.add(cleaned)
+
+    def _is_anchor(tok: str) -> bool:
+        # A real anchor is a specific/explicit symbol that is NOT merely a file
+        # path component.
+        if tok in path_tokens:
+            return False
+        return _is_specific(tok) or _named_explicitly(tok)
+
+    # The filter only runs when the task has a strong anchor — a specific symbol
+    # (snake_case/CamelCase) OR an explicitly-named one (quoted/qualified/called),
+    # even if all-lowercase (Codex P2 #333, 5th round: ``trace obj->parse dispatch``
+    # anchors on the qualified ``parse`` yet has no _is_specific token, so the bare
+    # prose ``dispatch`` must still be droppable).
+    if any(_is_anchor(tok) for tok in out):
+        out = [
+            tok
+            for tok in out
+            if _is_specific(tok)
+            or tok.lower() not in _GENERIC_VERBS
+            or _named_explicitly(tok)
+        ]
+    return out
+
+
+def _normalise_hit(hit: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": hit.get("name", ""),
+        "kind": hit.get("kind", "unknown"),
+        "file": hit.get("file") or hit.get("file_path", ""),
+        "line": int(hit.get("line", 0) or 0),
+        "end_line": int(hit.get("end_line", 0) or 0),
+        "language": hit.get("language", ""),
+    }
+
+
+def _nodes_from_hits(
+    hits: list[dict[str, Any]], max_nodes: int
+) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for hit in hits:
+        if len(nodes) >= max_nodes:
+            break
+        node = _node_from_ref(hit)
+        # RFC-0009: these are the task's named entry points (vs nodes added later
+        # by call-graph expansion). Mark them so _build_code_blocks ranks them
+        # first and inlines their full body.
+        node["is_entry"] = True
+        key = (node["name"], node.get("file", ""), node.get("line", 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        nodes.append(node)
+    return nodes
+
+
+def _node_from_ref(ref: dict[str, Any]) -> dict[str, Any]:
+    hit = _normalise_hit(ref)
+    node: dict[str, Any] = {
+        "id": _node_id(hit["name"], hit["file"], hit["line"]),
+        "name": hit["name"],
+        "kind": hit["kind"],
+        "file": hit["file"],
+        "line": hit["line"],
+    }
+    if hit["end_line"] >= hit["line"] > 0:
+        node["end_line"] = hit["end_line"]
+    if hit["language"]:
+        node["language"] = hit["language"]
+    return node
+
+
+def _node_id(name: str, file_path: str, line: int) -> str:
+    return f"{os.path.basename(file_path)}:{name}:{line}"
+
+
+def _safe_refs(
+    callable_obj: Any, name: str, file_path: str | None
+) -> list[dict[str, Any]]:
+    try:
+        return callable_obj(name, file_path) or []
+    except Exception:
+        try:
+            return callable_obj(name) or []
+        except Exception:
+            return []
+
+
+def _callee_ref_to_hit(ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": ref.get("callee_name", ""),
+        "kind": "function",
+        "file": ref.get("callee_file", ""),
+        "line": int(ref.get("callee_line", 0) or 0),
+        "end_line": 0,
+        "language": "",
+    }
+
+
+def _caller_ref_to_hit(ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": ref.get("caller_name", ""),
+        "kind": "function",
+        "file": ref.get("caller_file", ""),
+        "line": int(ref.get("caller_line", 0) or 0),
+        "end_line": 0,
+        "language": "",
+    }
+
+
+def _safe_chain(
+    graph: Any, name: str, file_path: str | None, depth: int
+) -> list[dict[str, Any]]:
+    try:
+        return graph.call_chain(name, file_path=file_path, depth=depth) or []
+    except Exception:
+        try:
+            return graph.call_chain(name, depth=depth) or []
+        except Exception:
+            return []
+
+
+def _build_code_blocks(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    max_code_blocks: int,
+    project_root: str,
+) -> list[dict[str, Any]]:
+    if max_code_blocks <= 0:
+        return []
+    degrees = _edge_degrees(nodes, edges)
+    # RFC-0009: rank the task's named entry points FIRST (before graph-centrality),
+    # so the answer symbol always gets a block ahead of a high-degree hub like a
+    # cache accessor. Within each tier, fall back to edge-degree then line.
+    ranked = sorted(
+        nodes,
+        key=lambda n: (
+            not n.get("is_entry", False),
+            -degrees.get(n["id"], 0),
+            n.get("line", 0),
+        ),
+    )
+    blocks: list[dict[str, Any]] = []
+    seen_files_lines: set[tuple[str, int]] = set()
+    for node in ranked:
+        if len(blocks) >= max_code_blocks:
+            break
+        file_path = node.get("file", "")
+        start_line = int(node.get("line", 0) or 0)
+        if not file_path or start_line < 1:
+            continue
+        dedupe_key = (file_path, start_line)
+        if dedupe_key in seen_files_lines:
+            continue
+        seen_files_lines.add(dedupe_key)
+        abs_path = (
+            file_path
+            if os.path.isabs(file_path)
+            else os.path.join(project_root, file_path)
+        )
+        lines = read_file_lines(abs_path)
+        if not lines:
+            continue
+        raw_end = int(node.get("end_line", 0) or 0)
+        end_known = raw_end >= start_line
+        # RFC-0009: entry-point / task-relevant symbols inline their FULL body up
+        # to _MAX_ENTRY_BODY_LINES so the agent answers in one call; tangential
+        # (expansion) nodes keep the small _MAX_BLOCK_LINES cap (RFC-0006 thrift).
+        block_cap = _MAX_ENTRY_BODY_LINES if node.get("is_entry") else _MAX_BLOCK_LINES
+        # Nodes from call-graph expansion (callees/callers) often have no
+        # end_line; fall back to the cap window for those.
+        full_end = raw_end if end_known else start_line + block_cap - 1
+        # Long bodies still get a truncation marker pointing at the rest, so the
+        # agent can read on for the rare over-budget function.
+        capped_end = min(full_end, start_line + block_cap - 1)
+        capped_end = min(capped_end, len(lines))
+        content = extract_snippet_from_lines(lines, start_line, capped_end)
+        if not content:
+            continue
+        if end_known:
+            real_end = min(full_end, len(lines))
+            if real_end > capped_end:
+                content = (
+                    content.rstrip("\n")
+                    + f"\n    # … {real_end - capped_end} more lines "
+                    f"({file_path}:{capped_end + 1}-{real_end})\n"
+                )
+        elif capped_end < len(lines):
+            # End line unknown (call-graph node) AND we stopped at the cap before
+            # EOF — the function may continue. Emit an explicit hint so the agent
+            # knows to read onward rather than assuming the snippet is complete
+            # (Codex P2 on #293: the old fallback silently dropped lines 25+).
+            content = (
+                content.rstrip("\n")
+                + f"\n    # … snippet capped at {block_cap} lines; "
+                f"end unknown — read {file_path}:{capped_end + 1}+ if needed\n"
+            )
+        blocks.append(
+            {
+                "file": file_path,
+                "name": node["name"],
+                "start_line": start_line,
+                "end_line": capped_end,
+                "content": content,
+            }
+        )
+    return blocks
+
+
+def _edge_degrees(
+    nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+) -> dict[str, int]:
+    degrees = {node["id"]: 0 for node in nodes}
+    for edge in edges:
+        if edge["source"] in degrees:
+            degrees[edge["source"]] += 1
+        if edge["target"] in degrees:
+            degrees[edge["target"]] += 1
+    return degrees
+
+
+def _snapshot_definition_lines(
+    nodes: list[dict[str, Any]], conn: Any
+) -> list[dict[str, Any]]:
+    """Re-resolve each node's line to its symbol definition line.
+
+    Codex P2 (#1299 round-13, C59): ``EdgeStore.query_callees`` keeps the
+    call-site line on resolved cross-file callee nodes; certified code
+    blocks must point at the definition, so the line is re-looked-up from
+    ``ast_symbol_rows`` (degrading to the node's own line when unknown).
+    """
+
+    try:
+        rows = conn.execute(
+            "SELECT file_path, name, line FROM ast_symbol_rows"
+        ).fetchall()
+    except Exception:  # nosec B110 — legacy schema keeps node lines
+        return nodes
+    by_key: dict[tuple[str, str], set[int]] = {}
+    for row in rows:
+        key = (str(row["file_path"]), str(row["name"]))
+        by_key.setdefault(key, set()).add(int(row["line"]))
+    resolved: list[dict[str, Any]] = []
+    for node in nodes:
+        lines = by_key.get((str(node.get("file", "")), str(node.get("name", ""))))
+        if lines:
+            node = dict(node)
+            current = node.get("line")
+            if current in lines:
+                pass  # already a definition line
+            elif len(lines) == 1:
+                # Single definition: the cross-file call-site line resolves
+                # to it deterministically.
+                node["line"] = next(iter(lines))
+            # else: overloaded/duplicate names — the call-site line is the
+            # only identity evidence; do NOT guess a different definition.
+        resolved.append(node)
+    return resolved
+
+
+def _snapshot_certified_node_file(file_path: Any, reader_root: str, conn: Any) -> bool:
+    """Return whether one nav node's file path is snapshot-certified.
+
+    The certified route serves code blocks only for relative, in-root,
+    INVENTORY-COVERED file paths: absolute paths and ``..`` segments (which
+    can be encoded in edge metadata) are rejected lexically; a symlink-
+    resolved containment check keeps the path inside the snapshot's
+    canonical root; and ``ast_index`` membership guarantees the bytes are
+    generation-certified (Codex P1 #1299 round-6/7).
+    """
+
+    if not isinstance(file_path, str) or not file_path:
+        return False
+    normalized = file_path.replace("\\", "/")
+    if normalized.startswith("/") or ".." in normalized.split("/"):
+        return False
+    root_resolved = os.path.realpath(reader_root)
+    candidate = os.path.realpath(os.path.join(reader_root, normalized))
+    if candidate != root_resolved and not candidate.startswith(root_resolved + os.sep):
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM ast_index WHERE file_path = ? LIMIT 1", (normalized,)
+        ).fetchone()
+    except Exception:  # nosec B110 — legacy schema degrades to reject
+        return False
+    return row is not None
+
+
+def _unique_files(nodes: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for node in nodes:
+        file_path = node.get("file", "")
+        if file_path and file_path not in seen:
+            seen.add(file_path)
+            out.append(file_path)
+    return out
+
+
+def _is_test_file(file_path: str) -> int:
+    """Rank-tier wrapper: 1 for test files, 0 otherwise.
+
+    Thin shim over the shared, canonical ``utils.test_detection.is_test_file``
+    so every ranking path agrees on what counts as a test (see that module).
+    Detected by FILE path only, never by symbol name, so a production class
+    named ``TestRunner`` is never demoted.
+    """
+    return 1 if _shared_is_test_file(file_path) else 0
+
+
+def _is_non_prod_file(file_path: str) -> int:
+    """Rank-tier: 1 when the file lives under a non-production directory.
+
+    Issue #441: examples/, scripts/, corpus/, fixtures/ etc. dominated
+    entry_points because only test files were demoted. Production code is
+    the primary audience for architecture questions; non-prod files are only
+    surfaced when NO production match exists.
+
+    Uses the shared ``_SHARED_NON_PROD_DIRS`` set from ``test_gap_analyzer``
+    (single source of truth — import rather than duplicate).
+    """
+    if not file_path:
+        return 0
+    # Normalise to forward slashes for consistent splitting on all platforms.
+    parts = file_path.replace("\\", "/").split("/")
+    return 1 if any(p in _SHARED_NON_PROD_DIRS for p in parts) else 0
+
+
+def _entry_rank(hit: dict[str, Any]) -> tuple[int, int, str, int]:
+    file_path = hit.get("file", "")
+    is_test = _is_test_file(file_path)
+    kind_rank = 0 if hit.get("kind") in {"class", "function", "method"} else 1
+    return (is_test, kind_rank, hit.get("file", ""), int(hit.get("line", 0) or 0))
+
+
+def _name_match_score(name: str, candidates: list[str]) -> int:
+    """Count how many task candidates appear inside a symbol name.
+
+    Relevance signal for entry-point ranking: a symbol matching more task
+    words is more on-topic. ``applyIndexOperationOnPrimary`` matches
+    apply+index+operation (3); ``apply`` matches only apply (1). Case-
+    insensitive substring match; candidates shorter than 3 chars are ignored
+    to avoid spurious hits.
+    """
+    if not name:
+        return 0
+    lowered = name.lower()
+    score = 0
+    for cand in candidates:
+        c = cand.lower()
+        if len(c) >= 3 and c in lowered:
+            score += 1
+    return score
+
+
+def _compound_candidates(candidates: list[str]) -> list[str]:
+    """Build camelCase joins of ordered task-word pairs.
+
+    Single-word FTS tokenizes ``applyIndexOperationOnPrimary`` as one opaque
+    token, so the plain word ``apply`` never recalls it. Joining task words
+    pairwise (``apply`` + ``index`` -> ``applyIndex``) produces substrings the
+    cascade LIKE tier matches precisely against multi-word method names, with
+    far less noise than a bare ``%apply%`` scan. Capped to keep the number of
+    cascade queries bounded on large indexes.
+    """
+    words = [c for c in candidates if len(c) >= 3][:6]
+    out: list[str] = []
+    seen: set[str] = set()
+    existing = {c.lower() for c in candidates}
+    for i, a in enumerate(words):
+        for j, b in enumerate(words):
+            if i == j:
+                continue
+            joined = a[0].lower() + a[1:] + b[0].upper() + b[1:]
+            low = joined.lower()
+            if low in seen or low in existing:
+                continue
+            seen.add(low)
+            out.append(joined)
+    return out[:12]
+
+
+def _entry_rank_v2(
+    entry: dict[str, Any],
+    candidates: list[str],
+    wants_tests: bool = False,
+) -> tuple[int, int, int, int, int, int, str, int]:
+    """Relevance-aware ranking key for an aggregated entry-point hit.
+
+    Order of precedence:
+      1. non-prod tier (production code < examples/scripts/corpus)
+      2. non-test before test (unless wants_tests)
+      3. definition kinds before refs
+      4. MORE matched task words first
+      5. MORE candidate hits first
+      6. better BM25 rank
+      7. file/line for a stable tie-break
+
+    Issue #441: added non-prod tier so examples/ and scripts/ entries always
+    rank below production code of equal relevance — they are surfaced only
+    when no production match exists.
+
+    When ``wants_tests`` is set (the task itself asks about tests/specs), the
+    test-demotion tier is disabled so relevant test symbols are not pushed
+    past the result limit — codegraph_context takes natural-language tasks,
+    and "X tests" must be allowed to return test code (Codex P2 #291).
+    """
+    hit = entry["hit"]
+    file_path = hit.get("file", "")
+    # Test-intent queries must not demote test/spec/benchmark paths via the
+    # non-prod tier either (Codex P2 on #487) — the tier exists to stop
+    # examples/ from crowding out production, not to bury requested tests.
+    non_prod_tier = 0 if wants_tests else _is_non_prod_file(file_path)
+    test_tier = 0 if wants_tests else _is_test_file(file_path)
+    kind_rank = 0 if hit.get("kind") in {"class", "function", "method"} else 1
+    name_match = _name_match_score(hit.get("name", ""), candidates)
+    return (
+        non_prod_tier,
+        test_tier,
+        kind_rank,
+        -name_match,
+        -int(entry.get("matches", 0)),
+        int(entry.get("best_rank", 0)),
+        file_path,
+        int(hit.get("line", 0) or 0),
+    )
+
+
+def _looks_like_trace(task: str) -> bool:
+    lowered = task.lower()
+    return any(
+        word in lowered for word in ("trace", "flow", "through", "pipeline", "how does")
+    )
+
+
+def _next_step(has_code: bool, has_entry_points: bool) -> str:
+    if has_code:
+        return (
+            "Answer from code_blocks and the graph now. Only call a narrower "
+            "codegraph tool if a specific edge or symbol is missing."
+        )
+    if has_entry_points:
+        return "Use the nodes and edges to answer; code snippets were not available."
+    return "Try codegraph_symbol_search with an exact symbol name or broaden the task."
+
+
+def _next_step_lean(
+    has_code: bool,
+    has_entry_points: bool,
+    entry_points: list[dict[str, Any]] | None = None,
+) -> str:
+    """Next-step hint for the lean (default) response path.
+
+    Always names the ``include_graph=true`` flag so the agent knows the full
+    call graph is available on re-request — the progressive-disclosure contract.
+
+    Issue #441: when code_blocks exist but ALL entry points are from non-prod
+    directories (examples/, scripts/, corpus/ …), the agent must NOT be told
+    to "Answer from code_blocks now" — that would mislead it into answering a
+    production question from demo/script code. Instead surface the top found
+    symbol and suggest a refined search focused on the production package.
+    """
+    if has_code:
+        # Check whether ALL matched entry points are from non-production dirs.
+        # If so, warn the agent and suggest a refined search rather than
+        # "answer now" — production queries should not be answered from demos.
+        if entry_points and all(
+            _is_non_prod_file(ep.get("file", "")) for ep in entry_points
+        ):
+            top = entry_points[0]
+            top_name = top.get("name", "")
+            top_file = top.get("file", "")
+            return (
+                f"Matches found only in non-production files (e.g. {top_name!r} "
+                f"in {top_file!r}). These are examples/scripts, not the "
+                "production implementation. Use search action=symbol or "
+                "search action=content with a more specific term to find the "
+                "production code. For the full call graph add include_graph=true."
+            )
+        # Production (or mixed) matches: name the top entry point so the agent
+        # has grounding rather than a blank "answer now" with no reference.
+        top_name = entry_points[0].get("name", "") if entry_points else ""
+        anchor = f" (starting from {top_name!r})" if top_name else ""
+        return (
+            f"Answer from code_blocks now{anchor}. "
+            "For the full call graph (nodes/edges) add include_graph=true."
+        )
+    if has_entry_points:
+        return (
+            "Entry points found; code snippets were not available. "
+            "For the full call graph add include_graph=true."
+        )
+    return "Try codegraph_symbol_search with an exact symbol name or broaden the task."
+
+
+def _build_related_symbols(
+    nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a compact CG-style related-symbols list grouped by file.
+
+    Each entry is ``{"file": str, "symbols": ["name:line", ...]}``, sorted by
+    file path then by line number within each file. Nodes without a file or
+    without a name are skipped. This mirrors CodeGraph's "Related Symbols"
+    format (``file: name:line, name:line``) at a fraction of the per-node
+    dict cost — no language, no kind, no end_line, no id.
+    """
+    by_file: dict[str, list[tuple[int, str]]] = {}
+    for node in nodes:
+        file_path = node.get("file", "")
+        name = node.get("name", "")
+        if not file_path or not name:
+            continue
+        line = int(node.get("line", 0) or 0)
+        by_file.setdefault(file_path, []).append((line, name))
+
+    groups: list[dict[str, Any]] = []
+    for file_path in sorted(by_file):
+        entries = sorted(by_file[file_path])  # sort by (line, name)
+        symbols = [f"{name}:{line}" for line, name in entries]
+        groups.append({"file": file_path, "symbols": symbols})
+    return groups

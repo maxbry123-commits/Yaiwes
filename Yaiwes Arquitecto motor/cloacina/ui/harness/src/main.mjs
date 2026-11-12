@@ -1,0 +1,362 @@
+#!/usr/bin/env node
+/*
+ *  Copyright 2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+// Cloacina UI seed/demo workload harness (CLOACI-I-0117 / T-0660).
+//
+// Drives a target cloacina-server through the SAME SDK the UI ships on
+// (@cloacina/client): ensures a tenant, uploads the demo `.cloacina`
+// packages, and runs executions in one of two modes:
+//
+//   seed  — produces a deterministic state for automated UAT (T-0661):
+//           one COMPLETED run, one FAILED run, one IN-FLIGHT run, then exits.
+//   loop  — fires executions forever on an interval, mixing fast/slow/failing
+//           runs so the UI always has live activity to watch (the demo).
+//
+// All config is via env (see README). Notably:
+//   - executions are keyed by WORKFLOW NAME, not package name. The server's
+//     execute route resolves against the scheduler registry (workflow name,
+//     e.g. `demo_slow_workflow`), while list/detail use the package name
+//     (`demo-slow-rust`) — a known platform naming-drift gap. The harness
+//     therefore executes by the workflow names below.
+
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+import { CloacinaClient } from "@cloacina/client";
+
+import { produce } from "./produce.mjs";
+
+const env = process.env;
+const cfg = {
+  serverUrl: env.HARNESS_SERVER_URL ?? "http://localhost:8080",
+  apiKey: env.HARNESS_API_KEY ?? "",
+  tenant: env.HARNESS_TENANT ?? "public",
+  packageDir: env.HARNESS_PACKAGE_DIR ?? "./packages",
+  // CLOACI-T-0779: optional comma-separated package-name prefixes; when set, only
+  // matching `.cloacina` files are uploaded — lets a second tenant seed a curated
+  // subset (distinct from `public`, which uploads everything). Empty = all.
+  packagePrefixes: (env.HARNESS_PACKAGES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  // CLOACI-T-0779: exclude filter — public uploads everything EXCEPT the acme-*
+  // packages (which belong to the acme tenant), so the two tenants stay disjoint.
+  packagePrefixesExclude: (env.HARNESS_PACKAGES_EXCLUDE ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  mode: (env.HARNESS_MODE ?? "seed").toLowerCase(),
+  intervalMs: intEnv("HARNESS_INTERVAL_MS", 8000),
+  slowWorkflow: env.HARNESS_SLOW_WORKFLOW ?? "demo_slow_workflow",
+  failWorkflow: env.HARNESS_FAIL_WORKFLOW ?? "demo_fail_workflow",
+  healthTimeoutMs: intEnv("HARNESS_HEALTH_TIMEOUT_MS", 60000),
+  runTimeoutMs: intEnv("HARNESS_RUN_TIMEOUT_MS", 60000),
+  registerTimeoutMs: intEnv("HARNESS_REGISTER_TIMEOUT_MS", 120000),
+  // Live CG data feed (WS-11). `produce` mode pushes boundary events on this
+  // interval; Kafka feed only runs when a broker is configured.
+  // Number ("500") or range ("50-100") — a range gives each feed its own
+  // interval drawn from the band so the accumulators aren't in lockstep.
+  produceIntervalMs: rangeEnv("HARNESS_PRODUCE_INTERVAL_MS", 2000),
+  kafkaBroker: env.HARNESS_KAFKA_BROKER ?? "",
+  kafkaTopic: env.HARNESS_KAFKA_TOPIC ?? "demo.kafka.stream",
+  // Socket accumulators to feed over WS (comma list). Default orderbook,pricing
+  // (the host demo's CGs); set empty for Kafka-only stacks (the compose demo).
+  wsAccumulators: (env.HARNESS_WS_ACCUMULATORS ?? "orderbook,pricing").split(","),
+};
+
+function intEnv(name, dflt) {
+  const v = env[name];
+  if (v === undefined || v === "") return dflt;
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+// "500" → 500; "50-100" → {min: 50, max: 100}.
+function rangeEnv(name, dflt) {
+  const v = env[name];
+  if (v === undefined || v === "") return dflt;
+  const m = v.match(/^(\d+)\s*-\s*(\d+)$/);
+  if (m) return { min: Number.parseInt(m[1], 10), max: Number.parseInt(m[2], 10) };
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+const log = (...args) => console.log(`[seed-harness]`, ...args);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeClient() {
+  if (!cfg.apiKey) throw new Error("HARNESS_API_KEY is required");
+  return new CloacinaClient({
+    baseUrl: cfg.serverUrl,
+    apiKey: cfg.apiKey,
+    tenant: cfg.tenant,
+  });
+}
+
+async function waitForHealth(client) {
+  const deadline = Date.now() + cfg.healthTimeoutMs;
+  for (;;) {
+    try {
+      await client.health();
+      return;
+    } catch (err) {
+      if (Date.now() > deadline) {
+        throw new Error(`server not healthy after ${cfg.healthTimeoutMs}ms: ${err}`);
+      }
+      await sleep(1000);
+    }
+  }
+}
+
+/** Best-effort tenant creation. `public` already exists; others we create. */
+async function ensureTenant(client) {
+  if (cfg.tenant === "public") {
+    log(`tenant: public (server default)`);
+    return;
+  }
+  try {
+    await client.createTenant({ name: cfg.tenant });
+    log(`tenant: created '${cfg.tenant}'`);
+  } catch (err) {
+    // Duck-type on .status rather than `instanceof` — the SDK error class can
+    // differ by realm across the package symlink.
+    const status = err && typeof err.status === "number" ? err.status : 0;
+    if (status === 409 || status === 400) {
+      log(`tenant: '${cfg.tenant}' already exists`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/** Upload every `.cloacina` package in the package dir. Idempotent-ish: an
+ *  already-registered package is logged and skipped, not fatal. */
+async function uploadPackages(client) {
+  let entries;
+  try {
+    // Sort for a deterministic upload order: the reconciler loads packages by
+    // registration time (created_at), so cross-package trigger subscriptions
+    // (a `#[workflow(triggers=[…])]` referencing a trigger declared in another
+    // package — e.g. the demo fan-out fixtures) require the publisher to upload
+    // before the subscriber. readdir order is filesystem-arbitrary; sorting by
+    // filename makes it stable (CLOACI-T-0777).
+    entries = (await readdir(cfg.packageDir))
+      .filter((f) => f.endsWith(".cloacina"))
+      .sort();
+    // CLOACI-T-0779: curated-subset seeding + cross-tenant exclusion. Include
+    // first (acme uploads only acme-*), then exclude (public drops acme-*), so
+    // the tenants' package sets are disjoint.
+    if (cfg.packagePrefixes.length > 0) {
+      const before = entries.length;
+      entries = entries.filter((f) => cfg.packagePrefixes.some((p) => f.startsWith(p)));
+      log(`package include [${cfg.packagePrefixes.join(", ")}]: ${entries.length}/${before} packages`);
+    }
+    if (cfg.packagePrefixesExclude.length > 0) {
+      const before = entries.length;
+      entries = entries.filter((f) => !cfg.packagePrefixesExclude.some((p) => f.startsWith(p)));
+      log(`package exclude [${cfg.packagePrefixesExclude.join(", ")}]: ${entries.length}/${before} packages`);
+    }
+  } catch (err) {
+    // No package dir is fine for a driver-only role (loop mode against an
+    // already-seeded server): there's nothing to upload, just fire workflows.
+    log(`no package dir '${cfg.packageDir}' (${err.code ?? err}) — skipping upload`);
+    return;
+  }
+  if (entries.length === 0) {
+    log(`WARNING: no .cloacina packages found in ${cfg.packageDir} — nothing to upload`);
+    return;
+  }
+  for (const file of entries) {
+    const bytes = new Uint8Array(await readFile(path.join(cfg.packageDir, file)));
+    try {
+      const res = await client.uploadWorkflow(bytes);
+      log(`uploaded ${file} → ${res.package_id ?? "(registered)"}`);
+    } catch (err) {
+      if (err && typeof err.status === "number") {
+        log(`upload ${file}: ${err.status} ${err.code} (${err.message}) — continuing`);
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+async function execute(client, workflow, context) {
+  const body = context === undefined ? {} : { context };
+  const res = await client.executeWorkflow(workflow, body);
+  return res.execution_id;
+}
+
+/** Execute, retrying while the workflow isn't in the runtime registry yet.
+ *  Packages build asynchronously after upload and the reconciler loads them
+ *  on a periodic tick, so the first executes can 400 with "not found in
+ *  registry" until that lands (same race the e2e harness polls through). */
+async function executeReady(client, workflow, context) {
+  const deadline = Date.now() + cfg.registerTimeoutMs;
+  for (;;) {
+    try {
+      return await execute(client, workflow, context);
+    } catch (err) {
+      // The package builds asynchronously and the reconciler loads it on a
+      // periodic tick, so early executes 400 with "not found in registry".
+      // Match on the message text (robust across module boundaries) rather
+      // than `instanceof`.
+      const msg = err && err.message ? String(err.message) : String(err);
+      const notReady = /not found in registry/i.test(msg);
+      if (!notReady || Date.now() > deadline) throw err;
+      await sleep(2000);
+    }
+  }
+}
+
+/** Poll an execution until it reaches a terminal status or times out. */
+async function waitForTerminal(client, execId) {
+  const terminal = new Set(["completed", "failed", "cancelled", "canceled"]);
+  const deadline = Date.now() + cfg.runTimeoutMs;
+  for (;;) {
+    const detail = await client.getExecution(execId);
+    const status = String(detail.status ?? "").toLowerCase();
+    if (terminal.has(status)) return status;
+    if (Date.now() > deadline) return `${status} (timed out waiting for terminal)`;
+    await sleep(1000);
+  }
+}
+
+async function seed(client) {
+  log("seed mode: building a deterministic completed / failed / in-flight state");
+
+  // 1) COMPLETED — slow workflow at its natural (jittered) pace. We omit
+  //    step_seconds so the fixture's per-task variability shows through
+  //    instead of a flat pinned duration. executeReady absorbs the
+  //    post-upload build/registration race.
+  const doneId = await executeReady(client, cfg.slowWorkflow, {});
+  log(`completed-run: ${doneId} (waiting for terminal…)`);
+  const doneStatus = await waitForTerminal(client, doneId);
+  log(`completed-run: ${doneId} → ${doneStatus}`);
+
+  // 2) FAILED — the fail fixture errors deterministically.
+  const failId = await executeReady(client, cfg.failWorkflow);
+  log(`failed-run: ${failId} (waiting for terminal…)`);
+  const failStatus = await waitForTerminal(client, failId);
+  log(`failed-run: ${failId} → ${failStatus}`);
+
+  // 3) IN-FLIGHT — another natural-pace slow run, left running on exit.
+  const liveId = await executeReady(client, cfg.slowWorkflow, {});
+  log(`in-flight-run: ${liveId} (left running at natural pace)`);
+
+  // 4) MANUAL TRIGGER FIRE (CLOACI-T-0664) — fire the manual-only
+  //    `settlement_close` trigger once so the demo shows an operator fire
+  //    fanning out to its subscribed workflows (gold "manual" pill on the
+  //    started runs). Best-effort: the fan-out packages may still be
+  //    compiling on a cold stack; a miss is logged, not fatal.
+  try {
+    await client.fireTrigger("settlement_close", {
+      event: { region: "eu-west", as_of_date: new Date().toISOString().slice(0, 10) },
+    });
+    log("manual-fire: settlement_close → fanned out to subscribed workflows");
+  } catch (err) {
+    log(`manual-fire: settlement_close skipped (${err?.message ?? err})`);
+  }
+
+  log("seed complete:");
+  log(`  completed = ${doneId} (${doneStatus})`);
+  log(`  failed    = ${failId} (${failStatus})`);
+  log(`  in-flight = ${liveId} (running)`);
+
+  // Hand the execution IDs to whatever orchestrated us (the ui-e2e lane reads
+  // these to point Playwright at the in-flight + failed runs).
+  if (env.HARNESS_SUMMARY_FILE) {
+    const summary = {
+      completed: { execution_id: doneId, status: doneStatus },
+      failed: { execution_id: failId, status: failStatus },
+      inflight: { execution_id: liveId },
+    };
+    await writeFile(env.HARNESS_SUMMARY_FILE, JSON.stringify(summary, null, 2));
+    log(`wrote summary → ${env.HARNESS_SUMMARY_FILE}`);
+  }
+}
+
+async function loop(client) {
+  log(`loop mode: firing every ${cfg.intervalMs}ms (Ctrl-C to stop)`);
+  let stop = false;
+  process.on("SIGINT", () => {
+    log("SIGINT — stopping after the current tick");
+    stop = true;
+  });
+  process.on("SIGTERM", () => {
+    stop = true;
+  });
+
+  let n = 0;
+  while (!stop) {
+    n += 1;
+    try {
+      if (n % 4 === 0) {
+        const id = await executeReady(client, cfg.failWorkflow);
+        log(`tick ${n}: failing run ${id}`);
+      } else {
+        // Fire the slow workflow at its natural (jittered) pace — no pinned
+        // step_seconds — so the dashboard accumulates a realistic spread of
+        // task spans and inter-task waits across runs (the distribution views).
+        // Ticks faster than a run completes, so runs overlap and contend,
+        // which is itself part of the demo's variability.
+        const id = await executeReady(client, cfg.slowWorkflow, {});
+        log(`tick ${n}: slow run ${id}`);
+      }
+    } catch (err) {
+      log(`tick ${n}: execute failed — ${err instanceof Error ? err.message : err}`);
+    }
+    await sleep(cfg.intervalMs);
+  }
+  log("loop stopped");
+}
+
+async function main() {
+  log(`server=${cfg.serverUrl} tenant=${cfg.tenant} mode=${cfg.mode} packages=${cfg.packageDir}`);
+  const client = makeClient();
+  await waitForHealth(client);
+
+  // `produce` only feeds data into already-loaded CGs — it doesn't touch
+  // tenants/packages. seed/loop ensure the tenant + upload packages first.
+  if (cfg.mode === "produce") {
+    await produce({
+      serverUrl: cfg.serverUrl.replace(/\/+$/, ""),
+      apiKey: cfg.apiKey,
+      intervalMs: cfg.produceIntervalMs,
+      kafkaBroker: cfg.kafkaBroker,
+      kafkaTopic: cfg.kafkaTopic,
+      wsAccumulators: cfg.wsAccumulators,
+    });
+    return;
+  }
+
+  await ensureTenant(client);
+  await uploadPackages(client);
+
+  if (cfg.mode === "loop") {
+    await loop(client);
+  } else if (cfg.mode === "seed") {
+    await seed(client);
+  } else {
+    throw new Error(`unknown HARNESS_MODE '${cfg.mode}' (expected seed|loop|produce)`);
+  }
+}
+
+main().catch((err) => {
+  console.error(`[seed-harness] fatal: ${err instanceof Error ? err.stack : err}`);
+  process.exit(1);
+});

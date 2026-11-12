@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""
+Safe-to-Edit MCP Tool
+
+Answers the question AI agents ask most: "Can I safely modify this file?"
+
+Combines dependency analysis, health scoring, and test proximity to produce
+a risk assessment with specific warnings and a concrete pre-edit checklist.
+"""
+
+import os
+from pathlib import Path
+from typing import Any
+
+from ...constants import EDIT_KINDS
+from ...health_scorer import HealthScorer
+from ...project_graph import DependencyGraph
+from ...read_existing_access import (
+    format_read_existing_failure,
+    index_capability_schema_properties,
+    read_existing_index_consumer,
+    validate_required_index_access,
+)
+from ...utils import setup_logger
+from ...wire_owner import EDIT_SAFE_ACTION_VERSION
+from .base_tool import BaseMCPTool, mirror_summary_line
+from .utils.parse_validity import is_file_parse_broken, syntax_error_failure
+from .utils.safe_to_edit_helpers import (
+    SafeToEditContext,
+    build_file_dependency_view,
+    build_snapshot_file_dependency_view,
+    build_snapshot_syntax_causal_envelope,
+    is_init_file,
+    snapshot_inventory,
+    snapshot_stale_edges,
+)
+from .utils.safe_to_edit_helpers import (
+    build_safe_to_edit_result as _build_safe_to_edit_result,
+)
+from .utils.safe_to_edit_helpers import to_relative as _to_relative
+from .utils.safe_to_edit_risk import compute_risk
+
+logger = setup_logger(__name__)
+
+TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "file_path": {
+            "type": "string",
+            "description": "Path to the file you plan to edit",
+        },
+        "edit_type": {
+            "type": "string",
+            "enum": list(EDIT_KINDS),
+            "description": "Type of edit planned (affects risk assessment)",
+            "default": "refactor",
+        },
+        "output_format": {
+            "type": "string",
+            "enum": ["json"],
+            "description": "Output format: JSON",
+            "default": "json",
+        },
+        **index_capability_schema_properties(),
+    },
+    "required": ["file_path"],
+    "additionalProperties": False,
+}
+
+
+class SafeToEditTool(BaseMCPTool):
+    """MCP Tool that assesses how safe it is to edit a specific file."""
+
+    def __init__(self, project_root: str | None = None) -> None:
+        self._graph: DependencyGraph | None = None
+        self._scorer: HealthScorer | None = None
+        super().__init__(project_root)
+
+    def _on_project_root_changed(self, project_root: str | None) -> None:
+        self._graph = None
+        self._scorer = None
+
+    # _get_graph: implementation
+    def _get_graph(self) -> DependencyGraph:
+        if not self.project_root:
+            raise ValueError("Project root not set.")
+        self._graph = DependencyGraph(self.project_root)
+        return self._graph
+
+    # _get_scorer: implementation
+    def _get_scorer(self) -> HealthScorer:
+        # Conditional check
+        if self._scorer is None:
+            self._scorer = HealthScorer()
+        return self._scorer
+
+    # get_tool_definition: implementation
+    def get_tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": "safe_to_edit",
+            "description": (
+                "Pre-edit safety check for a single file: how many other "
+                "modules depend on it, which test files cover it, and a "
+                "concrete checklist of pre-edit verifications. Returns a "
+                "risk_level (SAFE/CAUTION/UNSAFE) plus actionable next "
+                "steps. MUST be called before editing any production-facing "
+                "file — the built-in Edit tool gives you no visibility into "
+                "downstream impact.\n\n"
+                "WHEN TO USE:\n"
+                "- Before ANY edit to a public-facing module / utility\n"
+                "- Before renaming or deleting a function (paired with "
+                "modification_guard)\n"
+                "- To know which tests must pass after the edit\n"
+                "- To check coupling before reorganising a directory\n"
+                "\n"
+                "WHEN NOT TO USE:\n"
+                "- For a private/internal helper with no external callers "
+                "(check via trace_impact first)\n"
+                "- To assess CODE QUALITY of the file — use file_health\n"
+                "- For symbol-level rename impact — use modification_guard"
+            ),
+            "inputSchema": self.get_tool_schema(),
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        }
+
+    # get_tool_schema: implementation
+    def get_tool_schema(self) -> dict[str, Any]:
+        return TOOL_SCHEMA
+
+    @staticmethod
+    def _file_path_argument(arguments: dict[str, Any]) -> str:
+        if "file_path" not in arguments:
+            raise ValueError("file_path is required")
+        file_path = arguments["file_path"]
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError("file_path must be a non-empty string")
+        return file_path
+
+    # validate_arguments: implementation
+    def validate_arguments(self, arguments: dict[str, Any]) -> bool:
+        self._file_path_argument(arguments)
+        validate_required_index_access(self, arguments)
+        return True
+
+    # execute: implementation
+    async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        file_path = self._file_path_argument(arguments)
+        # Codex P1 (#1257): fail closed when the project root was never
+        # bound. resolve_and_validate_file_path would pass base_path=None
+        # into SecurityValidator and skip the project-boundary layer, so an
+        # arbitrary relative path would validate with no boundary
+        # established. Mirror validate_read_existing_paths: unbound root +
+        # read_existing route raises the stable MISSING_PROJECT_ROOT error.
+        if arguments.get("access_mode") == "read_existing" and not self.project_root:
+            # Codex P1 (#1257) + review P2 (#1299): fail closed BEFORE path
+            # validation (an arbitrary path must not validate with no
+            # boundary), and emit the CLASSIFIED failure envelope (evidence +
+            # action_version) instead of a bare raise that escapes the wire
+            # contract.
+            failure = format_read_existing_failure(
+                "MISSING_PROJECT_ROOT",
+                output_format=arguments.get("output_format", "json"),
+                action_version=EDIT_SAFE_ACTION_VERSION,
+            )
+            return failure
+        # Security/project-boundary checks precede successful unavailable
+        # classification so malformed paths remain validation failures.
+        resolved = self.resolve_and_validate_file_path(file_path)
+        self.validate_arguments(arguments)
+        read_existing_result = read_existing_index_consumer(
+            self,
+            arguments,
+            reader=lambda snapshot, conn: self._read_existing_payload(
+                arguments, resolved, conn, snapshot=snapshot
+            ),
+            action_version=EDIT_SAFE_ACTION_VERSION,
+        )
+        if read_existing_result is not None:
+            return read_existing_result
+
+        edit_type = arguments.get("edit_type", "refactor")
+        output_format = arguments.get("output_format", "json")
+
+        # Conditional check
+        if not Path(resolved).exists():
+            raise ValueError(f"File not found: {file_path}")
+
+        from ..utils.format_helper import apply_output_format_to_response
+
+        # M3 (round-26 dogfood): if tree-sitter reports any ERROR node we
+        # cannot trust the dependency graph or the health scorer — both
+        # walk the AST. Without this gate ``safe_to_edit`` graded
+        # ``def broken(:`` as ``risk=safe`` and an agent could happily
+        # proceed with "planned changes" against a broken file. The
+        # short-circuit envelope keeps the same shape as the success
+        # path (file_path / agent_summary / output_format) but pins
+        # ``risk=high`` + ``verdict=ERROR`` + ``signal=syntax_error``.
+        syntax_response = _syntax_error_response(resolved, file_path, edit_type)
+        if syntax_response is not None:
+            syntax_response["output_format"] = output_format
+            return apply_output_format_to_response(syntax_response, output_format)
+
+        result = _build_safe_to_edit_result(
+            SafeToEditContext(
+                file_path=file_path,
+                edit_type=edit_type,
+                resolved_path=resolved,
+                project_root=self.project_root or ".",
+                graph=build_file_dependency_view(
+                    resolved,
+                    self.project_root or ".",
+                ),
+                scorer=self._get_scorer(),
+            )
+        )
+        # Echo the requested output_format so agents can audit envelope
+        # parity without re-reading their own call site.
+        result["output_format"] = output_format
+        # RFC-0022 P0.5: echo the adapter-owned wire owner version on the
+        # success path.
+        result["action_version"] = EDIT_SAFE_ACTION_VERSION
+
+        # M14 (round-26): also echo ``language`` on the success path.
+        # The syntax-error short-circuit above already echoes it; the
+        # success path used to only echo on the dispatcher-routed
+        # path, leaving CLI / direct callers with ``language=None``.
+        if "language" not in result:
+            from ...language_detector import detect_language_from_file
+
+            try:
+                detected = detect_language_from_file(
+                    resolved, project_root=self.project_root
+                )
+            except Exception:  # nosec B110 — language detection best-effort
+                detected = "unknown"
+            if detected and detected != "unknown":
+                result["language"] = detected
+
+        # M10 (round-26): mirror top-level ``verdict`` into
+        # ``agent_summary.verdict`` so chained agents see the same answer
+        # at both surfaces. safe_to_edit historically only set top-level
+        # ``verdict`` (SAFE / CAUTION / UNSAFE); ``mirror_summary_line``
+        # now propagates it into ``agent_summary``.
+        result = mirror_summary_line(result)
+
+        # RFC-0027 L6.2: declare the cost beside the answer.  This is the route
+        # an agent runs before every edit, and the L5 baseline shows its first
+        # (computed) call at 3453 ms against 51-69 ms for every cached repeat,
+        # so the tier is the actionable part of the declaration.
+        from ...cache.query_cost import cost_fields, query_cost
+
+        result.update(
+            cost_fields(query_cost("edit", "safe", self.project_root, arguments))
+        )
+
+        return apply_output_format_to_response(result, output_format)
+
+    def _read_existing_payload(
+        self,
+        arguments: dict[str, Any],
+        resolved: str,
+        conn: Any,
+        snapshot: Any | None = None,
+    ) -> dict[str, Any]:
+        """RFC-0022 P0.4: build the risk envelope from the certified snapshot.
+
+        The dependency view comes exclusively from the snapshot ``edges``
+        and ``ast_index`` tables; the syntax gate, health score, and test
+        discovery still read the live source, but the after-read source
+        recapture (in the consumer seam) certifies those bytes still match
+        the snapshot generation before any result is emitted. Syntax errors
+        short-circuit the dependency/health walk exactly like the legacy
+        path (M3 round-26 gate).
+        """
+        file_path = arguments["file_path"]
+        edit_type = arguments.get("edit_type", "refactor")
+
+        # Codex-review P3 (#1297-followup): the snapshot's canonical_root is
+        # the authoritative root for every relative/live-file computation —
+        # never the shared tool root (a concurrent set_project_path could
+        # re-point it mid-read).
+        reader_root = (
+            snapshot.canonical_root
+            if snapshot is not None and snapshot.canonical_root
+            else self.project_root or "."
+        )
+        # Canonicalize the resolved path before relativising: on macOS the
+        # security validator's abspath (/var/folders/...) and the snapshot's
+        # canonical_root (/private/var/folders/...) differ by symlink, which
+        # would make to_relative fall back to the absolute path and miss every
+        # ast_index/edges row (CLAUDE.md §2 resolution contract).
+        rel_path = _to_relative(os.path.realpath(resolved), reader_root)
+        if os.sep == "\\":
+            rel_path = rel_path.replace("\\", "/")
+        # Codex P1 (#1299): a target outside the snapshot source inventory
+        # (markdown/yaml, hidden, or excluded files) is not covered by the
+        # before/after source recaptures. The gate runs BEFORE any
+        # existence/language/syntax probe so uncertified bytes can never
+        # short-circuit into an available envelope — a missing target is
+        # necessarily outside the inventory too, so its answer also comes
+        # from the snapshot, never from live filesystem state (round-3/4).
+        inventory = snapshot_inventory(conn) if snapshot is not None else None
+        if snapshot is not None:
+            if inventory is None or rel_path not in inventory:
+                raise ValueError("FILE_NOT_INDEXED")
+        if not Path(resolved).exists():
+            raise ValueError("FILE_NOT_FOUND")
+
+        syntax_response = _syntax_error_response(resolved, file_path, edit_type)
+        if syntax_response is not None:
+            if snapshot is not None:
+                syntax_response["causal_envelope"] = (
+                    build_snapshot_syntax_causal_envelope(
+                        conn,
+                        rel_path,
+                        file_path,
+                        inventory=inventory,
+                    )
+                )
+            return syntax_response
+
+        graph = build_snapshot_file_dependency_view(
+            conn,
+            rel_path,
+            inventory=inventory,
+        )
+        result = _build_safe_to_edit_result(
+            SafeToEditContext(
+                file_path=file_path,
+                edit_type=edit_type,
+                resolved_path=resolved,
+                project_root=reader_root,
+                graph=graph,
+                scorer=self._get_scorer(),
+                # Codex P1 (#1299): the certified route derives constraint
+                # facts from the snapshot connection and never touches the
+                # live .ast-cache (zero-write read).
+                snapshot_conn=conn if snapshot is not None else None,
+                certified_inventory=inventory,
+                stale_edges=tuple(
+                    snapshot_stale_edges(conn, rel_path, inventory=inventory)
+                ),
+            )
+        )
+        # RFC-0022 P0.5: echo the adapter-owned wire owner version on the
+        # success path (the consumer seam adds output_format + evidence).
+        # The builder never sets ``language``, so detect it here (the legacy
+        # axis keeps its own equivalent guard at the execute level).
+        result["action_version"] = EDIT_SAFE_ACTION_VERSION
+        from ...language_detector import detect_language_from_file
+
+        try:
+            detected = detect_language_from_file(resolved, project_root=reader_root)
+        except Exception:  # nosec B110 — language detection best-effort
+            detected = "unknown"
+        if detected and detected != "unknown":
+            result["language"] = detected
+        return mirror_summary_line(result)
+
+
+def _syntax_error_response(
+    resolved: str,
+    file_path: str,
+    edit_type: str,
+) -> dict[str, Any] | None:
+    """M3 (round-26): short-circuit when tree-sitter detected syntax errors.
+
+    Returns ``None`` when the file parses cleanly (caller continues with
+    the normal dependency + health + test-discovery walk). Otherwise
+    returns a risk envelope that matches the success-path shape (so
+    downstream consumers don't have to special-case the keys) but pins
+    ``risk=high`` and ``risk_level=dangerous`` so any agent reading
+    either field sees the same answer.
+
+    Why ``risk_level=dangerous`` not ``safe``: broken syntax means we
+    cannot enumerate dependents or score health — every downstream
+    walker is going to choke on the partial AST. ``dangerous`` is the
+    safest default: an agent must investigate the syntax error before
+    editing anything.
+    """
+    # Detect language locally — safe_to_edit doesn't otherwise know it.
+    from ...language_detector import detect_language_from_file
+
+    language = detect_language_from_file(resolved)
+    if not language or language == "unknown":
+        return None
+    if not is_file_parse_broken(resolved, language):
+        return None
+    summary_line = f"{file_path} signal=syntax_error verdict=ERROR"
+    return {
+        # #1812: the file could not be analyzed, so this is a failure.
+        **syntax_error_failure(file_path),
+        "action_version": EDIT_SAFE_ACTION_VERSION,
+        "file_path": file_path,
+        "edit_type": edit_type,
+        "language": language,
+        # ``risk_level`` is the canonical safe_to_edit field (cross-tool
+        # contract). Use ``dangerous`` because broken syntax blocks the
+        # entire downstream walk.
+        "risk_level": "dangerous",
+        "risk": "dangerous",
+        "verdict": "ERROR",
+        "signal": "syntax_error",
+        # Empty live downstream/test hints — we cannot compute them from the
+        # broken tree. The certified route overwrites ``causal_envelope``
+        # with immutable snapshot facts before this response is emitted.
+        "downstream_dependents": [],
+        "dependencies": [],
+        "test_files": [],
+        "has_tests": False,
+        "causal_envelope": {
+            # ``None`` means unevaluated.  Empty lists would falsely certify
+            # that the live path evaluated these complete-set fields and found
+            # nothing, even though syntax failure prevented the walk.
+            "dependents": None,
+            "dependencies": None,
+            "exercising_tests": None,
+            "constraint_verdict": "unknown",
+            "verification_command": None,
+            "stale_edges": None,
+        },
+        "pre_edit_checklist": [
+            "Fix syntax errors so the file parses cleanly.",
+            "Re-run safe_to_edit after the file parses.",
+        ],
+        "recommendation": (
+            "File fails to parse — tree-sitter reported syntax errors. "
+            "Fix syntax before editing further."
+        ),
+        "summary_line": summary_line,
+        "agent_summary": {
+            "summary_line": summary_line,
+            "next_step": ("file fails to parse — fix syntax before further analysis"),
+            "verdict": "ERROR",
+            "risk": "high",
+        },
+    }
+
+
+def _compute_risk(*args: Any, **kwargs: Any) -> tuple[str, list[dict[str, str]]]:
+    """Compatibility wrapper for tests and internal imports."""
+    return compute_risk(*args, **kwargs)
+
+
+def _is_init_file(file_path: str) -> bool:
+    """Compatibility wrapper for tests and internal imports."""
+    return is_init_file(file_path)

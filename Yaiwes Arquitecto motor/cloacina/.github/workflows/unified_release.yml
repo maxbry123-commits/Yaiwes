@@ -1,0 +1,689 @@
+---
+name: "Unified Release"
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Step 1: Run nightly test suite as a release prerequisite
+  # -----------------------------------------------------------------------
+
+  nightly-suite:
+    name: Release Validation (Nightly Suite)
+    uses: ./.github/workflows/nightly.yml
+    # The caller's permissions are the ceiling for the called workflow. The
+    # workflow-level block above is intentionally minimal, so grant here the
+    # superset the nested nightly jobs need: packages:write (nightly-docker),
+    # actions:write (prune-caches), issues:write (notify-failure/close-resolved),
+    # contents:read (checkout). Without this the run fails at startup.
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+      issues: write
+
+  # -----------------------------------------------------------------------
+  # Step 2: Version verification
+  # -----------------------------------------------------------------------
+
+  verify-version:
+    name: Verify Version
+    needs: [nightly-suite]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Verify version matches tag
+        run: |
+          tag_version=${GITHUB_REF#refs/tags/}
+          # Remove 'v' prefix if present
+          tag_version=${tag_version#v}
+          cargo_version=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "cloacina") | .version')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "Tag version ($tag_version) doesn't match Cargo.toml version ($cargo_version)"
+            exit 1
+          fi
+
+      # SDK lockstep (CLOACI-I-0113 / REQ-008): npm + PyPI client packages and
+      # the committed OpenAPI doc must carry the workspace version.
+      - name: Verify SDK versions in lockstep
+        run: python3 scripts/check_sdk_versions.py
+
+  # -----------------------------------------------------------------------
+  # Step 3: Publish to crates.io
+  # -----------------------------------------------------------------------
+
+  publish-cargo:
+    name: Publish to crates.io
+    needs: [verify-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://crates.io/crates/cloacina
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Publish to crates.io
+        run: |
+          # Publish in dependency order. Treat "already published" as success
+          # (idempotent re-runs); fail loud on any other error so silent publish
+          # failures can't silently produce a partial release like cloacina@0.5.1
+          # did under the previous `|| echo` mask.
+          publish() {
+            local crate="$1"
+            # Capture cargo publish's own exit code via PIPESTATUS so pipefail
+            # quirks (e.g., tee succeeding while cargo publish silently failed
+            # in some edge cases) can't mask a real failure. cloacina@0.5.1 was
+            # never published despite the prior `|| echo` mask reporting OK —
+            # that's the failure mode this guards against.
+            cargo publish -p "$crate" 2>&1 | tee /tmp/publish.log
+            local rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then
+              echo "✓ $crate published"
+            elif grep -qE "already (exists|uploaded)" /tmp/publish.log; then
+              echo "○ $crate already published (skipping)"
+            else
+              echo "✗ $crate publish failed (exit $rc)"
+              exit 1
+            fi
+          }
+
+          # Tier 1: leaf authoring + types (no internal deps).
+          # cloacina-api-types first — cloacina itself depends on it (T-0642).
+          publish cloacina-api-types
+          sleep 30
+          publish cloacina-macros
+          sleep 30
+          publish cloacina-workflow
+          sleep 30
+          publish cloacina-build
+          sleep 30
+          publish cloacina-computation-graph
+          sleep 30
+          publish cloacina-workflow-plugin
+          sleep 30
+          publish cloacina-testing
+          sleep 30
+          # v0.10.0 postmortem: born this cycle (I-0132/I-0139) but never added
+          # here — `cloacina` depends on it, so the whole Tier-2+ chain failed
+          # with "no matching package named cloacina-constructor-contract".
+          publish cloacina-constructor-contract
+          sleep 30
+
+          # Tier 2: engine.
+          publish cloacina
+          sleep 30
+
+          # Tier 3: Python runtime crate (depends on cloacina + cloacina-computation-graph).
+          # Published to crates.io so cloacina-server (which depends on it) can resolve.
+          # The `cloaca` Python wheel is a separate artifact built via maturin and
+          # published to PyPI in a later job; this is the Rust-side crate.
+          publish cloacina-python
+          sleep 30
+
+          # Tier 3.5: service client SDK (depends on cloacina-api-types only;
+          # must precede cloacinactl, which consumes it — T-0646).
+          publish cloacina-client
+          sleep 30
+
+          # Tier 4: binaries (depend on cloacina + workflow-plugin + python).
+          publish cloacinactl
+          sleep 30
+          publish cloacina-compiler
+          sleep 30
+          # v0.10.0 postmortem: cloacina-server grew a dep on cloacina-agent
+          # (fleet work, I-0127) — the agent crate must publish first.
+          publish cloacina-agent
+          sleep 30
+          publish cloacina-server
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # -----------------------------------------------------------------------
+  # Step 4: Build Python wheels (abi3 — one wheel per platform)
+  # -----------------------------------------------------------------------
+
+  build-wheels:
+    name: Build Wheel (${{ matrix.target }})
+    needs: [verify-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install libpq (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install libpq (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libpq
+          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        # --strip: pyproject sets strip=false so dev/CI wheels keep symbols for
+        # crash forensics (CLOACI-I-0140); shipped wheels stay stripped/lean.
+        run: maturin build --release --strip --target ${{ matrix.target }} --manifest-path crates/cloacina-python/Cargo.toml
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: target/wheels/cloaca-*.whl
+          retention-days: 14
+
+  build-sdist:
+    name: Build Source Distribution
+    needs: [verify-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build sdist
+        run: maturin sdist --manifest-path crates/cloacina-python/Cargo.toml
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloaca-sdist
+          path: target/wheels/cloaca-*.tar.gz
+          retention-days: 14
+
+  # -----------------------------------------------------------------------
+  # Step 5: Publish to PyPI
+  # -----------------------------------------------------------------------
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-wheels, build-sdist]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://pypi.org/project/cloaca/
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cloaca-sdist
+          path: dist/
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          verbose: true
+          password: ${{ secrets.PYPI_TOKEN }}
+          # Tolerate idempotent re-runs of the release on the same tag: if a
+          # prior run already uploaded these files, skip rather than 400. Mirrors
+          # the "already published" handling in the crates.io publish job.
+          skip-existing: true
+
+  # -----------------------------------------------------------------------
+  # (Step 4c npm-publish job removed 2026-07-29: the @cloacina/client npm
+  # publish was broken for multiple releases — the @cloacina scope was never
+  # bootstrapped on npmjs (E404 on first scoped PUT) and the job soft-failed
+  # every train. The TypeScript SDK still lives in clients/typescript and
+  # stays in the SDK version-lockstep check; reinstate a publish job if/when
+  # the npm org exists.)
+  # -----------------------------------------------------------------------
+
+  # -----------------------------------------------------------------------
+  # Step 4d: Publish the Python SDK (cloacina-client) to PyPI
+  # (CLOACI-I-0113 / T-0648). Distinct from the `cloaca` embedded-runtime
+  # wheels above — this is the pure-Python service client.
+  # -----------------------------------------------------------------------
+
+  publish-pypi-client:
+    name: Publish cloacina-client to PyPI
+    needs: [verify-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+      url: https://pypi.org/project/cloacina-client/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist + wheel
+        working-directory: clients/python
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/python/dist/
+          verbose: true
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
+
+  # -----------------------------------------------------------------------
+  # Step 5b: Build + upload cloacinactl release binaries (CLOACI-I-0111 / T-0603)
+  #
+  # Cross-compiles `cloacinactl` for the four supported targets, packages
+  # each as a tarball with a SHA256 sidecar, and uploads them to the
+  # GitHub Release for the tag. Powers `scripts/install.sh`.
+  # -----------------------------------------------------------------------
+
+  build-release-binaries:
+    name: Build Binary (${{ matrix.target }})
+    needs: [verify-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    # Creating the GitHub Release and uploading the cloacinactl tarballs needs
+    # contents:write. The workflow-level default is contents:read, so grant it
+    # here — without it the upload step 403s ("Resource not accessible by
+    # integration") and the binaries / Release never appear.
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          # Native ARM64 Linux (CLOACI-T-0807) — was Docker `cross`, whose image
+          # has no Python interpreter for pyo3-build-config (pulled transitively
+          # via cloacina-workflow-plugin), failing the build.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cross: false
+          # x86_64-apple-darwin (Intel macOS) intentionally dropped — EOL target
+          # + scarce macos-13 runners; aarch64 (Apple Silicon) covers modern Macs.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install libpq (Linux native)
+        if: runner.os == 'Linux' && matrix.cross == false
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install libpq (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libpq
+          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      # CLOACI-T-0650 / T-0807: the distributed CLI drops `kafka` (a runtime
+      # accumulator backend it doesn't need); postgres+sqlite cover its DB needs.
+      # It still pulls pyo3 transitively via cloacina-workflow-plugin, so every
+      # leg now builds natively on a runner that has a Python interpreter + the
+      # matching-arch libpq (no Docker `cross`).
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p cloacinactl --no-default-features --features postgres,sqlite --bin cloacinactl
+
+      - name: Strip binary
+        if: runner.os == 'Linux' && matrix.cross == false
+        run: strip target/${{ matrix.target }}/release/cloacinactl
+      - name: Strip binary (macOS)
+        if: runner.os == 'macOS'
+        run: strip -x target/${{ matrix.target }}/release/cloacinactl
+
+      - name: Package tarball + sha256 sidecar
+        id: pack
+        env:
+          TAG_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_REF#refs/tags/}"
+          asset="cloacinactl-${tag}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${asset}" cloacinactl
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${asset}" > "${asset}.sha256")
+          else
+            (cd dist && shasum -a 256 "${asset}" > "${asset}.sha256")
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (intra-workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/cloacinactl-*
+          retention-days: 14
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cloacinactl-*.tar.gz
+            dist/cloacinactl-*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # -----------------------------------------------------------------------
+  # Step 5c: Build + push cloacina-server Docker image (CLOACI-I-0111 / T-0604)
+  #
+  # Multi-arch build via buildx, pushed to ghcr.io/<owner>/cloacina-server.
+  # Tags applied: <semver>, <major>.<minor>, latest.
+  # -----------------------------------------------------------------------
+
+  # Per-arch NATIVE builds (T-0940): same pattern as nightly-docker — the
+  # arm64 half used to compile the whole workspace under QEMU. The per-arch
+  # gha cache scopes are shared with the nightly job, so a release build
+  # that follows validation is nearly a pure cache replay.
+  publish-docker:
+    name: Publish cloacina-server image
+    needs: [verify-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name
+        id: img
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/cloacina-server" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push by digest (native ${{ matrix.platform }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.img.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=server-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,ignore-error=true,scope=server-image-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-image-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-docker-manifest:
+    name: Publish image manifest
+    needs: [publish-docker]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Compute tags
+        id: tags
+        env:
+          TAG_REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_REF#refs/tags/}"     # vX.Y.Z
+          version="${tag#v}"              # X.Y.Z
+          major_minor="${version%.*}"     # X.Y
+          owner_lc=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner_lc}/cloacina-server"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: release-image-digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create version + latest manifests
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          VERSION: ${{ steps.tags.outputs.version }}
+          MAJOR_MINOR: ${{ steps.tags.outputs.major_minor }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:${MAJOR_MINOR}" \
+            -t "${IMAGE}:latest" \
+            $(printf -- "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      - name: Smoke test (--version against linux/amd64)
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+        run: |
+          set -euo pipefail
+          # The amd64 manifest is the runner's native arch; pull and
+          # exercise --version. Verifies the entrypoint, the binary
+          # actually runs, and clap reports the build version.
+          docker run --rm "${IMAGE}:latest" --version
+
+  # -----------------------------------------------------------------------
+  # (Step 5c-ui removed, v0.10.0 postmortem: the standalone cloacina-ui image
+  # was retired in CLOACI-I-0130 — the web UI ships embedded in the server
+  # image — but this job survived, pointing at the deleted ui/Dockerfile, and
+  # failed the release train. The charts/cloacina-ui standalone-SPA path is
+  # deployed from source, not a first-party image.)
+  # -----------------------------------------------------------------------
+
+  # -----------------------------------------------------------------------
+  # Step 5d: Publish Helm chart (CLOACI-I-0111 / T-0605)
+  #
+  # Packages charts/cloacina-server and pushes it as an OCI artifact to
+  # ghcr.io/<owner>/charts/cloacina-server. Runs after publish-docker so
+  # the image referenced by the chart's appVersion is guaranteed present.
+  # -----------------------------------------------------------------------
+
+  publish-helm:
+    name: Publish Helm chart
+    needs: [verify-version, publish-docker-manifest]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
+      - name: Set tag-derived chart version
+        env:
+          TAG_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_REF#refs/tags/}"
+          version="${tag#v}"
+          # Sync chart's `version` and `appVersion` to the release tag.
+          # Chart's own internal versioning resumes its independent path
+          # on the next non-release commit.
+          sed -i -E "s/^version: .*/version: ${version}/" charts/cloacina-server/Chart.yaml
+          sed -i -E "s/^appVersion: .*/appVersion: \"${version}\"/" charts/cloacina-server/Chart.yaml
+          grep -E "^(version|appVersion):" charts/cloacina-server/Chart.yaml
+          # (charts/cloacina-ui retired with the standalone SPA image,
+          # I-0130/I-0141 — the UI ships embedded in cloacina-server. T-0940
+          # removed the chart: it defaulted to an image that no longer exists.)
+
+      - name: Log in to ghcr.io (Helm OCI push)
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${GITHUB_TOKEN}" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Lint charts
+        run: |
+          helm lint charts/cloacina-server
+
+      - name: Package charts
+        run: |
+          mkdir -p dist-charts
+          helm package charts/cloacina-server --destination dist-charts
+
+      - name: Push charts to ghcr.io
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner_lc=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          chart_pkg=$(ls dist-charts/cloacina-server-*.tgz | head -n1)
+          [ -n "${chart_pkg}" ] || { echo "no cloacina-server chart package found" >&2; exit 1; }
+          helm push "${chart_pkg}" "oci://ghcr.io/${owner_lc}/charts"
+
+  # -----------------------------------------------------------------------
+  # Step 6: Cache hygiene
+  #
+  # Tag-scoped caches are write-once: they're only re-used if you re-run
+  # the release workflow on the same tag, which is a degenerate case. Drop
+  # them once publish has succeeded so they don't accumulate per release
+  # (each tag was producing ~3 GB of GHA cache).
+  # -----------------------------------------------------------------------
+
+  prune-tag-caches:
+    name: Prune Tag-Scoped Caches
+    needs: [publish-cargo, publish-pypi, build-release-binaries, publish-docker-manifest, publish-helm]
+    if: always() && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete caches for this tag ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # The /caches list endpoint expects a normalized ref. Tag-scoped
+          # caches are stored under the literal "refs/heads/<tag-ref>" path
+          # GH actions cache writes them to — strip the leading "refs/" so
+          # we match both representations seen in the cache list.
+          ids=$(gh api --paginate "repos/${REPO}/actions/caches?per_page=100" \
+            --jq ".actions_caches[] | select(.ref == \"${TAG_REF}\" or .ref == \"refs/heads/${TAG_REF}\") | .id")
+          if [ -z "${ids}" ]; then
+            echo "no tag-scoped caches for ${TAG_REF}"
+            exit 0
+          fi
+          echo "${ids}" | while read id; do
+            echo "deleting cache ${id}"
+            gh api -X DELETE "repos/${REPO}/actions/caches/${id}" || true
+          done

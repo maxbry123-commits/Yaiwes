@@ -1,0 +1,202 @@
+-- in.cue --
+import (
+	"list"
+	"strings"
+	"text/template"
+)
+
+list1: {
+	// Note that Top is not incomplete, only its first element is.
+	// We allow FlattenN to proceed and pass on the incomplete values.
+	Out1: list.FlattenN(Top, 1)
+	Out2: [...] & list.FlattenN(Top, 1)
+	Out3: list.FlattenN(Top, 1) & [...]
+
+	// This evaluates to a list with an incomplete element.
+	Top: [
+		[for _, F in _Sub {F}],
+	]
+
+	_Sub: a.b
+	a: {} // b does not
+}
+
+list2: {
+	Out1: list.FlattenN(_Top, 1)
+	Out2: [...] & list.FlattenN(_Top, 1)
+	Out3: list.FlattenN(_Top, 1) & [...]
+
+	// This evaluates to a list with an incomplete element.
+	_Top: [
+		for _, F in #Sub {F},
+	]
+
+	#Sub: a.b
+
+	a: {} // b does not
+}
+
+value1: {
+	a: len('sf' | 'dd')
+}
+
+value2: {
+	len('sf' | 'dd')
+
+}
+
+incompleteArgDecimalList: {
+	a: #a & {param: 123}
+	#a: {
+		param:       int
+		transformed: +param
+		max:         list.Max([transformed])
+	}
+}
+
+incompleteArgStringList: {
+	a: #a & {param: "123"}
+	#a: {
+		param:       string
+		transformed: param + ""
+		joined:      strings.Join([transformed], "-")
+	}
+}
+
+incompleteList: {
+	x:       _
+	decimal: list.Max(x)
+	str:     strings.Join(x, "")
+}
+
+// TODO: add better error positions.
+incompleteListError: {
+	x:       y + []
+	y:       _
+	decimal: list.Max(x)
+	str:     strings.Join(x, "")
+}
+
+badListType: {
+	x:       2
+	decimal: list.Max(x)
+	str:     strings.Join(x, "")
+}
+
+badListError: {
+	x:       2 + y
+	y:       "foo"
+	decimal: list.Max(x)
+	str:     strings.Join(x, "")
+}
+
+// Issue #1095
+// Preserve combined error severity for multiple errors.
+multipleErrors: {
+	#T: {
+		params: {
+			x: string
+			y: string
+		}
+		out: template.Execute("{{.x}} {{.y}}", params)
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  list1: {
+    Out1: 〈import;list〉.FlattenN(〈0;Top〉, 1)
+    Out2: ([
+      ...,
+    ] & 〈import;list〉.FlattenN(〈0;Top〉, 1))
+    Out3: (〈import;list〉.FlattenN(〈0;Top〉, 1) & [
+      ...,
+    ])
+    Top: [
+      [
+        for _, F in 〈2;_Sub〉 {
+          〈1;F〉
+        },
+      ],
+    ]
+    _Sub: 〈0;a〉.b
+    a: {}
+  }
+  list2: {
+    Out1: 〈import;list〉.FlattenN(〈0;_Top〉, 1)
+    Out2: ([
+      ...,
+    ] & 〈import;list〉.FlattenN(〈0;_Top〉, 1))
+    Out3: (〈import;list〉.FlattenN(〈0;_Top〉, 1) & [
+      ...,
+    ])
+    _Top: [
+      for _, F in 〈1;#Sub〉 {
+        〈1;F〉
+      },
+    ]
+    #Sub: 〈0;a〉.b
+    a: {}
+  }
+  value1: {
+    a: len(('sf'|'dd'))
+  }
+  value2: {
+    len(('sf'|'dd'))
+  }
+  incompleteArgDecimalList: {
+    a: (〈0;#a〉 & {
+      param: 123
+    })
+    #a: {
+      param: int
+      transformed: +〈0;param〉
+      max: 〈import;list〉.Max([
+        〈1;transformed〉,
+      ])
+    }
+  }
+  incompleteArgStringList: {
+    a: (〈0;#a〉 & {
+      param: "123"
+    })
+    #a: {
+      param: string
+      transformed: (〈0;param〉 + "")
+      joined: 〈import;strings〉.Join([
+        〈1;transformed〉,
+      ], "-")
+    }
+  }
+  incompleteList: {
+    x: _
+    decimal: 〈import;list〉.Max(〈0;x〉)
+    str: 〈import;strings〉.Join(〈0;x〉, "")
+  }
+  incompleteListError: {
+    x: (〈0;y〉 + [])
+    y: _
+    decimal: 〈import;list〉.Max(〈0;x〉)
+    str: 〈import;strings〉.Join(〈0;x〉, "")
+  }
+  badListType: {
+    x: 2
+    decimal: 〈import;list〉.Max(〈0;x〉)
+    str: 〈import;strings〉.Join(〈0;x〉, "")
+  }
+  badListError: {
+    x: (2 + 〈0;y〉)
+    y: "foo"
+    decimal: 〈import;list〉.Max(〈0;x〉)
+    str: 〈import;strings〉.Join(〈0;x〉, "")
+  }
+  multipleErrors: {
+    #T: {
+      params: {
+        x: string
+        y: string
+      }
+      out: 〈import;"text/template"〉.Execute("{{.x}} {{.y}}", 〈0;params〉)
+    }
+  }
+}

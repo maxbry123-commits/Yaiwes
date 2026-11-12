@@ -1,0 +1,48 @@
+# Tests for @experiment(shortcircuit): short-circuit evaluation of && and ||.
+# When the left operand alone determines the result, the right operand is not
+# evaluated and any error or incomplete value it carries is suppressed.
+-- cue.mod/module.cue --
+module: "test.com"
+language: version: "v0.17.0"
+-- in.cue --
+@experiment(shortcircuit)
+
+// Incomplete fields used as right operands in short-circuit tests.
+incompleteInt:  int
+incompleteBool: bool
+
+// Short-circuit && : false && anything = false.
+// Right operand not evaluated; errors/incomplete values suppressed.
+andFalseBottom:     false && _|_
+andFalseIncomplete: false && incompleteInt
+andFalseTrue:       false && true
+
+// No short-circuit: && falls through when left is true.
+andTrueTrue:  true && true
+andTrueFalse: true && false
+
+// Short-circuit || : true || anything = true.
+// Right operand not evaluated; errors/incomplete values suppressed.
+orTrueBottom:     true || _|_
+orTrueIncomplete: true || incompleteBool
+orTrueTrue:       true || true
+
+// No short-circuit: || falls through when left is false.
+orFalseFalse: false || false
+orFalseTrue:  false || true
+-- out/compile --
+--- in.cue
+{
+  incompleteInt: int
+  incompleteBool: bool
+  andFalseBottom: (false && _|_(explicit error (_|_ literal) in source))
+  andFalseIncomplete: (false && 〈0;incompleteInt〉)
+  andFalseTrue: (false && true)
+  andTrueTrue: (true && true)
+  andTrueFalse: (true && false)
+  orTrueBottom: (true || _|_(explicit error (_|_ literal) in source))
+  orTrueIncomplete: (true || 〈0;incompleteBool〉)
+  orTrueTrue: (true || true)
+  orFalseFalse: (false || false)
+  orFalseTrue: (false || true)
+}

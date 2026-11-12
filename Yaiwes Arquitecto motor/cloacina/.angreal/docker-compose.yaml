@@ -1,0 +1,76 @@
+---
+# Pinned project name so this backing-services stack is unambiguously Cloacina's
+# and never collides with the default `angreal` project used by other angreal
+# repos on the same machine. `angreal ui`'s full demo/e2e stack is a SEPARATE
+# project (`cloacina-demo`, docker/docker-compose.demo.yml); `angreal purge`
+# tears down both.
+name: cloacina-dev
+services:
+  postgres:
+    image: postgres:16
+    container_name: cloacina-postgres
+    environment:
+      POSTGRES_USER: cloacina
+      POSTGRES_PASSWORD: cloacina
+      POSTGRES_DB: cloacina
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: postgres -c max_connections=500
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloacina"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: cloacina-kafka
+    environment:
+      # KRaft mode (KIP-500) — no ZooKeeper
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      CLUSTER_ID: cloacina-dev-cluster-001
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # CLOACI-T-0804: OIDC test issuer for the relying-party tests. Host-run server
+  # → localhost issuer (see .angreal/dex-config.yaml). Lightweight + in-memory;
+  # only the OIDC tests use it, other lanes just ignore it.
+  dex:
+    image: dexidp/dex:v2.41.1
+    container_name: cloacina-dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex-config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "5556:5556"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:5556/dex/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+    name: cloacina_postgres_data
+  kafka_data:
+    name: cloacina_kafka_data

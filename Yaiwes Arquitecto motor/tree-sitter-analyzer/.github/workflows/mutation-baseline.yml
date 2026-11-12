@@ -1,0 +1,116 @@
+name: Mutation Baseline (RFC-0017)
+
+# Nightly, on the `mutation-test` PR label, or by hand.
+#
+# Fail-closed: every module listed by scripts/run_mutation_baseline.py runs in
+# its own matrix job, and the job fails when mutmut fails, when it produces no
+# stats report or zero mutants, or when the unkilled count exceeds
+# tests/effectiveness/mutation_ratchet.json. The ratchet only goes down. This
+# workflow does not gate merges (it is not part of the Quality Gate); a red
+# nightly run is the signal.
+#
+# mutmut requires os.fork — Linux only; NOT on Windows.
+# Do NOT add this job to the cross-platform reusable test matrix.
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'Module to mutate (all = every module in scripts/run_mutation_baseline.py)'
+        required: false
+        default: 'all'
+        type: string
+  pull_request:
+    types: [labeled]
+  schedule:
+    # Nightly on the default branch; each module job is bounded to 30 minutes.
+    - cron: '0 2 * * *'
+
+jobs:
+  modules:
+    name: Select modules
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'mutation-test')
+    timeout-minutes: 5
+    outputs:
+      modules: ${{ steps.select.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/run_mutation_baseline.py
+          sparse-checkout-cone-mode: false
+      - name: Resolve module list
+        id: select
+        env:
+          MODULE: ${{ github.event.inputs.module || 'all' }}
+        run: |
+          set -euo pipefail
+          all="$(python3 scripts/run_mutation_baseline.py --list)"
+          if [ "$MODULE" = "all" ]; then
+            modules="$all"
+          else
+            # An unknown name fails here instead of producing an empty matrix.
+            python3 -c 'import json,sys; m=sys.argv[1]; sys.exit(0 if m in json.loads(sys.argv[2]) else f"unknown module {m!r}")' "$MODULE" "$all"
+            modules="[\"$MODULE\"]"
+          fi
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+
+  mutation:
+    name: Mutation score (${{ matrix.module }})
+    needs: modules
+    # Linux only — mutmut uses os.fork which does not exist on Windows.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.modules.outputs.modules) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies (dev group includes mutmut)
+        run: uv sync --group dev
+
+      # Not masked: a mutmut failure, a missing report or a ratchet breach
+      # fails this job.
+      - name: Run mutation baseline
+        run: |
+          uv run python scripts/run_mutation_baseline.py "${{ matrix.module }}" \
+            --report-dir mutation-report
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### Mutation: ${{ matrix.module }}"
+            if [ -f "mutation-report/${{ matrix.module }}.json" ]; then
+              echo '```json'
+              cat "mutation-report/${{ matrix.module }}.json"
+              echo '```'
+            else
+              echo "No report was produced (the run failed before mutmut exported its stats)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: mutation-report-${{ matrix.module }}-${{ github.run_id }}
+          path: |
+            mutation-report/
+            mutants/mutmut-cicd-stats.json
+          retention-days: 14
+          if-no-files-found: error

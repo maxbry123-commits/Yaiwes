@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""FacadeTool — the P0 geode-layer dispatcher for the 62 -> 6 consolidation.
+
+A ``FacadeTool`` is a single MCP tool that fans an ``action`` parameter out
+to one of many *inner* tools, without changing the inner tools' logic,
+output, or verdict envelope. It is the foundation every Wave-B facade
+(``nav`` / ``structure`` / ``search`` / ``health`` / ``edit`` / ``project``)
+builds on.
+
+Design constraints distilled from the engineering review
+(``.recon/review-engineering.md``) and PRD §0 Errata:
+
+F4 (Landmine A) — strict-param projection
+    ``BaseMCPTool.__init_subclass__`` wraps every tool's ``execute`` with
+    ``enforce_strict_params`` (``additionalProperties: False`` by default).
+    An inner tool therefore raises ``ValueError: unknown parameter 'action'``
+    if the facade forwards the merged dict verbatim. The facade MUST project
+    the caller's args down to each inner tool's own ``inputSchema.properties``
+    whitelist before delegating: strip facade control keys (``action`` /
+    ``scope`` / ``mode`` when the inner doesn't declare them) AND drop
+    sibling-action params.
+
+    公开门面保持渐进式 schema；选定动作后先按内部 schema 校验。未知字段、拼写
+    错误和同级动作字段必须返回 ``INVALID_ARGUMENT``，不能依靠后续投影静默丢弃。
+
+F5 — bespoke routing
+    Three production routes bypass ``registry[name].execute()``:
+    ``analyze_code_structure`` -> ``table_format_tool``,
+    ``extract_code_section`` -> ``handle_extract_code_section`` (batch
+    reshaping). These register as ``bespoke_map`` callables;
+    the facade forwards the cleaned args (control keys stripped) but does
+    NOT project them to an inner schema — the bespoke callable owns its own
+    arg handling — and tolerates a non-dict return.
+
+R3 — symbol / function_name normalize
+    Some inner tools read ``function_name`` (callers/callees), others read
+    ``symbol`` (navigate/resolve). The facade copies ``symbol`` ->
+    ``function_name`` (when the target inner declares ``function_name`` and
+    the caller didn't set it) BEFORE projection, else the canonical
+    ``symbol`` would be stripped before it could be copied.
+
+G3 — rebind propagation
+    ``server.set_project_path`` loops ``_tools.values()`` calling
+    ``set_project_path`` on each. The facade does NOT override
+    ``set_project_path`` (forbidden by
+    ``test_no_mcp_tool_overrides_set_project_path``); instead it forwards the
+    new root to every held inner instance via the allowed
+    ``_on_project_root_changed`` hook.
+
+The facade never re-wraps the inner's response: ``verdict`` / ``agent_summary``
+stay verbatim so the centralised envelope in
+``base_tool.py`` and the MCP dispatch normaliser remain the single source of
+truth.
+"""
+
+from __future__ import annotations
+
+import difflib
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from ...cache.answer_cache import get_answer_cache
+from ...cache.answer_cache_policy import build_answer_key, provenance_block
+from ...latency import get_latency_recorder
+from .base_tool import BaseMCPTool
+from .facade_discovery import build_help_response
+
+
+def _with_provenance(result: Any, key: Any, served_from: str) -> Any:
+    """Attach the RFC-0027 L6.1 rule-5 visibility block to ``result``.
+
+    ``served_from`` is exactly ``"cache"`` or ``"computed"``. A cache that lies
+    about freshness is worse than no cache, so this is attached to a miss as
+    well as a hit — an agent must never have to infer which it got.
+
+    A non-dict result (an F5 bespoke exit code) is returned untouched; those
+    routes are not on the allowlist, so this is defence in depth.
+    """
+    if not isinstance(result, dict):
+        return result
+    result["provenance"] = provenance_block(key, served_from)
+    return result
+
+
+# A bespoke route may return ``dict`` (normal envelope) or ``int`` (exit code
+# when suppress_output=True).
+BespokeHandler = Callable[[dict[str, Any]], Awaitable[Any]]
+
+# Facade control keys that are never forwarded to an inner tool unless the
+# inner explicitly declares them in its own schema. ``action`` selects the
+# route; ``scope`` / ``mode`` are facade-level discriminators (PRD R2/R4/R5)
+# whose meaning is action-scoped and whose legal set the inner validates.
+_FACADE_CONTROL_KEYS: frozenset[str] = frozenset({"action"})
+
+# 响应层控制字段由门面或公共边界消费；即使某个内部动作不声明，也不是业务参数
+# 拼写错误。投影仍按内部 schema 决定是否转发。
+_FACADE_RESPONSE_CONTROL_KEYS: frozenset[str] = frozenset({"output_format"})
+
+# 每个门面都在公共 inputSchema 中显式公开这些高频核心参数。Wave D 为缩减
+# 工具定义令牌，不再把每个内部工具的参数原样合并到公共模式中；旧做法会把
+# 大量已经退役的外部搜索参数重新带入 ``search``。公共模式只声明跨动作共享
+# 参数，并允许 ``additionalProperties: True``。内部工具专属参数仍可传入，再由
+# ``_project_args`` 按内部工具的真实模式白名单投影，因此 F4 严格参数投影不受
+# 影响。各动作的参数发现信息放在门面的 ``description`` 中，而不塞进模式主体。
+#
+# 参数描述有意保持简短：动作语义已在门面描述中呈现，在八个门面上重复长说明
+# 只会浪费令牌。每项使用一个短句即可保留类型信息和可发现性。
+_CORE_FACADE_PARAMS: dict[str, dict[str, Any]] = {
+    "scope": {
+        "type": "string",
+        "description": "Action discriminator (e.g. point|graph).",
+    },
+    "mode": {"type": "string", "description": "Action sub-mode (e.g. summary|cycles)."},
+    "file_path": {"type": "string", "description": "Target file path."},
+    "symbol": {"type": "string", "description": "Symbol/function name."},
+    "function_name": {
+        "type": "string",
+        "description": "Function name (alias of symbol).",
+    },
+    "query": {"type": "string", "description": "Search query/pattern."},
+    "language": {"type": "string", "description": "Language hint (usually auto)."},
+    "limit": {"type": "integer", "description": "Max results."},
+    "output_format": {
+        "type": "string",
+        "enum": ["json"],
+        "description": "Output format: JSON.",
+    },
+    "target_action": {
+        "type": "string",
+        "description": "Business action to describe when action is help.",
+    },
+}
+
+
+class FacadeTool(BaseMCPTool):
+    """One MCP tool fanning ``action`` out to many inner tools.
+
+    Parameters
+    ----------
+    facade_name:
+        Public MCP tool name (e.g. ``"search"``).
+    action_map:
+        ``{action_name: inner_tool_instance}``. Each inner is a live
+        ``BaseMCPTool`` whose ``execute`` is routed to after arg projection.
+    bespoke_map:
+        Optional ``{action_name: async callable}`` for F5 routes that bypass
+        the registry. The callable receives the cleaned args (control keys
+        stripped, R3-normalized) and owns its own arg handling. Its return
+        may be a ``dict`` or a bare ``int``; the facade forwards it as-is.
+    description:
+        Optional facade description used in ``get_tool_definition``.
+    annotations:
+        Optional MCP annotations dict. A facade spanning read + mutating
+        actions cannot honestly declare a single ``readOnlyHint``; callers
+        pass the honest (usually non-read-only) set or omit it.
+    extra_public_params:
+        Optional ``{param_name: json_schema_spec}`` of facade-specific params
+        surfaced on THIS facade's public inputSchema in addition to
+        ``_CORE_FACADE_PARAMS`` (#640: ``kind`` worked via
+        additionalProperties but was undiscoverable to schema-reading
+        agents). Use sparingly — one high-value param, never a per-inner
+        union (the Wave D token diet stands). Never added to ``required``.
+    action_scoped_params:
+        Optional mapping from a public parameter to the facade actions where it
+        is meaningful. Calls supplying that parameter to another action fail
+        explicitly instead of silently dropping it during inner projection.
+    """
+
+    def __init__(
+        self,
+        facade_name: str,
+        action_map: dict[str, BaseMCPTool],
+        bespoke_map: dict[str, BespokeHandler] | None = None,
+        *,
+        description: str = "",
+        annotations: dict[str, Any] | None = None,
+        project_root: str | None = None,
+        extra_public_params: dict[str, dict[str, Any]] | None = None,
+        action_scoped_params: dict[str, frozenset[str]] | None = None,
+    ) -> None:
+        self.facade_name = facade_name
+        self.action_map: dict[str, BaseMCPTool] = dict(action_map)
+        self.bespoke_map: dict[str, BespokeHandler] = dict(bespoke_map or {})
+        # Inner instances reachable only through a bespoke closure (F5). They
+        # are not in ``action_map`` but still need G3 rebind propagation, so
+        # callers register them via ``register_bespoke_inner``.
+        self._bespoke_inners: list[BaseMCPTool] = []
+        # #1562：bespoke 路由可声明机器可读 schema，供 action=help 返回。
+        self._bespoke_schemas: dict[str, dict[str, Any]] = {}
+        self._description = description
+        self._annotations = annotations
+        self._extra_public_params: dict[str, dict[str, Any]] = dict(
+            extra_public_params or {}
+        )
+        self._action_scoped_params = dict(action_scoped_params or {})
+        # BaseMCPTool.__init__ wires security/path resolver + fires
+        # _on_project_root_changed (which forwards to inner instances).
+        super().__init__(project_root)
+
+    # -- rebind propagation (G3) -------------------------------------------
+
+    def register_bespoke_schema(
+        self, action: str, schema: dict[str, Any] | None
+    ) -> None:
+        """为 bespoke 动作登记 help schema；``None``（inner 无 schema）不登记。"""
+        if action not in self.bespoke_map:
+            raise ValueError(f"{action!r} is not a bespoke action")
+        if schema is not None:
+            self._bespoke_schemas[action] = schema
+
+    def register_bespoke_inner(self, inner: BaseMCPTool) -> None:
+        """Register an inner instance reachable only via a bespoke closure (F5).
+
+        Such an instance is not in ``action_map`` but still needs to be
+        rebound when the project root changes. We rebind it immediately to the
+        facade's current root so it is consistent from the moment of
+        registration, then keep it for future rebinds.
+        """
+        self._bespoke_inners.append(inner)
+        root = self.project_root
+        if root is None:
+            return
+        try:
+            inner.set_project_path(root)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_project_root_changed(self, project_root: str | None) -> None:
+        """Forward the new project root to every held inner instance.
+
+        Called from both ``__init__`` and ``set_project_path`` (via
+        ``_apply_project_root``) in BaseMCPTool. We never override
+        ``set_project_path`` itself — that is forbidden by
+        ``test_no_mcp_tool_overrides_set_project_path``.
+        """
+        # ``action_map`` / ``_bespoke_inners`` are assigned before
+        # super().__init__() in our __init__, so they are present by the time
+        # the init-time hook fires — but guard anyway for subclasses that init
+        # differently.
+        if project_root is None:
+            return
+        inners = list(getattr(self, "action_map", {}).values())
+        inners.extend(getattr(self, "_bespoke_inners", []))
+        for inner in inners:
+            try:
+                inner.set_project_path(project_root)
+            except Exception:  # noqa: BLE001 — one bad inner must not abort rebind
+                pass
+
+    # -- arg projection (F4) + normalize (R3) ------------------------------
+
+    @staticmethod
+    def _inner_property_names(inner: BaseMCPTool) -> set[str]:
+        """Return the inner tool's declared top-level schema property names."""
+        try:
+            definition = inner.get_tool_definition()
+        except Exception:  # noqa: BLE001
+            return set()
+        schema = definition.get("inputSchema") if isinstance(definition, dict) else None
+        if not isinstance(schema, dict):
+            return set()
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            return set()
+        return set(props.keys())
+
+    def _project_args(self, inner: BaseMCPTool, args: dict[str, Any]) -> dict[str, Any]:
+        """Project caller args onto the inner tool's schema whitelist.
+
+        Steps:
+        1. Strip facade control keys (``action``).
+        2. R3 normalize: copy ``symbol`` -> ``function_name`` when the inner
+           declares ``function_name`` and the caller didn't set it. Done
+           BEFORE the whitelist filter so ``symbol`` isn't dropped first.
+        3. Filter to the inner's declared properties (drops sibling-action
+           params + control keys the inner doesn't accept) — required because
+           the inner's strict-param guard rejects unknown keys.
+        """
+        cleaned = {k: v for k, v in args.items() if k not in _FACADE_CONTROL_KEYS}
+        inner_props = self._inner_property_names(inner)
+
+        # R3 normalize — before the whitelist filter.  Inners disagree about
+        # which canonical name they read, so fill whichever one this inner
+        # declares from whichever one the caller used.  Only the
+        # ``symbol`` -> ``function_name`` direction existed, so an agent that
+        # learned ``function_name`` from ``callers`` and passed it to
+        # ``lineage`` got a bare ``KeyError: 'symbol'`` out of the tool instead
+        # of the alias the facade declares in its own schema.
+        if (
+            "symbol" in inner_props
+            and not cleaned.get("symbol")
+            and cleaned.get("function_name")
+        ):
+            cleaned["symbol"] = cleaned["function_name"]
+
+        if (
+            "function_name" in inner_props
+            and not cleaned.get("function_name")
+            and cleaned.get("symbol")
+        ):
+            cleaned["function_name"] = cleaned["symbol"]
+
+        # Wave 1b (audit structure-01): the canonical ``symbol`` also fills
+        # ``class_name`` for inners that declare it (class_hierarchy /
+        # class_inspect), mirroring R3. Without this the facade dropped
+        # ``symbol`` before projection — so class_tree silently returned the
+        # global summary and class_detail raised "class_name is required".
+        if (
+            "class_name" in inner_props
+            and not cleaned.get("class_name")
+            and cleaned.get("symbol")
+        ):
+            cleaned["class_name"] = cleaned["symbol"]
+
+        if not inner_props:
+            # Inner declared no properties — cannot whitelist; forward as-is
+            # minus control keys (the inner's own guard skips empty schemas).
+            return cleaned
+        return {k: v for k, v in cleaned.items() if k in inner_props}
+
+    def _accepted_argument_names(self, inner: BaseMCPTool) -> set[str]:
+        """返回所选动作真正接受的调用参数，包括门面声明的符号别名。"""
+        inner_props = self._inner_property_names(inner)
+        accepted = (
+            set(inner_props) | _FACADE_CONTROL_KEYS | _FACADE_RESPONSE_CONTROL_KEYS
+        )
+        if "symbol" in inner_props:
+            accepted.add("function_name")
+        if "function_name" in inner_props or "class_name" in inner_props:
+            accepted.add("symbol")
+        return accepted
+
+    def _invalid_arguments(
+        self, inner: BaseMCPTool, arguments: dict[str, Any]
+    ) -> list[str]:
+        """找出会被动作投影静默丢弃的调用参数。"""
+        accepted = self._accepted_argument_names(inner)
+        return sorted(key for key in arguments if key not in accepted)
+
+    @staticmethod
+    def _clean_bespoke_args(args: dict[str, Any]) -> dict[str, Any]:
+        """Strip facade control keys for a bespoke route (no schema projection).
+
+        Bespoke handlers (F5) own their own arg validation, so we only remove
+        the facade's own control keys and apply R3 normalize defensively.
+        """
+        cleaned = {k: v for k, v in args.items() if k not in _FACADE_CONTROL_KEYS}
+        if not cleaned.get("function_name") and cleaned.get("symbol"):
+            # Defensive R3 copy; harmless for bespoke handlers that ignore it.
+            cleaned["function_name"] = cleaned["symbol"]
+        if not cleaned.get("symbol") and cleaned.get("function_name"):
+            cleaned["symbol"] = cleaned["function_name"]
+        return cleaned
+
+    # -- error envelope ----------------------------------------------------
+
+    def _available_actions(self) -> list[str]:
+        return sorted(set(self.action_map) | set(self.bespoke_map))
+
+    def _closest_action(self, action: str) -> str | None:
+        """Return the single closest valid action to ``action`` (a likely
+        typo), or ``None`` when nothing is close enough.
+
+        Uses ``difflib.get_close_matches`` over the registered actions so a
+        near-miss like ``navigte`` self-heals to ``navigate`` in-band, saving
+        an agent a wasted discovery turn. A far-off action yields ``None`` (no
+        spurious suggestion)."""
+        matches = difflib.get_close_matches(
+            action, self._available_actions(), n=1, cutoff=0.6
+        )
+        return matches[0] if matches else None
+
+    def _action_error(
+        self, message: str, suggestion: str | None = None
+    ) -> dict[str, Any]:
+        """Return a canonical error envelope listing available actions.
+
+        When ``suggestion`` is set (the closest valid action to a typo'd
+        unknown action), it is prepended to the ``error`` message as a
+        ``did you mean: <suggestion>`` hint and surfaced in the envelope under
+        ``suggestion`` for programmatic recovery. The full valid-action list is
+        still enumerated regardless, so a wrong suggestion never strands the
+        agent."""
+        available = self._available_actions()
+        if suggestion is not None:
+            message = f"did you mean: {suggestion}? {message}"
+        summary_line = f"{self.facade_name}: {message}"
+        if suggestion is not None:
+            next_step = f"Did you mean action {suggestion!r}? Else set action to one of: {', '.join(available)}."
+        elif available:
+            next_step = f"Set action to one of: {', '.join(available)}."
+        else:
+            next_step = "No actions are registered on this facade."
+        return {
+            "success": False,
+            "verdict": "ERROR",
+            "error_type": "validation",
+            "error": message,
+            "facade": self.facade_name,
+            "available_actions": available,
+            "suggestion": suggestion,
+            "summary_line": summary_line,
+            "agent_summary": {
+                "verdict": "ERROR",
+                "summary_line": summary_line,
+                "next_step": next_step,
+            },
+        }
+
+    def _argument_error(
+        self,
+        action: str,
+        inner: BaseMCPTool,
+        invalid: list[str],
+        *,
+        supported_actions: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
+        """返回可由 Agent 自动修复的动作级参数错误。"""
+        allowed = sorted(self._accepted_argument_names(inner))
+        suggestions: dict[str, str] = {}
+        for name in invalid:
+            if supported_actions and name in supported_actions:
+                continue
+            matches = difflib.get_close_matches(name, allowed, n=1, cutoff=0.6)
+            if matches:
+                suggestions[name] = matches[0]
+
+        correction = "; ".join(
+            f"{name!r} -> {suggestions[name]!r}"
+            for name in invalid
+            if name in suggestions
+        )
+        next_step = (
+            f"Use only arguments supported by action {action!r}: {', '.join(allowed)}."
+        )
+        if correction:
+            next_step = f"Correct these arguments: {correction}. {next_step}"
+        if supported_actions:
+            scoped_guidance = "; ".join(
+                f"{name!r} is supported by actions: {', '.join(actions)}"
+                for name, actions in supported_actions.items()
+            )
+            next_step = (
+                f"Remove the action-inapplicable argument or use it with its "
+                f"supported action. {scoped_guidance}. {next_step}"
+            )
+        summary_line = (
+            f"{self.facade_name}.{action}: unsupported arguments: {', '.join(invalid)}"
+        )
+        response: dict[str, Any] = {
+            "success": False,
+            "verdict": "ERROR",
+            "error_type": "validation",
+            "error_code": "INVALID_ARGUMENT",
+            "error": summary_line,
+            "facade": self.facade_name,
+            "action": action,
+            "invalid_arguments": invalid,
+            "allowed_arguments": allowed,
+            "suggestions": suggestions,
+            "summary_line": summary_line,
+            "agent_summary": {
+                "verdict": "ERROR",
+                "summary_line": summary_line,
+                "next_step": next_step,
+            },
+        }
+        if supported_actions:
+            response["supported_actions"] = supported_actions
+        return response
+
+    def _argument_value_error(
+        self, action: str, argument: str, value: Any, allowed_values: list[Any]
+    ) -> dict[str, Any]:
+        """返回门面公共控制字段的值校验错误。"""
+        if action in self.action_map:
+            allowed_arguments = sorted(
+                self._accepted_argument_names(self.action_map[action])
+            )
+        else:
+            allowed_arguments = sorted(self.get_tool_schema()["properties"])
+        summary_line = (
+            f"{self.facade_name}.{action}: invalid value for {argument!r}: {value!r}"
+        )
+        next_step = (
+            f"Set {argument!r} to one of: "
+            + ", ".join(repr(item) for item in allowed_values)
+            + "."
+        )
+        return {
+            "success": False,
+            "verdict": "ERROR",
+            "error_type": "validation",
+            "error_code": "INVALID_ARGUMENT",
+            "error": summary_line,
+            "facade": self.facade_name,
+            "action": action,
+            "invalid_arguments": [argument],
+            "invalid_values": {argument: value},
+            "allowed_arguments": allowed_arguments,
+            "allowed_values": {argument: allowed_values},
+            "suggestions": {},
+            "summary_line": summary_line,
+            "agent_summary": {
+                "verdict": "ERROR",
+                "summary_line": summary_line,
+                "next_step": next_step,
+            },
+        }
+
+    # -- dispatch ----------------------------------------------------------
+
+    async def execute(self, arguments: dict[str, Any]) -> Any:
+        """Route ``arguments['action']`` to the matching inner / bespoke route.
+
+        Returns the inner/bespoke result verbatim (``dict`` or, for F5
+        bespoke routes, possibly a bare ``int``). Never re-wraps the verdict
+        envelope.
+        """
+        action = arguments.get("action")
+        if not action or not isinstance(action, str):
+            return self._action_error("missing required parameter 'action'")
+
+        # 渐进发现入口不进入业务 action 枚举，因此不会扩大公开动作数量。无目标时
+        # 返回精简工作流；指定 target_action 时从真实 inner schema 生成调用契约。
+        if action == "help":
+            return build_help_response(
+                facade_name=self.facade_name,
+                available_actions=self._available_actions(),
+                full_description=self.full_description(),
+                action_map=self.action_map,
+                bespoke_actions=set(self.bespoke_map),
+                arguments=arguments,
+                target_action=arguments.get("target_action"),
+                bespoke_schemas=self._bespoke_schemas,
+            )
+
+        if (
+            (action in self.action_map or action in self.bespoke_map)
+            and "output_format" in arguments
+            and arguments["output_format"] != "json"
+        ):
+            return self._argument_value_error(
+                action, "output_format", arguments["output_format"], ["json"]
+            )
+
+        scoped_invalid = {
+            parameter: sorted(allowed_actions)
+            for parameter, allowed_actions in self._action_scoped_params.items()
+            if parameter in arguments and action not in allowed_actions
+        }
+        if scoped_invalid:
+            if action in self.action_map:
+                return self._argument_error(
+                    action,
+                    self.action_map[action],
+                    sorted(scoped_invalid),
+                    supported_actions=scoped_invalid,
+                )
+            parameter = sorted(scoped_invalid)[0]
+            allowed = ", ".join(scoped_invalid[parameter])
+            return self._action_error(
+                f"parameter {parameter!r} applies only to action(s): {allowed}"
+            )
+
+        # RFC-0025 Layer 5: the facade is the public (tool, action) surface, so
+        # it is the one seam where a latency observation is unambiguous —
+        # instrumenting inner tools instead would double-count every facade
+        # call and key the reservoir by class name rather than by route.
+        # Only the two dispatching branches are timed; the argument-validation
+        # error paths below are not routes and must not pollute the p95.
+        recorder = get_latency_recorder()
+
+        # Bespoke routes (F5) take precedence and bypass schema projection.
+        if action in self.bespoke_map:
+            handler = self.bespoke_map[action]
+            cleaned = self._clean_bespoke_args(arguments)
+            with recorder.measure(self.facade_name, action):
+                return await handler(cleaned)
+
+        if action in self.action_map:
+            inner = self.action_map[action]
+            invalid = self._invalid_arguments(inner, arguments)
+            if invalid:
+                return self._argument_error(action, inner, invalid)
+            projected = self._project_args(inner, arguments)
+            # RFC-0027 L6.1: the answer cache sits on the same seam as the
+            # latency recorder, for the same reason — the facade is the public
+            # (tool, action) surface, so a key built here describes exactly the
+            # question the caller asked. Only allowlisted read-only routes are
+            # eligible; for every other action ``build_answer_key`` returns
+            # ``None`` on an allowlist lookup and the path below is unchanged.
+            #
+            # The whole cache path — key derivation, lookup, store — is INSIDE
+            # the measured window. Deriving the key costs a source-tree
+            # fingerprint (~20 ms on this repo), and the first version of this
+            # code built it outside the recorder: the baseline then reported a
+            # cache hit as 0.0 ms, i.e. the instrumentation lied about the cost
+            # the caller actually waits for. A measurement that flatters the
+            # change is worse than no measurement.
+            with recorder.measure(self.facade_name, action):
+                key = build_answer_key(
+                    self.facade_name, action, projected, self.project_root
+                )
+                if key is None:
+                    return await inner.execute(projected)
+                cache = get_answer_cache()
+                cached = cache.lookup(key)
+                if cached is not None:
+                    return _with_provenance(cached.payload, key, "cache")
+                result = await inner.execute(projected)
+                cache.store(key, result)
+                return _with_provenance(result, key, "computed")
+
+        available = self._available_actions()
+        valid = ", ".join(available) if available else "(none registered)"
+        suggestion = self._closest_action(action)
+        return self._action_error(
+            f"unknown action {action!r}; valid actions are: {valid}",
+            suggestion=suggestion,
+        )
+
+    # -- schema / definition ----------------------------------------------
+
+    def get_tool_schema(self) -> dict[str, Any]:
+        """返回精简的公共门面模式：必需的 ``action`` 加核心共享参数。
+
+        Wave D 通过缩减工具定义控制令牌开销。公共模式不再合并全部内部工具参数，
+        而采用以下规则：
+
+        * ``action`` 是包含全部可路由动作的必需枚举，用于选择路由。
+        * ``_CORE_FACADE_PARAMS`` 显式声明高频跨动作参数，使公共表面保持类型化且
+          可发现。
+        * ``additionalProperties: True`` 接受未列出的内部工具专属参数。
+        * 各动作的参数发现信息放在门面 ``description`` 中，而不放进模式主体。
+
+        F4 不受影响：``_project_args`` 依据 ``inner.get_tool_definition()`` 返回的
+        真实内部模式投影调用参数，不依赖此公共模式。因此精简公共表面不会误投影
+        或泄漏同级动作参数；每个内部工具仍用自己的严格模式保证动作级正确性。
+        """
+        schema_actions = sorted({*self._available_actions(), "help"})
+        properties: dict[str, Any] = {
+            "action": {
+                "type": "string",
+                "enum": schema_actions,
+                "description": (
+                    "Which business capability to invoke, or help for discovery. "
+                    "One of: " + ", ".join(schema_actions)
+                ),
+            },
+        }
+        # Core shared params — copy specs so callers can't mutate our constants.
+        for key, spec in _CORE_FACADE_PARAMS.items():
+            properties[key] = dict(spec)
+        # Facade-specific public params (#640) — declared, never required.
+        for key, spec in self._extra_public_params.items():
+            properties[key] = dict(spec)
+
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": ["action"],
+            # Lenient on purpose: inner-specific params arrive here and are
+            # projected internally against the inner's real schema. Inner tools
+            # remain strict. Self-rejection here would defeat the facade.
+            "additionalProperties": True,
+        }
+
+    def _expensive_route_details(self) -> str:
+        """The owning inner tool's prose for this facade's costly actions.
+
+        A facade replaces its inners, and the inner tools are not separately
+        registered, so prose that lives only on an inner tool is unreachable by
+        any caller. The budget table for ``health action=project`` sat in exactly
+        that position: "SLOW: ... ~4min on <3k" was written on
+        ``check_project_health``, which no client can read, while the call failed
+        at a default timeout.
+
+        ``action=help`` is on-demand, so carrying the detail here costs nothing
+        per request while making the always-sent description's pointer true.
+        """
+        from ...cache.query_cost import EXPENSIVE_ROUTES
+
+        blocks: list[str] = []
+        for (tool, action), _route in sorted(EXPENSIVE_ROUTES.items()):
+            if tool != self.facade_name:
+                continue
+            inner = self.action_map.get(action)
+            if inner is None:
+                continue
+            text = (inner.get_tool_definition().get("description") or "").strip()
+            if text:
+                blocks.append(f"## action={action} (declared expensive)\n{text}")
+        return "\n\n" + "\n\n".join(blocks) if blocks else ""
+
+    def full_description(self) -> str:
+        """The per-action prose, withheld from the tool definition (Wave E).
+
+        Still the single source of the documented-per-action contract: the tests
+        that pin "a documented parameter must exist in the inner schema" read
+        this, and ``action=help`` serves it, so the drift guard keeps working
+        while the always-sent surface stays one keyword-bearing sentence.
+        """
+        base = self._description or self._short_description()
+        return base + self._expensive_route_details()
+
+    def _expensive_action_note(self) -> str:
+        """Name this facade's costly actions, derived from the cost registry.
+
+        The inner tool that owns a slow route carries the full budget prose, but
+        a facade replaces it: an MCP client reads the facade description and
+        never the inner one, so a cost stated only there cannot be read before
+        the call. ``health action=project`` measured 202 s on a 268-package
+        monorepo while its inner description said "SLOW: ... ~4min on <3k" —
+        text no caller could see, and the call failed at the client's default
+        timeout instead.
+
+        Derived rather than restated so the route set has one home in
+        ``EXPENSIVE_ROUTES``. The suffix is a pointer: the bucket table and the
+        ``budget_seconds`` field stay with the route that owns them.
+        """
+        from ...cache.query_cost import EXPENSIVE_ROUTES
+
+        parts: list[str] = []
+        for (tool, action), route in sorted(EXPENSIVE_ROUTES.items()):
+            if tool != self.facade_name:
+                continue
+            note = f"action={action} is slow"
+            if route.cheaper_alternative:
+                note += f" (prefer {route.cheaper_alternative})"
+            parts.append(note)
+        if not parts:
+            return ""
+        return " Cost: " + "; ".join(parts) + "."
+
+    def _short_description(self) -> str:
+        """The keyword-bearing first sentence, with the per-action prose behind ``help``.
+
+        Wave E tool-def token diet. Wave D moved per-action params out of the
+        schema body and into the facade description; this moves the prose out of
+        the tool definition every request pays for and behind an explicit call.
+        Measured on the eight facades: their descriptions are 23,084 of the
+        36,055 characters of tool-definition surface (~9,013 tokens), and
+        collapsing them to this form reclaims 94% of the whole surface.
+
+        The first sentence is kept because it is not decoration. It carries the
+        ``codegraph`` keyword that a headless agent's ToolSearch matches on, and
+        a test pins that. Only the per-action parameter prose — which a caller
+        needs *after* choosing an action, never before — moves behind
+        ``action=help``, where it is still one call away and nothing is lost.
+        """
+        actions = ", ".join(self._available_actions())
+        text = (self._description or "").strip()
+        if not text:
+            return (
+                f"{self.facade_name}: {len(self._available_actions())} actions via "
+                f"'action' ({actions}). Pass action=help with target_action for "
+                "an exact action schema."
+            )
+        head = text.split("\n", 1)[0]
+        first = head.split(". ")[0].rstrip()
+        if not first.endswith("."):
+            first += "."
+        if len(first) > 200:
+            first = first[:197].rstrip() + "..."
+        return (
+            f"{first} Actions: {actions}. "
+            "Pass action=help with target_action for an exact action schema."
+            + self._expensive_action_note()
+        )
+
+    def get_tool_definition(self) -> dict[str, Any]:
+        definition: dict[str, Any] = {
+            "name": self.facade_name,
+            "description": self._short_description(),
+            "inputSchema": self.get_tool_schema(),
+        }
+        if self._annotations is not None:
+            definition["annotations"] = self._annotations
+        return definition
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> bool:
+        """A facade only requires a known ``action``; inner tools validate the
+        rest. Returns True / raises ValueError (BaseMCPTool contract)."""
+        action = arguments.get("action")
+        if not action or not isinstance(action, str):
+            raise ValueError("missing required parameter 'action'")
+        if action == "help":
+            return True
+        if action not in self.action_map and action not in self.bespoke_map:
+            raise ValueError(
+                f"unknown action {action!r}; expected one of "
+                f"{self._available_actions()}"
+            )
+        return True

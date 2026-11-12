@@ -1,0 +1,408 @@
+"""
+Tests for MetadataResolver: ensure decorator defaults, templates, and callables
+resolve with the correct precedence. Tracker.run and ScenarioContext.run rely
+on these guarantees to keep execution logic consistent.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from consist.core.decorators import define_step
+from consist.core.metadata_resolver import MetadataResolver
+
+
+def test_resolver_precedence_overrides_decorator_defaults() -> None:
+    @define_step(outputs=["decorator"], tags=["decorator"], cache_mode="reuse")
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver()
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config={"explicit": True},
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=["explicit"],
+        facet={"explicit": True},
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=True,
+        year=None,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs=None,
+        outputs=["explicit"],
+        output_paths=None,
+        cache_mode="overwrite",
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+
+    assert resolved.outputs == ["explicit"]
+    assert resolved.tags == ["explicit"]
+    assert resolved.cache_mode == "overwrite"
+    assert resolved.config == {"explicit": True}
+    assert resolved.facet == {"explicit": True}
+    assert resolved.facet_index is True
+
+
+def test_resolver_name_template_precedence_and_fallback() -> None:
+    @define_step(name_template="{func_name}__y{year}")
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver(default_name_template="{func_name}__default")
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=2030,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs=None,
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+    assert resolved.name == "step__y2030"
+
+    resolver_default = MetadataResolver(default_name_template="{func_name}__default")
+    resolved_default = resolver_default.resolve(
+        fn=lambda: None,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=None,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs=None,
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+    assert resolved_default.name == "<lambda>__default"
+
+
+def test_resolver_disables_step_defaults_and_templates() -> None:
+    @define_step(outputs=["decorator"], name_template="{func_name}__decorator")
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver(allow_template=False, apply_step_defaults=False)
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=None,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs=None,
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+    assert resolved.outputs is None
+    assert resolved.name == "step"
+
+
+def test_resolver_raises_missing_name() -> None:
+    class CallableNoName:
+        def __call__(self) -> None:
+            return None
+
+    resolver = MetadataResolver()
+    with pytest.raises(ValueError, match="missing"):
+        resolver.resolve(
+            fn=CallableNoName(),
+            name=None,
+            model=None,
+            description=None,
+            config=None,
+            inputs=None,
+            input_keys=None,
+            optional_input_keys=None,
+            tags=None,
+            facet=None,
+            facet_from=None,
+            facet_schema_version=None,
+            facet_index=None,
+            year=None,
+            iteration=None,
+            phase=None,
+            stage=None,
+            consist_settings=None,
+            consist_workspace=None,
+            consist_state=None,
+            runtime_kwargs=None,
+            outputs=None,
+            output_paths=None,
+            cache_mode=None,
+            cache_hydration=None,
+            cache_version=None,
+            validate_cached_outputs=None,
+            load_inputs=None,
+            missing_name_error="missing",
+        )
+
+
+def test_resolver_callable_metadata() -> None:
+    @define_step(
+        model=lambda ctx: f"{ctx.func_name}_model",
+        outputs=lambda ctx: [f"out_{ctx.year}"],
+    )
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver()
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=2040,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs=None,
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+
+    assert resolved.model == "step_model"
+    assert resolved.outputs == ["out_2040"]
+
+
+def test_resolver_decorator_config_and_facet_defaults() -> None:
+    @define_step(
+        config=lambda ctx: {"year": ctx.year},
+        facet=lambda ctx: {"scenario": ctx.runtime_kwargs.get("scenario")},
+        facet_index=True,
+    )
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver()
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=2030,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs={"scenario": "baseline"},
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+
+    assert resolved.config == {"year": 2030}
+    assert resolved.facet == {"scenario": "baseline"}
+    assert resolved.facet_index is True
+
+
+def test_resolver_populates_runtime_fields_from_runtime_kwargs() -> None:
+    @define_step(
+        config=lambda ctx: {"scenario": ctx.runtime_settings["scenario"]},
+        identity_inputs=lambda ctx: [
+            Path("runtime_dep.yaml")
+            if ctx.runtime_workspace == "/workspace/runtime"
+            else Path("other_dep.yaml")
+        ],
+    )
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver()
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=None,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs={
+            "settings": {"scenario": "baseline"},
+            "workspace": "/workspace/runtime",
+        },
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+    )
+
+    assert resolved.config == {"scenario": "baseline"}
+    assert resolved.identity_inputs == [Path("runtime_dep.yaml")]
+
+
+def test_resolver_prefers_explicit_recommended_identity_fields() -> None:
+    decorator_adapter = object()
+    explicit_adapter = object()
+    decorator_dep = Path("decorator_identity.yaml")
+    explicit_dep = Path("explicit_identity.yaml")
+
+    @define_step(adapter=decorator_adapter, identity_inputs=[decorator_dep])
+    def step() -> None:
+        return None
+
+    resolver = MetadataResolver()
+    resolved = resolver.resolve(
+        fn=step,
+        name=None,
+        model=None,
+        description=None,
+        config=None,
+        inputs=None,
+        input_keys=None,
+        optional_input_keys=None,
+        tags=None,
+        facet=None,
+        facet_from=None,
+        facet_schema_version=None,
+        facet_index=None,
+        year=None,
+        iteration=None,
+        phase=None,
+        stage=None,
+        consist_settings=None,
+        consist_workspace=None,
+        consist_state=None,
+        runtime_kwargs=None,
+        outputs=None,
+        output_paths=None,
+        cache_mode=None,
+        cache_hydration=None,
+        cache_version=None,
+        validate_cached_outputs=None,
+        load_inputs=None,
+        missing_name_error="missing",
+        adapter=explicit_adapter,
+        identity_inputs=[explicit_dep],
+    )
+
+    assert resolved.adapter is explicit_adapter
+    assert resolved.identity_inputs == [explicit_dep]

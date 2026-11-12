@@ -1,0 +1,40 @@
+# Pinned to v0.17.0: the subject is definition embedding with siblings
+# before explicitopen is stable.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- in.cue --
+a: {
+	#A
+}
+
+a: c: 1
+
+#A: b: 1
+
+b: {
+	#A
+    leaf: "leaf value"
+    interpolation: "more \(leaf_ref)"
+    leaf_ref: leaf
+
+}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    〈1;#A〉
+  }
+  a: {
+    c: 1
+  }
+  #A: {
+    b: 1
+  }
+  b: {
+    〈1;#A〉
+    leaf: "leaf value"
+    interpolation: "more \(〈0;leaf_ref〉)"
+    leaf_ref: 〈0;leaf〉
+  }
+}

@@ -1,0 +1,37 @@
+[workspace]
+
+[package]
+name = "complex-dag-example"
+version = "0.2.0-alpha.5"
+authors = ["Dylan Storey <dylan.storey@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/colliery-io/cloacina"
+homepage = "https://github.com/colliery-io/cloacina"
+documentation = "https://colliery-io.github.io/cloacina/"
+readme = "README.md"
+keywords = []
+categories = []
+edition = "2024"
+rust-version = "1.99"
+description = "Complex DAG structure example for testing workflow visualization"
+
+[features]
+default = ["packaged"]
+packaged = []
+
+[lib]
+crate-type = ["cdylib"]
+
+# Lean packaged-workflow deps: crates.io VERSION deps (what `cloacinactl
+# package new` emits), resolved against the local crates by the dev/demo
+# compiler's `--dev-workspace`. A packaged workflow needs ONLY the authoring
+# crates — NOT the `cloacina` engine umbrella (Context/TaskError come from
+# cloacina-workflow). (CLOACI-T-0900 re-author off the pre-T-0887 path deps.)
+[dependencies]
+cloacina-macros = "0.12"
+cloacina-workflow = { version = "0.12", features = ["packaged"] }
+cloacina-workflow-plugin = "0.12"
+serde_json = "1.0"
+
+[build-dependencies]
+cloacina-build = "0.12"

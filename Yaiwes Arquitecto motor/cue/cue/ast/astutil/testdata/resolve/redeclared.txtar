@@ -1,0 +1,82 @@
+# Scenarios that produce redeclaration errors from astutil.Resolve.
+# Each .cue file isolates one scenario so out/resolve/errors lists all of
+# them in one place.
+# The old prefix alias syntax (X=) is only accepted below v0.18.0, where
+# @experiment(aliasv2) is stable; pin the language version so
+# that this test keeps exercising it.
+-- cue.mod/module.cue --
+module: "test.example"
+language: version: "v0.17.0"
+-- old_label.cue --
+// Old-style label alias on sibling fields.
+N=("foo"): 1
+N=("bar"): 2
+-- postfix_single.cue --
+@experiment(aliasv2)
+
+// Postfix single-form alias on sibling fields.
+a~X: 1
+b~X: 2
+-- postfix_field.cue --
+@experiment(aliasv2)
+
+// Postfix dual-form, V (field reference) shared across siblings.
+"foo"~(_, V): {a: 1}
+"bar"~(_, V): {b: 2}
+-- postfix_label.cue --
+@experiment(aliasv2)
+
+// Postfix dual-form, K (label name capture) shared across siblings.
+// Regression test for https://cuelang.org/issue/4342.
+"foo"~(N, _): 1
+"bar"~(N, _): 2
+-- let_clauses.cue --
+// Two let clauses with the same name in the same scope.
+top: {
+	let X = 1
+	let X = 2
+	v: X
+}
+-- let_clauses_top.cue --
+// Two let clauses with the same name at file scope.
+let Y = 1
+let Y = 2
+v: Y
+-- alias_field_clash.cue --
+// An alias and a regular field cannot share a name in one scope.
+clash: {
+	let X = 1
+	X: 2
+}
+-- for_clause.cue --
+// A for clause declares its key and value in the same block.
+// See https://cuelang.org/issue/4012.
+structFor: {for k, k in {a: 1} {b: k}}
+listFor: [for i, i in [5] {i}]
+
+// The blank identifier _ declares nothing.
+blank: {for _, _ in [1] {a: _}}
+-- out/resolve/errors --
+cannot have both alias and field with name "X" in same scope:
+    ./alias_field_clash.cue:4:5
+alias "k" redeclared in same scope:
+    ./for_clause.cue:3:20
+alias "i" redeclared in same scope:
+    ./for_clause.cue:4:18
+alias "X" redeclared in same scope:
+    ./let_clauses.cue:4:2
+alias "Y" redeclared in same scope:
+    ./let_clauses_top.cue:3:1
+alias "N" redeclared in same scope:
+    ./old_label.cue:3:1
+alias "V" redeclared in same scope:
+    ./postfix_field.cue:5:1
+alias "N" redeclared in same scope:
+    ./postfix_label.cue:6:8
+alias "X" redeclared in same scope:
+    ./postfix_single.cue:5:1
+-- out/resolve/postfix_label --
+3[N]: Scope: 0[<nil>] Node: 0[]
+4[_]: Scope: 0[<nil>] Node: 0[]
+6[N]: Scope: 0[<nil>] Node: 0[]
+7[_]: Scope: 0[<nil>] Node: 0[]

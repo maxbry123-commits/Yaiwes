@@ -1,0 +1,15 @@
+TODO: the evaluator does not normalize disjuncts.
+It needs to be determined under which circumstances is desirable.
+The redundancy that remains from not normalizing can be useful.
+
+-- in.cue --
+a: string | string
+b: *1 | *int
+c: *1.0 | *float
+-- out/compile --
+--- in.cue
+{
+  a: (string|string)
+  b: (*1|*int)
+  c: (*1.0|*float)
+}

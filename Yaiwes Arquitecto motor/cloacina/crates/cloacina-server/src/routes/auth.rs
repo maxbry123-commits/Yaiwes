@@ -1,0 +1,736 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Bearer token auth middleware with LRU cache.
+//!
+//! Extracts `Authorization: Bearer <key>` headers, hashes the token,
+//! checks an LRU cache (30s TTL) before falling back to the DAL.
+//! Applied via `route_layer` so unauthenticated routes still 404 correctly.
+
+use axum::{
+    extract::{Request, State},
+    http::header,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tracing::warn;
+
+use cloacina::dal::unified::api_keys::ApiKeyInfo;
+
+use crate::AppState;
+use crate::routes::error::ApiError;
+
+/// Authenticated key info inserted into request extensions.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedKey {
+    pub key_id: uuid::Uuid,
+    pub name: String,
+    pub permissions: String,
+    pub tenant_id: Option<String>,
+    pub is_admin: bool,
+}
+
+/// A cached entry with TTL tracking.
+struct CachedEntry {
+    info: ApiKeyInfo,
+    inserted_at: Instant,
+}
+
+/// LRU cache for validated API key hashes with TTL expiry.
+pub struct KeyCache {
+    cache: Mutex<LruCache<String, CachedEntry>>,
+    ttl: Duration,
+}
+
+impl KeyCache {
+    /// Create a new key cache.
+    /// Default: 256 entries, 30 second TTL.
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity).expect("cache capacity must be > 0"),
+            )),
+            ttl,
+        }
+    }
+
+    /// Create with default settings (256 entries, 30s TTL).
+    pub fn default_cache() -> Self {
+        Self::new(256, Duration::from_secs(30))
+    }
+
+    /// Look up a key hash. Returns None if not cached or expired.
+    pub async fn get(&self, hash: &str) -> Option<ApiKeyInfo> {
+        let mut cache = self.cache.lock().await;
+        if let Some(entry) = cache.get(hash) {
+            if entry.inserted_at.elapsed() < self.ttl {
+                return Some(entry.info.clone());
+            }
+            // Expired — lazy eviction
+            cache.pop(hash);
+        }
+        None
+    }
+
+    /// Insert a validated key into the cache.
+    pub async fn insert(&self, hash: String, info: ApiKeyInfo) {
+        let mut cache = self.cache.lock().await;
+        cache.put(
+            hash,
+            CachedEntry {
+                info,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Evict a specific key (used after revocation).
+    #[allow(dead_code)]
+    pub async fn evict(&self, hash: &str) {
+        let mut cache = self.cache.lock().await;
+        cache.pop(hash);
+    }
+
+    /// Clear all entries.
+    pub async fn clear(&self) {
+        let mut cache = self.cache.lock().await;
+        cache.clear();
+    }
+}
+
+/// Validate a bearer token and return the authenticated key info.
+///
+/// Shared logic used by both the HTTP middleware and WebSocket handlers.
+/// Checks the LRU cache first, then falls back to the DAL.
+pub async fn validate_token(state: &AppState, token: &str) -> Result<AuthenticatedKey, ApiError> {
+    let hash = cloacina::security::api_keys::hash_api_key(token);
+
+    // Check cache first (avoids DB hit)
+    if let Some(info) = state.key_cache.get(&hash).await {
+        return Ok(AuthenticatedKey {
+            key_id: info.id,
+            name: info.name,
+            permissions: info.permissions,
+            tenant_id: info.tenant_id,
+            is_admin: info.is_admin,
+        });
+    }
+
+    // Cache miss — check DB
+    let dal = cloacina::dal::DAL::new(state.database.clone());
+    match dal.api_keys().validate_hash(&hash).await {
+        Ok(Some(info)) => {
+            let auth = AuthenticatedKey {
+                key_id: info.id,
+                name: info.name.clone(),
+                permissions: info.permissions.clone(),
+                tenant_id: info.tenant_id.clone(),
+                is_admin: info.is_admin,
+            };
+            state.key_cache.insert(hash, info).await;
+            Ok(auth)
+        }
+        Ok(None) => {
+            warn!("API key validation failed — unknown or revoked key");
+            // CLOACI-T-0595 / API-06: canonical ApiError envelope.
+            Err(ApiError::unauthorized("invalid or revoked API key"))
+        }
+        Err(e) => {
+            warn!("API key validation error: {}", e);
+            Err(ApiError::internal(
+                "internal error during authentication".to_string(),
+            ))
+        }
+    }
+}
+
+/// Auth middleware — validates Bearer token against cache then DAL.
+///
+/// On success, inserts `AuthenticatedKey` into request extensions.
+/// On failure, returns 401 JSON error.
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let token = match extract_bearer_token(&request) {
+        Some(t) => t.to_string(),
+        None => {
+            return ApiError::unauthorized("missing or malformed Authorization header")
+                .into_response();
+        }
+    };
+
+    match validate_token(&state, &token).await {
+        Ok(auth) => {
+            record_auth_span_fields(&tracing::Span::current(), &auth);
+            request.extensions_mut().insert(auth);
+            next.run(request).await
+        }
+        Err(resp) => resp.into_response(),
+    }
+}
+
+/// CLOACI-T-0578: attach `tenant_id`, `key_id`, `role` to the current
+/// request span after authentication. Every downstream `tracing::info!`,
+/// every `audit::log_*` emit, and every OTLP span attribute under this
+/// request inherits the values.
+///
+/// The fields must have been pre-declared as `tracing::field::Empty` on
+/// the span by `request_id_middleware`; recording an unknown field is a
+/// silent no-op (a known footgun called out in T-0578's risk section).
+///
+/// Field mapping:
+/// - `key_id`: the API key's UUID (high cardinality but bounded by total
+///   key count; not used as a Prom label).
+/// - `tenant_id`: the key's tenant scope. `None` + `is_admin = true`
+///   renders as the `<admin>` sentinel so admin actions are still
+///   distinguishable in logs.
+/// - `role`: the `permissions` string (`admin` | `write` | `read`). God
+///   mode (`is_admin = true`) keeps its underlying `permissions` value
+///   here, with admin-ness implied by the sentinel `tenant_id`.
+pub(crate) fn record_auth_span_fields(span: &tracing::Span, auth: &AuthenticatedKey) {
+    span.record("key_id", tracing::field::display(&auth.key_id));
+    match &auth.tenant_id {
+        Some(t) => {
+            span.record("tenant_id", tracing::field::display(t));
+        }
+        None if auth.is_admin => {
+            span.record("tenant_id", "<admin>");
+        }
+        None => {
+            span.record("tenant_id", "<none>");
+        }
+    }
+    span.record("role", auth.permissions.as_str());
+}
+
+/// Extract the Bearer token from the Authorization header.
+fn extract_bearer_token(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+// ---------------------------------------------------------------------------
+// Authorization helpers — used by handlers to enforce tenant and admin checks
+// ---------------------------------------------------------------------------
+
+impl AuthenticatedKey {
+    /// Check if this key can access the given tenant's resources.
+    ///
+    /// - Admin keys (is_admin=true) can access any tenant — god mode. This
+    ///   includes the now-first-class `"public"` tenant.
+    /// - Tenant-scoped keys can only access their own tenant. CLOACI-T-0817:
+    ///   `"public"` is a real named tenant, so a `Some("public")` key accesses
+    ///   `"public"` via the ordinary same-tenant rule below.
+    /// - A non-admin key with `tenant_id=None` accesses nothing. The only
+    ///   legitimate `None` key is the bootstrap/admin key, which is `is_admin`
+    ///   and short-circuits above; we deliberately do NOT let a non-admin `None`
+    ///   key implicitly reach `"public"` — that retired the old `None == public`
+    ///   conflation between the admin realm and the public tenant.
+    pub fn can_access_tenant(&self, tenant_id: &str) -> bool {
+        if self.is_admin {
+            return true;
+        }
+        match &self.tenant_id {
+            Some(key_tenant) => key_tenant == tenant_id,
+            None => false,
+        }
+    }
+
+    /// Returns a 403 response for tenant access denied.
+    pub fn forbidden_response() -> ApiError {
+        ApiError::forbidden("tenant_access_denied", "access denied for this tenant")
+    }
+
+    /// Returns a 403 response for admin-only operations.
+    pub fn admin_required_response() -> ApiError {
+        ApiError::forbidden("admin_required", "admin access required")
+    }
+
+    /// Check if this key has at least write permission.
+    /// Roles: admin > write > read.
+    /// God mode (is_admin) implicitly has all permissions.
+    pub fn can_write(&self) -> bool {
+        self.is_admin || self.permissions == "admin" || self.permissions == "write"
+    }
+
+    /// Check if this key has admin role within its tenant.
+    /// Note: is_admin (god mode) is separate from permissions="admin" (tenant admin).
+    pub fn can_admin(&self) -> bool {
+        self.is_admin || self.permissions == "admin"
+    }
+
+    /// Returns a 403 response for insufficient role.
+    pub fn insufficient_role_response() -> ApiError {
+        ApiError::forbidden("insufficient_permissions", "insufficient permissions")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket ticket store — short-lived, single-use tickets for WS auth
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// A single-use, time-limited ticket for WebSocket authentication.
+/// Avoids exposing long-lived API keys in query parameters.
+struct WsTicket {
+    auth: AuthenticatedKey,
+    expires_at: Instant,
+}
+
+/// Store for single-use WebSocket auth tickets.
+///
+/// **DB-backed when a `Database` is supplied** (CLOACI-T-0916): tickets live
+/// in the `ws_tickets` table, so a ticket minted on one server replica
+/// redeems on ANY replica — no session affinity, mirroring the OIDC
+/// login-flow precedent (T-0801). Single-use is an atomic compare-and-set in
+/// the DAL, so concurrent redeem attempts (even from different replicas)
+/// admit exactly one. Redemption happens once per WS connect, so the DB
+/// round-trip needs no in-memory hot path.
+///
+/// Falls back to an in-memory map when constructed without a DB
+/// (tests / single-process). The in-memory map is bounded to prevent memory
+/// exhaustion from repeated `POST /auth/ws-ticket` calls without consumption;
+/// expired tickets are lazily evicted on `issue()`. The DB path prunes
+/// expired rows opportunistically inside the DAL's `issue`.
+pub struct WsTicketStore {
+    db: Option<cloacina::database::Database>,
+    tickets: Mutex<HashMap<String, WsTicket>>,
+    ttl: Duration,
+    max_capacity: usize,
+}
+
+impl WsTicketStore {
+    /// In-memory store (single process / tests) with the given TTL.
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            db: None,
+            tickets: Mutex::new(HashMap::new()),
+            ttl,
+            max_capacity: 1024,
+        }
+    }
+
+    /// DB-backed store (multi-replica safe). CLOACI-T-0916.
+    pub fn with_db(db: cloacina::database::Database, ttl: Duration) -> Self {
+        Self {
+            db: Some(db),
+            tickets: Mutex::new(HashMap::new()),
+            ttl,
+            max_capacity: 1024,
+        }
+    }
+
+    /// Issue a new ticket for the given authenticated key.
+    /// Returns the ticket string (UUID).
+    pub async fn issue(&self, auth: AuthenticatedKey) -> String {
+        if let Some(db) = &self.db {
+            let dal = cloacina::dal::DAL::new(db.clone());
+            match dal
+                .ws_tickets()
+                .issue(
+                    cloacina::dal::unified::WsTicketAuth {
+                        key_id: auth.key_id,
+                        name: auth.name.clone(),
+                        permissions: auth.permissions.clone(),
+                        tenant_id: auth.tenant_id.clone(),
+                        is_admin: auth.is_admin,
+                    },
+                    self.ttl,
+                )
+                .await
+            {
+                Ok(ticket) => return ticket,
+                Err(e) => {
+                    // Fail closed: an unpersisted ticket must not be handed
+                    // out (it would be unredeemable on other replicas). The
+                    // fresh UUID below is unknown to every store, so the
+                    // client's connect attempt fails cleanly with 401.
+                    warn!("ws-ticket persist failed: {e}");
+                    return uuid::Uuid::new_v4().to_string();
+                }
+            }
+        }
+
+        let ticket = uuid::Uuid::new_v4().to_string();
+        let entry = WsTicket {
+            auth,
+            expires_at: Instant::now() + self.ttl,
+        };
+        let mut store = self.tickets.lock().await;
+
+        // Evict expired tickets
+        let now = Instant::now();
+        store.retain(|_, v| v.expires_at > now);
+
+        // If still at capacity, drop the oldest entry
+        if store.len() >= self.max_capacity {
+            if let Some(oldest_key) = store
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                store.remove(&oldest_key);
+            }
+        }
+
+        store.insert(ticket.clone(), entry);
+        ticket
+    }
+
+    /// Consume a ticket — returns the authenticated key if valid and not
+    /// expired. Single-use: exactly one of any number of concurrent consume
+    /// attempts (on any replica, in DB mode) succeeds.
+    pub async fn consume(&self, ticket: &str) -> Option<AuthenticatedKey> {
+        if let Some(db) = &self.db {
+            let dal = cloacina::dal::DAL::new(db.clone());
+            return match dal.ws_tickets().redeem(ticket).await {
+                Ok(Some(auth)) => Some(AuthenticatedKey {
+                    key_id: auth.key_id,
+                    name: auth.name,
+                    permissions: auth.permissions,
+                    tenant_id: auth.tenant_id,
+                    is_admin: auth.is_admin,
+                }),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("ws-ticket redeem failed: {e}");
+                    None
+                }
+            };
+        }
+
+        let mut store = self.tickets.lock().await;
+        if let Some(entry) = store.remove(ticket) {
+            if entry.expires_at > Instant::now() {
+                return Some(entry.auth);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_auth(name: &str) -> AuthenticatedKey {
+        AuthenticatedKey {
+            key_id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            permissions: "read".to_string(),
+            tenant_id: None,
+            is_admin: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ticket_issue_and_consume() {
+        let store = WsTicketStore::new(Duration::from_secs(60));
+        let auth = make_auth("test-key");
+        let ticket = store.issue(auth.clone()).await;
+
+        let consumed = store.consume(&ticket).await;
+        assert!(consumed.is_some(), "valid ticket should be consumed");
+        assert_eq!(consumed.unwrap().name, "test-key");
+    }
+
+    #[tokio::test]
+    async fn test_ticket_single_use() {
+        let store = WsTicketStore::new(Duration::from_secs(60));
+        let ticket = store.issue(make_auth("key")).await;
+
+        let first = store.consume(&ticket).await;
+        assert!(first.is_some(), "first consume should succeed");
+
+        let second = store.consume(&ticket).await;
+        assert!(second.is_none(), "second consume should fail (single-use)");
+    }
+
+    #[tokio::test]
+    async fn test_ticket_invalid_rejected() {
+        let store = WsTicketStore::new(Duration::from_secs(60));
+        store.issue(make_auth("key")).await;
+
+        let result = store.consume("not-a-real-ticket").await;
+        assert!(result.is_none(), "invalid ticket should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_ticket_expired_rejected() {
+        let store = WsTicketStore::new(Duration::from_millis(1));
+        let ticket = store.issue(make_auth("key")).await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let result = store.consume(&ticket).await;
+        assert!(result.is_none(), "expired ticket should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_ticket_store_bounded() {
+        let store = WsTicketStore::new(Duration::from_secs(60));
+        // Override max_capacity for testing
+        let store = WsTicketStore {
+            max_capacity: 3,
+            ..store
+        };
+
+        // Issue 4 tickets — store should evict oldest when at capacity
+        let _t1 = store.issue(make_auth("key1")).await;
+        let _t2 = store.issue(make_auth("key2")).await;
+        let _t3 = store.issue(make_auth("key3")).await;
+        let t4 = store.issue(make_auth("key4")).await;
+
+        // Store should have at most 3 entries
+        let count = store.tickets.lock().await.len();
+        assert!(
+            count <= 3,
+            "store should be bounded to max_capacity, got {}",
+            count
+        );
+
+        // Most recent ticket should still be valid
+        let result = store.consume(&t4).await;
+        assert!(
+            result.is_some(),
+            "most recent ticket should survive eviction"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CLOACI-T-0578: span field recording
+    // -----------------------------------------------------------------------
+
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct StringWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for StringWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for StringWriter {
+        type Writer = StringWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a `tracing` subscriber that pre-declares the three
+    /// CLOACI-T-0578 fields as Empty, then captures and returns the
+    /// subscriber output. Inside `f`, the current span is the pre-declared
+    /// one — so `record(...)` calls actually attach values.
+    fn capture_under_request_span<F>(f: F) -> String
+    where
+        F: FnOnce(&tracing::Span),
+    {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = StringWriter(buffer.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "request",
+                tenant_id = tracing::field::Empty,
+                key_id = tracing::field::Empty,
+                role = tracing::field::Empty,
+            );
+            let _guard = span.enter();
+            f(&span);
+            // Emit one event inside the span to force a subscriber flush
+            // that includes the recorded fields.
+            tracing::info!("span fields probe");
+        });
+
+        let bytes = buffer.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn make_auth_with(tenant: Option<&str>, is_admin: bool, permissions: &str) -> AuthenticatedKey {
+        AuthenticatedKey {
+            key_id: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            permissions: permissions.to_string(),
+            tenant_id: tenant.map(str::to_string),
+            is_admin,
+        }
+    }
+
+    #[test]
+    fn record_auth_span_fields_tenant_scoped() {
+        let auth = make_auth_with(Some("acme"), false, "write");
+        let key_id_str = auth.key_id.to_string();
+        let output = capture_under_request_span(|span| {
+            record_auth_span_fields(span, &auth);
+        });
+        assert!(
+            output.contains("tenant_id=\"acme\"") || output.contains("tenant_id=acme"),
+            "expected tenant_id=acme in: {output}"
+        );
+        assert!(
+            output.contains(&key_id_str),
+            "expected key_id {key_id_str} in: {output}"
+        );
+        assert!(
+            output.contains("role=\"write\"") || output.contains("role=write"),
+            "expected role=write in: {output}"
+        );
+    }
+
+    #[test]
+    fn record_auth_span_fields_admin_sentinel() {
+        let auth = make_auth_with(None, true, "admin");
+        let output = capture_under_request_span(|span| {
+            record_auth_span_fields(span, &auth);
+        });
+        // Admin god-mode without an explicit tenant renders the <admin>
+        // sentinel so admin actions are still distinguishable in logs.
+        assert!(
+            output.contains("<admin>"),
+            "expected <admin> sentinel in: {output}"
+        );
+        assert!(
+            output.contains("role=\"admin\"") || output.contains("role=admin"),
+            "expected role=admin in: {output}"
+        );
+    }
+
+    #[test]
+    fn record_auth_span_fields_no_tenant_no_admin() {
+        // Global key (no tenant, not admin) — renders <none> sentinel.
+        let auth = make_auth_with(None, false, "read");
+        let output = capture_under_request_span(|span| {
+            record_auth_span_fields(span, &auth);
+        });
+        assert!(
+            output.contains("<none>"),
+            "expected <none> sentinel in: {output}"
+        );
+    }
+
+    #[test]
+    fn record_auth_span_fields_unauth_request_leaves_empty() {
+        // No call to record_auth_span_fields — fields stay Empty and
+        // should not render with concrete values in the captured output.
+        let output = capture_under_request_span(|_span| {
+            // intentionally no recording
+        });
+        // Empty fields don't render as "field=<value>"; they're omitted
+        // by the fmt subscriber. So the output should NOT contain a
+        // populated tenant_id.
+        assert!(
+            !output.contains("tenant_id=\"") && !output.contains("tenant_id=ac"),
+            "unauthenticated request must not show populated tenant_id: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ticket_store_evicts_expired_on_issue() {
+        let store = WsTicketStore::new(Duration::from_millis(1));
+
+        // Issue tickets that will expire
+        store.issue(make_auth("expired1")).await;
+        store.issue(make_auth("expired2")).await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Issue a new ticket — should evict expired ones
+        let store = WsTicketStore {
+            db: None,
+            tickets: store.tickets,
+            ttl: Duration::from_secs(60), // new tickets get long TTL
+            max_capacity: store.max_capacity,
+        };
+        let fresh = store.issue(make_auth("fresh")).await;
+
+        // Only the fresh ticket should remain
+        let count = store.tickets.lock().await.len();
+        assert_eq!(count, 1, "expired tickets should be evicted on issue");
+
+        let result = store.consume(&fresh).await;
+        assert!(result.is_some(), "fresh ticket should be valid");
+    }
+
+    // -----------------------------------------------------------------------
+    // CLOACI-T-0817: `can_access_tenant` after retiring the `None == public`
+    // duality. "public" is a first-class named tenant; the admin/bootstrap
+    // `None` key keeps god-mode; a non-admin `None` key reaches nothing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn admin_key_can_access_public_and_any_tenant() {
+        // The bootstrap/god key: tenant=None + is_admin.
+        let god = make_auth_with(None, true, "admin");
+        assert!(god.can_access_tenant("public"));
+        assert!(god.can_access_tenant("acme"));
+        assert!(god.can_access_tenant("anything-at-all"));
+    }
+
+    #[test]
+    fn public_tenant_key_accesses_public_only() {
+        let public_key = make_auth_with(Some("public"), false, "admin");
+        assert!(
+            public_key.can_access_tenant("public"),
+            "a Some(\"public\") key reaches the public tenant via same-tenant"
+        );
+        assert!(
+            !public_key.can_access_tenant("acme"),
+            "the public tenant is isolated from named tenants"
+        );
+    }
+
+    #[test]
+    fn named_tenant_key_accesses_own_tenant_only() {
+        let acme = make_auth_with(Some("acme"), false, "write");
+        assert!(acme.can_access_tenant("acme"));
+        assert!(!acme.can_access_tenant("public"));
+        assert!(!acme.can_access_tenant("beta"));
+    }
+
+    #[test]
+    fn non_admin_none_key_accesses_nothing() {
+        // Retired behavior: a non-admin None key used to reach "public".
+        let orphan = make_auth_with(None, false, "admin");
+        assert!(
+            !orphan.can_access_tenant("public"),
+            "a non-admin None key must NOT implicitly reach the public tenant"
+        );
+        assert!(!orphan.can_access_tenant("acme"));
+    }
+}

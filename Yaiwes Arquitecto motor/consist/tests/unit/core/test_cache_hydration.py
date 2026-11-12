@@ -1,0 +1,3293 @@
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+from sqlmodel import SQLModel
+
+from consist.core.cache import ActiveRunCacheOptions, hydrate_cache_hit_outputs
+from consist.core.materialize import (
+    build_materialize_items_for_keys,
+    materialize_artifacts,
+    materialize_artifacts_from_sources,
+)
+from consist.core.tracker import Tracker
+from consist.models.artifact import Artifact
+from consist.models.artifact_schema import (
+    ArtifactSchema,
+    ArtifactSchemaField,
+    ArtifactSchemaObservation,
+    ArtifactSchemaRelation,
+)
+from consist.models.config_facet import ConfigFacet
+from consist.models.run import ConsistRecord, Run, RunArtifactLink, RunArtifacts
+from consist.models.run_config_kv import RunConfigKV
+from consist.types import (
+    ArtifactSpec,
+    CacheOptions,
+    EnumCapture,
+    ExecutionOptions,
+    FilenamePattern,
+    OutputSet,
+)
+
+
+def _init_core_tables(tracker: Tracker) -> None:
+    core_tables = [
+        getattr(Run, "__table__"),
+        getattr(Artifact, "__table__"),
+        getattr(RunArtifactLink, "__table__"),
+        getattr(ConfigFacet, "__table__"),
+        getattr(RunConfigKV, "__table__"),
+        getattr(ArtifactSchema, "__table__"),
+        getattr(ArtifactSchemaField, "__table__"),
+        getattr(ArtifactSchemaObservation, "__table__"),
+        getattr(ArtifactSchemaRelation, "__table__"),
+    ]
+    if tracker.engine:
+        with tracker.engine.connect() as connection:
+            with connection.begin():
+                SQLModel.metadata.create_all(connection, tables=core_tables)
+                if tracker.db:
+                    tracker.db._relax_run_parent_fk()
+                    tracker.db._ensure_schema_links_view()
+
+
+def test_outputs_requested_selects_complete_same_identity_candidate(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"a-{calls}\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text(f"b-{calls}\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    incomplete = tracker_a.run(
+        fn=write_outputs,
+        name="candidate_selection",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    incomplete.outputs["b"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    complete = tracker_b.run(
+        fn=write_outputs,
+        name="candidate_selection",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_mode="overwrite"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_c = Tracker(run_dir=tmp_path / "runs_c", db_path=db_path)
+    _init_core_tables(tracker_c)
+    cache_key = (
+        incomplete.run.config_hash or "",
+        incomplete.run.input_hash or "",
+        incomplete.run.git_hash or "",
+    )
+    tracker_c._local_cache_index[cache_key] = incomplete.run
+
+    result = tracker_c.run(
+        fn=write_outputs,
+        name="candidate_selection",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 2
+    assert result.cache_hit is True
+    assert result.run.meta["cache_source"] == complete.run.id
+    assert (
+        Path(result.run.meta["materialized_outputs"]["a"]).read_text(encoding="utf-8")
+        == "a-2\n"
+    )
+    assert (
+        Path(result.run.meta["materialized_outputs"]["b"]).read_text(encoding="utf-8")
+        == "b-2\n"
+    )
+
+
+def test_outputs_requested_incomplete_only_candidate_is_a_cache_miss(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"a-{calls}\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text(f"b-{calls}\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    incomplete = tracker_a.run(
+        fn=write_outputs,
+        name="incomplete_candidate_miss",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    incomplete.outputs["b"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    result = tracker_b.run(
+        fn=write_outputs,
+        name="incomplete_candidate_miss",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 2
+    assert result.cache_hit is False
+    assert "cache_hit" not in (result.run.meta or {})
+    assert result.outputs["a"].path.read_text(encoding="utf-8") == "a-2\n"
+    assert result.outputs["b"].path.read_text(encoding="utf-8") == "b-2\n"
+
+
+def test_outputs_requested_fallback_replaces_incomplete_local_candidate(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"a-{calls}\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text(f"b-{calls}\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    incomplete = tracker_a.run(
+        fn=write_outputs,
+        name="fallback_candidate_replacement",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    incomplete.outputs["b"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    cache_key = (
+        incomplete.run.config_hash or "",
+        incomplete.run.input_hash or "",
+        incomplete.run.git_hash or "",
+    )
+    tracker_b._local_cache_index[cache_key] = incomplete.run
+
+    fallback = tracker_b.run(
+        fn=write_outputs,
+        name="fallback_candidate_replacement",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    replay = tracker_b.run(
+        fn=write_outputs,
+        name="fallback_candidate_replacement",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 2
+    assert fallback.cache_hit is False
+    assert replay.cache_hit is True
+    assert replay.run.meta["cache_source"] == fallback.run.id
+    assert (
+        Path(replay.run.meta["materialized_outputs"]["a"]).read_text(encoding="utf-8")
+        == "a-2\n"
+    )
+    assert (
+        Path(replay.run.meta["materialized_outputs"]["b"]).read_text(encoding="utf-8")
+        == "b-2\n"
+    )
+
+
+def test_outputs_requested_preflights_stale_candidates_before_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"a-{calls}\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text(f"b-{calls}\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    stale = tracker_a.run(
+        fn=write_outputs,
+        name="preflight_stale_candidates",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    stale.outputs["b"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    second_stale = tracker_b.run(
+        fn=write_outputs,
+        name="preflight_stale_candidates",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_mode="overwrite"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    second_stale.outputs["a"].path.unlink()
+
+    tracker_c = Tracker(run_dir=tmp_path / "runs_c", db_path=db_path)
+    _init_core_tables(tracker_c)
+    complete = tracker_c.run(
+        fn=write_outputs,
+        name="preflight_stale_candidates",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_mode="overwrite"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_d = Tracker(run_dir=tmp_path / "runs_d", db_path=db_path)
+    _init_core_tables(tracker_d)
+    monkeypatch.setattr(
+        tracker_d,
+        "_find_matching_cached_runs",
+        lambda *_args, **_kwargs: [stale.run, second_stale.run, complete.run],
+    )
+    materialized_run_ids: list[str] = []
+    original_materialize = Tracker.materialize_run_outputs
+
+    def record_materialization(self, run_id: str, **kwargs):
+        materialized_run_ids.append(run_id)
+        return original_materialize(self, run_id, **kwargs)
+
+    monkeypatch.setattr(Tracker, "materialize_run_outputs", record_materialization)
+
+    result = tracker_d.run(
+        fn=write_outputs,
+        name="preflight_stale_candidates",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 3
+    assert result.cache_hit is True
+    assert result.run.meta["cache_source"] == complete.run.id
+    assert materialized_run_ids == [complete.run.id]
+    assert any(
+        "rejected before materialization: missing recovery source" in record.message
+        for record in caplog.records
+    )
+
+
+def test_outputs_requested_rejects_copy_failure_after_source_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"a-{calls}\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text(f"b-{calls}\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    copy_failure = tracker_a.run(
+        fn=write_outputs,
+        name="preflight_copy_failure",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    complete = tracker_b.run(
+        fn=write_outputs,
+        name="preflight_copy_failure",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_mode="overwrite"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_c = Tracker(run_dir=tmp_path / "runs_c", db_path=db_path)
+    _init_core_tables(tracker_c)
+    monkeypatch.setattr(
+        tracker_c,
+        "_find_matching_cached_runs",
+        lambda *_args, **_kwargs: [copy_failure.run, complete.run],
+    )
+    materialized_run_ids: list[str] = []
+    original_materialize = Tracker.materialize_run_outputs
+
+    def fail_first_materialization(self, run_id: str, **kwargs):
+        materialized_run_ids.append(run_id)
+        if run_id == copy_failure.run.id:
+            return SimpleNamespace(
+                materialized={},
+                skipped_missing_source=[],
+                failed=["a"],
+                summary="failed=1",
+            )
+        return original_materialize(self, run_id, **kwargs)
+
+    monkeypatch.setattr(Tracker, "materialize_run_outputs", fail_first_materialization)
+
+    result = tracker_c.run(
+        fn=write_outputs,
+        name="preflight_copy_failure",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 2
+    assert result.cache_hit is True
+    assert result.run.meta["cache_source"] == complete.run.id
+    assert materialized_run_ids == [copy_failure.run.id, complete.run.id]
+    assert any(
+        "rejected after materialization: copy/validation failure" in record.message
+        for record in caplog.records
+    )
+
+
+def test_outputs_requested_unrecoverable_candidates_execute_once_without_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"a-{calls}\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text(f"b-{calls}\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    stale = tracker_a.run(
+        fn=write_outputs,
+        name="preflight_unrecoverable",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    stale.outputs["b"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    monkeypatch.setattr(
+        tracker_b,
+        "_find_matching_cached_runs",
+        lambda *_args, **_kwargs: [stale.run],
+    )
+    materialized_run_ids: list[str] = []
+    original_materialize = Tracker.materialize_run_outputs
+
+    def record_materialization(self, run_id: str, **kwargs):
+        materialized_run_ids.append(run_id)
+        return original_materialize(self, run_id, **kwargs)
+
+    monkeypatch.setattr(Tracker, "materialize_run_outputs", record_materialization)
+
+    result = tracker_b.run(
+        fn=write_outputs,
+        name="preflight_unrecoverable",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 2
+    assert result.cache_hit is False
+    assert materialized_run_ids == []
+    assert any(
+        "rejected before materialization: missing recovery source" in record.message
+        for record in caplog.records
+    )
+
+
+def test_outputs_requested_materializes_a_recoverable_first_candidate_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_outputs(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text("a\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text("b\n", encoding="utf-8")
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    complete = tracker_a.run(
+        fn=write_outputs,
+        name="preflight_complete_candidate",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    materialized_run_ids: list[str] = []
+    original_materialize = Tracker.materialize_run_outputs
+
+    def record_materialization(self, run_id: str, **kwargs):
+        materialized_run_ids.append(run_id)
+        return original_materialize(self, run_id, **kwargs)
+
+    monkeypatch.setattr(Tracker, "materialize_run_outputs", record_materialization)
+
+    result = tracker_b.run(
+        fn=write_outputs,
+        name="preflight_complete_candidate",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 1
+    assert result.cache_hit is True
+    assert result.run.meta["cache_source"] == complete.run.id
+    assert materialized_run_ids == [complete.run.id]
+
+
+def test_outputs_requested_miss_policy_demotes_missing_requested_key(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    calls: list[str] = []
+
+    def write_outputs(ctx) -> None:
+        calls.append(ctx.run_dir.name)
+        (ctx.run_dir / "a.txt").write_text("a\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text("b\n", encoding="utf-8")
+
+    first = tracker_a.run(
+        fn=write_outputs,
+        name="strict_requested_outputs",
+        output_paths={"a": "a.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    second = tracker_b.run(
+        fn=write_outputs,
+        name="strict_requested_outputs",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert len(calls) == 2
+    assert second.cache_hit is False
+    assert set(second.outputs) == {"a", "b"}
+    assert second.outputs["a"].path.read_text(encoding="utf-8") == "a\n"
+    assert second.outputs["b"].path.read_text(encoding="utf-8") == "b\n"
+    assert second.outputs["a"].id != first.outputs["a"].id
+    assert "cache_hit" not in (second.run.meta or {})
+    assert "cache_source" not in (second.run.meta or {})
+    linked_outputs = tracker_b.get_artifacts_for_run(second.run.id).outputs
+    assert {artifact.id for artifact in linked_outputs.values()} == {
+        artifact.id for artifact in second.outputs.values()
+    }
+
+
+def test_outputs_requested_miss_policy_keeps_complete_candidate_as_hit(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    calls = 0
+
+    def write_output(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text("a\n", encoding="utf-8")
+
+    tracker_a.run(
+        fn=write_output,
+        name="strict_complete_candidate",
+        output_paths={"a": "a.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    result = tracker_b.run(
+        fn=write_output,
+        name="strict_complete_candidate",
+        output_paths={"a": "a.txt"},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 1
+    assert result.cache_hit is True
+    materialized = Path(result.run.meta["materialized_outputs"]["a"])
+    assert materialized.read_text(encoding="utf-8") == "a\n"
+
+
+def test_outputs_requested_miss_policy_removes_partial_candidate_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    observed_before_fresh_execution: list[bool] = []
+
+    def write_output(ctx) -> None:
+        output_path = ctx.run_dir / "a.txt"
+        observed_before_fresh_execution.append(output_path.exists())
+        output_path.write_text("fresh\n", encoding="utf-8")
+
+    tracker_a.run(
+        fn=write_output,
+        name="strict_promotion_failure",
+        output_paths={"a": "a.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    def partially_promote(*, items, **kwargs):
+        _, source, destination = items[0]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+        return {}
+
+    monkeypatch.setattr(
+        "consist.core.materialize.materialize_artifacts_from_sources",
+        partially_promote,
+    )
+    result = tracker_b.run(
+        fn=write_output,
+        name="strict_promotion_failure",
+        output_paths={"a": "a.txt"},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert result.cache_hit is False
+    assert observed_before_fresh_execution == [False, False]
+    assert result.outputs["a"].path.read_text(encoding="utf-8") == "fresh\n"
+
+
+def test_outputs_requested_miss_policy_demotes_missing_source(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    calls = 0
+
+    def write_output(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        (ctx.run_dir / "a.txt").write_text(f"run={calls}\n", encoding="utf-8")
+
+    first = tracker_a.run(
+        fn=write_output,
+        name="strict_missing_source",
+        output_paths={"a": "a.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    first.outputs["a"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    result = tracker_b.run(
+        fn=write_output,
+        name="strict_missing_source",
+        output_paths={"a": "a.txt"},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 2
+    assert result.cache_hit is False
+    assert result.outputs["a"].path.read_text(encoding="utf-8") == "run=2\n"
+
+
+def test_outputs_requested_miss_policy_does_not_promote_partial_staging(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    observed_a_before_execution: list[bool] = []
+
+    def write_outputs(ctx) -> None:
+        a_path = ctx.run_dir / "a.txt"
+        observed_a_before_execution.append(a_path.exists())
+        a_path.write_text("a\n", encoding="utf-8")
+        (ctx.run_dir / "b.txt").write_text("b\n", encoding="utf-8")
+
+    first = tracker_a.run(
+        fn=write_outputs,
+        name="strict_partial_staging",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    first.outputs["b"].path.unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    result = tracker_b.run(
+        fn=write_outputs,
+        name="strict_partial_staging",
+        output_paths={"a": "a.txt", "b": "b.txt"},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert result.cache_hit is False
+    assert observed_a_before_execution == [False, False]
+    assert result.outputs["a"].path.read_text(encoding="utf-8") == "a\n"
+    assert result.outputs["b"].path.read_text(encoding="utf-8") == "b\n"
+
+
+def test_miss_policy_requires_requested_output_hydration(tmp_path: Path) -> None:
+    tracker = Tracker(run_dir=tmp_path / "runs")
+
+    with pytest.raises(
+        ValueError,
+        match="cache_hydration_failure='miss' requires cache_hydration='outputs-requested' or 'outputs-all'",
+    ):
+        tracker.run(
+            fn=lambda: None,
+            name="invalid_strict_hydration",
+            cache_options=CacheOptions(cache_hydration_failure="miss"),
+        )
+
+
+def test_outputs_requested_miss_policy_accepts_complete_zarr_directory(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    calls = 0
+
+    def write_zarr(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        zarr_path = ctx.run_dir / "skims.zarr"
+        zarr_path.mkdir()
+        (zarr_path / "0.0").write_bytes(b"skim")
+
+    output_paths = {"skims": ArtifactSpec(path="skims.zarr", driver="zarr")}
+    tracker_a.run(
+        fn=write_zarr,
+        name="strict_zarr_candidate",
+        output_paths=output_paths,
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    result = tracker_b.run(
+        fn=write_zarr,
+        name="strict_zarr_candidate",
+        output_paths=output_paths,
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == 1
+    assert result.cache_hit is True
+    materialized = Path(result.run.meta["materialized_outputs"]["skims"])
+    assert (materialized / "0.0").read_bytes() == b"skim"
+
+
+def test_tracker_run_output_set_cache_hit_materializes_members_under_new_root(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+    calls: list[str] = []
+
+    def step_a(ctx) -> None:
+        calls.append("a")
+        output_set_root = ctx.run_dir / "annual"
+        output_set_root.mkdir(parents=True, exist_ok=True)
+        (output_set_root / "annual_2030.csv").write_text("year,value\n2030,1\n")
+        (output_set_root / "annual_2035.csv").write_text("year,value\n2035,2\n")
+
+    first = tracker_a.run(
+        fn=step_a,
+        name="annual_step",
+        output_sets={"annual": OutputSet(root="annual", include="annual_*.csv")},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == ["a"]
+    assert set(first.outputs) == {"annual"}
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    def step_b(ctx) -> None:
+        calls.append("b")
+        raise AssertionError("cache hit should skip execution")
+
+    second = tracker_b.run(
+        fn=step_b,
+        name="annual_step",
+        output_sets={"annual": OutputSet(root="rehydrated", include="annual_*.csv")},
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert calls == ["a"]
+    assert second.cache_hit is True
+    assert set(second.outputs) == {"annual"}
+    assert second.outputs["annual"].meta["artifact_set"] is True
+    hydrated_root = run_dir_b / "outputs" / "annual_step" / second.run.id / "rehydrated"
+    assert (hydrated_root / "annual_2030.csv").read_text() == "year,value\n2030,1\n"
+    assert (hydrated_root / "annual_2035.csv").read_text() == "year,value\n2035,2\n"
+
+
+def test_tracker_run_output_set_cache_hit_validates_expected_members(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    def step_a(ctx) -> None:
+        output_set_root = ctx.run_dir / "annual"
+        output_set_root.mkdir(parents=True, exist_ok=True)
+        (output_set_root / "annual_2030.csv").write_text("year,value\n2030,1\n")
+
+    tracker_a.run(
+        fn=step_a,
+        name="annual_step",
+        output_sets={
+            "annual": OutputSet(
+                root="annual",
+                include="annual_*.csv",
+                expected_members=["annual_2030.csv"],
+            )
+        },
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    def step_b(ctx) -> None:
+        raise AssertionError("cache hit should validate before execution")
+
+    with pytest.raises(ValueError, match="missing expected members"):
+        tracker_b.run(
+            fn=step_b,
+            name="annual_step",
+            output_sets={
+                "annual": OutputSet(
+                    root="rehydrated",
+                    include="annual_*.csv",
+                    expected_members=["annual_2030.csv", "annual_2035.csv"],
+                )
+            },
+            cache_options=CacheOptions(cache_hydration="outputs-requested"),
+            execution_options=ExecutionOptions(inject_context="ctx"),
+        )
+
+
+def test_tracker_run_output_set_cache_hit_changes_when_capture_allowlist_changes(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    calls: list[str] = []
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    def step_a(ctx) -> None:
+        calls.append("a")
+        output_set_root = ctx.run_dir / "trips"
+        output_set_root.mkdir(parents=True, exist_ok=True)
+        (output_set_root / "trip_home.csv").write_text("purpose\nhome\n")
+
+    first = tracker_a.run(
+        fn=step_a,
+        name="trip_step",
+        output_sets={
+            "trips": OutputSet(
+                root="trips",
+                include=FilenamePattern.glob("trip_*.csv").with_captures(
+                    EnumCapture(
+                        name="purpose",
+                        allowed={"home", "work"},
+                        wildcard=1,
+                    )
+                ),
+            )
+        },
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert first.cache_hit is False
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    def step_b(ctx) -> None:
+        calls.append("b")
+        output_set_root = ctx.run_dir / "trips"
+        output_set_root.mkdir(parents=True, exist_ok=True)
+        (output_set_root / "trip_home.csv").write_text("purpose\nhome\n")
+
+    second = tracker_b.run(
+        fn=step_b,
+        name="trip_step",
+        output_sets={
+            "trips": OutputSet(
+                root="trips",
+                include=FilenamePattern.glob("trip_*.csv").with_captures(
+                    EnumCapture(
+                        name="purpose",
+                        allowed={"home", "work", "shopping"},
+                        wildcard=1,
+                    )
+                ),
+            )
+        },
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert second.cache_hit is False
+    assert calls == ["a", "b"]
+
+
+def test_cache_hydration_policies_end_to_end(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Consolidated cache hydration coverage (behavior + failure modes).
+
+    We deliberately simulate the two-run-dir scenario that motivated the feature:
+    - run_dir_a produces cached outputs (the original producer run_dir).
+    - run_dir_b consumes the cached outputs (a new run_dir).
+
+    The test is both a regression suite and narrative documentation of behavior:
+    1) metadata: cache hits hydrate Artifact objects only (no bytes copied).
+    2) outputs-requested: cache hits materialize only selected outputs to caller paths.
+    3) outputs-all: cache hits materialize all outputs to a caller-provided directory.
+    4) inputs-missing: cache misses copy missing inputs into the current run_dir
+       before execution, so downstream code can read bytes without rerunning cached steps.
+    5) invalid combinations of cache_hydration + args raise ValueError early.
+    """
+    caplog.set_level(logging.WARNING)
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    # Seed a producer run with two CSV outputs that will be reused as cached artifacts.
+    with tracker_a.start_run("producer", model="producer", cache_mode="overwrite"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "a.csv").write_text("value\n1\n")
+        (out_dir / "b.csv").write_text("value\n2\n")
+        tracker_a.log_artifact(out_dir / "a.csv", key="a", direction="output")
+        tracker_a.log_artifact(out_dir / "b.csv", key="b", direction="output")
+
+    cached_outputs = tracker_a.get_artifacts_for_run("producer").outputs
+    bundle_outputs = tracker_a.load_input_bundle("producer")
+    assert set(bundle_outputs.keys()) == set(cached_outputs.keys())
+    with pytest.raises(ValueError):
+        tracker_a.load_input_bundle("missing_bundle")
+    cached_a = cached_outputs["a"]
+    cached_b = cached_outputs["b"]
+
+    # Cache-hydration = metadata: cache hits hydrate artifacts only (no bytes copied).
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+    with tracker_b.start_run("meta_hit", model="producer", cache_mode="reuse"):
+        pass
+    assert not (tracker_b.run_dir / "a.csv").exists()
+    assert not (tracker_b.run_dir / "b.csv").exists()
+
+    # Cache-hydration = outputs-requested: copy only selected outputs on cache hits.
+    caplog.clear()
+    requested_dest = tmp_path / "requested_a.csv"
+    if requested_dest.exists():
+        requested_dest.unlink()
+    requested_meta = None
+    with tracker_b.start_run(
+        "requested_hit",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"a": requested_dest},
+    ) as t:
+        assert t.is_cached
+        requested_meta = dict(
+            (t.current_consist.run.meta or {}).get("materialized_outputs", {})
+        )
+    assert requested_dest.exists()
+    assert requested_dest.read_text() == "value\n1\n"
+    assert not (tmp_path / "requested_b.txt").exists()
+    assert requested_meta == {"a": str(requested_dest.resolve())}
+
+    # Cache-hydration = outputs-all: copy all outputs to a requested directory.
+    all_dir = tmp_path / "materialized_all"
+    if all_dir.exists():
+        for path in all_dir.iterdir():
+            if path.is_file():
+                path.unlink()
+    else:
+        all_dir.mkdir(parents=True, exist_ok=True)
+    all_meta = None
+    with tracker_b.start_run(
+        "all_hit",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-all",
+        materialize_cached_outputs_dir=all_dir,
+    ) as t:
+        assert t.is_cached
+        all_meta = dict(
+            (t.current_consist.run.meta or {}).get("materialized_outputs", {})
+        )
+    assert (all_dir / "outputs" / "a.csv").read_text() == "value\n1\n"
+    assert (all_dir / "outputs" / "b.csv").read_text() == "value\n2\n"
+    assert all_meta == {
+        "a": str((all_dir / "outputs" / "a.csv").resolve()),
+        "b": str((all_dir / "outputs" / "b.csv").resolve()),
+    }
+
+    # Cache-hydration = inputs-missing: copy missing inputs before executing a cache miss.
+    # We simulate a cache miss by changing the model name, while keeping inputs the same.
+    expected_input_a = tracker_b.run_dir / "outputs" / "a.csv"
+    expected_input_b = tracker_b.run_dir / "outputs" / "b.csv"
+    if expected_input_a.exists():
+        expected_input_a.unlink()
+    if expected_input_b.exists():
+        expected_input_b.unlink()
+
+    with tracker_b.start_run(
+        "consumer_miss",
+        model="consumer",
+        inputs=[cached_a, cached_b],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        # Missing inputs should be copied into the new run_dir before execution.
+        assert expected_input_a.exists()
+        assert expected_input_b.exists()
+        assert expected_input_a.read_text() == "value\n1\n"
+        assert expected_input_b.read_text() == "value\n2\n"
+
+    # Multi-model usage from a single bundle: each run selects its own subset of inputs.
+    expected_input_b.unlink()
+    with tracker_b.start_run(
+        "model_a",
+        model="model_a",
+        inputs=[bundle_outputs["a"]],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        assert (tracker_b.run_dir / "outputs" / "a.csv").exists()
+        assert not (tracker_b.run_dir / "outputs" / "b.csv").exists()
+
+    expected_input_a.unlink()
+    with tracker_b.start_run(
+        "model_b",
+        model="model_b",
+        inputs=[bundle_outputs["b"]],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        assert (tracker_b.run_dir / "outputs" / "b.csv").exists()
+
+    # Sanity check: core materialize helper still works for direct copies.
+    dest_manual = tmp_path / "manual_copy.csv"
+    result = materialize_artifacts(
+        tracker=tracker_a, items=[(cached_a, dest_manual)], on_missing="raise"
+    )
+    assert dest_manual.exists()
+    assert result["a"] == str(dest_manual.resolve())
+
+    # DB-backed inputs-missing: ingested CSVs should be reconstructed from DuckDB
+    # when the original run_dir files are gone.
+    tracker_a.ingest(cached_a)
+    tracker_a.ingest(cached_b)
+    cached_outputs_ingested = tracker_a.get_artifacts_for_run("producer").outputs
+    cached_a_ingested = cached_outputs_ingested["a"]
+    cached_b_ingested = cached_outputs_ingested["b"]
+
+    (run_dir_a / "outputs" / "a.csv").unlink()
+    (run_dir_a / "outputs" / "b.csv").unlink()
+
+    if expected_input_a.exists():
+        expected_input_a.unlink()
+    if expected_input_b.exists():
+        expected_input_b.unlink()
+
+    with tracker_b.start_run(
+        "consumer_miss_db",
+        model="consumer_db",
+        inputs=[cached_a_ingested, cached_b_ingested],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        assert expected_input_a.exists()
+        assert expected_input_b.exists()
+        df_a = pd.read_csv(expected_input_a)
+        df_b = pd.read_csv(expected_input_b)
+        assert "value" in df_a.columns
+        assert "value" in df_b.columns
+
+    # Outputs-all should recover ingested tabular outputs from DuckDB when the
+    # historical cold files are gone.
+    materialized_all_missing = tmp_path / "materialized_all_missing"
+    with tracker_b.start_run(
+        "all_hit_missing_source",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-all",
+        materialize_cached_outputs_dir=materialized_all_missing,
+    ) as t:
+        assert t.is_cached
+    assert (materialized_all_missing / "outputs" / "a.csv").exists()
+    assert (materialized_all_missing / "outputs" / "b.csv").exists()
+
+    # Inputs-missing should raise for ingested artifacts with unsupported drivers.
+    bad_artifact = Artifact(
+        key="unsupported",
+        container_uri="./outputs/unsupported.txt",
+        driver="txt",
+        run_id=cached_a.run_id,
+        meta={"is_ingested": True},
+    )
+    with pytest.raises(ValueError):
+        try:
+            with tracker_b.start_run(
+                "consumer_miss_unsupported",
+                model="consumer_bad",
+                inputs=[bad_artifact],
+                cache_mode="reuse",
+                cache_hydration="inputs-missing",
+            ):
+                pass
+        finally:
+            if tracker_b.current_consist:
+                tracker_b.end_run(status="failed")
+
+    # Invalid option combinations should raise ValueError early.
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_missing_paths",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="outputs-requested",
+        ):
+            pass
+
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_missing_dir",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="outputs-all",
+        ):
+            pass
+
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_metadata_with_paths",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="metadata",
+            materialize_cached_output_paths={"a": tmp_path / "unused.txt"},
+        ):
+            pass
+
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_metadata_with_source_root",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="metadata",
+            materialize_cached_outputs_source_root=tmp_path / "archive",
+        ):
+            pass
+
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_outputs_requested_with_dir",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="outputs-requested",
+            materialize_cached_output_paths={"a": tmp_path / "unused.txt"},
+            materialize_cached_outputs_dir=tmp_path / "unused_dir",
+        ):
+            pass
+
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_outputs_all_with_paths",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="outputs-all",
+            materialize_cached_outputs_dir=tmp_path / "unused_dir",
+            materialize_cached_output_paths={"a": tmp_path / "unused.txt"},
+        ):
+            pass
+
+    with pytest.raises(ValueError):
+        with tracker_b.start_run(
+            "invalid_cache_hydration_value",
+            model="producer",
+            cache_mode="reuse",
+            cache_hydration="not-a-policy",
+        ):
+            pass
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_build_materialize_items_and_materialize_from_sources(tmp_path: Path) -> None:
+    """
+    Build materialization items by key and copy from explicit sources.
+
+    This covers the helper that maps keys to artifacts and the copy routine
+    used for historical run recovery.
+    """
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_file = source_dir / "source.txt"
+    source_file.write_text("payload", encoding="utf-8")
+
+    artifact = Artifact(
+        key="alpha",
+        container_uri="./source.txt",
+        driver="txt",
+        meta={},
+    )
+    missing_artifact = Artifact(
+        key="missing",
+        container_uri="./missing.txt",
+        driver="txt",
+        meta={},
+    )
+
+    items = build_materialize_items_for_keys(
+        [artifact, missing_artifact],
+        destinations_by_key={"alpha": tmp_path / "dest.txt", "unknown": tmp_path / "x"},
+    )
+    assert items == [(artifact, tmp_path / "dest.txt")]
+
+    materialized = materialize_artifacts_from_sources(
+        [(artifact, source_file, tmp_path / "dest.txt")],
+        allowed_base=tmp_path,
+        on_missing="raise",
+    )
+    assert materialized == {"alpha": str((tmp_path / "dest.txt").resolve())}
+    assert (tmp_path / "dest.txt").read_text(encoding="utf-8") == "payload"
+
+
+def test_outputs_requested_permission_denied_warns_and_continues(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Permission errors during output materialization should warn and continue.
+    """
+    caplog.set_level(logging.WARNING)
+    db_path = str(tmp_path / "provenance.db")
+    run_dir = tmp_path / "runs"
+    tracker = Tracker(run_dir=run_dir, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker)
+
+    with tracker.start_run("seed", model="model", cache_mode="overwrite"):
+        out_dir = tracker.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "out.csv"
+        out_path.write_text("value\n1\n", encoding="utf-8")
+        tracker.log_artifact(out_path, key="out", direction="output")
+
+    def _raise_permission(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("consist.core.materialize.shutil.copy2", _raise_permission)
+
+    dest_path = tmp_path / "dest.csv"
+    with tracker.start_run(
+        "hit",
+        model="model",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"out": dest_path},
+    ):
+        pass
+
+    assert not dest_path.exists()
+    run = tracker.get_run("hit")
+    assert run is not None
+    assert "materialized_outputs" not in (run.meta or {})
+    assert any(
+        "Failed to materialize run output" in record.message
+        or "Cached output materialization completed with partial results"
+        in record.message
+        for record in caplog.records
+    )
+
+    if tracker.engine:
+        tracker.engine.dispose()
+
+
+def test_inputs_missing_permission_denied_warns_and_continues(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Permission errors during inputs-missing materialization should warn and continue.
+    """
+    caplog.set_level(logging.WARNING)
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    with tracker_a.start_run("seed", model="model", cache_mode="overwrite"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "out.csv"
+        out_path.write_text("value\n1\n", encoding="utf-8")
+        artifact = tracker_a.log_artifact(out_path, key="out", direction="output")
+
+    def _raise_permission(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("consist.core.materialize.shutil.copy2", _raise_permission)
+
+    with tracker_b.start_run(
+        "consumer",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        pass
+
+    dest_path = tracker_b.run_dir / "outputs" / "out.csv"
+    assert not dest_path.exists()
+    run = tracker_b.get_run("consumer")
+    assert run is not None
+    assert "materialized_inputs" not in (run.meta or {})
+    assert any(
+        "Failed to materialize cached input" in record.message
+        for record in caplog.records
+    )
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_inputs_missing_preserves_existing_stale_destination_by_default(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_default_preserve", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source = out_dir / "a.csv"
+        source.write_text("value\nexpected\n", encoding="utf-8")
+        artifact = tracker_a.log_artifact(source, key="a", direction="output")
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "a.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("value\nstale\n", encoding="utf-8")
+
+    with tracker_b.start_run(
+        "consumer_default_preserve",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        assert destination.read_text(encoding="utf-8") == "value\nstale\n"
+
+    run = tracker_b.get_run("consumer_default_preserve")
+    assert run is not None
+    assert "materialized_inputs" not in (run.meta or {})
+
+
+def test_inputs_missing_restores_missing_input_from_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    archive_root = tmp_path / "archive"
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_input_recovery_root", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source = out_dir / "a.csv"
+        source.write_text("value\nexpected\n", encoding="utf-8")
+        tracker_a.log_artifact(source, key="a", direction="output")
+
+    archive_output = archive_root / "outputs" / "a.csv"
+    archive_output.parent.mkdir(parents=True, exist_ok=True)
+    archive_output.write_text("value\nexpected\n", encoding="utf-8")
+    artifact = tracker_a.get_run_outputs("producer_input_recovery_root")["a"]
+    tracker_a.set_artifact_recovery_roots(artifact, [archive_root])
+    (tracker_a.run_dir / "outputs" / "a.csv").unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "a.csv"
+
+    with tracker_b.start_run(
+        "consumer_input_recovery_root",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+    ):
+        assert destination.read_text(encoding="utf-8") == "value\nexpected\n"
+
+    run = tracker_b.get_run("consumer_input_recovery_root")
+    assert run is not None
+    assert (run.meta or {}).get("materialized_inputs") == {
+        "a": str(destination.resolve())
+    }
+
+
+def test_inputs_missing_validates_and_overwrites_stale_destination_from_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    archive_root = tmp_path / "archive"
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_stale_recovery_root", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source = out_dir / "a.csv"
+        source.write_text("value\nexpected\n", encoding="utf-8")
+        tracker_a.log_artifact(source, key="a", direction="output")
+
+    archive_output = archive_root / "outputs" / "a.csv"
+    archive_output.parent.mkdir(parents=True, exist_ok=True)
+    archive_output.write_text("value\nexpected\n", encoding="utf-8")
+    artifact = tracker_a.get_run_outputs("producer_stale_recovery_root")["a"]
+    tracker_a.set_artifact_recovery_roots(artifact, [archive_root])
+    (tracker_a.run_dir / "outputs" / "a.csv").unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "a.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("value\nstale\n", encoding="utf-8")
+
+    with tracker_b.start_run(
+        "consumer_stale_recovery_root",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=True,
+    ):
+        assert destination.read_text(encoding="utf-8") == "value\nexpected\n"
+
+    run = tracker_b.get_run("consumer_stale_recovery_root")
+    assert run is not None
+    assert (run.meta or {}).get("materialized_inputs") == {
+        "a": str(destination.resolve())
+    }
+
+
+def test_inputs_missing_validation_skips_stale_historical_source_for_recovery_root(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    archive_root = tmp_path / "archive"
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    live_file = tracker_a.run_dir / "outputs" / "file.csv"
+    live_file.parent.mkdir(parents=True, exist_ok=True)
+    with tracker_a.start_run("producer_baseline_same_path", model="producer"):
+        live_file.write_text("kind,value\nbaseline,1\n", encoding="utf-8")
+        tracker_a.log_artifact(live_file, key="baseline", direction="output")
+
+    baseline = tracker_a.get_run_outputs("producer_baseline_same_path")["baseline"]
+    archive_file = archive_root / "outputs" / "file.csv"
+    archive_file.parent.mkdir(parents=True, exist_ok=True)
+    archive_file.write_text("kind,value\nbaseline,1\n", encoding="utf-8")
+    tracker_a.set_artifact_recovery_roots(baseline, [archive_root])
+
+    with tracker_a.start_run(
+        "producer_forecasted_same_path",
+        model="producer",
+        cache_mode="overwrite",
+    ):
+        live_file.write_text("kind,value\nforecasted,2\n", encoding="utf-8")
+        tracker_a.log_artifact(live_file, key="forecasted", direction="output")
+
+    assert live_file.read_text(encoding="utf-8") == "kind,value\nforecasted,2\n"
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "file.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("kind,value\nforecasted,2\n", encoding="utf-8")
+
+    with tracker_b.start_run(
+        "consumer_baseline_same_path",
+        model="consumer",
+        inputs=[baseline],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=True,
+    ):
+        assert destination.read_text(encoding="utf-8") == "kind,value\nbaseline,1\n"
+
+    run = tracker_b.get_run("consumer_baseline_same_path")
+    assert run is not None
+    assert (run.meta or {}).get("materialized_inputs") == {
+        "baseline": str(destination.resolve())
+    }
+
+
+def test_inputs_missing_validation_preserves_existing_destination_without_hash(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_no_hash", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source = out_dir / "a.csv"
+        source.write_text("value\nexpected\n", encoding="utf-8")
+        artifact = tracker_a.log_artifact(source, key="a", direction="output")
+    artifact.hash = None
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "a.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("value\nstale\n", encoding="utf-8")
+
+    with tracker_b.start_run(
+        "consumer_no_hash",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=True,
+    ):
+        assert destination.read_text(encoding="utf-8") == "value\nstale\n"
+
+
+def test_inputs_missing_validation_overwrites_stale_ingested_db_fallback(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_ingested_stale", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source = out_dir / "a.csv"
+        source.write_text("value\nexpected\n", encoding="utf-8")
+        artifact = tracker_a.log_artifact(source, key="a", direction="output")
+    tracker_a.ingest(artifact)
+    artifact = tracker_a.get_artifacts_for_run("producer_ingested_stale").outputs["a"]
+    (tracker_a.run_dir / "outputs" / "a.csv").unlink()
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "a.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("value\nstale\n", encoding="utf-8")
+
+    with tracker_b.start_run(
+        "consumer_ingested_stale",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="reuse",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=True,
+    ):
+        df = pd.read_csv(destination)
+        assert df["value"].tolist() == ["expected"]
+
+    run = tracker_b.get_run("consumer_ingested_stale")
+    assert run is not None
+    assert (run.meta or {}).get("materialized_inputs") == {
+        "a": str(destination.resolve())
+    }
+
+
+def test_validate_materialized_inputs_requires_inputs_missing(
+    tmp_path: Path,
+) -> None:
+    tracker = Tracker(run_dir=tmp_path / "runs", db_path=str(tmp_path / "db.duckdb"))
+    _init_core_tables(tracker)
+
+    with pytest.raises(ValueError, match="requires cache_hydration='inputs-missing'"):
+        with tracker.start_run(
+            "invalid_validate_materialized_inputs",
+            model="model",
+            cache_hydration="metadata",
+            validate_materialized_inputs=True,
+        ):
+            pass
+
+
+def test_outputs_requested_uses_historical_mount_metadata_when_current_mount_is_stale(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Stale current mounts should not block output restoration when historical
+    mount metadata can still reconstruct the original source.
+    """
+    caplog.set_level(logging.WARNING)
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    mount_a = tmp_path / "mount_a"
+    mount_b = tmp_path / "mount_b"
+    mount_a.mkdir(parents=True, exist_ok=True)
+    mount_b.mkdir(parents=True, exist_ok=True)
+
+    source_path = mount_a / "a.csv"
+    source_path.write_text("value\n1\n", encoding="utf-8")
+
+    tracker_a = Tracker(
+        run_dir=run_dir_a, db_path=db_path, mounts={"outputs": str(mount_a)}
+    )
+    _init_core_tables(tracker_a)
+    with tracker_a.start_run("producer", model="producer", cache_mode="overwrite"):
+        tracker_a.log_artifact(source_path, key="a", direction="output")
+
+    tracker_b = Tracker(
+        run_dir=run_dir_b,
+        db_path=db_path,
+        mounts={"outputs": str(mount_b)},
+        allow_external_paths=True,
+    )
+    _init_core_tables(tracker_b)
+
+    dest = tmp_path / "dest.csv"
+    with tracker_b.start_run(
+        "requested_hit",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"a": dest},
+    ) as t:
+        assert t.is_cached
+
+    assert dest.exists()
+    assert dest.read_text(encoding="utf-8") == "value\n1\n"
+    assert not any(
+        "Cached output materialization completed with partial results" in record.message
+        for record in caplog.records
+    )
+
+
+def test_outputs_requested_allows_current_mount_root_without_external_paths(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    workspace_root = tmp_path / "workspace_mount"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+    with tracker_a.start_run(
+        "producer_mount_hit", model="producer", cache_mode="overwrite"
+    ):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "out.csv"
+        out_path.write_text("value\n1\n", encoding="utf-8")
+        tracker_a.log_artifact(out_path, key="out", direction="output")
+
+    tracker_b = Tracker(
+        run_dir=run_dir_b,
+        db_path=db_path,
+        mounts={"workspace": str(workspace_root)},
+    )
+    _init_core_tables(tracker_b)
+
+    dest = workspace_root / "restored.csv"
+    with tracker_b.start_run(
+        "requested_hit_mount_root",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"out": dest},
+    ) as t:
+        assert t.is_cached
+
+    assert dest.read_text(encoding="utf-8") == "value\n1\n"
+
+
+def test_outputs_requested_moved_run_dir_is_a_cache_miss(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Moved run directories make an outputs-requested candidate ineligible.
+    """
+    caplog.set_level(logging.DEBUG)
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+    with tracker_a.start_run("producer", model="producer", cache_mode="overwrite"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "out.csv"
+        out_path.write_text("value\n1\n", encoding="utf-8")
+        tracker_a.log_artifact(out_path, key="out", direction="output")
+
+    moved_dir = tmp_path / "runs_moved"
+    run_dir_a.rename(moved_dir)
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+
+    dest = tmp_path / "dest.csv"
+    with tracker_b.start_run(
+        "requested_hit",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"out": dest},
+    ) as t:
+        assert not t.is_cached
+
+    assert not dest.exists()
+    assert any(
+        "rejected before materialization: missing recovery source" in record.message
+        for record in caplog.records
+    )
+    run = tracker_b.get_run("requested_hit")
+    assert run is not None
+    assert "materialized_outputs" not in (run.meta or {})
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_hydrate_cache_hit_outputs_records_materialized_outputs_meta(
+    tmp_path: Path,
+) -> None:
+    """
+    hydrate_cache_hit_outputs should record materialized output destinations in run.meta.
+    """
+    tracker = Tracker(run_dir=tmp_path)
+
+    cached_run_dir = tmp_path / "cached_run"
+    cached_outputs = cached_run_dir / "outputs"
+    cached_outputs.mkdir(parents=True, exist_ok=True)
+    source_path = cached_outputs / "a.csv"
+    source_path.write_text("value\n1\n", encoding="utf-8")
+
+    artifact = Artifact(
+        key="a",
+        container_uri="./outputs/a.csv",
+        driver="csv",
+        run_id="cached",
+        meta={},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={"_physical_run_dir": str(cached_run_dir)},
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"a": artifact}
+    )
+
+    dest = tmp_path / "requested_a.csv"
+    options = ActiveRunCacheOptions(
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"a": dest},
+    )
+
+    hydrate_cache_hit_outputs(
+        tracker=tracker,
+        run=run,
+        cached_run=cached_run,
+        options=options,
+        link_outputs=False,
+    )
+
+    assert dest.exists()
+    assert run.meta["materialized_outputs"] == {"a": str(dest.resolve())}
+
+
+def test_outputs_all_uses_archive_source_root_for_mirror_recovery(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    archive_root = tmp_path / "archive"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer", model="producer", cache_mode="overwrite"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_a = out_dir / "a.csv"
+        source_b = out_dir / "b.csv"
+        source_a.write_text("value\n1\n", encoding="utf-8")
+        source_b.write_text("value\n2\n", encoding="utf-8")
+        tracker_a.log_artifact(source_a, key="a", direction="output")
+        tracker_a.log_artifact(source_b, key="b", direction="output")
+
+    archive_outputs = archive_root / "outputs"
+    archive_outputs.mkdir(parents=True, exist_ok=True)
+    (archive_outputs / "a.csv").write_text("value\n1\n", encoding="utf-8")
+    (archive_outputs / "b.csv").write_text("value\n2\n", encoding="utf-8")
+
+    (run_dir_a / "outputs" / "a.csv").unlink()
+    (run_dir_a / "outputs" / "b.csv").unlink()
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+
+    restored_root = tmp_path / "restored_from_archive"
+    with tracker_b.start_run(
+        "archive_hit",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-all",
+        materialize_cached_outputs_dir=restored_root,
+        materialize_cached_outputs_source_root=archive_root,
+    ) as t:
+        assert t.is_cached
+
+    assert (restored_root / "outputs" / "a.csv").read_text(
+        encoding="utf-8"
+    ) == "value\n1\n"
+    assert (restored_root / "outputs" / "b.csv").read_text(
+        encoding="utf-8"
+    ) == "value\n2\n"
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_outputs_requested_uses_archive_source_root_for_mirror_recovery(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    archive_root = tmp_path / "archive"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_req", model="producer", cache_mode="overwrite"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_a = out_dir / "a.csv"
+        source_a.write_text("value\n1\n", encoding="utf-8")
+        tracker_a.log_artifact(source_a, key="a", direction="output")
+
+    archive_outputs = archive_root / "outputs"
+    archive_outputs.mkdir(parents=True, exist_ok=True)
+    (archive_outputs / "a.csv").write_text("value\n1\n", encoding="utf-8")
+
+    (run_dir_a / "outputs" / "a.csv").unlink()
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+
+    requested_dest = tmp_path / "requested_from_archive.csv"
+    with tracker_b.start_run(
+        "archive_requested_hit",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"a": requested_dest},
+        materialize_cached_outputs_source_root=archive_root,
+    ) as t:
+        assert t.is_cached
+
+    assert requested_dest.read_text(encoding="utf-8") == "value\n1\n"
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_outputs_requested_miss_policy_handles_source_root_success_and_failure(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    archive_root = tmp_path / "archive"
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("strict_source_root", model="producer"):
+        source = tracker_a.run_dir / "outputs" / "a.csv"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("value\n1\n", encoding="utf-8")
+        tracker_a.log_artifact(source, key="a", direction="output")
+
+    archive_source = archive_root / "outputs" / "a.csv"
+    archive_source.parent.mkdir(parents=True, exist_ok=True)
+    archive_source.write_text("value\n1\n", encoding="utf-8")
+    source.unlink()
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+    with tracker_b.start_run(
+        "strict_source_root_success",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="miss",
+        materialize_cached_output_paths={"a": tmp_path / "success.csv"},
+        materialize_cached_outputs_source_root=archive_root,
+    ) as active:
+        assert active.is_cached
+
+    with tracker_b.start_run(
+        "strict_source_root_failure",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="miss",
+        materialize_cached_output_paths={"a": tmp_path / "failure.csv"},
+        materialize_cached_outputs_source_root=tmp_path / "missing_archive",
+    ) as active:
+        assert not active.is_cached
+
+
+def test_outputs_requested_miss_policy_validates_existing_destination(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    with tracker_a.start_run("strict_existing_candidate", model="producer"):
+        source = tracker_a.run_dir / "outputs" / "a.csv"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("value\n1\n", encoding="utf-8")
+        tracker_a.log_artifact(source, key="a", direction="output")
+
+    tracker_b = Tracker(
+        run_dir=tmp_path / "runs_b", db_path=db_path, allow_external_paths=True
+    )
+    _init_core_tables(tracker_b)
+    matching_destination = tmp_path / "matching.csv"
+    matching_destination.write_text("value\n1\n", encoding="utf-8")
+    with tracker_b.start_run(
+        "strict_existing_match",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="miss",
+        materialize_cached_output_paths={"a": matching_destination},
+    ) as active:
+        assert active.is_cached
+
+    mismatched_destination = tmp_path / "mismatched.csv"
+    mismatched_destination.write_text("value\nstale\n", encoding="utf-8")
+    with tracker_b.start_run(
+        "strict_existing_mismatch",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="miss",
+        materialize_cached_output_paths={"a": mismatched_destination},
+    ) as active:
+        assert active.is_cached
+    assert mismatched_destination.read_text(encoding="utf-8") == "value\n1\n"
+
+    # Non-strict hydration (cache_hydration_failure="warn") also overwrites stale destinations
+    warn_stale_destination = tmp_path / "warn_stale.csv"
+    warn_stale_destination.write_text("value\nstale\n", encoding="utf-8")
+    with tracker_b.start_run(
+        "warn_existing_mismatch",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="warn",
+        materialize_cached_output_paths={"a": warn_stale_destination},
+    ) as active:
+        assert active.is_cached
+    assert warn_stale_destination.read_text(encoding="utf-8") == "value\n1\n"
+
+
+def test_outputs_requested_miss_policy_rolls_back_backed_up_destination_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    with tracker_a.start_run("strict_backup_rollback_producer", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_a = out_dir / "a.csv"
+        source_b = out_dir / "b.csv"
+        source_a.write_text("value\n1\n", encoding="utf-8")
+        source_b.write_text("value\n2\n", encoding="utf-8")
+        tracker_a.log_artifact(source_a, key="a", direction="output")
+        tracker_a.log_artifact(source_b, key="b", direction="output")
+
+    tracker_b = Tracker(
+        run_dir=tmp_path / "runs_b", db_path=db_path, allow_external_paths=True
+    )
+    _init_core_tables(tracker_b)
+    dest_a = tmp_path / "dest_a.csv"
+    dest_b = tmp_path / "dest_b.csv"
+    dest_a.write_text("value\nstale-a\n", encoding="utf-8")
+
+    # Case 1: output #2 is missing in historical run -> rejected before promotion, dest_a preserved
+    source_b.unlink()
+    with tracker_b.start_run(
+        "strict_backup_rollback_missing_b",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="miss",
+        materialize_cached_output_paths={"a": dest_a, "b": dest_b},
+    ) as active:
+        assert not active.is_cached
+    assert dest_a.read_text(encoding="utf-8") == "value\nstale-a\n"
+    assert not dest_b.exists()
+
+    # Case 2: output #2 exists for staging, but promotion fails mid-way after promoting dest_a
+    source_b.write_text("value\n2\n", encoding="utf-8")
+
+    def partial_promote(*, items, **kwargs):
+        art_a, staged_a, target_a = items[0]
+        target_a.write_bytes(staged_a.read_bytes())
+        return {art_a.key: str(target_a.resolve())}
+
+    monkeypatch.setattr(
+        "consist.core.materialize.materialize_artifacts_from_sources",
+        partial_promote,
+    )
+    with tracker_b.start_run(
+        "strict_backup_rollback_partial_promote",
+        model="producer",
+        cache_hydration="outputs-requested",
+        cache_hydration_failure="miss",
+        materialize_cached_output_paths={"a": dest_a, "b": dest_b},
+    ) as active:
+        assert not active.is_cached
+    assert dest_a.read_text(encoding="utf-8") == "value\nstale-a\n"
+    assert not dest_b.exists()
+
+
+def test_outputs_all_uses_artifact_recovery_roots_without_source_root(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    archive_root = tmp_path / "archive"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_recovery_all", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_a = out_dir / "a.csv"
+        source_b = out_dir / "b.csv"
+        source_a.write_text("value\n1\n", encoding="utf-8")
+        source_b.write_text("value\n2\n", encoding="utf-8")
+        tracker_a.log_artifact(source_a, key="a", direction="output")
+        tracker_a.log_artifact(source_b, key="b", direction="output")
+
+    archive_outputs = archive_root / "outputs"
+    archive_outputs.mkdir(parents=True, exist_ok=True)
+    (archive_outputs / "a.csv").write_text("value\n1\n", encoding="utf-8")
+    (archive_outputs / "b.csv").write_text("value\n2\n", encoding="utf-8")
+
+    historical_outputs = tracker_a.get_run_outputs("producer_recovery_all")
+    tracker_a.set_artifact_recovery_roots(historical_outputs["a"], [archive_root])
+    tracker_a.set_artifact_recovery_roots(historical_outputs["b"], [archive_root])
+
+    (run_dir_a / "outputs" / "a.csv").unlink()
+    (run_dir_a / "outputs" / "b.csv").unlink()
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+
+    restored_root = tmp_path / "restored_from_recovery_roots"
+    with tracker_b.start_run(
+        "artifact_root_hit_all",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-all",
+        materialize_cached_outputs_dir=restored_root,
+    ) as t:
+        assert t.is_cached
+
+    assert (restored_root / "outputs" / "a.csv").read_text(
+        encoding="utf-8"
+    ) == "value\n1\n"
+    assert (restored_root / "outputs" / "b.csv").read_text(
+        encoding="utf-8"
+    ) == "value\n2\n"
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_outputs_requested_uses_artifact_recovery_roots_without_source_root(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    archive_root = tmp_path / "archive"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    with tracker_a.start_run("producer_recovery_requested", model="producer"):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_a = out_dir / "a.csv"
+        source_a.write_text("value\n1\n", encoding="utf-8")
+        tracker_a.log_artifact(source_a, key="a", direction="output")
+
+    archive_outputs = archive_root / "outputs"
+    archive_outputs.mkdir(parents=True, exist_ok=True)
+    (archive_outputs / "a.csv").write_text("value\n1\n", encoding="utf-8")
+
+    historical_output = tracker_a.get_run_outputs("producer_recovery_requested")["a"]
+    tracker_a.set_artifact_recovery_roots(historical_output, [archive_root])
+
+    (run_dir_a / "outputs" / "a.csv").unlink()
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+
+    requested_dest = tmp_path / "requested_from_recovery_roots.csv"
+    with tracker_b.start_run(
+        "artifact_root_hit_requested",
+        model="producer",
+        cache_mode="reuse",
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"a": requested_dest},
+    ) as t:
+        assert t.is_cached
+
+    assert requested_dest.read_text(encoding="utf-8") == "value\n1\n"
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_cache_validation_accepts_archived_outputs_via_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    run_dir_a = tmp_path / "runs_a"
+    run_dir_b = tmp_path / "runs_b"
+    archive_root = tmp_path / "archive_validation"
+
+    tracker_a = Tracker(run_dir=run_dir_a, db_path=db_path)
+    _init_core_tables(tracker_a)
+    with tracker_a.start_run(
+        "producer_validation", model="producer", cache_mode="overwrite"
+    ):
+        out_dir = tracker_a.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "out.csv"
+        out_path.write_text("value\n1\n", encoding="utf-8")
+        artifact = tracker_a.log_artifact(out_path, key="out", direction="output")
+
+    tracker_a.archive_artifact(artifact, archive_root, mode="copy")
+    out_path.unlink()
+
+    tracker_b = Tracker(run_dir=run_dir_b, db_path=db_path, allow_external_paths=True)
+    _init_core_tables(tracker_b)
+
+    with tracker_b.start_run(
+        "validation_hit", model="producer", cache_mode="reuse"
+    ) as t:
+        assert t.is_cached
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_outputs_all_delegates_to_run_materialization_with_preserved_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    When the tracker exposes run-scoped output materialization, outputs-all should
+    delegate there and keep the historical relative layout.
+
+    This also covers the cache-hit/earlier-producer case by using a linked artifact
+    whose run_id differs from the cached run being hydrated.
+    """
+    tracker = Tracker(
+        run_dir=tmp_path / "active_runs",
+        mounts={"outputs": str(tmp_path / "current_mount")},
+        allow_external_paths=True,
+    )
+    artifact = Artifact(
+        key="network",
+        container_uri="outputs://beam/network.parquet",
+        driver="parquet",
+        run_id="producer",
+        meta={"mount_root": str(tmp_path / "historical_mount")},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={
+            "_physical_run_dir": str(tmp_path / "historical_run"),
+            "mounts": {"outputs": str(tmp_path / "historical_mount")},
+        },
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"network": artifact}
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def _materialize_run_outputs(
+        self,
+        run_id: str,
+        *,
+        target_root: str | Path,
+        source_root: str | Path | None = None,
+        keys=None,
+        preserve_existing: bool = True,
+        on_missing: str = "warn",
+        db_fallback: str = "if_ingested",
+    ):
+        calls.append(
+            {
+                "run_id": run_id,
+                "target_root": Path(target_root),
+                "source_root": source_root,
+                "keys": keys,
+                "preserve_existing": preserve_existing,
+                "on_missing": on_missing,
+                "db_fallback": db_fallback,
+            }
+        )
+        restored = Path(target_root) / "beam" / "network.parquet"
+        restored.parent.mkdir(parents=True, exist_ok=True)
+        restored.write_text("payload", encoding="utf-8")
+        return SimpleNamespace(
+            materialized={"network": str(restored.resolve())},
+            skipped_missing_source=[],
+            failed=[],
+            summary="materialized_fs=1",
+        )
+
+    monkeypatch.setattr(
+        Tracker,
+        "materialize_run_outputs",
+        _materialize_run_outputs,
+        raising=False,
+    )
+
+    out_dir = tmp_path / "restored_outputs"
+    archive_root = tmp_path / "archive_outputs"
+    options = ActiveRunCacheOptions(
+        cache_hydration="outputs-all",
+        materialize_cached_outputs_dir=out_dir,
+        materialize_cached_outputs_source_root=archive_root,
+    )
+
+    hydrate_cache_hit_outputs(
+        tracker=tracker,
+        run=run,
+        cached_run=cached_run,
+        options=options,
+        link_outputs=False,
+    )
+
+    assert (out_dir / "beam" / "network.parquet").read_text(
+        encoding="utf-8"
+    ) == "payload"
+    assert run.meta["materialized_outputs"] == {
+        "network": str((out_dir / "beam" / "network.parquet").resolve())
+    }
+    assert calls == [
+        {
+            "run_id": "cached",
+            "target_root": out_dir.resolve(),
+            "source_root": archive_root,
+            "keys": None,
+            "preserve_existing": True,
+            "on_missing": "raise",
+            "db_fallback": "if_ingested",
+        }
+    ]
+
+
+def test_outputs_all_legacy_fallback_uses_artifact_recovery_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = Tracker(run_dir=tmp_path / "active_runs", allow_external_paths=True)
+    archive_root = tmp_path / "archive_outputs"
+    archived = archive_root / "outputs" / "a.csv"
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    archived.write_text("value\n1\n", encoding="utf-8")
+
+    artifact = Artifact(
+        key="a",
+        container_uri="./outputs/a.csv",
+        driver="csv",
+        run_id=None,
+        meta={"recovery_roots": [str(archive_root)]},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"a": artifact}
+    )
+
+    monkeypatch.setattr(
+        "consist.core.cache._can_delegate_run_output_materialization",
+        lambda _tracker: False,
+    )
+
+    restored_root = tmp_path / "restored_outputs"
+    options = ActiveRunCacheOptions(
+        cache_hydration="outputs-all",
+        materialize_cached_outputs_dir=restored_root,
+    )
+
+    hydrate_cache_hit_outputs(
+        tracker=tracker,
+        run=run,
+        cached_run=cached_run,
+        options=options,
+        link_outputs=False,
+    )
+
+    restored = restored_root / "outputs" / "a.csv"
+    assert restored.read_text(encoding="utf-8") == "value\n1\n"
+    assert run.meta["materialized_outputs"] == {"a": str(restored.resolve())}
+
+
+def test_outputs_all_legacy_fallback_raises_on_missing_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = Tracker(run_dir=tmp_path / "active_runs", allow_external_paths=True)
+    artifact = Artifact(
+        key="a",
+        container_uri="./outputs/a.csv",
+        driver="csv",
+        run_id=None,
+        meta={},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"a": artifact}
+    )
+
+    monkeypatch.setattr(
+        "consist.core.cache._can_delegate_run_output_materialization",
+        lambda _tracker: False,
+    )
+
+    with pytest.raises(FileNotFoundError, match="source path missing"):
+        hydrate_cache_hit_outputs(
+            tracker=tracker,
+            run=run,
+            cached_run=cached_run,
+            options=ActiveRunCacheOptions(
+                cache_hydration="outputs-all",
+                materialize_cached_outputs_dir=tmp_path / "restored_outputs",
+            ),
+            link_outputs=False,
+        )
+
+
+def test_outputs_requested_delegates_via_staging_and_warns_on_missing_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    outputs-requested should use the run-scoped materializer as a staging step
+    while preserving legacy warning behavior for missing requested keys.
+    """
+    caplog.set_level(logging.WARNING)
+    tracker = Tracker(run_dir=tmp_path / "active_runs", allow_external_paths=True)
+    artifact = Artifact(
+        key="a",
+        container_uri="./outputs/a.csv",
+        driver="csv",
+        run_id="producer",
+        meta={},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={"_physical_run_dir": str(tmp_path / "historical_run")},
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"a": artifact}
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def _materialize_run_outputs(
+        self,
+        run_id: str,
+        *,
+        target_root: str | Path,
+        source_root: str | Path | None = None,
+        keys=None,
+        preserve_existing: bool = True,
+        on_missing: str = "warn",
+        db_fallback: str = "if_ingested",
+    ):
+        staging_root = Path(target_root)
+        staged = staging_root / "outputs" / "a.csv"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text("value\n1\n", encoding="utf-8")
+        calls.append(
+            {
+                "run_id": run_id,
+                "target_root": staging_root,
+                "source_root": source_root,
+                "keys": keys,
+                "preserve_existing": preserve_existing,
+                "on_missing": on_missing,
+                "db_fallback": db_fallback,
+            }
+        )
+        return SimpleNamespace(
+            materialized={"a": str(staged.resolve())},
+            skipped_missing_source=[],
+            failed=[],
+            summary="materialized_fs=1",
+        )
+
+    monkeypatch.setattr(
+        Tracker,
+        "materialize_run_outputs",
+        _materialize_run_outputs,
+        raising=False,
+    )
+
+    destination = tmp_path / "requested.csv"
+    archive_root = tmp_path / "archive_outputs"
+    options = ActiveRunCacheOptions(
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={
+            "a": destination,
+            "missing": tmp_path / "missing.csv",
+        },
+        materialize_cached_outputs_source_root=archive_root,
+    )
+
+    hydrate_cache_hit_outputs(
+        tracker=tracker,
+        run=run,
+        cached_run=cached_run,
+        options=options,
+        link_outputs=False,
+    )
+
+    assert destination.read_text(encoding="utf-8") == "value\n1\n"
+    assert run.meta["materialized_outputs"] == {"a": str(destination.resolve())}
+    assert calls[0]["run_id"] == "cached"
+    assert calls[0]["source_root"] == archive_root
+    assert calls[0]["keys"] == ["a"]
+    assert calls[0]["preserve_existing"] is False
+    assert calls[0]["on_missing"] == "warn"
+    assert calls[0]["db_fallback"] == "if_ingested"
+    assert any("missing keys" in record.message for record in caplog.records)
+
+
+def test_outputs_requested_source_root_does_not_warn_and_continue_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tracker = Tracker(run_dir=tmp_path / "active_runs", allow_external_paths=True)
+    artifact = Artifact(
+        key="a",
+        container_uri="./outputs/a.csv",
+        driver="csv",
+        run_id="producer",
+        meta={},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={"_physical_run_dir": str(tmp_path / "historical_run")},
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"a": artifact}
+    )
+
+    def _raise_from_run_api(self, run_id: str, **kwargs):
+        raise AttributeError("unexpected delegated failure")
+
+    monkeypatch.setattr(
+        Tracker,
+        "materialize_run_outputs",
+        _raise_from_run_api,
+        raising=False,
+    )
+
+    options = ActiveRunCacheOptions(
+        cache_hydration="outputs-requested",
+        materialize_cached_output_paths={"a": tmp_path / "requested.csv"},
+        materialize_cached_outputs_source_root=tmp_path / "archive_outputs",
+    )
+
+    with pytest.raises(AttributeError, match="unexpected delegated failure"):
+        hydrate_cache_hit_outputs(
+            tracker=tracker,
+            run=run,
+            cached_run=cached_run,
+            options=options,
+            link_outputs=False,
+        )
+
+
+def test_outputs_requested_legacy_fallback_warns_on_missing_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    tracker = Tracker(run_dir=tmp_path / "active_runs", allow_external_paths=True)
+    artifact = Artifact(
+        key="a",
+        container_uri="./outputs/a.csv",
+        driver="csv",
+        run_id=None,
+        meta={},
+    )
+    run = Run(
+        id="active",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+    cached_run = Run(
+        id="cached",
+        model_name="model",
+        config_hash=None,
+        git_hash=None,
+        meta={},
+    )
+
+    tracker.current_consist = ConsistRecord(run=run, config={})
+    tracker.get_artifacts_for_run = lambda _run_id: RunArtifacts(
+        inputs={}, outputs={"a": artifact}
+    )
+
+    monkeypatch.setattr(
+        "consist.core.cache._can_delegate_run_output_materialization",
+        lambda _tracker: False,
+    )
+
+    hydrate_cache_hit_outputs(
+        tracker=tracker,
+        run=run,
+        cached_run=cached_run,
+        options=ActiveRunCacheOptions(
+            cache_hydration="outputs-requested",
+            materialize_cached_output_paths={"a": tmp_path / "requested.csv"},
+        ),
+        link_outputs=False,
+    )
+
+    assert any("source path missing" in record.message for record in caplog.records)
+    assert "materialized_outputs" not in (run.meta or {})
+
+
+def test_tracker_run_cache_hit_hydrates_requested_output_set_members(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    calls = {"count": 0}
+
+    def write_annual_outputs(ctx) -> None:
+        calls["count"] += 1
+        annual_dir = ctx.run_dir / "annual"
+        annual_dir.mkdir(parents=True)
+        (annual_dir / "annual_2030.csv").write_text("year,value\n2030,1\n")
+        (annual_dir / "annual_2035.csv").write_text("year,value\n2035,2\n")
+
+    first = tracker_a.run(
+        fn=write_annual_outputs,
+        name="annual_forecast",
+        config={"years": [2030, 2035]},
+        output_sets={
+            "annual_outputs": OutputSet(
+                root="annual",
+                include="annual_*.csv",
+                expected_members=lambda config: [
+                    f"annual_{year}.csv" for year in config["years"]
+                ],
+            )
+        },
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert first.cache_hit is False
+    assert calls["count"] == 1
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    second = tracker_b.run(
+        fn=write_annual_outputs,
+        name="annual_forecast",
+        config={"years": [2030, 2035]},
+        output_sets={
+            "annual_outputs": OutputSet(
+                root="annual",
+                include="annual_*.csv",
+                expected_members=lambda config: [
+                    f"annual_{year}.csv" for year in config["years"]
+                ],
+            )
+        },
+        cache_options=CacheOptions(cache_hydration="outputs-requested"),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert second.cache_hit is True
+    assert calls["count"] == 1
+    assert set(second.outputs) == {"annual_outputs"}
+    assert second.outputs["annual_outputs"].driver == "artifact_set"
+
+    hydrated_root = tracker_b.run_artifact_dir(second.run) / "annual"
+    assert (hydrated_root / "annual_2030.csv").read_text() == "year,value\n2030,1\n"
+    assert (hydrated_root / "annual_2035.csv").read_text() == "year,value\n2035,2\n"
+
+
+def test_cache_hit_and_hydrated_outputs_support_set_artifact_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    def write_step(ctx) -> None:
+        out_dir = ctx.run_dir / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "step_result.csv").write_text("data\n100\n", encoding="utf-8")
+
+    # 1. Run producer step
+    res_a = tracker_a.run(
+        fn=write_step,
+        name="step_producer",
+        config={"param": 1},
+        output_paths={"res": "outputs/step_result.csv"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert res_a.cache_hit is False
+    assert "res" in res_a.outputs
+
+    # 2. Run step again in tracker_b to trigger cache hit
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+
+    res_b = tracker_b.run(
+        fn=write_step,
+        name="step_producer",
+        config={"param": 1},
+        output_paths={"res": "outputs/step_result.csv"},
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert res_b.cache_hit is True
+    cached_art = res_b.outputs["res"]
+
+    # 3. Attaching recovery roots on cached output artifact must succeed without ObjectDereferencedError
+    archive_root_1 = tmp_path / "archive_1"
+    archive_root_1.mkdir()
+    tracker_b.set_artifact_recovery_roots(cached_art, [archive_root_1], append=True)
+
+    persisted = tracker_b.db.get_artifact(cached_art.id)
+    assert persisted is not None
+    assert str(archive_root_1.resolve()) in persisted.meta.get("recovery_roots", [])
+
+    # 4. Output hydration path: hydrate_run_outputs produces detached clones via materialize.py
+    hydrated_result = tracker_b.hydrate_run_outputs(
+        res_b.run.id,
+        target_root=tracker_b.run_dir / "hydrated",
+    )
+    hydrated_art = hydrated_result["res"].artifact
+    archive_root_2 = tmp_path / "archive_2"
+    archive_root_2.mkdir()
+
+    # Attaching recovery roots on hydrated output artifact must also succeed without ObjectDereferencedError
+    tracker_b.set_artifact_recovery_roots(hydrated_art, [archive_root_2], append=True)
+    persisted_after = tracker_b.db.get_artifact(hydrated_art.id)
+    assert persisted_after is not None
+    assert str(archive_root_2.resolve()) in persisted_after.meta.get(
+        "recovery_roots", []
+    )
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_inputs_missing_validation_preserves_valid_and_rehydrates_corrupted_directory_input(
+    tmp_path: Path,
+) -> None:
+    """
+    With cache_hydration='inputs-missing' and validate_materialized_inputs=True:
+    1) A valid existing directory destination is preserved without re-copying
+       (even when historical and archive sources are unavailable).
+    2) A corrupted existing directory destination is replaced from a valid
+       recovery_root while skipping a corrupted historical source directory.
+    """
+    db_path = str(tmp_path / "provenance.db")
+    archive_root = tmp_path / "archive"
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    source_dir = tracker_a.run_dir / "outputs" / "skims.zarr"
+    (source_dir / "nested").mkdir(parents=True, exist_ok=True)
+    (source_dir / "nested" / "0.0").write_bytes(b"expected-skim")
+
+    with tracker_a.start_run("producer_dir_input", model="producer"):
+        artifact = tracker_a.log_output(
+            source_dir, key="skims", artifact_kind="directory"
+        )
+
+    tracker_a.archive_run_outputs("producer_dir_input", archive_root)
+    artifact = tracker_a.get_run_outputs("producer_dir_input")["skims"]
+
+    # Corrupt the historical source in runs_a while archive_root stays valid.
+    (source_dir / "nested" / "0.0").write_bytes(b"corrupted-historical")
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    destination = tracker_b.run_dir / "outputs" / "skims.zarr"
+    (destination / "nested").mkdir(parents=True, exist_ok=True)
+    (destination / "nested" / "0.0").write_bytes(b"expected-skim")
+
+    # 1) Valid existing destination is preserved without touching recovery sources.
+    with tracker_b.start_run(
+        "consumer_preserve_valid_dir",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="overwrite",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=True,
+    ):
+        assert (destination / "nested" / "0.0").read_bytes() == b"expected-skim"
+
+    preserved_run = tracker_b.get_run("consumer_preserve_valid_dir")
+    assert preserved_run is not None
+    assert "materialized_inputs" not in (preserved_run.meta or {})
+
+    # 2) Corrupt the existing destination; it should be overwritten from archive_root
+    #    (skipping the corrupted historical source in runs_a).
+    (destination / "nested" / "0.0").write_bytes(b"stale-destination")
+
+    with tracker_b.start_run(
+        "consumer_rehydrate_corrupted_dir",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="overwrite",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=True,
+    ):
+        assert (destination / "nested" / "0.0").read_bytes() == b"expected-skim"
+
+    rehydrated_run = tracker_b.get_run("consumer_rehydrate_corrupted_dir")
+    assert rehydrated_run is not None
+    assert (rehydrated_run.meta or {}).get("materialized_inputs") == {
+        "skims": str(destination.resolve())
+    }
+
+    # 3) When validate_materialized_inputs is disabled (default), missing directory
+    #    inputs should not perform manifest tree validation during recovery discovery.
+    import shutil
+
+    shutil.rmtree(destination)
+    with tracker_b.start_run(
+        "consumer_unvalidated_dir_recovery",
+        model="consumer",
+        inputs=[artifact],
+        cache_mode="overwrite",
+        cache_hydration="inputs-missing",
+        validate_materialized_inputs=False,
+    ):
+        assert (destination / "nested" / "0.0").read_bytes() == b"corrupted-historical"
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_outputs_requested_rejects_corrupted_directory_candidate_and_recovers_from_archive(
+    tmp_path: Path,
+) -> None:
+    """
+    Under cache_hydration='outputs-requested':
+    1) A cached candidate whose directory output is corrupted on disk (with no
+       valid recovery root) is rejected and falls back to re-execution.
+    2) When a valid recovery_root exists, outputs-requested skips the corrupted
+       historical directory tree and hydrates from the valid recovery_root.
+    """
+    db_path = str(tmp_path / "provenance.db")
+    calls = 0
+
+    def write_zarr(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        zarr_path = ctx.run_dir / "skims.zarr"
+        (zarr_path / "nested").mkdir(parents=True, exist_ok=True)
+        (zarr_path / "nested" / "0.0").write_bytes(f"skim-{calls}".encode("utf-8"))
+
+    output_paths = {"skims": ArtifactSpec(path="skims.zarr", driver="zarr")}
+
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+    first = tracker_a.run(
+        fn=write_zarr,
+        name="dir_candidate_hydration",
+        output_paths=output_paths,
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert calls == 1
+    # Corrupt nested file in first candidate's directory output (no recovery root).
+    (first.outputs["skims"].path / "nested" / "0.0").write_bytes(b"corrupted")
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    second = tracker_b.run(
+        fn=write_zarr,
+        name="dir_candidate_hydration",
+        output_paths=output_paths,
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    # Corrupted first candidate was rejected; second run executed fresh.
+    assert calls == 2
+    assert second.cache_hit is False
+    assert (second.outputs["skims"].path / "nested" / "0.0").read_bytes() == b"skim-2"
+
+    # Archive second run's outputs to archive_root, then corrupt its historical run_dir copy.
+    archive_root = tmp_path / "archive"
+    tracker_b.archive_run_outputs(second.run.id, archive_root)
+    (second.outputs["skims"].path / "nested" / "0.0").unlink()
+
+    tracker_c = Tracker(run_dir=tmp_path / "runs_c", db_path=db_path)
+    _init_core_tables(tracker_c)
+    third = tracker_c.run(
+        fn=write_zarr,
+        name="dir_candidate_hydration",
+        output_paths=output_paths,
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert calls == 2
+    assert third.cache_hit is True
+    assert third.run.meta["cache_source"] == second.run.id
+    hydrated_path = Path(third.run.meta["materialized_outputs"]["skims"])
+    assert (hydrated_path / "nested" / "0.0").read_bytes() == b"skim-2"
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+    if tracker_c.engine:
+        tracker_c.engine.dispose()
+
+
+def test_outputs_requested_replaces_stale_and_rolls_back_directory_destination_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    When a requested directory output destination already exists on disk before
+    candidate hydration and its contents do not match the cached manifest:
+    1) If the cached candidate is valid and promotion succeeds, the stale directory
+       destination is replaced with the cached directory.
+    2) If promotion fails after backing up the caller-owned directory destination,
+       the caller-owned directory destination is rolled back before the miss handler runs.
+    """
+    db_path = str(tmp_path / "provenance.db")
+    tracker_a = Tracker(run_dir=tmp_path / "runs_a", db_path=db_path)
+    _init_core_tables(tracker_a)
+
+    def write_zarr(ctx) -> None:
+        zarr_path = ctx.run_dir / "skims.zarr"
+        caller_file = zarr_path / "nested" / "0.0"
+        (zarr_path / "nested").mkdir(parents=True, exist_ok=True)
+        caller_file.write_bytes(b"fresh-skim")
+
+    output_paths = {"skims": ArtifactSpec(path="skims.zarr", driver="zarr")}
+    tracker_a.run(
+        fn=write_zarr,
+        name="dir_caller_destination_safety",
+        output_paths=output_paths,
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    custom_dest = tracker_b.run_dir / "custom_dest" / "skims.zarr"
+    (custom_dest / "nested").mkdir(parents=True, exist_ok=True)
+    (custom_dest / "nested" / "0.0").write_bytes(b"caller-uncommitted-bytes")
+
+    observed_during_miss: list[bytes] = []
+
+    def write_zarr_custom(ctx) -> None:
+        observed_during_miss.append((custom_dest / "nested" / "0.0").read_bytes())
+        (custom_dest / "nested" / "0.0").write_bytes(b"fresh-skim")
+
+    # 1) Valid cached candidate replaces stale directory destination on cache hit
+    hit_result = tracker_b.run(
+        fn=write_zarr_custom,
+        name="dir_caller_destination_safety",
+        output_paths={"skims": ArtifactSpec(path=custom_dest, driver="zarr")},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert hit_result.cache_hit is True
+    assert observed_during_miss == []
+    assert (custom_dest / "nested" / "0.0").read_bytes() == b"fresh-skim"
+
+    # 2) When promotion fails, the backed-up directory destination is rolled back
+    (custom_dest / "nested" / "0.0").write_bytes(b"caller-uncommitted-bytes")
+    monkeypatch.setattr(
+        "consist.core.materialize.materialize_artifacts_from_sources",
+        lambda **_kwargs: {},
+    )
+    miss_result = tracker_b.run(
+        fn=write_zarr_custom,
+        name="dir_caller_destination_safety",
+        output_paths={"skims": ArtifactSpec(path=custom_dest, driver="zarr")},
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="miss",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    assert miss_result.cache_hit is False
+    assert observed_during_miss == [b"caller-uncommitted-bytes"]
+
+    if tracker_a.engine:
+        tracker_a.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_cache_hit_abs_path_populated_for_skipped_existing_and_shapefile_bundles(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "provenance.db")
+    tracker = Tracker(run_dir=tmp_path / "runs", db_path=db_path)
+    _init_core_tables(tracker)
+
+    def produce(ctx) -> None:
+        csv_path = ctx.run_dir / "table.csv"
+        csv_path.write_text("x\n1\n", encoding="utf-8")
+        tracker.log_output(csv_path, key="table")
+
+        shp_dir = ctx.run_dir / "shapes"
+        shp_dir.mkdir(parents=True, exist_ok=True)
+        for ext in (".shp", ".shx", ".dbf"):
+            (shp_dir / f"zones{ext}").write_bytes(f"shp-{ext}".encode("utf-8"))
+        tracker.log_output(shp_dir / "zones.shp", key="zones")
+
+        bundle_root = ctx.run_dir / "bundle"
+        bundle_root.mkdir(parents=True, exist_ok=True)
+        (bundle_root / "part_a.csv").write_text("a\n1\n", encoding="utf-8")
+
+    output_sets = {
+        "bundle_set": OutputSet(
+            root="bundle",
+            include=FilenamePattern(
+                pattern="part_*.csv",
+                captures=(EnumCapture(name="part", allowed=("a",), wildcard=1),),
+            ),
+        )
+    }
+
+    tracker.run(
+        fn=produce,
+        name="produce_for_abs_path",
+        run_id="produce_abs_1",
+        outputs=["table", "zones"],
+        output_sets=output_sets,
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+
+    out_all_dir = tracker.run_dir / "outputs" / "hydrated_all"
+    rel_prefix = Path("outputs") / "produce_for_abs_path" / "produce_abs_1"
+    tracker.set_run_subdir_fn(lambda _run: "hydrated_all")
+    hit_1 = tracker.run(
+        fn=produce,
+        name="produce_for_abs_path",
+        run_id="produce_abs_hit_1",
+        outputs=["table", "zones"],
+        output_sets=output_sets,
+        cache_options=CacheOptions(
+            cache_hydration="outputs-all",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert hit_1.cache_hit is True
+    assert hit_1.outputs["table"].abs_path == str(
+        (out_all_dir / rel_prefix / "table.csv").resolve()
+    )
+    assert hit_1.outputs["zones"].abs_path == str(
+        (out_all_dir / rel_prefix / "shapes" / "zones.shp" / "zones.shp").resolve()
+    )
+
+    # Second cache hit into the same out_all_dir hits skipped_existing (preserve_existing=True)
+    # and must still populate abs_path for both scalar and shapefile bundle outputs.
+    hit_2 = tracker.run(
+        fn=produce,
+        name="produce_for_abs_path",
+        run_id="produce_abs_hit_2",
+        outputs=["table", "zones"],
+        output_sets=output_sets,
+        cache_options=CacheOptions(
+            cache_hydration="outputs-all",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert hit_2.cache_hit is True
+    assert hit_2.outputs["table"].abs_path == str(
+        (out_all_dir / rel_prefix / "table.csv").resolve()
+    )
+    assert hit_2.outputs["zones"].abs_path == str(
+        (out_all_dir / rel_prefix / "shapes" / "zones.shp" / "zones.shp").resolve()
+    )
+    tracker.set_run_subdir_fn(None)
+
+    # Verify outputs-requested with materialize_cached_output_set_roots sets parent OutputSet abs_path
+    tracker_b = Tracker(run_dir=tmp_path / "runs_b", db_path=db_path)
+    _init_core_tables(tracker_b)
+    hit_3 = tracker_b.run(
+        fn=produce,
+        name="produce_for_abs_path",
+        run_id="produce_abs_hit_3",
+        outputs=["table", "zones"],
+        output_sets=output_sets,
+        cache_options=CacheOptions(
+            cache_hydration="outputs-requested",
+            cache_hydration_failure="warn",
+        ),
+        execution_options=ExecutionOptions(inject_context="ctx"),
+    )
+    assert hit_3.cache_hit is True
+    expected_set_root = (
+        tracker_b.run_dir
+        / "outputs"
+        / "produce_for_abs_path"
+        / "produce_abs_hit_3"
+        / "bundle"
+    )
+    assert (expected_set_root / "part_a.csv").exists()
+    assert hit_3.outputs["bundle_set"].abs_path == str(expected_set_root.resolve())
+
+    if tracker.engine:
+        tracker.engine.dispose()
+    if tracker_b.engine:
+        tracker_b.engine.dispose()
+
+
+def test_dynamic_logged_outputs_hydrated_on_cold_scratch_with_eager_validation(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    db_path = str(tmp_path / "provenance.db")
+    workspace_dir = tmp_path / "workspace"
+    archive_dir = tmp_path / "archive"
+    tracker = Tracker(run_dir=workspace_dir, db_path=db_path)
+    _init_core_tables(tracker)
+
+    calls = 0
+
+    def run_dynamic_step(ctx) -> None:
+        nonlocal calls
+        calls += 1
+        out_dir = workspace_dir / "beam" / "output" / "ITERS" / "it.0"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        events_file = out_dir / "0.events.parquet"
+        events_file.write_bytes(f"events-{calls}".encode("utf-8"))
+        ctx.log_output(events_file, key="events_parquet")
+
+        skims_dir = out_dir / "0.skims.zarr"
+        (skims_dir / "chunk").mkdir(parents=True, exist_ok=True)
+        (skims_dir / "chunk" / "0.0").write_bytes(f"skims-{calls}".encode("utf-8"))
+        ctx.log_output(skims_dir, key="skims_zarr", artifact_kind="directory")
+
+    with tracker.scenario("dynamic_step_run_1") as scenario:
+        res1 = scenario.run(
+            fn=run_dynamic_step,
+            name="beam_step",
+            config={"iteration": 0},
+            execution_options=ExecutionOptions(inject_context="ctx"),
+        )
+    assert res1.cache_hit is False
+    assert calls == 1
+
+    for art in res1.outputs.values():
+        tracker.archive_artifact(art, archive_dir, mode="copy")
+
+    # Simulate cold scratch wipe
+    shutil.rmtree(workspace_dir / "beam")
+
+    # 1) Cache hit with outputs-requested + validate_cached_outputs="eager" hydrates dynamic outputs
+    with tracker.scenario("dynamic_step_run_2") as scenario:
+        res2 = scenario.run(
+            fn=run_dynamic_step,
+            name="beam_step",
+            config={"iteration": 0},
+            cache_options=CacheOptions(
+                cache_hydration="outputs-requested",
+                cache_hydration_failure="miss",
+                validate_cached_outputs="eager",
+            ),
+            execution_options=ExecutionOptions(inject_context="ctx"),
+        )
+    assert res2.cache_hit is True
+    assert calls == 1
+    hydrated_events = (
+        workspace_dir / "beam" / "output" / "ITERS" / "it.0" / "0.events.parquet"
+    )
+    hydrated_skims = (
+        workspace_dir / "beam" / "output" / "ITERS" / "it.0" / "0.skims.zarr"
+    )
+    assert hydrated_events.read_bytes() == b"events-1"
+    assert (hydrated_skims / "chunk" / "0.0").read_bytes() == b"skims-1"
+    assert res2.outputs["events_parquet"].abs_path == str(hydrated_events.resolve())
+    assert res2.outputs["skims_zarr"].abs_path == str(hydrated_skims.resolve())
+
+    # 2) Cache hit with outputs-all + cache_hydration_failure="miss" also hydrates dynamic outputs
+    shutil.rmtree(workspace_dir / "beam")
+    with tracker.scenario("dynamic_step_run_3") as scenario:
+        res3 = scenario.run(
+            fn=run_dynamic_step,
+            name="beam_step",
+            config={"iteration": 0},
+            cache_options=CacheOptions(
+                cache_hydration="outputs-all",
+                cache_hydration_failure="miss",
+            ),
+            execution_options=ExecutionOptions(inject_context="ctx"),
+        )
+    assert res3.cache_hit is True
+    assert calls == 1
+    assert hydrated_events.read_bytes() == b"events-1"
+    assert (hydrated_skims / "chunk" / "0.0").read_bytes() == b"skims-1"
+
+    # 3) If archive copy is missing/unrecoverable, cache_hydration="outputs-all" +
+    #    cache_hydration_failure="miss" (even with lazy validation) rejects the hit and re-executes
+    shutil.rmtree(workspace_dir / "beam")
+    (archive_dir / "beam" / "output" / "ITERS" / "it.0" / "0.events.parquet").unlink()
+
+    with tracker.scenario("dynamic_step_run_4_miss") as scenario:
+        res4 = scenario.run(
+            fn=run_dynamic_step,
+            name="beam_step",
+            config={"iteration": 0},
+            cache_options=CacheOptions(
+                cache_hydration="outputs-all",
+                cache_hydration_failure="miss",
+                validate_cached_outputs="lazy",
+            ),
+            execution_options=ExecutionOptions(inject_context="ctx"),
+        )
+    assert res4.cache_hit is False
+    assert calls == 2
+    assert hydrated_events.read_bytes() == b"events-2"
+    assert (hydrated_skims / "chunk" / "0.0").read_bytes() == b"skims-2"
+
+    if tracker.engine:
+        tracker.engine.dispose()

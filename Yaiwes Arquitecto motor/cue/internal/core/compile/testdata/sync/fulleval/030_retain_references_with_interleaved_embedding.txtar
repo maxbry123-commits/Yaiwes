@@ -1,0 +1,43 @@
+#name: retain references with interleaved embedding
+#evalFull
+-- in.cue --
+a: d: {
+	#base... // spread, as Y is not one of its fields
+	#info: {...}
+	Y:     #info.X
+}
+
+#base: {
+	#info: {...}
+}
+
+a: [string]~(Name,_): {
+	#info: {
+		X: "foo"
+	}
+}
+-- out/compile --
+--- in.cue
+{
+  a: {
+    d: {
+      〈2;#base〉...
+      #info: {
+        ...
+      }
+      Y: 〈0;#info〉.X
+    }
+  }
+  #base: {
+    #info: {
+      ...
+    }
+  }
+  a: {
+    [string]: {
+      #info: {
+        X: "foo"
+      }
+    }
+  }
+}

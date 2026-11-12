@@ -1,0 +1,54 @@
+# Pinned to v0.17.0: root embedding through indirections, whose
+# share-ID assertions ride on the shape a closed embedding has before
+# explicitopen is stable.
+-- cue.mod/module.cue --
+module: "mod.test"
+language: version: "v0.17.0"
+-- in.cue --
+_schema // embed schema through indirections
+_schema: #Schema
+#Schema: {
+	a?: b?: string
+}
+a: b: "foo"
+c: "foo"
+
+
+x: {
+	_schema // embed schema through indirections
+	_schema: #Schema
+	#Schema: {
+		a?: b?: string
+	}
+	a: b: "foo"
+	c: "foo"
+}
+
+-- out/compile --
+--- in.cue
+{
+  〈0;_schema〉
+  _schema: 〈0;#Schema〉
+  #Schema: {
+    a?: {
+      b?: string
+    }
+  }
+  a: {
+    b: "foo"
+  }
+  c: "foo"
+  x: {
+    〈0;_schema〉
+    _schema: 〈0;#Schema〉
+    #Schema: {
+      a?: {
+        b?: string
+      }
+    }
+    a: {
+      b: "foo"
+    }
+    c: "foo"
+  }
+}

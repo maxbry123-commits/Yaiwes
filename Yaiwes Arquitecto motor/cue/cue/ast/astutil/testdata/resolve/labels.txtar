@@ -1,0 +1,47 @@
+# The old prefix alias syntax (X=) is only accepted below v0.18.0, where
+# @experiment(aliasv2) is stable; pin the language version so
+# that this test keeps exercising it.
+-- cue.mod/module.cue --
+module: "test.example"
+language: version: "v0.17.0"
+-- in.cue --
+[X=string]: name: X
+a: X
+
+Z=[string]: {x: string, y: Z.x}
+c: Z
+
+// `_` should not resolve.
+_: 1
+x: _
+
+for _ in [1] {a: _}
+-- out/resolve/in --
+4[X]:       Scope: 0[<nil>]       Node: 0[]
+5[string]:  Scope: 0[<nil>]       Node: 0[]
+8[name]:    Scope: 0[<nil>]       Node: 0[]
+9[X]:       Scope: 2[*ast.Field]  Node: 5[string]
+11[a]:      Scope: 0[<nil>]       Node: 0[]
+12[X]:      Scope: 0[<nil>]       Node: 0[]
+15[Z]:      Scope: 0[<nil>]       Node: 0[]
+16[string]: Scope: 0[<nil>]       Node: 0[]
+19[x]:      Scope: 0[<nil>]       Node: 0[]
+20[string]: Scope: 0[<nil>]       Node: 0[]
+22[y]:      Scope: 0[<nil>]       Node: 0[]
+23[Z]:      Scope: 13[*ast.Field] Node: 13[Z=[string]: {x: string, y: Z.x}]
+24[x]:      Scope: 0[<nil>]       Node: 0[]
+26[c]:      Scope: 0[<nil>]       Node: 0[]
+27[Z]:      Scope: 0[<nil>]       Node: 0[]
+29[_]:      Scope: 0[<nil>]       Node: 0[]
+31[x]:      Scope: 0[<nil>]       Node: 0[]
+32[_]:      Scope: 0[<nil>]       Node: 0[]
+34[_]:      Scope: 0[<nil>]       Node: 0[]
+37[a]:      Scope: 0[<nil>]       Node: 0[]
+38[_]:      Scope: 0[<nil>]       Node: 0[]
+Unresolved: 5[string]
+Unresolved: 12[X]
+Unresolved: 16[string]
+Unresolved: 20[string]
+Unresolved: 27[Z]
+Unresolved: 32[_]
+Unresolved: 38[_]

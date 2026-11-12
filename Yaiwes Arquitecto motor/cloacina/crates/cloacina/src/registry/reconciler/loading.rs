@@ -1,0 +1,3833 @@
+/*
+ *  Copyright 2025-2026 Colliery Software
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+//! Package loading, unloading, and task/workflow registration.
+
+use tracing::{debug, error, info, warn};
+
+use super::{PackageState, RegistryReconciler};
+use crate::Runtime;
+use crate::registry::error::RegistryError;
+use crate::registry::types::{WorkflowMetadata, WorkflowPackageId};
+use crate::task::TaskNamespace;
+use std::sync::Arc;
+
+/// Best-effort humantime parser for trigger metadata's poll_interval
+/// strings (e.g. "5s", "500ms", "1m"). Falls back to `None` for
+/// unparsable values; callers default to a safe constant. Used by
+/// `step_load_custom_triggers` when registering FFI trigger adapters
+/// from packaged cdylibs (the cdylib serializes the duration as a
+/// string in `TriggerPackageMetadata`).
+fn parse_humantime_duration(s: &str) -> Option<std::time::Duration> {
+    let trimmed = s.trim();
+    if let Some(num) = trimmed.strip_suffix("ms") {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    } else if let Some(num) = trimmed.strip_suffix('s') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    } else if let Some(num) = trimmed.strip_suffix('m') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m * 60))
+    } else if let Some(num) = trimmed.strip_suffix('h') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|h| std::time::Duration::from_secs(h * 3600))
+    } else {
+        trimmed
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    }
+}
+
+/// Write the cdylib bytes to a temp path and dlopen via fidius. The
+/// returned `PluginHandle` keeps the dlopen'd library alive; drop it to
+/// release. Used by `step_load_custom_triggers` to register FFI
+/// `Trigger` adapters for packaged cdylibs whose inventory submissions
+/// don't reach the host's `inventory::iter` (cross-cdylib linker
+/// boundary).
+fn load_plugin_handle_from_bytes(library_data: &[u8]) -> Result<fidius_host::PluginHandle, String> {
+    use std::io::Write;
+    let library_extension = crate::registry::loader::package_loader::get_library_extension();
+    let temp_dir = tempfile::TempDir::new().map_err(|e| format!("temp dir: {}", e))?;
+    let temp_path = temp_dir
+        .path()
+        .join(format!("trigger_plugin.{}", library_extension));
+    {
+        let mut f =
+            std::fs::File::create(&temp_path).map_err(|e| format!("create temp library: {}", e))?;
+        f.write_all(library_data)
+            .map_err(|e| format!("write temp library: {}", e))?;
+    }
+    let loaded = fidius_host::loader::load_library(&temp_path)
+        .map_err(|e| format!("dlopen failed: {:?}", e))?;
+    let plugin = loaded
+        .plugins
+        .into_iter()
+        .next()
+        .ok_or_else(|| "library exposes no fidius plugins".to_string())?;
+    let handle = fidius_host::PluginHandle::from_loaded(plugin);
+    // Leak the temp_dir so the file path stays valid for the lifetime
+    // of the dlopen handle. The OS reclaims on process exit; for the
+    // long-running daemon/server use case this matches the intended
+    // load lifecycle (one tempdir per package, dropped on full process
+    // restart).
+    std::mem::forget(temp_dir);
+    Ok(handle)
+}
+
+impl RegistryReconciler {
+    /// Load a package into the global registries.
+    ///
+    /// Since the compiler service (CLOACI-I-0097) owns all `cargo build`
+    /// invocations, the reconciler no longer compiles anything. It:
+    /// 1. Fetches the source archive + prebuilt cdylib (`compiled_data`)
+    ///    from the workflow registry — `get_workflow` only returns
+    ///    packages in `build_status = 'success'`.
+    /// 2. Unpacks the source for manifest + (Python) task extraction.
+    /// 3. Dispatches by language: Rust hands `compiled_data` to fidius FFI,
+    ///    Python imports from source.
+    pub(super) async fn load_package(
+        &self,
+        metadata: WorkflowMetadata,
+    ) -> Result<(), RegistryError> {
+        // CLOACI-T-0918: early load steps persist schedule rows (cron +
+        // poll) through the CronWorkflowRegistrar. If a LATER step fails,
+        // the package never becomes tracked, `unload_package` never runs
+        // for it, and those rows are orphaned ghosts that keep firing /
+        // showing in the Triggers view. Collect every schedule id created
+        // during the load and roll them all back on any failure.
+        let mut created_schedule_ids: Vec<String> = Vec::new();
+        let result = self
+            .load_package_inner(metadata.clone(), &mut created_schedule_ids)
+            .await;
+        if result.is_err() && !created_schedule_ids.is_empty() {
+            self.rollback_schedule_rows(&metadata, &created_schedule_ids)
+                .await;
+        }
+        result
+    }
+
+    /// Best-effort cleanup of schedule rows created by a load that later
+    /// failed (CLOACI-T-0918). Mirrors the unload path's schedule teardown;
+    /// failures are logged, not propagated — the load error is the primary
+    /// signal.
+    pub(super) async fn rollback_schedule_rows(
+        &self,
+        metadata: &WorkflowMetadata,
+        schedule_ids: &[String],
+    ) {
+        let Some(registrar) = self.cron_registrar.as_ref() else {
+            // Ids can only exist if a registrar was attached during the
+            // load, so this is unreachable in practice — but degrade loudly.
+            warn!(
+                "Package {} v{}: {} schedule row(s) created by a failed load but no \
+                 registrar attached for rollback — rows may stay live in the DB",
+                metadata.package_name,
+                metadata.version,
+                schedule_ids.len()
+            );
+            return;
+        };
+        let mut dropped = 0usize;
+        for schedule_id in schedule_ids {
+            match registrar.unregister_cron_workflow(schedule_id).await {
+                Ok(()) => dropped += 1,
+                Err(e) => warn!(
+                    "Package {} v{}: failed to roll back schedule '{}' after failed load: {}",
+                    metadata.package_name, metadata.version, schedule_id, e
+                ),
+            }
+        }
+        info!(
+            "Package {} v{}: rolled back {}/{} schedule row(s) after failed load",
+            metadata.package_name,
+            metadata.version,
+            dropped,
+            schedule_ids.len()
+        );
+    }
+
+    async fn load_package_inner(
+        &self,
+        metadata: WorkflowMetadata,
+        created_schedule_ids: &mut Vec<String>,
+    ) -> Result<(), RegistryError> {
+        debug!(
+            "Loading package: {} v{}",
+            metadata.package_name, metadata.version
+        );
+
+        // Get the package archive data from the registry
+        let loaded_workflow = self
+            .registry
+            .get_workflow(&metadata.package_name, &metadata.version)
+            .await?
+            .ok_or_else(|| RegistryError::PackageNotFound {
+                package_name: metadata.package_name.clone(),
+                version: metadata.version.clone(),
+            })?;
+
+        // CLOACI-T-0571: defense-in-depth signature existence check.
+        // When `require_signatures` is on, refuse to load any package
+        // whose source bytes have no matching `package_signatures` row.
+        // The upload route is the strong verification gate (CLOACI-I-0103);
+        // this catches direct DB inserts that bypass it.
+        if self.config.require_signatures {
+            let package_hash = {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&loaded_workflow.package_data);
+                hex::encode(hasher.finalize())
+            };
+            let has_sig = self
+                .registry
+                .find_signature(&package_hash)
+                .await
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: format!(
+                        "signature-existence check failed for {} v{}: {}",
+                        metadata.package_name, metadata.version, e
+                    ),
+                })?;
+            if !has_sig {
+                let msg = format!(
+                    "no signature row present for package {} v{} (hash {}); \
+                     refusing to load (require_signatures=true)",
+                    metadata.package_name, metadata.version, package_hash
+                );
+                tracing::warn!(
+                    package_name = %metadata.package_name,
+                    package_version = %metadata.version,
+                    package_hash = %package_hash,
+                    "{}",
+                    msg
+                );
+                if let Some(org_id) = self.config.verification_org_id {
+                    crate::security::audit::log_package_load_failure(
+                        org_id,
+                        &format!("{} v{}", metadata.package_name, metadata.version),
+                        &msg,
+                        "missing_signature",
+                    );
+                }
+                return Err(RegistryError::RegistrationFailed { message: msg });
+            }
+        }
+
+        // --- Step 1: write archive to a temp file ---
+        let work_dir = tempfile::TempDir::new().map_err(|e| RegistryError::RegistrationFailed {
+            message: format!("Failed to create temp dir: {}", e),
+        })?;
+
+        let archive_path = work_dir.path().join(format!(
+            "{}-{}.cloacina",
+            metadata.package_name, metadata.version
+        ));
+
+        tokio::fs::write(&archive_path, &loaded_workflow.package_data)
+            .await
+            .map_err(|e| RegistryError::RegistrationFailed {
+                message: format!("Failed to write archive to temp file: {}", e),
+            })?;
+
+        // --- Step 2: unpack archive ---
+        let extract_dir = work_dir.path().join("source");
+        tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
+            RegistryError::RegistrationFailed {
+                message: format!("Failed to create extract dir: {}", e),
+            }
+        })?;
+
+        let archive_path_clone = archive_path.clone();
+        let extract_dir_clone = extract_dir.clone();
+        let source_dir = tokio::task::spawn_blocking(move || {
+            fidius_core::package::unpack_package(&archive_path_clone, &extract_dir_clone).map_err(
+                |e| RegistryError::RegistrationFailed {
+                    message: format!("Failed to unpack source archive: {}", e),
+                },
+            )
+        })
+        .await
+        .map_err(|e| RegistryError::RegistrationFailed {
+            message: format!("spawn_blocking failed during unpack: {}", e),
+        })??;
+
+        // --- Step 3: load manifest and validate ---
+        // T-E / I-0102: `#[serde(deny_unknown_fields)]` on CloacinaMetadata
+        // makes legacy `package_type` and `[[triggers]]` keys hard-error at
+        // deserialization. Wrap the deserializer error with a friendlier
+        // migration hint so users see what to change rather than the raw
+        // "unknown field" message.
+        let source_dir_clone = source_dir.clone();
+        let pkg_name_for_err = metadata.package_name.clone();
+        let cloacina_manifest = tokio::task::spawn_blocking(move || {
+            cloacina_workflow_plugin::manifest::load_resolved_manifest(&source_dir_clone).map_err(
+                |e| {
+                    let raw = e.to_string();
+                    let migration_hint = if raw.contains("package_type") {
+                        " — `package_type` was removed in CLOACI-I-0102; primitives are now \
+                     self-declared via the unified `cloacina::package!()` shell macro and \
+                     per-primitive macros (`#[workflow]`, `#[reactor]`, `#[trigger]`, \
+                     `#[computation_graph]`)"
+                    } else if raw.contains("triggers") {
+                        " — `[[triggers]]` in package.toml was removed in CLOACI-I-0102; declare \
+                     workflow → trigger subscriptions via `#[workflow(triggers = [...])]` on \
+                     the workflow module instead"
+                    } else {
+                        ""
+                    };
+                    RegistryError::RegistrationFailed {
+                        message: format!(
+                            "Failed to load package.toml for {}: {}{}",
+                            pkg_name_for_err, raw, migration_hint
+                        ),
+                    }
+                },
+            )
+        })
+        .await
+        .map_err(|e| RegistryError::RegistrationFailed {
+            message: format!("spawn_blocking failed during manifest load: {}", e),
+        })??;
+
+        debug!(
+            "Package manifest loaded: {} v{} language={}",
+            cloacina_manifest.package.name,
+            cloacina_manifest.package.version,
+            cloacina_manifest.metadata.language
+        );
+
+        // T-E / I-0102: deprecation warnings removed; `[[triggers]]` and
+        // `package_type` are now hard-errored at deserialization via
+        // `#[serde(deny_unknown_fields)]` on `CloacinaMetadata`. The
+        // friendly migration message is wrapped at the manifest-load
+        // boundary below.
+
+        // --- Step 4, 5, 6: language-specific loading ---
+        //
+        // `compiled_data` is populated by the compiler service for Rust / mixed
+        // packages. CLOACI-T-0905 (multi-arch): prefer THIS host's per-target
+        // artifact (compiler `run_per_target` builds into `package_artifacts`)
+        // over the primary build — the primary is whatever arch the compiler
+        // host runs, which on a mixed fleet is not necessarily ours. Falls back
+        // to the primary when no per-target artifact exists (single-arch
+        // deployments, where the primary IS the right arch). Hold onto the
+        // bytes so the computation-graph step below can reuse them without
+        // another DB round-trip.
+        let host_triple = crate::fleet::protocol::host_target_triple();
+        let per_target_cdylib = self
+            .registry
+            .get_compiled_data_for_target(&metadata.package_name, &metadata.version, &host_triple)
+            .await?;
+        // Provenance string woven into load-failure messages so a wrong-arch
+        // dlopen failure names WHICH artifact was tried (clear error, not a
+        // silent wrong-arch load).
+        let artifact_provenance = if per_target_cdylib.is_some() {
+            format!("per-target artifact for '{host_triple}'")
+        } else {
+            format!("primary build (no per-target artifact for '{host_triple}')")
+        };
+        let rust_cdylib_bytes = match per_target_cdylib {
+            Some(bytes) => {
+                info!(
+                    "Selected per-target cdylib ({} bytes, {}) for {} v{}",
+                    bytes.len(),
+                    host_triple,
+                    metadata.package_name,
+                    metadata.version
+                );
+                Some(bytes)
+            }
+            None => loaded_workflow.compiled_data.clone(),
+        };
+
+        // T-0554 Phase 2: per-language reactor_names tracking. The
+        // earlier pre/post inventory-diff approach didn't work for
+        // independently-compiled cdylibs (each fixture/example crate
+        // has its own `[workspace]`, so `cloacina-workflow-plugin` is
+        // a separate compilation with distinct linker symbols and
+        // `inventory::iter` doesn't see entries submitted by the
+        // dlopen'd cdylib). For Rust packages we use the FFI metadata
+        // directly; for Python we keep the diff path since the scoped
+        // Runtime is the authoritative source for that language.
+        let mut rust_reactor_names: Vec<String> = Vec::new();
+        let pre_load_reactor_names: std::collections::HashSet<String> = self
+            .runtime
+            .as_ref()
+            .map(|rt| rt.reactor_names().into_iter().collect())
+            .unwrap_or_default();
+
+        // Schedule ids created during this load accumulate into the
+        // caller-provided vec (`created_schedule_ids`) so `load_package`
+        // can roll them back if any later step fails (CLOACI-T-0918).
+        let mut triggerless_graph_names: Vec<String> = Vec::new();
+
+        let (task_namespaces, workflow_name, trigger_names, rust_graph_name) = if cloacina_manifest
+            .metadata
+            .language
+            == "rust"
+        {
+            // T-0554 / I-0102: Rust path now runs the precedence-ordered
+            // pipeline. Extract a unified PackageLoadView, then call six
+            // step helpers in fixed order.
+            let library_data =
+                rust_cdylib_bytes
+                    .clone()
+                    .ok_or_else(|| RegistryError::RegistrationFailed {
+                        message: format!(
+                            "Rust package {} v{} has no compiled_data and no per-target \
+                             artifact for '{}' — compiler service must produce the cdylib \
+                             before the reconciler loads it",
+                            metadata.package_name, metadata.version, host_triple
+                        ),
+                    })?;
+            info!(
+                "Loaded compiled cdylib ({} bytes, {}) for {}",
+                library_data.len(),
+                artifact_provenance,
+                metadata.package_name
+            );
+
+            // A wrong-arch cdylib dies here (dlopen). Name which artifact was
+            // tried so the failure is diagnosable (CLOACI-T-0905), instead of a
+            // bare loader error that reads like corruption.
+            let view = self.build_view_rust(&library_data).await.map_err(|e| {
+                RegistryError::RegistrationFailed {
+                    message: format!(
+                        "loading {} v{} from {} failed: {} (host triple '{}'; if this is a \
+                         wrong-arch cdylib, ensure the per-target compiler covers this arch)",
+                        metadata.package_name,
+                        metadata.version,
+                        artifact_provenance,
+                        e,
+                        host_triple
+                    ),
+                }
+            })?;
+            rust_reactor_names = view.reactors.iter().map(|r| r.name.clone()).collect();
+
+            // Step 0 (CLOACI-T-0907): stage the package's BUNDLED constructor
+            // providers before anything that may consume them spawns. This used
+            // to happen only inside step_load_constructor_nodes (i.e. only for
+            // packages with `constructor!` NODES) — but a provider-backed STREAM
+            // accumulator (`[[metadata.accumulators]] provider = ..`) consumes a
+            // bundled provider from step 3's reactor spawn, with no constructor
+            // node in sight. Packages that bundle nothing stage nothing.
+            //
+            // CLOACI-T-0925: the staged root is a VALUE now, handed to each step
+            // that resolves against it, instead of a process-global the next
+            // tenant's concurrent load overwrites.
+            let provider_root = self.stage_bundled_providers(&metadata).await?;
+
+            // Step 1: cron triggers — registered through the attached
+            // CronWorkflowRegistrar (no-op when none is wired).
+            created_schedule_ids.extend(self.step_load_cron_triggers(&metadata, &view).await?);
+            // Step 1b: persist poll-trigger schedule rows so the trigger
+            // scheduler polls them and they show in the Triggers view (WS-6).
+            created_schedule_ids.extend(self.step_persist_poll_schedules(&metadata, &view).await?);
+            // Step 2: custom triggers (validated against runtime).
+            let trigger_names =
+                self.step_load_custom_triggers(&metadata, &view, Some(&library_data))?;
+            // Step 3: reactors → graph scheduler.
+            self.step_load_reactors(
+                &metadata,
+                &view,
+                &cloacina_manifest.metadata,
+                provider_root.as_deref(),
+            )
+            .await?;
+            // Step 4: trigger-less CGs — register FFI adapters for any
+            // declared by the cdylib (cross-cdylib inventory doesn't
+            // reach the host runtime; close that gap with FFI dispatch
+            // through method index 8).
+            triggerless_graph_names = self
+                .step_load_triggerless_cgs(&metadata, &view, Some(&library_data))
+                .await?;
+            // Step 5: reactor-bound CG → graph scheduler. We do this
+            // BEFORE workflow registration so the (newly-supported)
+            // workflow→graph dispatch can resolve graph names if it
+            // wants to. Order is unchanged for legacy fixtures since
+            // their workflows don't reference graphs.
+            let rust_graph_name = self
+                .step_load_reactor_bound_cgs(
+                    &metadata,
+                    &view,
+                    &cloacina_manifest.metadata,
+                    &library_data,
+                    provider_root.as_deref(),
+                )
+                .await?;
+            // Step 5b: packaged `constructor!` nodes (CLOACI-T-0832/T-0836).
+            // Resolve each declared constructor node against the package's
+            // BUNDLED providers and register it into the runtime registry,
+            // BEFORE step 6 builds the workflow — the DAG builder
+            // (`create_workflow_from_host_registry_static`) enumerates the
+            // registry, so resolved nodes join the topology automatically.
+            self.step_load_constructor_nodes(&metadata, &library_data, provider_root.clone())
+                .await?;
+            // Step 6: workflows (tasks + workflow + trigger-subscription
+            // validation).
+            let (task_namespaces, workflow_name) =
+                self.step_load_workflows(&metadata, &library_data).await?;
+
+            (
+                task_namespaces,
+                workflow_name,
+                trigger_names,
+                rust_graph_name,
+            )
+        } else if cloacina_manifest.metadata.language == "python"
+            && !cloacina_manifest.metadata.has_computation_graph()
+        {
+            // Python workflow path — dispatched through the `PythonRuntime`
+            // trait. Binaries that register no runtime (e.g. the compiler
+            // service) error cleanly here; the server registers an impl
+            // at startup.
+            debug!("Loading Python package: {}", metadata.package_name);
+            // T-0554 Phase 2: snapshot scoped runtime registries BEFORE
+            // the Python import so `build_view_python` can compute the
+            // diff (= primitives this package introduced) post-import
+            // and feed the unified pipeline helpers.
+            let (py_pre_reactor_names, py_pre_trigger_names, py_pre_graph_names) =
+                self.snapshot_runtime_registries();
+            let runtime = crate::python_runtime::python_runtime().ok_or_else(|| {
+                RegistryError::RegistrationFailed {
+                    message: "Python package {} received but no PythonRuntime is attached \
+                              to this process — this binary does not support Python workflows"
+                        .replace("{}", &metadata.package_name),
+                }
+            })?;
+
+            let staging = work_dir.path().join("python-staging");
+            let tenant_id = self.config.default_tenant_id.clone();
+            let cloacina_runtime = self.runtime.clone().ok_or_else(|| {
+                RegistryError::RegistrationFailed {
+                    message: format!(
+                        "Python package {} received but the reconciler has no Runtime attached — \
+                         Python loads require a scoped Runtime",
+                        metadata.package_name
+                    ),
+                }
+            })?;
+
+            // CLOACI-T-0831: stage the package's bundled constructor providers
+            // BEFORE the module import — `cloaca.constructor(...)` calls resolve
+            // against the provider search path DURING import. Packages that
+            // bundle none stage nothing (`None`).
+            let provider_root = self.stage_bundled_providers(&metadata).await?;
+
+            let loaded = {
+                let archive_data = loaded_workflow.package_data.clone();
+                let runtime = runtime.clone();
+                let cloacina_runtime = cloacina_runtime.clone();
+                let import_provider_root = provider_root.clone();
+                tokio::task::spawn_blocking(move || {
+                    // CLOACI-T-0925: `cloaca.constructor(..)` runs INSIDE the
+                    // module import and cannot take the directory as an argument,
+                    // so install it as the ambient scope for the import. The
+                    // Python loader carries it onto the import thread it spawns
+                    // (the same way it carries ScopedRuntime/ScopedRegistration).
+                    #[cfg(feature = "constructors-wasm")]
+                    let _provider_scope =
+                        crate::registry::loader::ScopedProviderSearch::for_staged_root(
+                            import_provider_root,
+                        );
+                    #[cfg(not(feature = "constructors-wasm"))]
+                    let _ = import_provider_root;
+                    runtime
+                        .load_workflow_package(
+                            &archive_data,
+                            &staging,
+                            &tenant_id,
+                            &cloacina_runtime,
+                        )
+                        .map_err(|e| RegistryError::RegistrationFailed { message: e })
+                })
+                .await
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: format!("spawn_blocking failed during Python load: {}", e),
+                })??
+            };
+
+            // Python load now routes fully through the unified pipeline.
+            // build_view_python walks the scoped Runtime to produce
+            // wire-format reactor/trigger/graph metadata; step_load_*
+            // helpers consume the view identically to the Rust path.
+            let py_view = self.build_view_python(
+                &metadata.package_name,
+                &py_pre_reactor_names,
+                &py_pre_trigger_names,
+                &py_pre_graph_names,
+                &cloacina_manifest.metadata.accumulators,
+            );
+            created_schedule_ids.extend(self.step_load_cron_triggers(&metadata, &py_view).await?);
+            created_schedule_ids.extend(
+                self.step_persist_poll_schedules(&metadata, &py_view)
+                    .await?,
+            );
+            let trigger_names = self.step_load_custom_triggers(&metadata, &py_view, None)?;
+
+            // Reactors: route through the unified pipeline helper.
+            // build_view_python already produced wire-format reactor
+            // metadata by walking the scoped Runtime; step_load_reactors
+            // dispatches each into the scheduler via the same idempotent
+            // path the Rust pipeline uses. Replaces the old inline
+            // `dispatch_runtime_reactors_into_scheduler` call.
+            self.step_load_reactors(
+                &metadata,
+                &py_view,
+                &cloacina_manifest.metadata,
+                provider_root.as_deref(),
+            )
+            .await?;
+
+            info!(
+                "Python package loaded: {} v{} — {} tasks, workflow '{}'",
+                metadata.package_name,
+                metadata.version,
+                loaded.task_namespaces.len(),
+                loaded.workflow_name,
+            );
+
+            // Persist the Python task graph (CLOACI-T-0672). Python packages
+            // produce no cdylib, so `mark_build_success` couldn't populate the
+            // row's task list — write it here from the scoped Runtime's view so
+            // `GET /workflows/{name}` (and the UI DAG) show the tasks the same
+            // way Rust packages do. Best-effort: a failure must not abort load.
+            let py_task_graph: Vec<(String, Vec<String>)> = loaded
+                .tasks
+                .iter()
+                .map(|n| (n.id.clone(), n.dependencies.clone()))
+                .collect();
+            if !py_task_graph.is_empty() {
+                if let Err(e) = self
+                    .registry
+                    .persist_task_graph(metadata.id, py_task_graph)
+                    .await
+                {
+                    warn!(
+                        package = %metadata.package_name,
+                        error = %e,
+                        "failed to persist Python task graph metadata"
+                    );
+                }
+            }
+
+            (
+                loaded.task_namespaces,
+                Some(loaded.workflow_name),
+                trigger_names,
+                None,
+            )
+        } else if cloacina_manifest.metadata.language == "python"
+            && cloacina_manifest.metadata.has_computation_graph()
+        {
+            // Python CG packages: no workflow tasks to register.
+            // The CG import happens in step 7 below (Python branch only;
+            // Rust CG handled in the unified pipeline above).
+            (vec![], None, vec![], None)
+        } else {
+            return Err(RegistryError::RegistrationFailed {
+                message: format!(
+                    "Unsupported package language '{}' for package {} — only 'rust' and 'python' are supported",
+                    cloacina_manifest.metadata.language, metadata.package_name
+                ),
+            });
+        };
+
+        // --- Step 7: Python computation graph routing ---
+        // T-0554: Rust CG handling moved into the unified pipeline above
+        // (`step_load_reactor_bound_cgs`). This step now only handles the
+        // Python CG path, which still needs the dedicated PythonRuntime
+        // dispatch.
+        let graph_name = if rust_graph_name.is_some() {
+            rust_graph_name
+        } else if cloacina_manifest.metadata.has_computation_graph() {
+            if cloacina_manifest.metadata.language == "python" {
+                // Python computation graph: dispatch through the
+                // `PythonRuntime` trait. Same reasoning as the workflow
+                // branch — binaries without Python support error out here
+                // instead of trying to run pyo3 they don't link.
+                if let (Some(graph_name), Some(entry_module)) = (
+                    &cloacina_manifest.metadata.graph_name,
+                    &cloacina_manifest.metadata.entry_module,
+                ) {
+                    // T-0554 Phase 2: pre-snapshot scoped runtime so the
+                    // post-load view can drive cross-package contract
+                    // validation through the unified pipeline helpers.
+                    let (cg_pre_reactor_names, cg_pre_trigger_names, cg_pre_graph_names) =
+                        self.snapshot_runtime_registries();
+                    let runtime = crate::python_runtime::python_runtime().ok_or_else(|| {
+                        RegistryError::RegistrationFailed {
+                            message: format!(
+                                "Python CG package {} received but no PythonRuntime \
+                                     is attached to this process",
+                                metadata.package_name
+                            ),
+                        }
+                    })?;
+
+                    let staging = work_dir.path().join("python-cg-staging");
+                    let tenant = self.config.default_tenant_id.clone();
+                    let acc_overrides = cloacina_manifest.metadata.accumulators.clone();
+                    let gn = graph_name.clone();
+                    let em = entry_module.clone();
+
+                    let cloacina_runtime = self.runtime.clone().ok_or_else(|| {
+                        RegistryError::RegistrationFailed {
+                            message: format!(
+                                "Python CG package {} received but the reconciler has no Runtime \
+                                 attached — Python loads require a scoped Runtime",
+                                metadata.package_name
+                            ),
+                        }
+                    })?;
+                    // CLOACI-T-0925: this branch previously staged NOTHING, so a
+                    // Python CG package's provider-backed accumulators resolved
+                    // against whatever directory the last load left in the
+                    // process global — another tenant's tree in a shared server.
+                    // Stage its own bundle and scope the import to it, exactly
+                    // like the Python workflow branch above.
+                    let cg_provider_root = self.stage_bundled_providers(&metadata).await?;
+                    let maybe_decl = {
+                        let archive_data = loaded_workflow.package_data.clone();
+                        let gn_inner = gn.clone();
+                        let em_inner = em.clone();
+                        let tenant_inner = tenant.clone();
+                        let runtime = runtime.clone();
+                        let cloacina_runtime = cloacina_runtime.clone();
+                        let import_provider_root = cg_provider_root.clone();
+                        tokio::task::spawn_blocking(move || {
+                            #[cfg(feature = "constructors-wasm")]
+                            let _provider_scope =
+                                crate::registry::loader::ScopedProviderSearch::for_staged_root(
+                                    import_provider_root,
+                                );
+                            #[cfg(not(feature = "constructors-wasm"))]
+                            let _ = import_provider_root;
+                            runtime
+                                .load_cg_package(
+                                    &archive_data,
+                                    &staging,
+                                    &tenant_inner,
+                                    &gn_inner,
+                                    &em_inner,
+                                    &acc_overrides,
+                                    &cloacina_runtime,
+                                )
+                                .map_err(|e| RegistryError::RegistrationFailed { message: e })
+                        })
+                        .await
+                        .map_err(|e| {
+                            RegistryError::RegistrationFailed {
+                                message: format!(
+                                    "spawn_blocking failed during Python CG load: {}",
+                                    e
+                                ),
+                            }
+                        })??
+                    };
+
+                    // T-0554 Phase 2: build the Python view + run the
+                    // unified pipeline helpers (cron triggers, custom
+                    // triggers, reactors, cross-package contract
+                    // validation) BEFORE handing the declaration to
+                    // the scheduler. The reactor step replaces the old
+                    // inline `dispatch_runtime_reactors_into_scheduler`
+                    // call: build_view_python already produced wire-
+                    // format reactor metadata from the runtime walk,
+                    // so step_load_reactors dispatches it the same way
+                    // the Rust pipeline does.
+                    let cg_view = self.build_view_python(
+                        &metadata.package_name,
+                        &cg_pre_reactor_names,
+                        &cg_pre_trigger_names,
+                        &cg_pre_graph_names,
+                        &cloacina_manifest.metadata.accumulators,
+                    );
+                    let cg_cron_ids = self.step_load_cron_triggers(&metadata, &cg_view).await?;
+                    if !cg_cron_ids.is_empty() {
+                        created_schedule_ids.extend(cg_cron_ids);
+                    }
+                    created_schedule_ids.extend(
+                        self.step_persist_poll_schedules(&metadata, &cg_view)
+                            .await?,
+                    );
+                    let _ = self.step_load_custom_triggers(&metadata, &cg_view, None)?;
+                    self.step_load_reactors(
+                        &metadata,
+                        &cg_view,
+                        &cloacina_manifest.metadata,
+                        cg_provider_root.as_deref(),
+                    )
+                    .await?;
+                    if let Some(graph_meta) = cg_view.graph.as_ref() {
+                        if let Some(upstream_reactor_name) = graph_meta.trigger_reactor.as_deref() {
+                            let publisher_in_same_package = cg_view
+                                .reactors
+                                .iter()
+                                .any(|r| r.name == upstream_reactor_name);
+                            if !publisher_in_same_package {
+                                let scheduler_guard = self.graph_scheduler.read().await;
+                                if let Some(ref scheduler) = *scheduler_guard {
+                                    if let Some(upstream_acc_names) = scheduler
+                                        .reactor_accumulator_names(
+                                            upstream_reactor_name,
+                                            self.tenant_scope(),
+                                        )
+                                        .await
+                                    {
+                                        let upstream_set: std::collections::HashSet<&str> =
+                                            upstream_acc_names.iter().map(|s| s.as_str()).collect();
+                                        let missing: Vec<String> = graph_meta
+                                            .accumulators
+                                            .iter()
+                                            .filter(|a| !upstream_set.contains(a.name.as_str()))
+                                            .map(|a| a.name.clone())
+                                            .collect();
+                                        if !missing.is_empty() {
+                                            return Err(RegistryError::RegistrationFailed {
+                                                message: format!(
+                                                    "package '{}' subscribes to reactor '{}' but declares accumulator(s) {:?} \
+                                                     that are not part of the upstream reactor's contract (upstream declares {:?})",
+                                                    metadata.package_name,
+                                                    upstream_reactor_name,
+                                                    missing,
+                                                    upstream_acc_names,
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(decl) = maybe_decl {
+                        let scheduler_guard = self.graph_scheduler.read().await;
+                        if let Some(ref scheduler) = *scheduler_guard {
+                            if let Err(e) = scheduler
+                                .load_graph_in(decl, cg_provider_root.as_deref())
+                                .await
+                            {
+                                warn!(
+                                    "Failed to load Python CG '{}' into ComputationGraphScheduler: {}",
+                                    gn, e
+                                );
+                            } else {
+                                info!(
+                                    "Python computation graph '{}' loaded into ComputationGraphScheduler",
+                                    gn
+                                );
+                            }
+                        }
+                    }
+
+                    info!(
+                        "Python computation graph '{}' imported from '{}'",
+                        graph_name, entry_module
+                    );
+                    Some(graph_name.clone())
+                } else {
+                    warn!("Python computation graph package missing graph_name or entry_module");
+                    None
+                }
+            } else {
+                debug!("Unsupported language for computation graph");
+                None
+            }
+        } else {
+            None
+        };
+
+        // Tasks, workflows, and CGs are registered directly on the Runtime by
+        // the Rust + Python load paths above. For Rust cdylib packages we
+        // re-seed the Runtime from `inventory` after dlopen — but only
+        // for inventory entries from libraries linked into the host
+        // process, NOT from independently-compiled cdylibs. Each
+        // packaged crate has its own `cloacina-workflow-plugin`
+        // compilation with distinct linker symbols, so its
+        // `inventory::submit!` entries never reach the host's
+        // `inventory::iter`. The cross-cdylib path for triggers /
+        // trigger-less graphs / reactors goes through the FFI bridges
+        // (T-0553 follow-ups: `step_load_custom_triggers`,
+        // `step_load_triggerless_cgs`, `step_load_reactors`). This
+        // re-seed only catches late host-side submissions and is a
+        // no-op for the typical packaged-cdylib case.
+        // Python packages register through the thread-local scope and
+        // don't need this re-seed.
+        if let Some(runtime) = &self.runtime {
+            if cloacina_manifest.metadata.language == "rust" {
+                runtime.seed_from_inventory();
+            }
+        }
+
+        // T-0554 Phase 2: track reactors this package owns. Rust path
+        // uses FFI metadata (cross-cdylib safe). Python path uses the
+        // pre/post `Runtime::reactor_names()` diff (works because the
+        // scoped Runtime is the authoritative registry for Python).
+        let reactor_names: Vec<String> = if cloacina_manifest.metadata.language == "rust" {
+            rust_reactor_names
+        } else {
+            let post_load_reactor_names: std::collections::HashSet<String> = self
+                .runtime
+                .as_ref()
+                .map(|rt| rt.reactor_names().into_iter().collect())
+                .unwrap_or_default();
+            post_load_reactor_names
+                .difference(&pre_load_reactor_names)
+                .cloned()
+                .collect()
+        };
+
+        // Track the loaded package state
+        let package_state = PackageState {
+            metadata: metadata.clone(),
+            task_namespaces,
+            workflow_name,
+            trigger_names,
+            graph_name,
+            reactor_names,
+            cron_schedule_ids: created_schedule_ids.clone(),
+            triggerless_graph_names,
+        };
+
+        let mut loaded_packages = self.loaded_packages.write().await;
+        loaded_packages.insert(metadata.id, package_state);
+        drop(loaded_packages);
+
+        Ok(())
+    }
+
+    /// Unload a package from the global registries.
+    ///
+    /// Tear-down runs in REVERSE precedence order
+    /// (workflows → CGs → reactors → triggers → tasks). This mirrors the
+    /// load pipeline and lets the bound-subscriber guard inside
+    /// `unload_reactor` fire cleanly when an operator tries to drop a
+    /// publishing package while subscribers are still bound: the workflow
+    /// and CG steps run first, but the reactor step refuses if any
+    /// cross-package subscriber remains, and the unload as a whole
+    /// surfaces the rejection.
+    pub(super) async fn unload_package(
+        &self,
+        package_id: WorkflowPackageId,
+    ) -> Result<(), RegistryError> {
+        debug!("Unloading package: {}", package_id);
+
+        // Get the package state to know what to unload
+        let mut loaded_packages = self.loaded_packages.write().await;
+        let package_state =
+            loaded_packages
+                .remove(&package_id)
+                .ok_or_else(|| RegistryError::PackageNotFound {
+                    package_name: package_id.to_string(),
+                    version: "unknown".to_string(),
+                })?;
+        drop(loaded_packages);
+
+        // --- Step 1 (reverse): workflows ---
+        // Drop the workflow registration so future executions can't kick
+        // off new runs of this package's workflow.
+        if let Some(runtime) = &self.runtime {
+            if let Some(workflow_name) = &package_state.workflow_name {
+                runtime.unregister_workflow(workflow_name);
+            }
+        }
+
+        // --- Step 2a (reverse): trigger-less graphs registered via FFI ---
+        // These come out before reactor-bound CGs since workflow tasks
+        // that invoke them have already been deregistered in step 1.
+        if let Some(runtime) = &self.runtime {
+            for name in &package_state.triggerless_graph_names {
+                runtime.unregister_triggerless_graph(name);
+            }
+        }
+
+        // --- Step 2 (reverse): computation graphs ---
+        // Unbind the graph from its reactor (a no-op for trigger-less or
+        // bundled-form graphs). For bundled-form, `unload_graph` ALSO
+        // tears the reactor down if this was the last subscriber — that
+        // path is preserved here for back-compat. Cross-package
+        // subscribers leave the upstream reactor intact; the reactor's
+        // own owning package tears it down in step 3.
+        if let Some(graph_name) = &package_state.graph_name {
+            if let Some(runtime) = &self.runtime {
+                runtime.unregister_computation_graph(graph_name);
+            }
+            let scheduler_guard = self.graph_scheduler.read().await;
+            if let Some(ref scheduler) = *scheduler_guard {
+                if let Err(e) = scheduler
+                    .unload_graph(graph_name, self.tenant_scope())
+                    .await
+                {
+                    warn!("Failed to unload computation graph '{}': {}", graph_name, e);
+                }
+            }
+        }
+
+        // --- Step 3 (reverse): reactors owned by THIS package ---
+        // Iterate the reactors this package introduced and tear each
+        // one down at both layers:
+        // 1. Scheduler-side: stop the running reactor task + accumulators,
+        //    deregister endpoint-registry keys. The T-0544 M4 guard inside
+        //    `unload_reactor` rejects when any cross-package subscriber is
+        //    still bound; we surface the first such rejection as the
+        //    unload's overall error so operators get a clean signal that
+        //    they need to unload subscribers first.
+        // 2. Runtime-side: drop the reactor constructor from the global
+        //    `Runtime` registry. Without this, hot-reloading the same
+        //    package leaves a stale constructor entry; over many reload
+        //    cycles in a long-lived daemon this leaks (T-0564).
+        let mut reactor_unload_error: Option<String> = None;
+        let mut scheduler_unloaded_reactors: Vec<String> = Vec::new();
+        if !package_state.reactor_names.is_empty() {
+            let scheduler_guard = self.graph_scheduler.read().await;
+            if let Some(ref scheduler) = *scheduler_guard {
+                for reactor_name in &package_state.reactor_names {
+                    match scheduler
+                        .unload_reactor(reactor_name, self.tenant_scope())
+                        .await
+                    {
+                        Ok(()) => {
+                            debug!(
+                                "Reactor '{}' unloaded for package {}",
+                                reactor_name, package_state.metadata.package_name
+                            );
+                            scheduler_unloaded_reactors.push(reactor_name.clone());
+                        }
+                        Err(e) => {
+                            // Bundled-form CG packages: the reactor was
+                            // already torn down by `unload_graph` above
+                            // when this package was the last subscriber.
+                            // Treat "not loaded" as a clean no-op — and
+                            // still drop the runtime constructor below.
+                            if e.contains("not loaded") {
+                                scheduler_unloaded_reactors.push(reactor_name.clone());
+                                continue;
+                            }
+                            warn!(
+                                "Failed to unload reactor '{}' from package {}: {}",
+                                reactor_name, package_state.metadata.package_name, e
+                            );
+                            if reactor_unload_error.is_none() {
+                                reactor_unload_error = Some(format!(
+                                    "package '{}' owns reactor '{}' which has bound subscribers \
+                                     from another package: {}; unload subscribers first",
+                                    package_state.metadata.package_name, reactor_name, e
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Drop reactor constructors from the Runtime registry for every
+        // reactor whose scheduler-side teardown succeeded (or was a clean
+        // no-op). Reactors blocked by bound subscribers stay registered;
+        // the next unload attempt will try again once subscribers unbind.
+        if let Some(runtime) = &self.runtime {
+            for reactor_name in &scheduler_unloaded_reactors {
+                runtime.unregister_reactor(reactor_name);
+            }
+        }
+
+        // --- Step 4 (reverse): triggers ---
+        // Custom-poll triggers come out of the runtime registry; cron
+        // schedules go back through the attached CronWorkflowRegistrar
+        // (mirroring the load step). A missing registrar here is a
+        // best-effort no-op — if it wasn't there at load time, nothing
+        // to deregister either.
+        if let Some(runtime) = &self.runtime {
+            for trigger_name in &package_state.trigger_names {
+                runtime.unregister_trigger(trigger_name);
+            }
+        }
+        if !package_state.cron_schedule_ids.is_empty() {
+            if let Some(registrar) = self.cron_registrar.as_ref() {
+                for schedule_id in &package_state.cron_schedule_ids {
+                    if let Err(e) = registrar.unregister_cron_workflow(schedule_id).await {
+                        warn!(
+                            "Failed to drop cron schedule '{}' for package {}: {}",
+                            schedule_id, package_state.metadata.package_name, e
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "Package {} owns {} cron schedule(s) but no registrar is attached \
+                     for unload — schedules may stay live in the DB",
+                    package_state.metadata.package_name,
+                    package_state.cron_schedule_ids.len()
+                );
+            }
+        }
+
+        // --- Step 5 (reverse): tasks (drops the cdylib via task registrar) ---
+        // Always run this step so the dlopen handle gets dropped even if
+        // an earlier step warned. Reactor-only packages that fail to
+        // unload due to bound subscribers will be rejected below; the
+        // task registrar drop is harmless either way.
+        if let Some(runtime) = &self.runtime {
+            for ns in &package_state.task_namespaces {
+                runtime.unregister_task(ns);
+            }
+        }
+        let package_id_str = package_id.to_string();
+        self.task_registrar
+            .unregister_package_tasks(&package_id_str)
+            .map_err(|e| RegistryError::RegistrationFailed {
+                message: format!("Failed to unregister package tasks: {}", e),
+            })?;
+
+        if let Some(msg) = reactor_unload_error {
+            // CLOACI-T-0918: a REJECTED unload must not drop tracking. We
+            // removed the PackageState up front; if we return here without
+            // restoring it, the next reconcile cycle sees nothing to unload
+            // and the guard-blocked reactor runs forever as an untracked
+            // ghost. Re-insert a residual state carrying exactly what
+            // remains loaded (the reactors the bound-subscriber guard
+            // refused) so the next cycle retries the unload once the
+            // subscribers unbind. Everything torn down above stays torn
+            // down — the residual state reflects that.
+            let remaining_reactors: Vec<String> = package_state
+                .reactor_names
+                .iter()
+                .filter(|n| !scheduler_unloaded_reactors.contains(*n))
+                .cloned()
+                .collect();
+            let residual = PackageState {
+                metadata: package_state.metadata.clone(),
+                task_namespaces: Vec::new(),
+                workflow_name: None,
+                trigger_names: Vec::new(),
+                graph_name: None,
+                reactor_names: remaining_reactors,
+                cron_schedule_ids: Vec::new(),
+                triggerless_graph_names: Vec::new(),
+            };
+            let mut loaded_packages = self.loaded_packages.write().await;
+            loaded_packages.insert(package_id, residual);
+            drop(loaded_packages);
+            return Err(RegistryError::RegistrationFailed { message: msg });
+        }
+
+        info!(
+            "Unloaded package: {} v{}",
+            package_state.metadata.package_name, package_state.metadata.version
+        );
+
+        Ok(())
+    }
+
+    /// Register tasks from a package into the global task registry
+    pub(super) async fn register_package_tasks(
+        &self,
+        metadata: &WorkflowMetadata,
+        package_data: &[u8],
+    ) -> Result<Vec<TaskNamespace>, RegistryError> {
+        debug!(
+            "Loading tasks for package: {} v{}",
+            metadata.package_name, metadata.version
+        );
+
+        // Extract metadata from the .so file using PackageLoader
+        let package_metadata = self
+            .package_loader
+            .extract_metadata(package_data)
+            .await
+            .map_err(RegistryError::Loader)?;
+
+        debug!(
+            "Package {} contains {} tasks",
+            package_metadata.package_name,
+            package_metadata.tasks.len()
+        );
+
+        // Register tasks using TaskRegistrar
+        let package_id = metadata.id.to_string();
+        let tenant_id = Some(self.config.default_tenant_id.as_str());
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| RegistryError::RegistrationFailed {
+                message: format!(
+                    "Rust package {} received but the reconciler has no Runtime attached — \
+                     Rust loads require a scoped Runtime",
+                    metadata.package_name
+                ),
+            })?;
+
+        let task_namespaces = self
+            .task_registrar
+            .register_package_tasks(
+                &package_id,
+                package_data,
+                &package_metadata,
+                tenant_id,
+                runtime,
+            )
+            .await
+            .map_err(RegistryError::Loader)?;
+
+        info!(
+            "Successfully registered {} tasks for package {} v{}",
+            task_namespaces.len(),
+            metadata.package_name,
+            metadata.version
+        );
+
+        Ok(task_namespaces)
+    }
+
+    /// Register workflows from a package into the global workflow registry
+    pub(super) async fn register_package_workflows(
+        &self,
+        metadata: &WorkflowMetadata,
+        package_data: &[u8],
+    ) -> Result<Option<String>, RegistryError> {
+        debug!(
+            "Loading workflows for package: {} v{}",
+            metadata.package_name, metadata.version
+        );
+
+        // Extract metadata from the .so file using PackageLoader
+        let package_metadata = self
+            .package_loader
+            .extract_metadata(package_data)
+            .await
+            .map_err(RegistryError::Loader)?;
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| RegistryError::RegistrationFailed {
+                message: format!(
+                    "Rust package {} received but the reconciler has no Runtime attached — \
+                     Rust loads require a scoped Runtime",
+                    metadata.package_name
+                ),
+            })?;
+
+        // Check if package has tasks (which means it has a workflow since it was compiled with the macro)
+        if !package_metadata.tasks.is_empty() {
+            debug!(
+                "Package {} has {} tasks - workflow exists since it compiled with the unified `cloacina::package!()` shell macro",
+                metadata.package_name,
+                package_metadata.tasks.len()
+            );
+
+            // Extract the workflow name from the package metadata.
+            // The workflow name comes from the #[workflow(name = "...")] macro and
+            // is now carried directly on PackageMetadata.workflow_name (sourced
+            // from the cdylib's PackageTasksMetadata). Prefer it so the name we
+            // register the workflow under in the runner matches exactly what the
+            // API exposes and the UI executes by (CLOACI-T-0671). Fall back to
+            // the legacy template-parsing path for metadata predating the field.
+            let workflow_name = if !package_metadata.workflow_name.is_empty() {
+                package_metadata.workflow_name.clone()
+            } else if let Some(first_task) = package_metadata.tasks.first() {
+                // Legacy fallback: extract workflow name from namespaced_id_template
+                let template = &first_task.namespaced_id_template;
+                debug!("Parsing workflow_name from template: '{}'", template);
+
+                // Split by "::" and extract the workflow_id part (3rd component)
+                let parts: Vec<&str> = template.split("::").collect();
+                if parts.len() >= 3 {
+                    let workflow_part = parts[2];
+                    // Handle both {workflow} placeholder and actual workflow_id
+                    if workflow_part == "{workflow}" {
+                        // This is a template, need to look up actual workflow_id from registered tasks
+                        let mut found_id = None;
+                        for namespace in runtime.task_namespaces() {
+                            if namespace.package_name == metadata.package_name
+                                && namespace.tenant_id == self.config.default_tenant_id
+                            {
+                                debug!(
+                                    "Found registered task with workflow_id: '{}'",
+                                    namespace.workflow_id
+                                );
+                                found_id = Some(namespace.workflow_id.clone());
+                                break;
+                            }
+                        }
+                        // Use found ID or fallback
+                        found_id.unwrap_or_else(|| metadata.package_name.clone())
+                    } else {
+                        // This is the actual workflow_id
+                        workflow_part.to_string()
+                    }
+                } else {
+                    debug!("Template format unexpected, using package name as fallback");
+                    metadata.package_name.clone()
+                }
+            } else {
+                debug!("No tasks in package metadata, using package name as fallback");
+                metadata.package_name.clone()
+            };
+
+            debug!(
+                "Using workflow_name '{}' for workflow registration",
+                workflow_name
+            );
+
+            // Use the actual package name from metadata — the namespaced_id_template
+            // contains unresolved placeholders like {pkg} that don't match registered tasks
+            let task_package_name = metadata.package_name.clone();
+
+            debug!(
+                "Using task_package_name '{}' for task lookup",
+                task_package_name
+            );
+
+            // Create the workflow directly using the runtime-scoped task registry
+            // (avoid FFI isolation issues).
+            let _workflow = self.create_workflow_from_host_registry(
+                &task_package_name, // Use the correct package name from task metadata
+                &workflow_name,
+                &self.config.default_tenant_id,
+            )?;
+
+            // Register workflow constructor on the runtime so it recreates the
+            // workflow from the runtime's task registry each time.
+            let workflow_name_for_closure = workflow_name.clone();
+            let package_name_for_closure = task_package_name.clone();
+            let workflow_name_for_closure_static = workflow_name.clone();
+            let tenant_id_for_closure = self.config.default_tenant_id.clone();
+            let runtime_for_closure: Arc<Runtime> = runtime.clone();
+
+            // CLOACI-T-0924: attribute the registration to this package so a
+            // SECOND package claiming the same workflow name inside the same
+            // tenant is a loud load-time rejection instead of a silent
+            // overwrite. (Same package re-registering still replaces — the
+            // package-reload path depends on it.)
+            let owner = crate::tenant_scope::TenantOwner::package(&metadata.package_name);
+            runtime
+                .try_register_workflow(&owner, workflow_name.clone(), move || {
+                    debug!(
+                        "Creating workflow instance for {} using runtime registry",
+                        workflow_name_for_closure
+                    );
+
+                    // Recreate the workflow from the runtime task registry each time
+                    match Self::create_workflow_from_host_registry_static(
+                        &runtime_for_closure,
+                        &package_name_for_closure,
+                        &workflow_name_for_closure_static,
+                        &tenant_id_for_closure,
+                    ) {
+                        Ok(workflow) => workflow,
+                        Err(e) => {
+                            error!("Failed to create workflow from runtime registry: {}", e);
+                            // Fallback to empty workflow
+                            crate::workflow::Workflow::new(&workflow_name_for_closure)
+                        }
+                    }
+                })
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: e.to_string(),
+                })?;
+
+            info!(
+                "Registered workflow '{}' for package {} v{}",
+                workflow_name, metadata.package_name, metadata.version
+            );
+
+            Ok(Some(workflow_name))
+        } else {
+            debug!(
+                "Package {} has no workflow data - registering as task-only package",
+                metadata.package_name
+            );
+            Ok(None)
+        }
+    }
+
+    /// Create a workflow using the runtime-scoped task registry (avoiding FFI isolation).
+    pub(super) fn create_workflow_from_host_registry(
+        &self,
+        package_name: &str,
+        workflow_name: &str,
+        tenant_id: &str,
+    ) -> Result<crate::workflow::Workflow, RegistryError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| RegistryError::RegistrationFailed {
+                message: "create_workflow_from_host_registry called without a Runtime attached"
+                    .to_string(),
+            })?;
+        Self::create_workflow_from_host_registry_static(
+            runtime,
+            package_name,
+            workflow_name,
+            tenant_id,
+        )
+    }
+
+    /// Static version of create_workflow_from_host_registry for use in closures.
+    pub(super) fn create_workflow_from_host_registry_static(
+        runtime: &Arc<Runtime>,
+        package_name: &str,
+        workflow_name: &str,
+        tenant_id: &str,
+    ) -> Result<crate::workflow::Workflow, RegistryError> {
+        // Create workflow and add registered tasks from the runtime task registry
+        let mut workflow = crate::workflow::Workflow::new(workflow_name);
+        workflow.set_tenant(tenant_id);
+        workflow.set_package(package_name);
+
+        let mut found_tasks = 0;
+        for namespace in runtime.task_namespaces() {
+            // Only include tasks from this package, workflow, and tenant
+            if namespace.package_name == package_name
+                && namespace.workflow_id == workflow_name
+                && namespace.tenant_id == tenant_id
+            {
+                let task = runtime.get_task(&namespace).ok_or_else(|| {
+                    RegistryError::RegistrationFailed {
+                        message: format!(
+                            "Task {} vanished from runtime registry between enumeration and lookup",
+                            namespace
+                        ),
+                    }
+                })?;
+                workflow
+                    .add_task(task)
+                    .map_err(|e| RegistryError::RegistrationFailed {
+                        message: format!(
+                            "Failed to add task {} to workflow: {:?}",
+                            namespace.task_id, e
+                        ),
+                    })?;
+                found_tasks += 1;
+            }
+        }
+
+        debug!(
+            "Created workflow '{}' with {} tasks from runtime registry",
+            workflow_name, found_tasks
+        );
+
+        // Validate and finalize the workflow
+        workflow
+            .validate()
+            .map_err(|e| RegistryError::RegistrationFailed {
+                message: format!("Workflow validation failed: {:?}", e),
+            })?;
+
+        Ok(workflow.finalize())
+    }
+
+    /// Verify and track triggers declared in a package's `CloacinaMetadata`.
+    ///
+    /// The package's trigger implementations land in the Runtime via
+    /// `Runtime::seed_from_inventory()`, called immediately after the cdylib
+    /// is dlopened. This method checks that each declared trigger actually
+    /// appeared in the Runtime and tracks its name so it can be removed when
+    /// the package is unloaded.
+    /// Validate that every trigger named in `#[workflow(triggers = [...])]`
+    /// is registered in the runtime. Hard-errors if any name is missing —
+    /// the package's workflow won't fire from those triggers and the user
+    /// almost certainly typo'd a name.
+    pub(super) async fn validate_workflow_trigger_subscriptions(
+        &self,
+        metadata: &WorkflowMetadata,
+        package_data: &[u8],
+    ) -> Result<(), RegistryError> {
+        let package_metadata = self
+            .package_loader
+            .extract_metadata(package_data)
+            .await
+            .map_err(RegistryError::Loader)?;
+
+        if package_metadata.workflow_triggers.is_empty() {
+            return Ok(());
+        }
+
+        let Some(runtime) = self.runtime.as_ref() else {
+            warn!(
+                "Package {} v{} declares workflow trigger subscriptions but the reconciler has no \
+                 Runtime attached",
+                metadata.package_name, metadata.version
+            );
+            return Ok(());
+        };
+
+        let mut missing: Vec<String> = Vec::new();
+        for trigger_name in &package_metadata.workflow_triggers {
+            if runtime.get_trigger(trigger_name).is_none() {
+                missing.push(trigger_name.clone());
+            }
+        }
+
+        if !missing.is_empty() {
+            return Err(RegistryError::RegistrationFailed {
+                message: format!(
+                    "Package {} v{} declares `#[workflow(triggers = [...])]` referencing \
+                     trigger(s) not registered in this runtime: {:?}. Ensure the package \
+                     declaring those triggers is loaded first, or remove the typo.",
+                    metadata.package_name, metadata.version, missing
+                ),
+            });
+        }
+
+        info!(
+            "Package {} v{}: validated {} workflow trigger subscription(s)",
+            metadata.package_name,
+            metadata.version,
+            package_metadata.workflow_triggers.len()
+        );
+        Ok(())
+    }
+
+    // ========================================================================
+    // T-0554 — Precedence-ordered load pipeline.
+    //
+    // Six steps in fixed order: cron triggers → custom triggers → reactors
+    // → trigger-less CGs → reactor-bound CGs → workflows. Each helper is
+    // language-agnostic: it consumes a `PackageLoadView` produced by
+    // a per-language metadata-extraction adapter. Both Rust and Python
+    // adapters are wired today.
+    // ========================================================================
+
+    /// Extract a `PackageLoadView` from a Python scoped Runtime, given
+    /// pre-load snapshots of the runtime's reactor / trigger / graph
+    /// names. The diff identifies primitives this package introduced;
+    /// the helper walks the runtime to materialize wire-format metadata
+    /// matching what `build_view_rust` produces from FFI extraction.
+    ///
+    /// Tasks (the `PackageMetadata` field) intentionally come back empty
+    /// — the Python load path's `register_package_tasks`-equivalent runs
+    /// before this adapter is called, and the unified pipeline doesn't
+    /// re-register tasks from the view. (Tasks live on the `Runtime`
+    /// directly for Python; only the metadata view needs the shape
+    /// match.) (T-0554 Phase 2)
+    /// Snapshot the scoped Runtime's reactor / trigger / computation-graph
+    /// name sets. Used by the Python load paths to capture pre-import
+    /// state so `build_view_python` can compute the diff (= primitives
+    /// this package introduced) once the import finishes registering
+    /// into the same Runtime. Returns `(reactor, trigger, graph)` empty
+    /// sets when no Runtime is attached — callers treat that as
+    /// "no Runtime, no diff to compute."
+    fn snapshot_runtime_registries(
+        &self,
+    ) -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let rt = match self.runtime.as_ref() {
+            Some(rt) => rt,
+            None => return Default::default(),
+        };
+        (
+            rt.reactor_names().into_iter().collect(),
+            rt.trigger_names().into_iter().collect(),
+            rt.computation_graph_names().into_iter().collect(),
+        )
+    }
+
+    pub(super) fn build_view_python(
+        &self,
+        package_name: &str,
+        pre_reactor_names: &std::collections::HashSet<String>,
+        pre_trigger_names: &std::collections::HashSet<String>,
+        pre_graph_names: &std::collections::HashSet<String>,
+        accumulator_overrides: &[cloacina_workflow_plugin::types::AccumulatorConfig],
+    ) -> PackageLoadView {
+        use cloacina_workflow_plugin::{
+            GraphPackageMetadata, ReactorPackageMetadata, TriggerPackageMetadata,
+            types::AccumulatorDeclarationEntry,
+        };
+
+        let runtime = match self.runtime.as_ref() {
+            Some(rt) => rt,
+            None => {
+                return PackageLoadView {
+                    triggers: vec![],
+                    reactors: vec![],
+                    graph: None,
+                };
+            }
+        };
+
+        // Reactors: diff vs. pre-snapshot, then walk each runtime
+        // ReactorRegistration into wire-format with manifest accumulator
+        // overrides folded in.
+        let mut reactors: Vec<ReactorPackageMetadata> = Vec::new();
+        for name in runtime.reactor_names() {
+            if pre_reactor_names.contains(&name) {
+                continue;
+            }
+            let Some(reg) = runtime.get_reactor(&name) else {
+                continue;
+            };
+            let accumulators: Vec<AccumulatorDeclarationEntry> = reg
+                .accumulator_names
+                .iter()
+                .map(|acc_name| {
+                    // CLOACI-T-0839 precedence: manifest override (deployment
+                    // wins) → authored spec carried on the registration (e.g.
+                    // Python's `@cloaca.state_accumulator`) → passthrough.
+                    // Before the authored-spec fallback existed, packaged
+                    // Python state/stream accumulators silently degraded to
+                    // passthrough here.
+                    let (accumulator_type, config) = accumulator_overrides
+                        .iter()
+                        .find(|cfg| &cfg.name == acc_name)
+                        .map(|cfg| (cfg.accumulator_type.clone(), cfg.config.clone()))
+                        .or_else(|| {
+                            reg.accumulator_specs
+                                .iter()
+                                .find(|spec| &spec.name == acc_name)
+                                .map(|spec| (spec.accumulator_type.clone(), spec.config.clone()))
+                        })
+                        .unwrap_or_else(|| ("passthrough".to_string(), Default::default()));
+                    AccumulatorDeclarationEntry {
+                        name: acc_name.clone(),
+                        accumulator_type,
+                        config,
+                    }
+                })
+                .collect();
+            let reaction_mode = match reg.reaction_mode {
+                cloacina_computation_graph::ReactionMode::WhenAll => "when_all".to_string(),
+                _ => "when_any".to_string(),
+            };
+            reactors.push(ReactorPackageMetadata {
+                name: reg.name,
+                package_name: package_name.to_string(),
+                reaction_mode,
+                accumulators,
+            });
+        }
+
+        // Custom-poll triggers: the Python load path doesn't currently
+        // register cron triggers via this surface (cron runs through the
+        // daemon's separate path). Walk each runtime trigger and emit
+        // wire-format with cron_expression carried through.
+        let mut triggers: Vec<TriggerPackageMetadata> = Vec::new();
+        for name in runtime.trigger_names() {
+            if pre_trigger_names.contains(&name) {
+                continue;
+            }
+            let Some(impl_) = runtime.get_trigger(&name) else {
+                continue;
+            };
+            triggers.push(TriggerPackageMetadata {
+                name: impl_.name().to_string(),
+                workflow_name: impl_.workflow_name().to_string(),
+                package_name: package_name.to_string(),
+                poll_interval: format!("{}s", impl_.poll_interval().as_secs()),
+                cron_expression: impl_.cron_expression(),
+                allow_concurrent: impl_.allow_concurrent(),
+            });
+        }
+
+        // Computation graph: Python packages declare at most one CG per
+        // package today. Pull the first non-pre-snapshot graph name and
+        // shape it into wire-format. trigger_reactor / accumulators come
+        // from the runtime registration directly.
+        let graph: Option<GraphPackageMetadata> = runtime
+            .computation_graph_names()
+            .into_iter()
+            .find(|n| !pre_graph_names.contains(n))
+            .and_then(|graph_name| {
+                let reg = runtime.get_computation_graph(&graph_name)?;
+                let accumulators: Vec<AccumulatorDeclarationEntry> = reg
+                    .accumulator_names
+                    .iter()
+                    .map(|acc_name| {
+                        let (accumulator_type, config) = accumulator_overrides
+                            .iter()
+                            .find(|cfg| &cfg.name == acc_name)
+                            .map(|cfg| (cfg.accumulator_type.clone(), cfg.config.clone()))
+                            .unwrap_or_else(|| ("passthrough".to_string(), Default::default()));
+                        AccumulatorDeclarationEntry {
+                            name: acc_name.clone(),
+                            accumulator_type,
+                            config,
+                        }
+                    })
+                    .collect();
+                Some(GraphPackageMetadata {
+                    graph_name,
+                    package_name: package_name.to_string(),
+                    reaction_mode: reg.reaction_mode.clone(),
+                    // Wire-format default only (CLOACI-T-0918): the Python
+                    // CG's REAL strategy travels on the declaration built by
+                    // `load_cg_package`, not this view; and the Rust path's
+                    // manifest override happens in
+                    // `step_load_reactor_bound_cgs`.
+                    input_strategy: "latest".to_string(),
+                    accumulators,
+                    trigger_reactor: reg.trigger_reactor.clone(),
+                    // Python CG topology threading is a follow-up — the runtime
+                    // registration carries no node/edge graph yet. (CLOACI-T-0673)
+                    graph_data_json: None,
+                })
+            });
+
+        PackageLoadView {
+            triggers,
+            reactors,
+            graph,
+        }
+    }
+
+    /// Extract a `PackageLoadView` from a Rust cdylib via fidius FFI.
+    pub(super) async fn build_view_rust(
+        &self,
+        library_data: &[u8],
+    ) -> Result<PackageLoadView, RegistryError> {
+        let triggers = self
+            .package_loader
+            .extract_trigger_metadata(library_data)
+            .await
+            .map_err(RegistryError::Loader)
+            .unwrap_or_default();
+
+        let reactors = self
+            .package_loader
+            .extract_reactor_metadata(library_data)
+            .await
+            .map_err(RegistryError::Loader)
+            .unwrap_or_default();
+
+        let graph = self
+            .package_loader
+            .extract_graph_metadata(library_data)
+            .await
+            .unwrap_or_default();
+
+        Ok(PackageLoadView {
+            triggers,
+            reactors,
+            graph,
+        })
+    }
+
+    /// Pipeline step 1: cron triggers (entries with `cron_expression.is_some()`).
+    ///
+    /// When a `CronWorkflowRegistrar` is attached, each cron entry is
+    /// installed as a schedule and the returned schedule IDs are
+    /// captured into `PackageState::cron_schedule_ids` so unload can
+    /// drop them. Without a registrar, the step warns once per
+    /// declaration and returns an empty Vec — historically this was
+    /// the standalone-daemon's job (`cloacinactl daemon` registers
+    /// post-reconcile through its own loop), but server-mode users had
+    /// no equivalent until this hook landed.
+    pub(super) async fn step_load_cron_triggers(
+        &self,
+        metadata: &WorkflowMetadata,
+        view: &PackageLoadView,
+    ) -> Result<Vec<String>, RegistryError> {
+        let cron_entries: Vec<&cloacina_workflow_plugin::TriggerPackageMetadata> = view
+            .triggers
+            .iter()
+            .filter(|t| t.cron_expression.is_some())
+            .collect();
+        if cron_entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(registrar) = self.cron_registrar.as_ref() else {
+            warn!(
+                "Package {} v{}: {} cron trigger(s) declared but no CronWorkflowRegistrar \
+                 attached to the reconciler — cron schedules will NOT fire (this binary \
+                 must wire `with_cron_registrar` to support packaged cron triggers)",
+                metadata.package_name,
+                metadata.version,
+                cron_entries.len()
+            );
+            return Ok(Vec::new());
+        };
+
+        let mut schedule_ids = Vec::new();
+        for t in cron_entries {
+            let expr = t
+                .cron_expression
+                .as_deref()
+                .expect("cron_expression presence already filtered");
+            // Register the schedule against the trigger's TARGET workflow (its
+            // `#[trigger(on = "...")]` binding), NOT the trigger's own name —
+            // the cron scheduler executes `workflow_name` directly. Falls back
+            // to `t.name` for older package metadata that predates the
+            // `workflow_name` field. (CLOACI-T-0669)
+            let target_workflow = if t.workflow_name.is_empty() {
+                t.name.as_str()
+            } else {
+                t.workflow_name.as_str()
+            };
+            // Default to UTC so behavior is deterministic across hosts.
+            // The trigger metadata doesn't carry a timezone today; if we
+            // need per-trigger timezones in future, plumb a field on
+            // TriggerPackageMetadata.
+            match registrar
+                .register_cron_workflow(target_workflow, expr, "UTC")
+                .await
+            {
+                Ok(id) => {
+                    info!(
+                        "Package {} v{}: registered cron schedule for workflow '{}' \
+                         (trigger '{}', cron='{}', id={})",
+                        metadata.package_name, metadata.version, target_workflow, t.name, expr, id
+                    );
+                    schedule_ids.push(id);
+                }
+                Err(e) => {
+                    warn!(
+                        "Package {} v{}: failed to register cron schedule for workflow '{}' \
+                         (trigger '{}', cron='{}'): {}",
+                        metadata.package_name, metadata.version, target_workflow, t.name, expr, e
+                    );
+                }
+            }
+        }
+        Ok(schedule_ids)
+    }
+
+    /// Pipeline step 1b: persist `trigger`-type schedule rows for custom-poll
+    /// (non-cron) triggers (CLOACI-I-0124 / WS-6).
+    ///
+    /// `step_load_custom_triggers` registers the in-memory `Trigger` impl, but
+    /// the trigger scheduler drives polling off `get_enabled_triggers()` — the
+    /// `schedules` rows — and the Triggers read API lists those same rows. So a
+    /// packaged poll trigger that was only registered in-memory was both
+    /// invisible in the UI and never polled. This step closes that gap by
+    /// creating the schedule row through the attached `CronWorkflowRegistrar`,
+    /// mirroring `step_load_cron_triggers`. Returned IDs are captured into
+    /// `PackageState::cron_schedule_ids` (cron + poll rows share the same
+    /// delete-by-id unload path). No-op without a registrar.
+    pub(super) async fn step_persist_poll_schedules(
+        &self,
+        metadata: &WorkflowMetadata,
+        view: &PackageLoadView,
+    ) -> Result<Vec<String>, RegistryError> {
+        let poll_entries: Vec<&cloacina_workflow_plugin::TriggerPackageMetadata> = view
+            .triggers
+            .iter()
+            .filter(|t| t.cron_expression.is_none())
+            .collect();
+        if poll_entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(registrar) = self.cron_registrar.as_ref() else {
+            warn!(
+                "Package {} v{}: {} poll trigger(s) declared but no CronWorkflowRegistrar \
+                 attached — poll triggers will NOT be scheduled or appear in the Triggers view",
+                metadata.package_name,
+                metadata.version,
+                poll_entries.len()
+            );
+            return Ok(Vec::new());
+        };
+
+        let mut schedule_ids = Vec::new();
+        for t in poll_entries {
+            // Bind the schedule to the trigger's TARGET workflow (its
+            // `#[trigger(on = "...")]`), falling back to the trigger's own
+            // name for older metadata — same convention as the cron path.
+            let target_workflow = if t.workflow_name.is_empty() {
+                t.name.as_str()
+            } else {
+                t.workflow_name.as_str()
+            };
+            let poll_ms = parse_humantime_duration(&t.poll_interval)
+                .unwrap_or_else(|| std::time::Duration::from_secs(60))
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            match registrar
+                .register_poll_trigger(&t.name, target_workflow, poll_ms, t.allow_concurrent)
+                .await
+            {
+                Ok(id) => {
+                    info!(
+                        "Package {} v{}: registered poll-trigger schedule for workflow '{}' \
+                         (trigger '{}', poll={}ms, id={})",
+                        metadata.package_name,
+                        metadata.version,
+                        target_workflow,
+                        t.name,
+                        poll_ms,
+                        id
+                    );
+                    schedule_ids.push(id);
+                }
+                Err(e) => {
+                    warn!(
+                        "Package {} v{}: failed to register poll-trigger schedule for '{}': {}",
+                        metadata.package_name, metadata.version, t.name, e
+                    );
+                }
+            }
+        }
+        Ok(schedule_ids)
+    }
+
+    /// Pipeline step 2: custom-poll triggers (entries with
+    /// `cron_expression.is_none()`).
+    ///
+    /// In-process triggers (compiled into the host binary) reach the
+    /// runtime through `seed_from_inventory` after dlopen. Cross-cdylib
+    /// triggers (the common case for packaged workflows) DON'T —
+    /// independently-compiled cdylibs have their own
+    /// `cloacina-workflow-plugin` linker symbols, so the host's
+    /// `inventory::iter` never sees their submissions. To close that
+    /// gap, when `library_data` is provided we load the cdylib via
+    /// fidius and register an `FfiTriggerImpl` adapter for every
+    /// custom-poll trigger that isn't already in the runtime. The
+    /// adapter dispatches `poll()` through method index 6
+    /// (`invoke_trigger_poll`) on the cdylib's plugin.
+    pub(super) fn step_load_custom_triggers(
+        &self,
+        metadata: &WorkflowMetadata,
+        view: &PackageLoadView,
+        library_data: Option<&[u8]>,
+    ) -> Result<Vec<String>, RegistryError> {
+        let custom: Vec<&cloacina_workflow_plugin::TriggerPackageMetadata> = view
+            .triggers
+            .iter()
+            .filter(|t| t.cron_expression.is_none())
+            .collect();
+        if custom.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            warn!(
+                "Package {} v{}: {} custom trigger(s) declared but no Runtime is attached",
+                metadata.package_name,
+                metadata.version,
+                custom.len()
+            );
+            return Ok(Vec::new());
+        };
+        // FFI registration path: when the cdylib bytes are available,
+        // build a shared fidius PluginHandle once and register an
+        // FfiTriggerImpl per custom-poll trigger that isn't already in
+        // the runtime. We share the handle across all triggers from
+        // this package so we only pay the dlopen cost once.
+        let ffi_plugin: Option<Arc<fidius_host::PluginHandle>> = if let Some(bytes) = library_data {
+            let needs_ffi = custom
+                .iter()
+                .any(|t| runtime.get_trigger(&t.name).is_none());
+            if needs_ffi {
+                match load_plugin_handle_from_bytes(bytes) {
+                    Ok(h) => Some(Arc::new(h)),
+                    Err(e) => {
+                        warn!(
+                            "Package {} v{}: failed to open cdylib for FFI trigger \
+                             registration ({}); custom triggers will fall back to \
+                             inventory lookup only",
+                            metadata.package_name, metadata.version, e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // CLOACI-T-0924: the "already in the runtime, reuse it" fast path below
+        // is what lets an inventory/self-registered trigger satisfy this
+        // package. Ask first whether this package is *allowed* to claim the
+        // name: an entry owned by a DIFFERENT package in the same tenant is a
+        // loud load-time rejection, not a silent adoption (which would also let
+        // this package's unload tear down the other package's trigger).
+        let owner = crate::tenant_scope::TenantOwner::package(&metadata.package_name);
+        let mut tracked = Vec::new();
+        for t in &custom {
+            let free = runtime.may_claim_trigger(&owner, &t.name).map_err(|e| {
+                RegistryError::RegistrationFailed {
+                    message: e.to_string(),
+                }
+            })?;
+            if !free {
+                tracked.push(t.name.clone());
+                continue;
+            }
+            if let Some(handle) = ffi_plugin.as_ref() {
+                let poll_interval = parse_humantime_duration(&t.poll_interval)
+                    .unwrap_or_else(|| std::time::Duration::from_secs(60));
+                let handle_for_ctor = handle.clone();
+                let trigger_name = t.name.clone();
+                let allow_concurrent = t.allow_concurrent;
+                let cron_expression = t.cron_expression.clone();
+                runtime
+                    .try_register_trigger(&owner, t.name.clone(), move || {
+                        std::sync::Arc::new(
+                            crate::registry::loader::ffi_trigger::FfiTriggerImpl::new(
+                                handle_for_ctor.clone(),
+                                trigger_name.clone(),
+                                poll_interval,
+                                allow_concurrent,
+                                cron_expression.clone(),
+                            ),
+                        ) as std::sync::Arc<dyn cloacina_workflow::Trigger>
+                    })
+                    .map_err(|e| RegistryError::RegistrationFailed {
+                        message: e.to_string(),
+                    })?;
+                info!(
+                    "Package {} v{}: registered FFI trigger adapter for '{}' (poll={:?})",
+                    metadata.package_name, metadata.version, t.name, poll_interval
+                );
+                tracked.push(t.name.clone());
+            } else {
+                warn!(
+                    "Package {} v{}: trigger '{}' declared in metadata but no Trigger impl in runtime",
+                    metadata.package_name, metadata.version, t.name,
+                );
+            }
+        }
+        Ok(tracked)
+    }
+
+    /// Pipeline step 3: reactors. Dispatches each reactor entry into the
+    /// graph scheduler via `dispatch_package_reactors_into_scheduler`.
+    pub(super) async fn step_load_reactors(
+        &self,
+        metadata: &WorkflowMetadata,
+        view: &PackageLoadView,
+        manifest: &cloacina_workflow_plugin::CloacinaMetadata,
+        // CLOACI-T-0925: where THIS package's bundled providers were staged. The
+        // reactor's constructor ref and its provider-backed stream accumulators
+        // resolve there — never against process-wide state another tenant shares.
+        provider_root: Option<&std::path::Path>,
+    ) -> Result<(), RegistryError> {
+        if view.reactors.is_empty() {
+            return Ok(());
+        }
+        let scheduler_guard = self.graph_scheduler.read().await;
+        let Some(scheduler) = scheduler_guard.as_ref() else {
+            warn!(
+                "Package {} v{}: {} reactor(s) declared but no ComputationGraphScheduler is configured",
+                metadata.package_name,
+                metadata.version,
+                view.reactors.len()
+            );
+            return Ok(());
+        };
+        if let Err(e) =
+            crate::computation_graph::packaging_bridge::dispatch_package_reactors_into_scheduler_in(
+                &view.reactors,
+                scheduler,
+                &manifest.accumulators,
+                Some(self.config.default_tenant_id.clone()),
+                provider_root,
+            )
+            .await
+        {
+            warn!(
+                "Failed to dispatch package-declared reactors from {}: {}",
+                metadata.package_name, e
+            );
+        }
+        Ok(())
+    }
+
+    /// Pipeline step 4: trigger-less CGs.
+    ///
+    /// In-process trigger-less CGs (compiled into the host binary)
+    /// reach the runtime through `seed_from_inventory` after dlopen.
+    /// Cross-cdylib trigger-less CGs DON'T — same linker-section
+    /// limitation as triggers (T-0553 follow-up). When `library_data`
+    /// is provided we call `get_triggerless_graph_metadata` (FFI
+    /// method index 7), and for every entry that isn't already in the
+    /// runtime we register a `TriggerlessGraphRegistration` whose
+    /// `graph_fn` dispatches through `invoke_triggerless_graph` (FFI
+    /// method index 8). Each registered name is returned so unload
+    /// can drop them.
+    pub(super) async fn step_load_triggerless_cgs(
+        &self,
+        metadata: &WorkflowMetadata,
+        _view: &PackageLoadView,
+        library_data: Option<&[u8]>,
+    ) -> Result<Vec<String>, RegistryError> {
+        let Some(bytes) = library_data else {
+            return Ok(Vec::new());
+        };
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let triggerless_meta = match self
+            .package_loader
+            .extract_triggerless_graph_metadata(bytes)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(
+                    "Package {} v{}: extract_triggerless_graph_metadata returned no entries ({})",
+                    metadata.package_name, metadata.version, e
+                );
+                Vec::new()
+            }
+        };
+        if triggerless_meta.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let needs_handle = triggerless_meta
+            .iter()
+            .any(|m| runtime.get_triggerless_graph(&m.name).is_none());
+        let plugin_handle: Option<Arc<fidius_host::PluginHandle>> = if needs_handle {
+            match load_plugin_handle_from_bytes(bytes) {
+                Ok(h) => Some(Arc::new(h)),
+                Err(e) => {
+                    warn!(
+                        "Package {} v{}: failed to open cdylib for FFI trigger-less CG \
+                         registration ({}); these graphs will fall back to inventory \
+                         lookup only",
+                        metadata.package_name, metadata.version, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // CLOACI-T-0924: same claim check as custom triggers — reuse an entry
+        // this package may own, reject one a different package holds.
+        let owner = crate::tenant_scope::TenantOwner::package(&metadata.package_name);
+        let mut registered = Vec::new();
+        for entry in triggerless_meta {
+            let free = runtime
+                .may_claim_triggerless_graph(&owner, &entry.name)
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: e.to_string(),
+                })?;
+            if !free {
+                registered.push(entry.name.clone());
+                continue;
+            }
+            let Some(handle) = plugin_handle.as_ref() else {
+                warn!(
+                    "Package {} v{}: trigger-less graph '{}' declared in metadata but \
+                     no PluginHandle available for FFI dispatch",
+                    metadata.package_name, metadata.version, entry.name,
+                );
+                continue;
+            };
+            let graph_fn =
+                crate::registry::loader::ffi_triggerless_graph::build_ffi_triggerless_graph_fn(
+                    handle.clone(),
+                    entry.name.clone(),
+                    entry.terminal_node_names.len(),
+                );
+            let name_for_ctor = entry.name.clone();
+            let terminal_names = entry.terminal_node_names.clone();
+            runtime
+                .try_register_triggerless_graph(&owner, entry.name.clone(), move || {
+                    cloacina_workflow_plugin::TriggerlessGraphRegistration {
+                        name: name_for_ctor.clone(),
+                        graph_fn: graph_fn.clone(),
+                        terminal_node_names: terminal_names.clone(),
+                    }
+                })
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: e.to_string(),
+                })?;
+            info!(
+                "Package {} v{}: registered FFI trigger-less graph '{}' (terminals={:?})",
+                metadata.package_name, metadata.version, entry.name, entry.terminal_node_names,
+            );
+            registered.push(entry.name);
+        }
+        Ok(registered)
+    }
+
+    /// Pipeline step 5: reactor-bound CGs. Dispatches the (single)
+    /// computation graph from `view.graph` into the scheduler, merging
+    /// manifest accumulator config overrides.
+    pub(super) async fn step_load_reactor_bound_cgs(
+        &self,
+        metadata: &WorkflowMetadata,
+        view: &PackageLoadView,
+        manifest: &cloacina_workflow_plugin::CloacinaMetadata,
+        library_data: &[u8],
+        // CLOACI-T-0925: this package's staged provider tree (see
+        // `step_load_reactors`).
+        provider_root: Option<&std::path::Path>,
+    ) -> Result<Option<String>, RegistryError> {
+        let Some(graph_meta) = view.graph.clone() else {
+            return Ok(None);
+        };
+        info!(
+            "Computation graph detected: {} (accumulators: {:?})",
+            graph_meta.graph_name,
+            graph_meta
+                .accumulators
+                .iter()
+                .map(|a| &a.name)
+                .collect::<Vec<_>>()
+        );
+        // Merge manifest accumulator configs into FFI defaults.
+        let mut graph_meta = graph_meta;
+        for manifest_acc in &manifest.accumulators {
+            if let Some(ffi_acc) = graph_meta
+                .accumulators
+                .iter_mut()
+                .find(|a| a.name == manifest_acc.name)
+            {
+                ffi_acc.accumulator_type = manifest_acc.accumulator_type.clone();
+                ffi_acc.config = manifest_acc.config.clone();
+            }
+        }
+        // CLOACI-T-0918: honor the manifest's `[metadata] input_strategy`.
+        // The `package!()` FFI shell can't see package.toml at metadata
+        // time (and the Rust authoring surface has no per-graph strategy),
+        // so it always reports the wire default ("latest"). The manifest is
+        // authoritative here — without this override a declared
+        // `input_strategy = "sequential"` was silently ignored.
+        if let Some(strategy) = &manifest.input_strategy {
+            graph_meta.input_strategy = strategy.clone();
+        }
+
+        let scheduler_guard = self.graph_scheduler.read().await;
+        let Some(scheduler) = scheduler_guard.as_ref() else {
+            warn!(
+                "Computation graph '{}' detected but no ComputationGraphScheduler configured",
+                graph_meta.graph_name
+            );
+            return Ok(Some(graph_meta.graph_name));
+        };
+
+        // T-0554 Phase 2: cross-package contract validation. When the
+        // subscriber binds to a reactor it does not own (publisher loaded
+        // by a previous package), validate the subscriber's declared
+        // accumulator names match the upstream reactor's contract before
+        // we hand the declaration to the scheduler. The error path here
+        // names the offending package + the missing accumulators, which
+        // is more actionable than the generic "different contract"
+        // message that surfaces from `load_reactor`'s idempotent guard.
+        if let Some(upstream_reactor_name) = graph_meta.trigger_reactor.as_deref() {
+            let publisher_in_same_package = view
+                .reactors
+                .iter()
+                .any(|r| r.name == upstream_reactor_name);
+            if !publisher_in_same_package {
+                if let Some(upstream_acc_names) = scheduler
+                    .reactor_accumulator_names(upstream_reactor_name, self.tenant_scope())
+                    .await
+                {
+                    let upstream_set: std::collections::HashSet<&str> =
+                        upstream_acc_names.iter().map(|s| s.as_str()).collect();
+                    let missing: Vec<String> = graph_meta
+                        .accumulators
+                        .iter()
+                        .filter(|a| !upstream_set.contains(a.name.as_str()))
+                        .map(|a| a.name.clone())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(RegistryError::RegistrationFailed {
+                            message: format!(
+                                "package '{}' subscribes to reactor '{}' but declares accumulator(s) {:?} \
+                                 that are not part of the upstream reactor's contract (upstream declares {:?})",
+                                metadata.package_name,
+                                upstream_reactor_name,
+                                missing,
+                                upstream_acc_names,
+                            ),
+                        });
+                    }
+                } else {
+                    return Err(RegistryError::RegistrationFailed {
+                        message: format!(
+                            "package '{}' subscribes to reactor '{}' but no such reactor is loaded; \
+                             the publishing package must load before its subscribers",
+                            metadata.package_name, upstream_reactor_name,
+                        ),
+                    });
+                }
+            }
+        }
+
+        let mut decl = crate::computation_graph::packaging_bridge::build_declaration_from_ffi_in(
+            &graph_meta,
+            library_data.to_vec(),
+            provider_root,
+        );
+        decl.tenant_id = Some(self.config.default_tenant_id.clone());
+
+        // Mirror the CG into the scoped Runtime so executors can look it
+        // up without going through the global registry.
+        if let Some(runtime) = &self.runtime {
+            let graph_fn = decl.reactor.graph_fn.clone();
+            let accumulator_names: Vec<String> =
+                decl.accumulators.iter().map(|a| a.name.clone()).collect();
+            let reaction_mode = graph_meta.reaction_mode.clone();
+            // CLOACI-T-0924: attributed so a second package claiming this graph
+            // name inside the same tenant is rejected loudly.
+            let owner = crate::tenant_scope::TenantOwner::package(&metadata.package_name);
+            runtime
+                .try_register_computation_graph(&owner, graph_meta.graph_name.clone(), move || {
+                    crate::ComputationGraphRegistration {
+                        graph_fn: graph_fn.clone(),
+                        trigger_reactor: None,
+                        accumulator_names: accumulator_names.clone(),
+                        reaction_mode: reaction_mode.clone(),
+                    }
+                })
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: e.to_string(),
+                })?;
+        }
+
+        if let Err(e) = scheduler.load_graph_in(decl, provider_root).await {
+            warn!(
+                "Failed to load computation graph '{}' for package {}: {}",
+                graph_meta.graph_name, metadata.package_name, e
+            );
+        } else {
+            info!(
+                "Computation graph '{}' loaded into ComputationGraphScheduler",
+                graph_meta.graph_name
+            );
+        }
+
+        Ok(Some(graph_meta.graph_name))
+    }
+
+    /// Pipeline step 6: workflows. Registers tasks + workflow + validates
+    /// `#[workflow(triggers = [...])]` subscriptions against the runtime.
+    /// Step 5b (CLOACI-T-0832/T-0836): resolve packaged `constructor!` nodes
+    /// against the package's BUNDLED providers and register each as a task in the
+    /// runtime registry, so step 6's DAG builder picks them up like any other task.
+    ///
+    /// Flow: extract the cdylib's `ConstructorPackageMetadata` declarations (FFI
+    /// method 10; empty for constructor-free packages — the fast path costs one
+    /// FFI call). If any exist: fetch the provider archives stored for this
+    /// package (`package_providers`, written by the compiler's bundle step),
+    /// unpack them into a `providers/` tree, point the loader's provider search
+    /// path at it, and resolve each declaration via `load_constructor_node`
+    /// (name-in-configure member select + tenant capability grants), registering
+    /// the resolved node under `TaskNamespace(tenant, package, workflow, id)`.
+    ///
+    /// Fails closed: a package that declares constructor nodes but has no bundled
+    /// providers (or an unresolvable member/grant/config) does not load.
+    ///
+    /// Known v1 caveat (documented in CLOACI-T-0836): constructor nodes registered
+    /// here are dropped with the runtime rather than per-package unload.
+    /// Stage a package's bundled constructor providers (CLOACI-T-0836/T-0831):
+    /// fetch the `package_providers` rows and unpack each archive into a fresh
+    /// `providers/` tree. Returns the staged root — `None` when the package
+    /// bundles no providers.
+    ///
+    /// Shared by BOTH load paths: the Rust branch's Step 0/5b (before resolving FFI
+    /// constructor declarations) and the Python branch (BEFORE the module import,
+    /// so `cloaca.constructor(...)` calls resolve against the bundle during load).
+    ///
+    /// CLOACI-T-0925: staging NO LONGER points a process-global search path at the
+    /// result. Tenant is the isolation boundary and every tenant's reconciler runs
+    /// its own concurrent loop in this process, so a shared directory made one
+    /// tenant's staged providers visible to (and racily overwritten by) another's
+    /// resolution. The caller now owns the root: it passes it explicitly to every
+    /// host-side resolution site and installs it as a
+    /// [`crate::registry::loader::ScopedProviderSearch`] around the module import
+    /// for the call sites (Python's `cloaca.constructor`) that cannot take it as an
+    /// argument.
+    ///
+    /// The unpacked dir must outlive the process' use of the search path (wasm
+    /// components are re-read on every node load), so it is deliberately leaked —
+    /// one small dir per loaded package version, reclaimed on process exit
+    /// (mirrors the dlopen temp-dir lifecycle above).
+    ///
+    /// Fails closed: a package WITH bundled providers on a host built without
+    /// `constructors-wasm` cannot resolve them — hard error rather than a
+    /// mystery failure at import/execute.
+    pub(super) async fn stage_bundled_providers(
+        &self,
+        metadata: &WorkflowMetadata,
+    ) -> Result<Option<std::path::PathBuf>, RegistryError> {
+        let providers = self
+            .registry
+            .get_package_providers(&metadata.package_name, &metadata.version)
+            .await?;
+        if providers.is_empty() {
+            // Hermeticity: a package that bundles NOTHING must not resolve its
+            // constructor refs against whatever bundle another load staged. The
+            // `None` root becomes a `ProviderScope::Unbundled` at the call site,
+            // which skips the process-wide override for THIS load only (the
+            // pre-T-0925 code cleared that override process-wide, which fixed the
+            // load-order dependence but stomped every other tenant in flight).
+            // Already-loaded nodes are unaffected — they hold their wasm handles.
+            return Ok(None);
+        }
+
+        #[cfg(not(feature = "constructors-wasm"))]
+        {
+            Err(RegistryError::RegistrationFailed {
+                message: format!(
+                    "package {} v{} bundles {} constructor provider(s), but this host was \
+                     built without the `constructors-wasm` feature — it cannot resolve WASM \
+                     constructor providers (fail closed)",
+                    metadata.package_name,
+                    metadata.version,
+                    providers.len()
+                ),
+            })
+        }
+
+        #[cfg(feature = "constructors-wasm")]
+        {
+            use crate::registry::loader::unpack_provider_archive;
+
+            let providers_root = tempfile::TempDir::new()
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: format!("create providers dir: {e}"),
+                })?
+                .keep();
+            for (provider_name, archive_bytes) in &providers {
+                let archive_path = providers_root.join(format!("{provider_name}.cloacina"));
+                std::fs::write(&archive_path, archive_bytes).map_err(|e| {
+                    RegistryError::RegistrationFailed {
+                        message: format!("stage provider archive '{provider_name}': {e}"),
+                    }
+                })?;
+                unpack_provider_archive(&archive_path, &providers_root, &[]).map_err(|e| {
+                    RegistryError::RegistrationFailed {
+                        message: format!("unpack bundled provider '{provider_name}': {e}"),
+                    }
+                })?;
+            }
+            info!(
+                "Unpacked {} bundled provider(s) for {} v{} into {}",
+                providers.len(),
+                metadata.package_name,
+                metadata.version,
+                providers_root.display()
+            );
+            Ok(Some(providers_root))
+        }
+    }
+
+    /// `provider_root` is the tree this package's bundled providers were staged
+    /// into by [`Self::stage_bundled_providers`] (`None` = it bundles none). Every
+    /// node resolves against THAT directory explicitly (CLOACI-T-0925) — the
+    /// resolution runs on a `spawn_blocking` thread, so reading a process-global
+    /// there would race every other tenant's concurrent load.
+    pub(super) async fn step_load_constructor_nodes(
+        &self,
+        metadata: &WorkflowMetadata,
+        library_data: &[u8],
+        provider_root: Option<std::path::PathBuf>,
+    ) -> Result<(), RegistryError> {
+        let declarations = self
+            .package_loader
+            .extract_constructor_metadata(library_data)
+            .await
+            .map_err(RegistryError::Loader)?;
+        if declarations.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "constructors-wasm"))]
+        {
+            let _ = provider_root;
+            return Err(RegistryError::RegistrationFailed {
+                message: format!(
+                    "package {} v{} declares {} constructor node(s), but this host was built \
+                     without the `constructors-wasm` feature — it cannot resolve WASM \
+                     constructor providers (fail closed)",
+                    metadata.package_name,
+                    metadata.version,
+                    declarations.len()
+                ),
+            });
+        }
+
+        #[cfg(feature = "constructors-wasm")]
+        {
+            use crate::registry::loader::grants::GrantSpec;
+            use crate::registry::loader::load_constructor_node_in;
+
+            // Fail closed: decls with no bundle refuse to load — the hermetic
+            // guarantee. Step 0 already staged; re-stage only if the caller had
+            // nothing to hand us (keeps the direct-call test seam working).
+            let providers_root = match provider_root {
+                Some(root) => Some(root),
+                None => self.stage_bundled_providers(metadata).await?,
+            };
+            let Some(providers_root) = providers_root else {
+                return Err(RegistryError::RegistrationFailed {
+                    message: format!(
+                        "package {} v{} declares {} constructor node(s) but has NO bundled \
+                         providers — the build step must bundle each `from` provider \
+                         (CLOACI-T-0836) before the reconciler can resolve them",
+                        metadata.package_name,
+                        metadata.version,
+                        declarations.len()
+                    ),
+                });
+            };
+
+            let runtime =
+                self.runtime
+                    .as_ref()
+                    .ok_or_else(|| RegistryError::RegistrationFailed {
+                        message: format!(
+                            "package {} declares constructor nodes but the reconciler has no \
+                         Runtime attached",
+                            metadata.package_name
+                        ),
+                    })?;
+            let tenant = self.config.default_tenant_id.as_str();
+
+            // Resolve + register each declared node. wasmtime compilation is
+            // blocking work; hop off the async executor per node.
+            for decl in declarations {
+                let namespace =
+                    TaskNamespace::new(tenant, &metadata.package_name, &decl.workflow, &decl.id);
+                let dependencies: Vec<TaskNamespace> = decl
+                    .dependencies
+                    .iter()
+                    .map(|dep| {
+                        TaskNamespace::new(tenant, &metadata.package_name, &decl.workflow, dep)
+                    })
+                    .collect();
+                let grants = GrantSpec::from_pairs(decl.grants.clone());
+
+                let (node_id, from, constructor) =
+                    (decl.id.clone(), decl.from.clone(), decl.constructor.clone());
+                // Config values crossed the FFI wire JSON-encoded (bincode can't
+                // carry `serde_json::Value`); parse each back before binding.
+                let config: Vec<(String, serde_json::Value)> = decl
+                    .config
+                    .iter()
+                    .map(|(k, raw)| {
+                        serde_json::from_str(raw)
+                            .map(|v| (k.clone(), v))
+                            .map_err(|e| RegistryError::RegistrationFailed {
+                                message: format!(
+                                    "constructor node '{}': config value for '{}' is not \
+                                     valid JSON ({raw}): {e}",
+                                    decl.id, k
+                                ),
+                            })
+                    })
+                    .collect::<Result<_, _>>()?;
+                let search_path = providers_root.clone();
+                let node = tokio::task::spawn_blocking(move || {
+                    load_constructor_node_in(
+                        &search_path,
+                        &node_id,
+                        &from,
+                        &constructor,
+                        config,
+                        dependencies,
+                        grants,
+                    )
+                })
+                .await
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: format!("constructor node '{}' load join: {e}", decl.id),
+                })?
+                .map_err(|e| RegistryError::RegistrationFailed {
+                    message: format!(
+                        "resolve constructor node '{}' (from = '{}', constructor = '{}') for \
+                         package {} v{}: {e}",
+                        decl.id,
+                        decl.from,
+                        decl.constructor,
+                        metadata.package_name,
+                        metadata.version
+                    ),
+                })?;
+
+                runtime.register_task(namespace.clone(), move || node.clone());
+                info!(
+                    "Registered packaged constructor node {} (from = '{}', constructor = '{}')",
+                    namespace, decl.from, decl.constructor
+                );
+            }
+
+            Ok(())
+        }
+    }
+
+    pub(super) async fn step_load_workflows(
+        &self,
+        metadata: &WorkflowMetadata,
+        library_data: &[u8],
+    ) -> Result<(Vec<TaskNamespace>, Option<String>), RegistryError> {
+        let task_namespaces = self.register_package_tasks(metadata, library_data).await?;
+        let workflow_name = self
+            .register_package_workflows(metadata, library_data)
+            .await?;
+        // T-0554 Phase 2 e2e fix: seed inventory BEFORE the trigger
+        // subscription validator runs. `register_package_tasks` above
+        // dlopened the cdylib, which triggered the package's
+        // `inventory::submit!` blocks. Without this seed call, the
+        // submitted entries sit in inventory but aren't reflected in
+        // the runtime's trigger registry yet, so a workflow that
+        // declares `triggers = [...]` against a trigger from the same
+        // cdylib would always fail validation. The end-of-load seed
+        // call elsewhere covers re-seeds for late lookups; this one
+        // makes the in-package case work.
+        if let Some(runtime) = &self.runtime {
+            runtime.seed_from_inventory();
+        }
+        self.validate_workflow_trigger_subscriptions(metadata, library_data)
+            .await?;
+        Ok((task_namespaces, workflow_name))
+    }
+}
+
+/// T-0554 — Unified package metadata view fed into the precedence
+/// pipeline. Wire-format types from `cloacina-workflow-plugin`. Both the
+/// Rust FFI extraction path and (future) Python scoped-Runtime adapter
+/// produce values of this shape.
+pub(super) struct PackageLoadView {
+    pub(super) triggers: Vec<cloacina_workflow_plugin::TriggerPackageMetadata>,
+    pub(super) reactors: Vec<cloacina_workflow_plugin::ReactorPackageMetadata>,
+    pub(super) graph: Option<cloacina_workflow_plugin::GraphPackageMetadata>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Runtime;
+    use crate::registry::reconciler::ReconcilerConfig;
+    use crate::registry::workflow_registry::filesystem::FilesystemWorkflowRegistry;
+    use serial_test::serial;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Create a minimal RegistryReconciler for testing, wired up to a scoped
+    /// empty Runtime so trigger tracking doesn't depend on ambient globals.
+    fn make_test_reconciler() -> RegistryReconciler {
+        let registry = Arc::new(FilesystemWorkflowRegistry::new(vec![]));
+        let config = ReconcilerConfig::default();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let reconciler = RegistryReconciler::new(registry, config, rx)
+            .expect("Failed to create test reconciler");
+        reconciler.with_runtime(Arc::new(Runtime::empty()))
+    }
+
+    fn runtime_of(r: &RegistryReconciler) -> Arc<Runtime> {
+        r.runtime.clone().expect("reconciler must have a runtime")
+    }
+
+    fn make_test_metadata() -> WorkflowMetadata {
+        WorkflowMetadata {
+            id: Uuid::new_v4(),
+            registry_id: Uuid::new_v4(),
+            workflow_name: "test-workflow".to_string(),
+            package_name: "test-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            description: Some("Test package".to_string()),
+            author: None,
+            tasks: vec![],
+            task_graph: vec![],
+            schedules: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            paused: false,
+            declared_params: vec![],
+            declared_surfaces: vec![],
+            workflow_triggers: vec![],
+        }
+    }
+
+    fn make_cloacina_metadata() -> cloacina_workflow_plugin::CloacinaMetadata {
+        cloacina_workflow_plugin::CloacinaMetadata {
+            workflow_name: Some("test-workflow".to_string()),
+            graph_name: None,
+            language: "python".to_string(),
+            description: Some("Test".to_string()),
+            author: None,
+            requires_python: None,
+            entry_module: Some("test.tasks".to_string()),
+            reaction_mode: None,
+            input_strategy: None,
+            accumulators: Vec::new(),
+            providers: Default::default(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T-0554 Phase 2: build_view_python adapter tests
+    // -----------------------------------------------------------------------
+
+    fn empty_pre_snapshots() -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        (
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_view_python_returns_empty_view_for_unloaded_runtime() {
+        let reconciler = make_test_reconciler();
+        let (pre_r, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("empty-pkg", &pre_r, &pre_t, &pre_g, &[]);
+        assert!(view.reactors.is_empty());
+        assert!(view.triggers.is_empty());
+        assert!(view.graph.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_view_python_emits_wire_format_for_runtime_reactor() {
+        let reconciler = make_test_reconciler();
+        let runtime = runtime_of(&reconciler);
+        runtime.register_reactor("py_reactor".to_string(), || {
+            cloacina_computation_graph::ReactorRegistration {
+                name: "py_reactor".to_string(),
+                accumulator_names: vec!["src_a".to_string(), "src_b".to_string()],
+                accumulator_specs: vec![],
+                reaction_mode: cloacina_computation_graph::ReactionMode::WhenAny,
+                constructor: None,
+            }
+        });
+
+        let (pre_r, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("py-pkg", &pre_r, &pre_t, &pre_g, &[]);
+        assert_eq!(view.reactors.len(), 1);
+        let r = &view.reactors[0];
+        assert_eq!(r.name, "py_reactor");
+        assert_eq!(r.package_name, "py-pkg");
+        assert_eq!(r.reaction_mode, "when_any");
+        let acc_names: Vec<&str> = r.accumulators.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(acc_names, vec!["src_a", "src_b"]);
+        assert!(
+            r.accumulators
+                .iter()
+                .all(|a| a.accumulator_type == "passthrough")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_view_python_skips_pre_snapshot_entries() {
+        let reconciler = make_test_reconciler();
+        let runtime = runtime_of(&reconciler);
+        runtime.register_reactor("preexisting".to_string(), || {
+            cloacina_computation_graph::ReactorRegistration {
+                name: "preexisting".to_string(),
+                accumulator_names: vec!["x".to_string()],
+                accumulator_specs: vec![],
+                reaction_mode: cloacina_computation_graph::ReactionMode::WhenAny,
+                constructor: None,
+            }
+        });
+
+        let mut pre_r = std::collections::HashSet::new();
+        pre_r.insert("preexisting".to_string());
+        let (_, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("py-pkg", &pre_r, &pre_t, &pre_g, &[]);
+        assert!(
+            view.reactors.is_empty(),
+            "pre-snapshot reactors must not appear in the diff view"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_view_python_folds_accumulator_overrides() {
+        let reconciler = make_test_reconciler();
+        let runtime = runtime_of(&reconciler);
+        runtime.register_reactor("py_reactor".to_string(), || {
+            cloacina_computation_graph::ReactorRegistration {
+                name: "py_reactor".to_string(),
+                accumulator_names: vec!["topic_a".to_string()],
+                accumulator_specs: vec![],
+                reaction_mode: cloacina_computation_graph::ReactionMode::WhenAll,
+                constructor: None,
+            }
+        });
+
+        let mut config = std::collections::HashMap::new();
+        config.insert("topic".to_string(), "events".to_string());
+        let overrides = vec![cloacina_workflow_plugin::types::AccumulatorConfig {
+            name: "topic_a".to_string(),
+            accumulator_type: "stream".to_string(),
+            config,
+        }];
+
+        let (pre_r, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("py-pkg", &pre_r, &pre_t, &pre_g, &overrides);
+        assert_eq!(view.reactors.len(), 1);
+        let acc = &view.reactors[0].accumulators[0];
+        assert_eq!(acc.name, "topic_a");
+        assert_eq!(acc.accumulator_type, "stream");
+        assert_eq!(acc.config.get("topic").map(|s| s.as_str()), Some("events"));
+        assert_eq!(view.reactors[0].reaction_mode, "when_all");
+    }
+
+    /// CLOACI-T-0839: an AUTHORED accumulator spec carried on the runtime
+    /// registration (e.g. Python's `@cloaca.state_accumulator(capacity=5)`)
+    /// must reach the view when no manifest override exists — previously this
+    /// silently degraded to passthrough. A manifest override still wins.
+    #[tokio::test]
+    async fn build_view_python_honors_authored_accumulator_specs() {
+        let reconciler = make_test_reconciler();
+        let runtime = runtime_of(&reconciler);
+        runtime.register_reactor("py_state_rx".to_string(), || {
+            let mut config = std::collections::HashMap::new();
+            config.insert("capacity".to_string(), "5".to_string());
+            cloacina_computation_graph::ReactorRegistration {
+                name: "py_state_rx".to_string(),
+                accumulator_names: vec!["py_window".to_string(), "overridden".to_string()],
+                accumulator_specs: vec![
+                    cloacina_computation_graph::AccumulatorSpec {
+                        name: "py_window".to_string(),
+                        accumulator_type: "state".to_string(),
+                        config,
+                    },
+                    cloacina_computation_graph::AccumulatorSpec {
+                        name: "overridden".to_string(),
+                        accumulator_type: "state".to_string(),
+                        config: Default::default(),
+                    },
+                ],
+                reaction_mode: cloacina_computation_graph::ReactionMode::WhenAny,
+                constructor: None,
+            }
+        });
+
+        // Deployment override on the SECOND accumulator — it must beat the
+        // authored spec; the first accumulator uses its authored spec.
+        let overrides = vec![cloacina_workflow_plugin::types::AccumulatorConfig {
+            name: "overridden".to_string(),
+            accumulator_type: "passthrough".to_string(),
+            config: Default::default(),
+        }];
+
+        let (pre_r, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("py-pkg", &pre_r, &pre_t, &pre_g, &overrides);
+        assert_eq!(view.reactors.len(), 1);
+        let accs = &view.reactors[0].accumulators;
+        let window = accs.iter().find(|a| a.name == "py_window").unwrap();
+        assert_eq!(
+            window.accumulator_type, "state",
+            "authored spec must not degrade to passthrough"
+        );
+        assert_eq!(window.config.get("capacity").map(|s| s.as_str()), Some("5"));
+        let overridden = accs.iter().find(|a| a.name == "overridden").unwrap();
+        assert_eq!(
+            overridden.accumulator_type, "passthrough",
+            "manifest override must beat the authored spec"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CLOACI-T-0688: cron-trigger reconciler-path (Rust↔Python parity).
+    //
+    // `@cloaca.trigger(on=, cron=)` produces a runtime `Trigger` whose
+    // `cron_expression()`/`workflow_name()` are overridden (see
+    // `PythonTriggerWrapper`). These tests drive the host-side path that
+    // consumes that: `build_view_python` must emit a `TriggerPackageMetadata`
+    // carrying `cron_expression: Some(...)` + the `workflow_name` binding, and
+    // `step_load_cron_triggers` must select only cron-bearing triggers and
+    // register them against their TARGET workflow.
+    // -----------------------------------------------------------------------
+
+    /// A minimal cron-shaped `Trigger` impl mirroring what `PythonTriggerWrapper`
+    /// presents to the reconciler: a name distinct from its target workflow, an
+    /// overridden `cron_expression()`, and an overridden `workflow_name()`.
+    #[derive(Debug)]
+    struct MockCronTrigger {
+        name: String,
+        workflow: String,
+        cron: String,
+    }
+
+    #[async_trait::async_trait]
+    impl cloacina_workflow::Trigger for MockCronTrigger {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn poll_interval(&self) -> std::time::Duration {
+            // Ignored for cron triggers; reconciler routes by cron_expression().
+            std::time::Duration::from_secs(60)
+        }
+        fn allow_concurrent(&self) -> bool {
+            false
+        }
+        async fn poll(
+            &self,
+        ) -> Result<cloacina_workflow::TriggerResult, cloacina_workflow::TriggerError> {
+            Ok(cloacina_workflow::TriggerResult::Skip)
+        }
+        fn cron_expression(&self) -> Option<String> {
+            Some(self.cron.clone())
+        }
+        fn workflow_name(&self) -> &str {
+            &self.workflow
+        }
+    }
+
+    /// A custom-poll trigger (no cron expression) — exercises the `None` branch
+    /// so we can assert `step_load_cron_triggers` ignores it.
+    #[derive(Debug)]
+    struct MockPollTrigger {
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl cloacina_workflow::Trigger for MockPollTrigger {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn poll_interval(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(30)
+        }
+        fn allow_concurrent(&self) -> bool {
+            true
+        }
+        async fn poll(
+            &self,
+        ) -> Result<cloacina_workflow::TriggerResult, cloacina_workflow::TriggerError> {
+            Ok(cloacina_workflow::TriggerResult::Skip)
+        }
+        // cron_expression() / workflow_name() default (None / "").
+    }
+
+    /// In-memory cron registrar that records every `register_cron_workflow`
+    /// call so tests can assert what the reconciler routed to the cron path —
+    /// no DB required.
+    #[derive(Default)]
+    struct RecordingCronRegistrar {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+        /// Schedule ids passed to `unregister_cron_workflow` (CLOACI-T-0918:
+        /// lets tests assert rollback of schedule rows after a failed load).
+        unregisters: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::registry::reconciler::CronWorkflowRegistrar for RecordingCronRegistrar {
+        async fn register_cron_workflow(
+            &self,
+            workflow_name: &str,
+            cron_expression: &str,
+            timezone: &str,
+        ) -> Result<String, String> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((
+                workflow_name.to_string(),
+                cron_expression.to_string(),
+                timezone.to_string(),
+            ));
+            Ok(format!("schedule-{}", calls.len()))
+        }
+        async fn unregister_cron_workflow(&self, schedule_id: &str) -> Result<(), String> {
+            self.unregisters
+                .lock()
+                .unwrap()
+                .push(schedule_id.to_string());
+            Ok(())
+        }
+        // register_poll_trigger uses the trait default (errors loudly); the
+        // cron path under test never calls it.
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_view_python_emits_cron_metadata_for_runtime_trigger() {
+        let reconciler = make_test_reconciler();
+        let runtime = runtime_of(&reconciler);
+        runtime.register_trigger("nightly_cron".to_string(), || {
+            Arc::new(MockCronTrigger {
+                name: "nightly_cron".to_string(),
+                workflow: "etl_workflow".to_string(),
+                cron: "0 0 * * *".to_string(),
+            })
+        });
+
+        let (pre_r, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("cron-pkg", &pre_r, &pre_t, &pre_g, &[]);
+
+        assert_eq!(view.triggers.len(), 1, "one runtime trigger expected");
+        let t = &view.triggers[0];
+        assert_eq!(t.name, "nightly_cron");
+        assert_eq!(t.package_name, "cron-pkg");
+        // The two new RUNTIME-wired fields: cron expression + workflow binding.
+        assert_eq!(
+            t.cron_expression.as_deref(),
+            Some("0 0 * * *"),
+            "build_view_python must carry the runtime trigger's cron_expression()"
+        );
+        assert_eq!(
+            t.workflow_name, "etl_workflow",
+            "build_view_python must carry the runtime trigger's workflow_name() binding"
+        );
+        assert!(!t.allow_concurrent);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn step_load_cron_triggers_selects_cron_bearing_triggers() {
+        let registrar = Arc::new(RecordingCronRegistrar::default());
+        let reconciler = make_test_reconciler().with_cron_registrar(registrar.clone());
+        let runtime = runtime_of(&reconciler);
+
+        // One cron trigger (should be registered) + one custom-poll trigger
+        // (cron_expression() == None, must be ignored by the cron step).
+        runtime.register_trigger("nightly_cron".to_string(), || {
+            Arc::new(MockCronTrigger {
+                name: "nightly_cron".to_string(),
+                workflow: "etl_workflow".to_string(),
+                cron: "0 0 * * *".to_string(),
+            })
+        });
+        runtime.register_trigger("file_watch".to_string(), || {
+            Arc::new(MockPollTrigger {
+                name: "file_watch".to_string(),
+            })
+        });
+
+        let (pre_r, pre_t, pre_g) = empty_pre_snapshots();
+        let view = reconciler.build_view_python("cron-pkg", &pre_r, &pre_t, &pre_g, &[]);
+        assert_eq!(
+            view.triggers.len(),
+            2,
+            "both triggers should be in the view"
+        );
+
+        let metadata = make_test_metadata();
+        let ids = reconciler
+            .step_load_cron_triggers(&metadata, &view)
+            .await
+            .expect("step_load_cron_triggers should succeed");
+
+        // Exactly one cron schedule registered (the custom-poll one is skipped).
+        assert_eq!(
+            ids.len(),
+            1,
+            "only the cron-bearing trigger should register"
+        );
+
+        let calls = registrar.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // Registered against the TARGET workflow (workflow_name), not the
+        // trigger's own name — and carrying the cron expression + UTC tz.
+        assert_eq!(
+            calls[0],
+            (
+                "etl_workflow".to_string(),
+                "0 0 * * *".to_string(),
+                "UTC".to_string()
+            )
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T-0554 Phase 2 + T-0553 deferred AC: cross-package contract validation
+    // and reverse-order unload pipeline e2e (in-crate scaffolding).
+    // -----------------------------------------------------------------------
+
+    use crate::computation_graph::reactor::{InputStrategy, ReactionCriteria};
+    use crate::computation_graph::registry::EndpointRegistry;
+    use crate::computation_graph::scheduler::{AccumulatorDeclaration, ComputationGraphScheduler};
+
+    fn make_test_view_with_subscriber_graph(
+        package_name: &str,
+        upstream_reactor: &str,
+        subscriber_accumulators: Vec<&str>,
+    ) -> PackageLoadView {
+        use cloacina_workflow_plugin::{GraphPackageMetadata, types::AccumulatorDeclarationEntry};
+        let accumulators: Vec<AccumulatorDeclarationEntry> = subscriber_accumulators
+            .into_iter()
+            .map(|n| AccumulatorDeclarationEntry {
+                name: n.to_string(),
+                accumulator_type: "passthrough".to_string(),
+                config: Default::default(),
+            })
+            .collect();
+        PackageLoadView {
+            triggers: vec![],
+            reactors: vec![],
+            graph: Some(GraphPackageMetadata {
+                graph_name: format!("{}_graph", package_name),
+                package_name: package_name.to_string(),
+                reaction_mode: "when_any".to_string(),
+                input_strategy: "latest".to_string(),
+                accumulators,
+                trigger_reactor: Some(upstream_reactor.to_string()),
+                graph_data_json: None,
+            }),
+        }
+    }
+
+    async fn load_publishing_reactor_into_scheduler(
+        scheduler: &Arc<ComputationGraphScheduler>,
+        reactor_name: &str,
+        accumulators: &[&str],
+    ) {
+        use crate::computation_graph::packaging_bridge::PassthroughAccumulatorFactory;
+        let acc_decls: Vec<AccumulatorDeclaration> = accumulators
+            .iter()
+            .map(|n| AccumulatorDeclaration {
+                name: n.to_string(),
+                factory: Arc::new(PassthroughAccumulatorFactory),
+            })
+            .collect();
+        scheduler
+            .load_reactor(
+                reactor_name.to_string(),
+                acc_decls,
+                ReactionCriteria::WhenAny,
+                InputStrategy::Latest,
+                Some("public".to_string()),
+                vec![],
+                None,
+            )
+            .await
+            .expect("publishing reactor should load");
+    }
+
+    fn make_reconciler_with_scheduler(
+        scheduler: Arc<ComputationGraphScheduler>,
+    ) -> RegistryReconciler {
+        let registry = Arc::new(FilesystemWorkflowRegistry::new(vec![]));
+        let config = ReconcilerConfig::default();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let reconciler = RegistryReconciler::new(registry, config, rx)
+            .expect("Failed to create test reconciler")
+            .with_runtime(Arc::new(Runtime::empty()));
+        reconciler.with_graph_scheduler(scheduler)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cross_package_contract_mismatch_rejects_with_named_accumulators() {
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        load_publishing_reactor_into_scheduler(&scheduler, "shared_rx", &["alpha", "beta"]).await;
+
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+        let metadata = WorkflowMetadata {
+            package_name: "subscriber-mismatched".to_string(),
+            ..make_test_metadata()
+        };
+        let view = make_test_view_with_subscriber_graph(
+            "subscriber-mismatched",
+            "shared_rx",
+            vec!["alpha", "gamma"],
+        );
+        let manifest = make_cloacina_metadata();
+
+        let err = reconciler
+            .step_load_reactor_bound_cgs(&metadata, &view, &manifest, b"", None)
+            .await
+            .expect_err("subscriber declaring accumulator outside upstream contract must error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("subscriber-mismatched"),
+            "error must name the offending package: {}",
+            msg
+        );
+        assert!(
+            msg.contains("shared_rx"),
+            "error must name the upstream reactor: {}",
+            msg
+        );
+        assert!(
+            msg.contains("gamma"),
+            "error must name the missing accumulator: {}",
+            msg
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cross_package_subscriber_before_publisher_rejects_with_clear_error() {
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        // No publisher loaded; subscriber arrives first.
+
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+        let metadata = WorkflowMetadata {
+            package_name: "subscriber-orphan".to_string(),
+            ..make_test_metadata()
+        };
+        let view =
+            make_test_view_with_subscriber_graph("subscriber-orphan", "missing_rx", vec!["alpha"]);
+        let manifest = make_cloacina_metadata();
+
+        let err = reconciler
+            .step_load_reactor_bound_cgs(&metadata, &view, &manifest, b"", None)
+            .await
+            .expect_err("subscriber-before-publisher must error fast, no pending bindings");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("subscriber-orphan"),
+            "error names package: {}",
+            msg
+        );
+        assert!(
+            msg.contains("missing_rx"),
+            "error names the missing reactor: {}",
+            msg
+        );
+        assert!(
+            msg.contains("publishing package must load before"),
+            "error suggests load-order remediation: {}",
+            msg
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cross_package_subscriber_in_same_package_skips_validation() {
+        // When the subscriber declares its own reactor (publisher is in the
+        // same package), the cross-package pre-validation must NOT fire —
+        // the reactor has not been loaded yet at the moment step_load_
+        // reactor_bound_cgs runs (step 3 ran earlier in the pipeline, but
+        // the test path here does not include step 3). The validation must
+        // detect "publisher_in_same_package" via view.reactors and skip.
+        use cloacina_workflow_plugin::{
+            GraphPackageMetadata, ReactorPackageMetadata, types::AccumulatorDeclarationEntry,
+        };
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+
+        let metadata = WorkflowMetadata {
+            package_name: "self-publisher".to_string(),
+            ..make_test_metadata()
+        };
+        let view = PackageLoadView {
+            triggers: vec![],
+            reactors: vec![ReactorPackageMetadata {
+                name: "self_rx".to_string(),
+                package_name: "self-publisher".to_string(),
+                reaction_mode: "when_any".to_string(),
+                accumulators: vec![],
+            }],
+            graph: Some(GraphPackageMetadata {
+                graph_name: "self_graph".to_string(),
+                package_name: "self-publisher".to_string(),
+                reaction_mode: "when_any".to_string(),
+                input_strategy: "latest".to_string(),
+                accumulators: vec![AccumulatorDeclarationEntry {
+                    name: "any_acc".to_string(),
+                    accumulator_type: "passthrough".to_string(),
+                    config: Default::default(),
+                }],
+                trigger_reactor: Some("self_rx".to_string()),
+                graph_data_json: None,
+            }),
+        };
+        let manifest = make_cloacina_metadata();
+
+        // Even though the upstream "self_rx" has not been loaded into
+        // the scheduler, the validation must skip because the publisher
+        // appears in view.reactors. The downstream `load_graph` call
+        // will spin its own reactor instance via the bundled-form path.
+        let result = reconciler
+            .step_load_reactor_bound_cgs(&metadata, &view, &manifest, b"", None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "self-publishing graph must skip cross-package validation; got {:?}",
+            result
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unload_package_rejects_when_subscribers_remain_bound() {
+        // Reverse-order unload pipeline with T-0544 M4 reject-with-bound-
+        // subscribers guard: a publisher package owns reactor R; a
+        // subscriber from a different package binds to R. Attempting to
+        // unload the publisher first must surface a clean
+        // RegistrationFailed naming the publisher + R.
+        use crate::registry::reconciler::PackageState;
+        use crate::registry::types::WorkflowPackageId;
+
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        load_publishing_reactor_into_scheduler(&scheduler, "owned_rx", &["alpha"]).await;
+
+        // Bind a subscriber graph from another package to the reactor
+        // (simulating the cross-package fan-out path).
+        let graph_fn: crate::computation_graph::reactor::CompiledGraphFn = Arc::new(|_cache| {
+            Box::pin(async { cloacina_computation_graph::GraphResult::completed(vec![]) })
+        });
+        scheduler
+            .bind_graph_to_reactor(
+                "subscriber_graph".to_string(),
+                "owned_rx".to_string(),
+                crate::tenant_scope::TenantScope::tenant("public"),
+                graph_fn,
+            )
+            .await
+            .expect("subscriber should bind to publisher's reactor");
+
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+
+        // Manually insert publisher PackageState (the package owns
+        // owned_rx via reactor_names).
+        let publisher_id: WorkflowPackageId = uuid::Uuid::new_v4();
+        let publisher_state = PackageState {
+            metadata: WorkflowMetadata {
+                package_name: "publisher-pkg".to_string(),
+                ..make_test_metadata()
+            },
+            task_namespaces: vec![],
+            workflow_name: None,
+            trigger_names: vec![],
+            graph_name: None,
+            reactor_names: vec!["owned_rx".to_string()],
+            cron_schedule_ids: vec![],
+            triggerless_graph_names: vec![],
+        };
+        reconciler
+            .loaded_packages
+            .write()
+            .await
+            .insert(publisher_id, publisher_state);
+
+        let err = reconciler
+            .unload_package(publisher_id)
+            .await
+            .expect_err("unload must reject while subscribers remain bound");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("publisher-pkg"),
+            "error must name the publisher package: {}",
+            msg
+        );
+        assert!(
+            msg.contains("owned_rx"),
+            "error must name the reactor with bound subscribers: {}",
+            msg
+        );
+        assert!(
+            msg.contains("unload subscribers first"),
+            "error must instruct operator on unload order: {}",
+            msg
+        );
+
+        // Sanity-check that the reactor is still loaded.
+        assert!(
+            scheduler
+                .reactor_accumulator_names(
+                    "owned_rx",
+                    crate::tenant_scope::TenantScope::tenant("public")
+                )
+                .await
+                .is_some(),
+            "reactor must still exist after rejected unload"
+        );
+
+        // CLOACI-T-0918: the REJECTED unload must keep tracking state so
+        // the next reconcile cycle retries. Before the fix, the
+        // PackageState was removed up front and never restored — the
+        // guard-blocked reactor ran forever as an untracked ghost.
+        {
+            let loaded = reconciler.loaded_packages.read().await;
+            let residual = loaded
+                .get(&publisher_id)
+                .expect("rejected unload must keep the package tracked for retry");
+            assert_eq!(
+                residual.reactor_names,
+                vec!["owned_rx".to_string()],
+                "residual tracking must carry the reactor the guard refused to unload"
+            );
+        }
+
+        // Once the subscriber unbinds, the retried unload must succeed and
+        // drop tracking for good.
+        scheduler
+            .unload_graph(
+                "subscriber_graph",
+                crate::tenant_scope::TenantScope::tenant("public"),
+            )
+            .await
+            .expect("subscriber graph should unbind");
+        reconciler
+            .unload_package(publisher_id)
+            .await
+            .expect("retried unload must succeed once subscribers are unbound");
+        assert!(
+            !reconciler
+                .loaded_packages
+                .read()
+                .await
+                .contains_key(&publisher_id),
+            "tracking must be dropped after the successful retry"
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unload_package_succeeds_after_subscribers_unbound() {
+        // Companion to the rejection test: once subscribers are unbound,
+        // the publisher's unload completes cleanly and the reactor is
+        // torn down.
+        use crate::registry::reconciler::PackageState;
+        use crate::registry::types::WorkflowPackageId;
+
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        load_publishing_reactor_into_scheduler(&scheduler, "lone_rx", &["alpha"]).await;
+
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+
+        let publisher_id: WorkflowPackageId = uuid::Uuid::new_v4();
+        reconciler.loaded_packages.write().await.insert(
+            publisher_id,
+            PackageState {
+                metadata: WorkflowMetadata {
+                    package_name: "publisher-lone".to_string(),
+                    ..make_test_metadata()
+                },
+                task_namespaces: vec![],
+                workflow_name: None,
+                trigger_names: vec![],
+                graph_name: None,
+                reactor_names: vec!["lone_rx".to_string()],
+                cron_schedule_ids: vec![],
+                triggerless_graph_names: vec![],
+            },
+        );
+
+        reconciler
+            .unload_package(publisher_id)
+            .await
+            .expect("unload with no subscribers must succeed");
+
+        assert!(
+            scheduler
+                .reactor_accumulator_names(
+                    "lone_rx",
+                    crate::tenant_scope::TenantScope::tenant("public")
+                )
+                .await
+                .is_none(),
+            "reactor must be torn down after publisher unload"
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    /// T-0564: unload_package must drop the reactor constructor from the
+    /// Runtime registry alongside the scheduler-side teardown. Without
+    /// this, hot-reloading the same package leaves a stale constructor
+    /// entry; long-running daemons that reload the same package across
+    /// many cycles accumulate dead entries.
+    #[tokio::test]
+    #[serial]
+    async fn unload_package_drops_reactor_from_runtime_registry() {
+        use crate::registry::reconciler::PackageState;
+        use crate::registry::types::WorkflowPackageId;
+
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        load_publishing_reactor_into_scheduler(&scheduler, "ephemeral_rx", &["alpha"]).await;
+
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+
+        // Mirror what the load path does for Rust packages: register the
+        // reactor constructor in the Runtime registry. (For real loads
+        // this happens via `view.reactors` projection in
+        // `step_load_reactors`; here we register directly so the unload
+        // arm has something to remove.)
+        let runtime = runtime_of(&reconciler);
+        runtime.register_reactor("ephemeral_rx".to_string(), || {
+            cloacina_computation_graph::ReactorRegistration {
+                name: "ephemeral_rx".to_string(),
+                accumulator_names: vec!["alpha".to_string()],
+                accumulator_specs: vec![],
+                reaction_mode: cloacina_computation_graph::ReactionMode::WhenAny,
+                constructor: None,
+            }
+        });
+        assert!(
+            runtime.reactor_names().iter().any(|n| n == "ephemeral_rx"),
+            "precondition: reactor constructor registered before unload"
+        );
+
+        let publisher_id: WorkflowPackageId = uuid::Uuid::new_v4();
+        reconciler.loaded_packages.write().await.insert(
+            publisher_id,
+            PackageState {
+                metadata: WorkflowMetadata {
+                    package_name: "publisher-ephemeral".to_string(),
+                    ..make_test_metadata()
+                },
+                task_namespaces: vec![],
+                workflow_name: None,
+                trigger_names: vec![],
+                graph_name: None,
+                reactor_names: vec!["ephemeral_rx".to_string()],
+                cron_schedule_ids: vec![],
+                triggerless_graph_names: vec![],
+            },
+        );
+
+        reconciler
+            .unload_package(publisher_id)
+            .await
+            .expect("unload should succeed when no subscribers are bound");
+
+        assert!(
+            !runtime.reactor_names().iter().any(|n| n == "ephemeral_rx"),
+            "reactor constructor must be removed from Runtime registry after unload"
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // CLOACI-T-0918: partial-load schedule rollback + manifest input_strategy
+    // -----------------------------------------------------------------------
+
+    /// `rollback_schedule_rows` must drop every schedule id created by a
+    /// load that later failed — this is the cleanup seam `load_package`
+    /// invokes on any inner failure so partial loads can't orphan cron/poll
+    /// schedule rows.
+    #[tokio::test]
+    #[serial]
+    async fn rollback_schedule_rows_unregisters_every_created_id() {
+        let registrar = Arc::new(RecordingCronRegistrar::default());
+        let reconciler = make_test_reconciler().with_cron_registrar(registrar.clone());
+        let metadata = make_test_metadata();
+
+        let created = vec!["schedule-1".to_string(), "schedule-2".to_string()];
+        reconciler.rollback_schedule_rows(&metadata, &created).await;
+
+        let unregisters = registrar.unregisters.lock().unwrap();
+        assert_eq!(
+            *unregisters,
+            vec!["schedule-1".to_string(), "schedule-2".to_string()],
+            "every schedule row created by the failed load must be dropped"
+        );
+    }
+
+    /// CLOACI-T-0918: the manifest's `[metadata] input_strategy` must reach
+    /// the scheduler's declaration. The `package!()` FFI shell always emits
+    /// the wire default ("latest"); `step_load_reactor_bound_cgs` overrides
+    /// it from the manifest before building the declaration.
+    #[tokio::test]
+    #[serial]
+    async fn manifest_input_strategy_overrides_ffi_wire_default() {
+        use cloacina_workflow_plugin::{GraphPackageMetadata, types::AccumulatorDeclarationEntry};
+
+        let endpoint_registry = EndpointRegistry::new();
+        let scheduler = Arc::new(ComputationGraphScheduler::new(endpoint_registry));
+        let reconciler = make_reconciler_with_scheduler(scheduler.clone());
+
+        let metadata = WorkflowMetadata {
+            package_name: "sequential-pkg".to_string(),
+            ..make_test_metadata()
+        };
+        // Bundled-form graph (no trigger_reactor) — skips cross-package
+        // validation and spins its own reactor inside `load_graph`.
+        let view = PackageLoadView {
+            triggers: vec![],
+            reactors: vec![],
+            graph: Some(GraphPackageMetadata {
+                graph_name: "sequential_graph".to_string(),
+                package_name: "sequential-pkg".to_string(),
+                reaction_mode: "when_any".to_string(),
+                // What the FFI shell always reports (the wire default).
+                input_strategy: "latest".to_string(),
+                accumulators: vec![AccumulatorDeclarationEntry {
+                    name: "src".to_string(),
+                    accumulator_type: "passthrough".to_string(),
+                    config: Default::default(),
+                }],
+                trigger_reactor: None,
+                graph_data_json: None,
+            }),
+        };
+        let manifest = cloacina_workflow_plugin::CloacinaMetadata {
+            input_strategy: Some("sequential".to_string()),
+            ..make_cloacina_metadata()
+        };
+
+        reconciler
+            .step_load_reactor_bound_cgs(&metadata, &view, &manifest, b"", None)
+            .await
+            .expect("bundled-form graph load should succeed");
+
+        let graphs = scheduler.list_graphs().await;
+        let status = graphs
+            .iter()
+            .find(|g| g.name == "sequential_graph")
+            .expect("graph must be loaded into the scheduler");
+        assert_eq!(
+            status.input_strategy, "sequential",
+            "manifest input_strategy must override the FFI wire default"
+        );
+
+        scheduler.shutdown_all().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // CLOACI-T-0836 / T-0832: Step 5b — packaged constructor-node resolution
+    // against bundled providers. Gated on `constructors-wasm` (wasmtime); builds
+    // the packaged consumer fixture cdylib + the provider wasm archive in-test.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "constructors-wasm")]
+    mod constructor_nodes {
+        use super::*;
+        use crate::registry::WorkflowRegistry;
+        use crate::registry::types::LoadedWorkflow;
+        use async_trait::async_trait;
+        use std::path::PathBuf;
+        use std::sync::OnceLock;
+
+        fn workspace_root() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+        }
+
+        /// Build the packaged consumer fixture (a cdylib whose `constructor!` node
+        /// lowers to a ConstructorEntry declaration) once; return its bytes.
+        fn consumer_cdylib() -> &'static [u8] {
+            static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+            BYTES.get_or_init(|| {
+                let root = workspace_root().canonicalize().unwrap();
+                let fixture = root.join("examples/constructor-contract/packaged-consumer-fixture");
+
+                // Stage a temp copy with `__WORKSPACE__` rewritten to the absolute
+                // workspace root (same template scheme as compiler-happy-rust).
+                let stage = tempfile::TempDir::new().unwrap().keep();
+                std::fs::create_dir_all(stage.join("src")).unwrap();
+                let cargo = std::fs::read_to_string(fixture.join("Cargo.toml"))
+                    .unwrap()
+                    .replace("__WORKSPACE__", &root.display().to_string());
+                std::fs::write(stage.join("Cargo.toml"), cargo).unwrap();
+                for f in ["build.rs", "package.toml"] {
+                    std::fs::copy(fixture.join(f), stage.join(f)).unwrap();
+                }
+                std::fs::copy(fixture.join("src/lib.rs"), stage.join("src/lib.rs")).unwrap();
+
+                let status = std::process::Command::new("cargo")
+                    .args(["build", "--lib"])
+                    .current_dir(&stage)
+                    .status()
+                    .expect("spawn cargo build for packaged-consumer-fixture");
+                assert!(status.success(), "packaged-consumer-fixture build failed");
+
+                let ext = if cfg!(target_os = "macos") {
+                    "dylib"
+                } else {
+                    "so"
+                };
+                std::fs::read(
+                    stage
+                        .join("target/debug")
+                        .join(format!("libpackaged_consumer_fixture.{ext}")),
+                )
+                .expect("read built consumer cdylib")
+            })
+        }
+
+        /// Build + pack the `cloacina-provider-fs` provider archive once (what the
+        /// compiler's bundle step would store in `package_providers`).
+        fn provider_archive() -> &'static [u8] {
+            static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+            BYTES.get_or_init(|| {
+                let out = tempfile::TempDir::new().unwrap().keep();
+                let archive = out.join("cloacina-provider-fs.cloacina");
+                let opts = crate::packaging::constructor_provider::ProviderPackageOptions {
+                    crate_dir: workspace_root().join("providers/cloacina-provider-fs"),
+                    output: Some(archive.clone()),
+                    sign_key: None,
+                    manifest_bin: "emit_manifest".to_string(),
+                    release: false,
+                    runtime: cloacina_constructor_contract::ProviderRuntime::Wasm,
+                };
+                crate::packaging::constructor_provider::package_constructor_provider(&opts)
+                    .expect("package cloacina-provider-fs");
+                std::fs::read(&archive).expect("read provider archive")
+            })
+        }
+
+        /// A registry stub whose only real behavior is returning the bundled
+        /// provider archives — the seam `step_load_constructor_nodes` consumes.
+        struct ProviderStubRegistry {
+            providers: Vec<(String, Vec<u8>)>,
+        }
+
+        #[async_trait]
+        impl WorkflowRegistry for ProviderStubRegistry {
+            async fn register_workflow(
+                &mut self,
+                _package_data: Vec<u8>,
+            ) -> Result<WorkflowPackageId, RegistryError> {
+                unimplemented!("stub")
+            }
+            async fn get_workflow(
+                &self,
+                _package_name: &str,
+                _version: &str,
+            ) -> Result<Option<LoadedWorkflow>, RegistryError> {
+                Ok(None)
+            }
+            async fn list_workflows(&self) -> Result<Vec<WorkflowMetadata>, RegistryError> {
+                Ok(vec![])
+            }
+            async fn unregister_workflow(
+                &mut self,
+                _package_name: &str,
+                _version: &str,
+            ) -> Result<(), RegistryError> {
+                Ok(())
+            }
+            async fn get_package_providers(
+                &self,
+                _package_name: &str,
+                _version: &str,
+            ) -> Result<Vec<(String, Vec<u8>)>, RegistryError> {
+                Ok(self.providers.clone())
+            }
+        }
+
+        fn make_reconciler_with_providers(providers: Vec<(String, Vec<u8>)>) -> RegistryReconciler {
+            let registry = Arc::new(ProviderStubRegistry { providers });
+            let config = ReconcilerConfig::default();
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            RegistryReconciler::new(registry, config, rx)
+                .expect("create reconciler")
+                .with_runtime(Arc::new(Runtime::empty()))
+        }
+
+        fn consumer_metadata() -> WorkflowMetadata {
+            WorkflowMetadata {
+                package_name: "packaged-consumer-fixture".to_string(),
+                version: "0.1.0".to_string(),
+                workflow_name: "provider_consumer".to_string(),
+                ..make_test_metadata()
+            }
+        }
+
+        /// The full Step 5b happy path: bundled provider archive → unpack →
+        /// resolve the declared `constructor!` node by name → register → the node
+        /// RUNS (reads the granted file through the sandbox) and the DAG builder
+        /// picks it up.
+        #[tokio::test]
+        #[serial]
+        async fn resolves_and_runs_packaged_constructor_node_from_bundled_provider() {
+            // The fixture's compile-time config path.
+            let data_dir = std::path::Path::new("/tmp/cloacina-packaged-consumer-fixture");
+            std::fs::create_dir_all(data_dir).unwrap();
+            std::fs::write(data_dir.join("secret.txt"), "bundled secret").unwrap();
+
+            let reconciler = make_reconciler_with_providers(vec![(
+                "cloacina-provider-fs".to_string(),
+                provider_archive().to_vec(),
+            )]);
+            let metadata = consumer_metadata();
+
+            reconciler
+                .step_load_constructor_nodes(&metadata, consumer_cdylib(), None)
+                .await
+                .expect("Step 5b resolves the declared constructor node");
+
+            // Registered under (tenant, package, workflow, id) — where the DAG
+            // builder looks.
+            let runtime = runtime_of(&reconciler);
+            let ns = TaskNamespace::new(
+                &reconciler.config.default_tenant_id,
+                "packaged-consumer-fixture",
+                "provider_consumer",
+                "reader",
+            );
+            let task = runtime
+                .get_task(&ns)
+                .expect("constructor node registered in the runtime registry");
+
+            // The DAG builder assembles a workflow containing the node.
+            let workflow = RegistryReconciler::create_workflow_from_host_registry_static(
+                &runtime,
+                "packaged-consumer-fixture",
+                "provider_consumer",
+                &reconciler.config.default_tenant_id,
+            )
+            .expect("workflow builds from the registry");
+            assert!(
+                workflow
+                    .get_task_ids()
+                    .iter()
+                    .any(|t| t.task_id == "reader"),
+                "the resolved constructor node joins the workflow DAG"
+            );
+
+            // And the node actually RUNS: the sandboxed read succeeds through the
+            // fixture's fs grant.
+            let out = task
+                .execute(crate::Context::new())
+                .await
+                .expect("packaged constructor node executes");
+            assert_eq!(
+                out.get("contents"),
+                Some(&serde_json::json!("bundled secret")),
+                "read_file resolved from the BUNDLED provider read the granted file"
+            );
+        }
+
+        /// Fail closed: constructor declarations with NO bundled providers refuse
+        /// to load (the hermetic guarantee — no fallback to ambient dirs).
+        #[tokio::test]
+        #[serial]
+        async fn constructor_decls_without_bundled_providers_fail_closed() {
+            let reconciler = make_reconciler_with_providers(vec![]);
+            let metadata = consumer_metadata();
+
+            let err = reconciler
+                .step_load_constructor_nodes(&metadata, consumer_cdylib(), None)
+                .await
+                .expect_err("decls without bundled providers must fail closed");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("NO bundled providers"),
+                "error should say the bundle is missing, got: {msg}"
+            );
+        }
+
+        // (The constructor-free fast path — empty declarations → immediate Ok —
+        // is covered implicitly by every existing reconciler test that loads a
+        // constructor-free package through load_package unchanged.)
+    }
+}
