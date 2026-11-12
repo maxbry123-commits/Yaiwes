@@ -13,9 +13,6 @@ LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "0"))
 ITEM_DELAY_SECONDS = float(os.getenv("ITEM_DELAY_SECONDS", "2"))
 RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "0"))
-ITEM_DELAY_SECONDS = float(os.getenv("ITEM_DELAY_SECONDS", "2"))
-RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120"))
-MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "0"))
 
 
 def load_queue():
