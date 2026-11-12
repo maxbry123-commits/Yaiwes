@@ -1,0 +1,129 @@
+{
+  "version": "0.4.0",
+  "app": {
+    "name": "Memento-S",
+    "theme_options": {
+      "system": {
+        "zh-CN": "跟随系统",
+        "en-US": "System"
+      },
+      "light": {
+        "zh-CN": "亮色",
+        "en-US": "Light"
+      },
+      "dark": {
+        "zh-CN": "暗色",
+        "en-US": "Dark"
+      }
+    },
+    "language_options": {
+      "zh-CN": {
+        "zh-CN": "中文",
+        "en-US": "Chinese"
+      },
+      "en-US": {
+        "zh-CN": "Chinese",
+        "en-US": "English"
+      }
+    }
+  },
+  "skills": {
+    "catalog_path": "router_data/skills_catalog.jsonl",
+    "github_mirrors": [
+      "https://gh-proxy.com/"
+    ],
+    "cloud_catalog_url": "https://skills.yangtzeailab.com/",
+    "retrieval": {
+      "top_k": 5,
+      "min_score": 0.012,
+      "router_backend": "hybrid",
+      "embedding_model": "Qwen3-Embedding-4B",
+      "embedding_dimension": 2560,
+      "embedding_base_url": "https://skills.yangtzeailab.com/api/v1",
+      "embedding_api_key": "sk-xxxxxx",
+      "qwen_tokenizer_path": "Qwen/Qwen3-Embedding-0.6B",
+      "qwen_model_path": "",
+      "qwen_device": "auto",
+      "qwen_max_length": 8192,
+      "qwen_batch_size": 32,
+      "qwen_timeout_sec": 30,
+      "qwen_query_instruction": "Instruct: Given a user query, retrieve relevant skill descriptions that match the query\nQuery:",
+      "reranker_enabled": true,
+      "reranker_min_score": 0.001
+    },
+    "execution": {
+      "timeout_sec": 3600,
+      "max_reflection_retries": 3,
+      "sandbox_provider": "uv",
+      "uv_python_version": "3.12",
+      "bash_timeout_sec": 3600,
+      "pip_install_timeout_sec": 180,
+      "cli_install_timeout_sec": 300,
+      "max_attempts": 3,
+      "same_signature_limit": 2
+    },
+    "evolution": {
+      "enabled": true,
+      "protected_skills": [
+        "filesystem",
+        "skill-creator",
+        "uv-pip-install",
+        "web-search"
+      ],
+      "min_attribution_confidence": 0.5,
+      "max_updates_per_step": 1,
+      "candidate_attempts": 1,
+      "utility_discovery_enabled": true,
+      "utility_discovery_threshold": 0.2,
+      "utility_min_samples": 3,
+      "test_timeout_sec": 180,
+      "synthetic_test_enabled": true,
+      "keep_failed_candidate": true,
+      "max_prompt_chars": 60000
+    }
+  },
+  "paths": {
+    "workspace_dir": null,
+    "skills_dir": null,
+    "db_dir": null,
+    "logs_dir": null,
+    "venv_dir": null,
+    "path_validation_enabled": false
+  },
+  "logging": {
+    "level": "DEBUG",
+    "verbose": true
+  },
+  "agent": {
+    "max_iterations": 100
+  },
+  "gateway": {
+    "enabled": true,
+    "mode": "gateway",
+    "websocket_host": "127.0.0.1",
+    "websocket_port": 8765,
+    "webhook_host": "127.0.0.1",
+    "webhook_port": 18080
+  },
+  "ota": {
+    "url": "https://ota.yangtzeailab.com/api/v1/check_for_updates"
+  },
+  "auth": {
+    "base_url": "https://ota.yangtzeailab.com/"
+  },
+  "dream": {
+    "enabled": true,
+    "min_hours": 24,
+    "min_sessions": 2,
+    "poll_interval_seconds": 600,
+    "scan_interval_seconds": 600
+  },
+  "memory": {
+    "enabled": true,
+    "min_staging_sessions": 5,
+    "min_staging_bytes": 10000,
+    "max_tokens_per_call": 2000,
+    "poll_interval_seconds": 60,
+    "priority_topics": []
+  }
+}

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# Install the dev shell's tools (Go, git, universal-ctags, buf) from the flake
+# and link them into ~/.local/bin, which is on PATH for every orb command, so
+# agents don't need to run commands through `nix develop`. The out-link keeps
+# the tools from being garbage collected.
+echo "Installing dev tools from flake.nix..."
+tools="$HOME/.local/share/zoekt-dev-tools"
+nix build .#dev-tools --out-link "$tools"
+mkdir -p "$HOME/.local/bin"
+ln -sf "$tools"/bin/* "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Go switches to the toolchain in go.mod before running any command in the
+# module, so this downloads that toolchain into the snapshot as well.
+echo "Downloading the Go toolchain and modules..."
+go mod download
+go version
+
+echo "Orb setup complete."

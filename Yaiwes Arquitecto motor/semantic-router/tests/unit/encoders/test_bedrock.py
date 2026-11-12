@@ -1,0 +1,486 @@
+import asyncio
+import json
+import os
+from io import BytesIO
+
+import pytest
+
+_ = pytest.importorskip("boto3")
+
+from semantic_router.encoders import BedrockEncoder  # noqa: E402
+
+
+@pytest.fixture
+def bedrock_encoder(mocker):
+    mocker.patch("semantic_router.encoders.bedrock.BedrockEncoder._initialize_client")
+    return BedrockEncoder(
+        access_key_id="fake_id",
+        secret_access_key="fake_secret",
+        session_token="fake_token",
+        region="us-west-2",
+    )
+
+
+@pytest.fixture
+def bedrock_encoder_with_cohere(mocker):
+    mocker.patch("semantic_router.encoders.bedrock.BedrockEncoder._initialize_client")
+    return BedrockEncoder(
+        name="cohere_model",
+        access_key_id="fake_id",
+        secret_access_key="fake_secret",
+        session_token="fake_token",
+        region="us-west-2",
+    )
+
+
+class TestBedrockEncoder:
+    def test_initialisation_with_default_values(self, bedrock_encoder):
+        assert bedrock_encoder.input_type == "search_query", (
+            "Default input type not set correctly"
+        )
+        assert bedrock_encoder.region == "us-west-2", "Region should be initialised"
+
+    def test_initialisation_with_custom_values(self, mocker):
+        name = "custom_model"
+        input_type = "custom_input"
+        bedrock_encoder = BedrockEncoder(
+            name=name,
+            input_type=input_type,
+            access_key_id="fake_id",
+            secret_access_key="fake_secret",
+            session_token="fake_token",
+            region="us-west-2",
+        )
+        assert bedrock_encoder.name == name, "Custom name not set correctly"
+        assert bedrock_encoder.region == "us-west-2", "Custom region not set correctly"
+        assert bedrock_encoder.input_type == input_type, (
+            "Custom input type not set correctly"
+        )
+
+    def test_initialisation_with_session_token(self, mocker):
+        mocker.patch(
+            "semantic_router.encoders.bedrock.BedrockEncoder._initialize_client"
+        )
+        bedrock_encoder = BedrockEncoder(
+            access_key_id="fake_id",
+            secret_access_key="fake_secret",
+            session_token="fake_token",
+            region="us-west-2",
+        )
+        assert bedrock_encoder.session_token == "fake_token", (
+            "Session token not set correctly"
+        )
+
+    def test_initialisation_with_missing_access_key(self, mocker):
+        mocker.patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "env_id"})
+        mocker.patch(
+            "semantic_router.encoders.bedrock.BedrockEncoder._initialize_client"
+        )
+        bedrock_encoder = BedrockEncoder(
+            access_key_id=None,
+            secret_access_key="fake_secret",
+            session_token="fake_token",
+            region="us-west-2",
+        )
+        assert bedrock_encoder.access_key_id == "env_id", (
+            "Access key ID not set correctly from environment variable"
+        )
+
+    def test_missing_access_key_id(self, mocker):
+        mocker.patch(
+            "semantic_router.encoders.bedrock.BedrockEncoder._initialize_client"
+        )
+
+        with pytest.raises(ValueError):
+            BedrockEncoder(access_key_id=None, secret_access_key="fake_secret")
+
+    def test_missing_secret_access_key(self, mocker):
+        mocker.patch(
+            "semantic_router.encoders.bedrock.BedrockEncoder._initialize_client"
+        )
+
+        with pytest.raises(ValueError):
+            BedrockEncoder(access_key_id="fake_id", secret_access_key=None)
+
+    def test_initialisation_missing_env_variables(self, mocker):
+        mocker.patch.dict(os.environ, {}, clear=True)
+        with pytest.raises(ValueError):
+            BedrockEncoder(
+                access_key_id=None,
+                secret_access_key=None,
+                session_token=None,
+                region=None,
+            )
+
+    def test_failed_client_initialisation(self, mocker):
+        mocker.patch.dict(os.environ, clear=True)
+
+        mocker.patch(
+            "semantic_router.encoders.bedrock.BedrockEncoder._initialize_client",
+            side_effect=Exception("Initialization failed"),
+        )
+
+        with pytest.raises(ValueError):
+            BedrockEncoder(access_key_id="fake_id", secret_access_key="fake_secret")
+
+    def test_call_method(self, bedrock_encoder):
+        response_content = json.dumps({"embedding": [0.1, 0.2, 0.3]})
+        response_body = BytesIO(response_content.encode("utf-8"))
+        mock_response = {"body": response_body}
+        bedrock_encoder.client.invoke_model.return_value = mock_response
+        result = bedrock_encoder(["test"])
+        assert isinstance(result, list), "Result should be a list"
+        assert all(isinstance(item, list) for item in result), (
+            "Each item in result should be a list"
+        )
+        assert result == [[0.1, 0.2, 0.3]], "Embedding should be [0.1, 0.2, 0.3]"
+
+    def test_call_with_expired_token(self, mocker, bedrock_encoder):
+        from botocore.exceptions import ClientError
+
+        mocker.patch("semantic_router.encoders.bedrock.sleep")
+
+        error_response = {"Error": {"Code": "ExpiredTokenException"}}
+        mocker.patch(
+            "semantic_router.encoders.bedrock.BedrockEncoder._initialize_client",
+            return_value=bedrock_encoder.client,
+        )
+
+        def invoke_model_side_effect(*args, **kwargs):
+            if not invoke_model_side_effect.expired_token_raised:
+                invoke_model_side_effect.expired_token_raised = True
+                raise ClientError(error_response, "invoke_model")
+            else:
+                return {
+                    "body": BytesIO(
+                        json.dumps({"embedding": [0.1, 0.2, 0.3]}).encode("utf-8")
+                    )
+                }
+
+        invoke_model_side_effect.expired_token_raised = False
+        bedrock_encoder.client.invoke_model.side_effect = invoke_model_side_effect
+
+        assert bedrock_encoder(["test"]) == [[0.1, 0.2, 0.3]]
+
+        bedrock_encoder._initialize_client.assert_called_once_with(
+            bedrock_encoder.access_key_id,
+            bedrock_encoder.secret_access_key,
+            None,
+            bedrock_encoder.region,
+        )
+
+    def test_call_retries_client_error(self, mocker, bedrock_encoder):
+        from botocore.exceptions import ClientError
+
+        sleep = mocker.patch("semantic_router.encoders.bedrock.sleep")
+        throttled = ClientError(
+            {"Error": {"Code": "ThrottlingException"}}, "invoke_model"
+        )
+        ok = {"body": BytesIO(json.dumps({"embedding": [0.1, 0.2]}).encode())}
+        bedrock_encoder.client.invoke_model.side_effect = [throttled, throttled, ok]
+
+        assert bedrock_encoder(["test"]) == [[0.1, 0.2]]
+        assert bedrock_encoder.client.invoke_model.call_count == 3
+        assert [c.args for c in sleep.call_args_list] == [(1,), (2,)]
+
+    def test_call_raises_after_retries_exhausted(self, mocker, bedrock_encoder):
+        from botocore.exceptions import ClientError
+
+        mocker.patch("semantic_router.encoders.bedrock.sleep")
+        bedrock_encoder.client.invoke_model.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException"}}, "invoke_model"
+        )
+
+        with pytest.raises(ValueError, match="Retries exhausted"):
+            bedrock_encoder(["test"])
+        assert bedrock_encoder.client.invoke_model.call_count == 3
+
+    def test_raises_value_error_if_call_to_bedrock_fails(self, bedrock_encoder):
+        bedrock_encoder.client.invoke_model.side_effect = Exception(
+            "Bedrock call failed."
+        )
+        with pytest.raises(ValueError):
+            bedrock_encoder(["test"])
+
+    def test_call_with_unknown_model_name(self, bedrock_encoder):
+        bedrock_encoder.name = "unknown_model"
+        with pytest.raises(ValueError):
+            bedrock_encoder(["test"])
+
+    def test_chunking_functionality(self, bedrock_encoder):
+        docs = ["This is a long text that needs to be chunked properly."]
+        chunked_docs = bedrock_encoder.chunk_strings(docs, MAX_WORDS=5)
+        assert isinstance(chunked_docs, list), "Chunked result should be a list"
+        assert len(chunked_docs[0]) > 1, (
+            "Document should be chunked into multiple parts"
+        )
+        assert all(isinstance(chunk, str) for chunk in chunked_docs[0]), (
+            "Chunks should be strings"
+        )
+
+    def test_get_env_variable(self):
+        var_name = "TEST_ENV_VAR"
+        default_value = "default"
+        os.environ[var_name] = "env_value"
+        assert BedrockEncoder.get_env_variable(var_name, None) == "env_value"
+        assert (
+            BedrockEncoder.get_env_variable(var_name, None, default_value)
+            == "env_value"
+        )
+        assert (
+            BedrockEncoder.get_env_variable("NON_EXISTENT_VAR", None, default_value)
+            == default_value
+        )
+
+    def test_get_env_variable_missing(self):
+        with pytest.raises(ValueError):
+            BedrockEncoder.get_env_variable("MISSING_VAR", None)
+
+    def test_uninitialised_client(self, bedrock_encoder):
+        bedrock_encoder.client = None
+
+        with pytest.raises(ValueError):
+            bedrock_encoder(["test"])
+
+    def test_missing_env_variables(self, mocker):
+        mocker.patch.dict(os.environ, clear=True)
+
+        with pytest.raises(ValueError):
+            BedrockEncoder()
+
+
+class TestBedrockEncoderWithCohere:
+    def test_cohere_embedding_single_chunk(self, bedrock_encoder_with_cohere):
+        response_content = json.dumps({"embeddings": [[0.1, 0.2, 0.3]]})
+        response_body = BytesIO(response_content.encode("utf-8"))
+        mock_response = {"body": response_body}
+        bedrock_encoder_with_cohere.client.invoke_model.return_value = mock_response
+        result = bedrock_encoder_with_cohere(["short test"])
+        assert isinstance(result, list), "Result should be a list"
+        assert all(isinstance(item, list) for item in result), (
+            "Each item should be a list"
+        )
+        assert result == [[0.1, 0.2, 0.3]], "Expected embedding [0.1, 0.2, 0.3]"
+
+    def test_cohere_input_type(self, bedrock_encoder_with_cohere):
+        bedrock_encoder_with_cohere.input_type = "different_type"
+        response_content = json.dumps({"embeddings": [[0.1, 0.2, 0.3]]})
+        response_body = BytesIO(response_content.encode("utf-8"))
+        mock_response = {"body": response_body}
+        bedrock_encoder_with_cohere.client.invoke_model.return_value = mock_response
+        result = bedrock_encoder_with_cohere(["test with different input type"])
+        assert isinstance(result, list), "Result should be a list"
+        assert result == [[0.1, 0.2, 0.3]], "Expected specific embeddings"
+
+    @staticmethod
+    def _one_embedding_per_text(**kwargs):
+        texts = json.loads(kwargs["body"])["texts"]
+        body = json.dumps({"embeddings": [[float(len(t))] for t in texts]})
+        return {"body": BytesIO(body.encode("utf-8"))}
+
+    def test_cohere_one_embedding_per_document(self, bedrock_encoder_with_cohere):
+        client = bedrock_encoder_with_cohere.client
+        client.invoke_model.side_effect = self._one_embedding_per_text
+        docs = ["word " * 100, "short"]
+
+        result = bedrock_encoder_with_cohere(docs)
+
+        assert len(result) == len(docs)
+        assert result == [[500.0], [5.0]]
+        # one call, with each document sent whole
+        assert client.invoke_model.call_count == 1
+        sent = json.loads(client.invoke_model.call_args.kwargs["body"])
+        assert sent == {"texts": docs, "input_type": "search_query"}
+
+    def test_cohere_batches_at_most_96_texts(self, bedrock_encoder_with_cohere):
+        client = bedrock_encoder_with_cohere.client
+        client.invoke_model.side_effect = self._one_embedding_per_text
+        docs = [f"doc {i}" for i in range(97)]
+
+        result = bedrock_encoder_with_cohere(docs)
+
+        assert len(result) == len(docs)
+        batches = [
+            json.loads(c.kwargs["body"])["texts"]
+            for c in client.invoke_model.call_args_list
+        ]
+        assert [len(b) for b in batches] == [96, 1]
+        assert sum(batches, []) == docs
+
+    def test_cohere_model_kwargs_reach_the_request(self, bedrock_encoder_with_cohere):
+        client = bedrock_encoder_with_cohere.client
+        client.invoke_model.side_effect = self._one_embedding_per_text
+
+        bedrock_encoder_with_cohere(
+            ["a"], model_kwargs={"truncate": "START", "input_type": "search_document"}
+        )
+
+        sent = json.loads(client.invoke_model.call_args.kwargs["body"])
+        assert sent == {
+            "texts": ["a"],
+            "input_type": "search_document",
+            "truncate": "START",
+        }
+
+    @pytest.mark.asyncio
+    async def test_cohere_one_embedding_per_document_async(
+        self, bedrock_encoder_with_cohere
+    ):
+        # Bedrock has no async client: a router's async path runs the sync call
+        from semantic_router.routers.indexed import _aencode
+
+        client = bedrock_encoder_with_cohere.client
+        client.invoke_model.side_effect = self._one_embedding_per_text
+        docs = ["word " * 100, "short"]
+
+        result = await _aencode(bedrock_encoder_with_cohere, docs, "documents")
+
+        assert len(result) == len(docs)
+        assert result == [[500.0], [5.0]]
+
+
+# 2,400 characters: the first 2,048 end in "B"s, the last 2,048 start with "A"s
+LONG_DOC = "A" * 1200 + "B" * 1200
+
+
+def _cohere_encoder(mocker, name):
+    mocker.patch("semantic_router.encoders.bedrock.BedrockEncoder._initialize_client")
+    mocker.patch("semantic_router.encoders.bedrock.sleep")
+    return BedrockEncoder(
+        name=name,
+        access_key_id="fake_id",
+        secret_access_key="fake_secret",
+        session_token="fake_token",
+        region="us-west-2",
+    )
+
+
+def _bedrock_cohere(max_chars=None):
+    """invoke_model as Bedrock answers it: one embedding per text (its length),
+    and a ValidationException for any text over `max_chars`."""
+    from botocore.exceptions import ClientError
+
+    def invoke_model(**kwargs):
+        texts = json.loads(kwargs["body"])["texts"]
+        if max_chars is not None and any(len(t) > max_chars for t in texts):
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ValidationException",
+                        "Message": f"expected maxLength: {max_chars}",
+                    }
+                },
+                "InvokeModel",
+            )
+        body = json.dumps({"embeddings": [[float(len(t))] for t in texts]})
+        return {"body": BytesIO(body.encode("utf-8"))}
+
+    return invoke_model
+
+
+def _sent(encoder):
+    return json.loads(encoder.client.invoke_model.call_args.kwargs["body"])
+
+
+class TestBedrockCohereV3TextLimit:
+    @pytest.mark.parametrize(
+        "name", ["cohere.embed-english-v3", "cohere.embed-multilingual-v3"]
+    )
+    def test_default_keeps_the_start(self, mocker, name):
+        encoder = _cohere_encoder(mocker, name)
+        encoder.client.invoke_model.side_effect = _bedrock_cohere(max_chars=2048)
+        docs = [LONG_DOC, "short"]
+
+        result = encoder(docs)
+
+        assert len(result) == len(docs)
+        assert result == [[2048.0], [5.0]]
+        assert _sent(encoder)["texts"] == [LONG_DOC[:2048], "short"]
+        assert "truncate" not in _sent(encoder)
+
+    @pytest.mark.parametrize(
+        "truncate, kept",
+        [("END", LONG_DOC[:2048]), ("START", LONG_DOC[-2048:])],
+        ids=["END", "START"],
+    )
+    def test_truncate_end_and_start(self, mocker, truncate, kept):
+        encoder = _cohere_encoder(mocker, "cohere.embed-english-v3")
+        encoder.client.invoke_model.side_effect = _bedrock_cohere(max_chars=2048)
+        docs = [LONG_DOC, "short"]
+
+        result = encoder(docs, model_kwargs={"truncate": truncate})
+
+        assert len(result) == len(docs)
+        assert result == [[2048.0], [5.0]]
+        assert _sent(encoder)["texts"] == [kept, "short"]
+        assert _sent(encoder)["truncate"] == truncate
+
+    def test_truncate_none_fails_before_any_call(self, mocker):
+        encoder = _cohere_encoder(mocker, "cohere.embed-english-v3")
+        encoder.client.invoke_model.side_effect = _bedrock_cohere(max_chars=2048)
+
+        with pytest.raises(ValueError, match="index 1 has 2400 characters"):
+            encoder(["short", LONG_DOC], model_kwargs={"truncate": "NONE"})
+        encoder.client.invoke_model.assert_not_called()
+
+    def test_truncate_none_sends_a_text_at_the_limit(self, mocker):
+        encoder = _cohere_encoder(mocker, "cohere.embed-english-v3")
+        encoder.client.invoke_model.side_effect = _bedrock_cohere(max_chars=2048)
+        doc = "x" * 2048
+
+        assert encoder([doc], model_kwargs={"truncate": "NONE"}) == [[2048.0]]
+        assert _sent(encoder)["texts"] == [doc]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "truncate, kept",
+        [("END", LONG_DOC[:2048]), ("START", LONG_DOC[-2048:]), ("NONE", None)],
+        ids=["END", "START", "NONE"],
+    )
+    async def test_truncate_async(self, mocker, truncate, kept):
+        # Bedrock has no async client: async callers run the sync call in a thread
+        encoder = _cohere_encoder(mocker, "cohere.embed-english-v3")
+        encoder.client.invoke_model.side_effect = _bedrock_cohere(max_chars=2048)
+        docs = [LONG_DOC, "short"]
+
+        def call():
+            return encoder(docs, model_kwargs={"truncate": truncate})
+
+        if kept is None:
+            with pytest.raises(ValueError, match="index 0 has 2400 characters"):
+                await asyncio.to_thread(call)
+            encoder.client.invoke_model.assert_not_called()
+            return
+        result = await asyncio.to_thread(call)
+        assert len(result) == len(docs)
+        assert _sent(encoder)["texts"] == [kept, "short"]
+
+    @pytest.mark.asyncio
+    async def test_router_async_path_keeps_the_start(self, mocker):
+        from semantic_router.routers.indexed import _aencode
+
+        encoder = _cohere_encoder(mocker, "cohere.embed-english-v3")
+        encoder.client.invoke_model.side_effect = _bedrock_cohere(max_chars=2048)
+        docs = [LONG_DOC, "short"]
+
+        result = await _aencode(encoder, docs, "documents")
+
+        assert len(result) == len(docs)
+        assert result == [[2048.0], [5.0]]
+
+
+class TestBedrockCohereV4:
+    @pytest.mark.parametrize(
+        "name",
+        ["cohere.embed-v4:0", "us.cohere.embed-v4:0", "global.cohere.embed-v4:0"],
+    )
+    def test_v4_sends_long_documents_whole(self, mocker, name):
+        encoder = _cohere_encoder(mocker, name)
+        encoder.client.invoke_model.side_effect = _bedrock_cohere()
+        docs = [LONG_DOC, "short"]
+
+        result = encoder(docs, model_kwargs={"truncate": "RIGHT"})
+
+        assert result == [[2400.0], [5.0]]
+        assert _sent(encoder)["texts"] == docs
+        assert _sent(encoder)["truncate"] == "RIGHT"

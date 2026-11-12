@@ -1,0 +1,226 @@
+language: c
+version: "2.0.0"
+
+# Known Limitations (v1):
+# - argv indexing patterns vary (argv[1], *(argv+1), etc.) -- only direct access matched
+# - Pointer aliasing (char *p = argv[1]; use(p)) -- tracked within same function only
+# - Function pointers for sinks -- NOT matched
+# - Struct member injection patterns -- NOT matched
+# - Preprocessor conditionals not resolved (#ifdef guards are invisible)
+# - read() cannot be distinguished as network vs file I/O at AST level
+# - CWE-416 (use-after-free) is NOT detected -- requires temporal ordering pass (future work)
+# - mktemp()/tmpnam() (CWE-676) require a taint source in the same function to trigger;
+#   standalone calls with hardcoded arguments will NOT be flagged
+# - printf("%s", tainted_var) (safe) cannot be distinguished from printf(tainted_var)
+#   (vulnerable) -- both are flagged as CWE-134 format string findings (false positive class)
+# - C source functions that deliver tainted data via output parameters (recv, fread, read,
+#   scanf, getline) are not effective taint sources in v1. Only functions whose return value
+#   IS the tainted data (argv, getenv, gets, fgets) work correctly with the LHS-seeding taint
+#   engine. Functions that write tainted data to a buffer argument are deferred to a future
+#   plan increment that adds output-parameter taint summaries.
+
+sources:
+  cli_input:
+    - pattern: "argv"
+      tree_sitter_query: |
+        (identifier) @source
+        (#eq? @source "argv")
+      severity: medium
+
+    # NOT YET SUPPORTED: output-parameter source (taints buffer arg, not return value). See Known Limitations.
+    # - pattern: "scanf"
+    #   tree_sitter_query: |
+    #     (call_expression
+    #       function: (identifier) @fn
+    #       (#match? @fn "^(scanf|fscanf|sscanf)$")) @source
+    #   severity: high
+
+    - pattern: "gets"
+      tree_sitter_query: |
+        (call_expression
+          function: (identifier) @fn
+          (#eq? @fn "gets")) @source
+      severity: critical
+
+    - pattern: "fgets"
+      tree_sitter_query: |
+        (call_expression
+          function: (identifier) @fn
+          (#eq? @fn "fgets")) @source
+      severity: medium
+
+  env_input:
+    - pattern: "getenv"
+      tree_sitter_query: |
+        (call_expression
+          function: (identifier) @fn
+          (#eq? @fn "getenv")) @source
+      severity: low
+
+  # NOT YET SUPPORTED: output-parameter source (taints buffer arg, not return value). See Known Limitations.
+  # network_input:
+  #   - pattern: "recv"
+  #     tree_sitter_query: |
+  #       (call_expression
+  #         function: (identifier) @fn
+  #         (#match? @fn "^(recv|recvfrom|recvmsg)$")) @source
+  #     severity: high
+  #
+  #   - pattern: "read"
+  #     tree_sitter_query: |
+  #       (call_expression
+  #         function: (identifier) @fn
+  #         (#eq? @fn "read")) @source
+  #     severity: medium
+
+  # NOT YET SUPPORTED: output-parameter source (taints buffer arg, not return value). See Known Limitations.
+  # file_input:
+  #   - pattern: "fread"
+  #     tree_sitter_query: |
+  #       (call_expression
+  #         function: (identifier) @fn
+  #         (#eq? @fn "fread")) @source
+  #     severity: medium
+  #
+  #   - pattern: "getline"
+  #     tree_sitter_query: |
+  #       (call_expression
+  #         function: (identifier) @fn
+  #         (#match? @fn "^(getline|getdelim)$")) @source
+  #     severity: medium
+
+sinks:
+  command_injection:
+    cwe: "CWE-78"
+    entries:
+      - pattern: "system"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#eq? @fn "system")) @sink
+        severity: critical
+
+      - pattern: "popen"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#eq? @fn "popen")) @sink
+        severity: critical
+
+      - pattern: "execv"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(execv|execl|execvp|execlp|execve|execle)$")) @sink
+        severity: critical
+
+  buffer_overflow:
+    cwe: "CWE-120"
+    entries:
+      - pattern: "strcpy"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(strcpy|strcat|wcscpy|wcscat)$")) @sink
+        severity: high
+
+      - pattern: "sprintf"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(sprintf|vsprintf)$")) @sink
+        severity: high
+
+  memory_corruption:
+    cwe: "CWE-119"
+    entries:
+      - pattern: "memcpy"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(memcpy|memmove|memset|bcopy)$")) @sink
+        severity: high
+
+  format_string:
+    cwe: "CWE-134"
+    entries:
+      - pattern: "printf"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(printf|fprintf|syslog)$")) @sink
+        severity: high
+
+  integer_overflow:
+    cwe: "CWE-190"
+    entries:
+      - pattern: "malloc"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(malloc|calloc|realloc)$")) @sink
+        severity: high
+
+  dangerous_function:
+    cwe: "CWE-676"
+    entries:
+      - pattern: "gets"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#eq? @fn "gets")) @sink
+        severity: critical
+
+      - pattern: "mktemp"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(mktemp|tmpnam)$")) @sink
+        severity: high
+
+  path_traversal:
+    cwe: "CWE-22"
+    entries:
+      - pattern: "fopen"
+        tree_sitter_query: |
+          (call_expression
+            function: (identifier) @fn
+            (#match? @fn "^(fopen|open)$")) @sink
+        severity: high
+
+sanitizers:
+  - pattern: "snprintf"
+    neutralizes:
+      - buffer_overflow
+    description: "Bounded format function -- use instead of sprintf"
+
+  - pattern: "strncpy"
+    neutralizes:
+      - buffer_overflow
+    description: "Bounded string copy -- partial mitigation only (null termination risk)"
+
+  - pattern: "strlcpy"
+    neutralizes:
+      - buffer_overflow
+    description: "Bounded string copy with guaranteed null termination (BSD/OpenSSL)"
+
+  - pattern: "strlcat"
+    neutralizes:
+      - buffer_overflow
+    description: "Bounded string concatenation with guaranteed null termination (BSD/OpenSSL)"
+
+  - pattern: "strncat"
+    neutralizes:
+      - buffer_overflow
+    description: "Bounded string concatenation -- partial mitigation (size semantics differ from strncpy)"
+
+  - pattern: "memcpy_s"
+    neutralizes:
+      - buffer_overflow
+      - memory_corruption
+    description: "C11 Annex K bounds-checked memory copy"
+
+  - pattern: "strcpy_s"
+    neutralizes:
+      - buffer_overflow
+    description: "C11 Annex K bounds-checked string copy"
