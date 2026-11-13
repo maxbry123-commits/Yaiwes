@@ -1,0 +1,43 @@
+{
+  "bundle_bytes": 15691512,
+  "bundle_sha256": "694ad52e1f63c46f62920302e41e2ded787adb044ef9f09c5114901f2b8cb7ab",
+  "extracted_tree": {
+    "bytes": 53747701,
+    "files": 9042,
+    "sha256": "87f1280e959cc9f59efbcece01159cd85ad03c2e5ff25671799c0a970965e8a0"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-04-07.bundle.zip.part-0001",
+      "sha256": "5cb5139537ade00fd013fcabbff33a4ab0e27196cbf6bfdedcdc2986e643d2a4"
+    },
+    {
+      "bytes": 3108600,
+      "name": "core-04-07.bundle.zip.part-0002",
+      "sha256": "879ca976c81b45fa49fcb1caa6ecd9cb74af98ba2841b59973409b871fef6681"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-07",
+  "source_bytes": 53747701,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 9042,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B02-ir-evidence/rdflib"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 53747701,
+    "files": 9042,
+    "sha256": "87f1280e959cc9f59efbcece01159cd85ad03c2e5ff25671799c0a970965e8a0"
+  }
+}
