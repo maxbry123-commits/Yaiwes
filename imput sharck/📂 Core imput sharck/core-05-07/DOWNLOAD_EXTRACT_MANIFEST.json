@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 4509499,
+  "bundle_sha256": "6966dd044677eab8a7da9e2e7b4cab3e4686ad850e2fe8cb46dd9b9bae057170",
+  "extracted_tree": {
+    "bytes": 15305919,
+    "files": 927,
+    "sha256": "af6ec27722da4cc284bef3a320a87b847eae62cf78f4ad9a2adb84effca0bede"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 4509499,
+      "name": "core-05-07.bundle.zip.part-0001",
+      "sha256": "6966dd044677eab8a7da9e2e7b4cab3e4686ad850e2fe8cb46dd9b9bae057170"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-07",
+  "source_bytes": 15305919,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 927,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/skills/toolhive-catalog"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 15305919,
+    "files": 927,
+    "sha256": "af6ec27722da4cc284bef3a320a87b847eae62cf78f4ad9a2adb84effca0bede"
+  }
+}
