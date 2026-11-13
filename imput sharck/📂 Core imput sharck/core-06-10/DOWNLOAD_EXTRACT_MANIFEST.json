@@ -1,0 +1,58 @@
+{
+  "bundle_bytes": 61159271,
+  "bundle_sha256": "f549925dd52a56523dac5e651844ec8f19e1910e5dd6910980e76664c3b63a5d",
+  "extracted_tree": {
+    "bytes": 72960775,
+    "files": 1685,
+    "sha256": "0c9cdad1a9c49392b097e2216990b3b0d7dd6d002147b1c57223eeda06e1d7dc"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-10.bundle.zip.part-0001",
+      "sha256": "ba6433bf5bab6af7cc295c536413532a7294ccbd5630205c17355b4d03cabafb"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-10.bundle.zip.part-0002",
+      "sha256": "4d62d046a74ca5cd596905141aaf87403609ef4611b6ba244b3a3db67380d514"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-10.bundle.zip.part-0003",
+      "sha256": "b71ce4f7943290eef1985cc1543d2360e44315b21aeb325326d82e21076cae23"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-10.bundle.zip.part-0004",
+      "sha256": "ef1e3bb7ae7b0ae90848938eeebffc638a072d5161c0e20aa046aab6c62f7827"
+    },
+    {
+      "bytes": 10827623,
+      "name": "core-06-10.bundle.zip.part-0005",
+      "sha256": "a1fcde9d1316ad24abe8769c41bf6158973d9fd8a6e7702079eba9c56e42c1db"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-10",
+  "source_bytes": 72960775,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 1685,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B03-code-runtime/sourcebot"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 72960775,
+    "files": 1685,
+    "sha256": "0c9cdad1a9c49392b097e2216990b3b0d7dd6d002147b1c57223eeda06e1d7dc"
+  }
+}
