@@ -1,0 +1,73 @@
+{
+  "bundle_bytes": 96214024,
+  "bundle_sha256": "0c9adf144a7e2a115661c921e2ad04091ec447302d62cc76a0ff4d9e657bd871",
+  "extracted_tree": {
+    "bytes": 207351947,
+    "files": 19226,
+    "sha256": "4c614c4ea5717a49cc24489ca465f10b5488348f15d7e559bb9e2968966a87c4"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0001",
+      "sha256": "85372ea592d4fd5518234207825114c98fc2348a6af47cfaa6da4704f32a0169"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0002",
+      "sha256": "018b98e02cf738b27640deaf0bba4781b87e5bf6a6333db0031d8c1a8d7355f1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0003",
+      "sha256": "a7ade50759f31088c08881b6e6770ba8b66847471312afff12da7ae1235b50e8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0004",
+      "sha256": "c3885911ca632863c8438a959742c39d6a5fe761a0328ff0606904d87dd36246"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0005",
+      "sha256": "6a499ef8a48bf82f95a1279a3b996e82ea089a3b8724c2587fc9c0793371a6f2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0006",
+      "sha256": "89f91bd27b2cfb4fa174666692c4ddb486dd1e5a82c0a59a4d96eed0bd0714e0"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-01-08.bundle.zip.part-0007",
+      "sha256": "700e3333f6e2cb7d6d89795b2a94d176eff347856f8e93482bcf91c06a6e6f33"
+    },
+    {
+      "bytes": 8133640,
+      "name": "core-01-08.bundle.zip.part-0008",
+      "sha256": "17baac1f353923b965d917a73a15ce21cb1aa7ba4e9f8b8ebf815fdbd3168518"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-01-08",
+  "source_bytes": 207351947,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 19226,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B02-ir-evidence/OpenSearch"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 207351947,
+    "files": 19226,
+    "sha256": "4c614c4ea5717a49cc24489ca465f10b5488348f15d7e559bb9e2968966a87c4"
+  }
+}
