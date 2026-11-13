@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 1275509,
+  "bundle_sha256": "5cd4dd98f307be372809668eafbe4742b82b9a1c92a37b360d8277db594cd542",
+  "extracted_tree": {
+    "bytes": 2989361,
+    "files": 186,
+    "sha256": "df8363d71b7a7b3f29f77662f1132d26e517cb33e2a4d3eb386f0b004bc5ea54"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1275509,
+      "name": "core-02-06.bundle.zip.part-0001",
+      "sha256": "5cd4dd98f307be372809668eafbe4742b82b9a1c92a37b360d8277db594cd542"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-02-06",
+  "source_bytes": 2989361,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 186,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/rag/ColBERT"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 2989361,
+    "files": 186,
+    "sha256": "df8363d71b7a7b3f29f77662f1132d26e517cb33e2a4d3eb386f0b004bc5ea54"
+  }
+}
