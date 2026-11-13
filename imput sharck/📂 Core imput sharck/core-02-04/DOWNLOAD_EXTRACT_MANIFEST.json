@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 674321,
+  "bundle_sha256": "5fc9e26cc0a337c3ad3104d2dc495889ade0a0846afd603c8051c6438e95f648",
+  "extracted_tree": {
+    "bytes": 1481986,
+    "files": 105,
+    "sha256": "df5f1a96a22eb84098dc6686117f2e4e636a09377e676cb010637e1cd9995657"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 674321,
+      "name": "core-02-04.bundle.zip.part-0001",
+      "sha256": "5fc9e26cc0a337c3ad3104d2dc495889ade0a0846afd603c8051c6438e95f648"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-02-04",
+  "source_bytes": 1481986,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 105,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/media-input-router/marshmallow"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 1481986,
+    "files": 105,
+    "sha256": "df5f1a96a22eb84098dc6686117f2e4e636a09377e676cb010637e1cd9995657"
+  }
+}
