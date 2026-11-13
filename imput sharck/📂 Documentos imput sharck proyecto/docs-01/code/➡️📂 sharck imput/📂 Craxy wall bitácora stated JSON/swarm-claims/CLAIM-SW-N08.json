@@ -1,0 +1,41 @@
+{
+  "schema": "sharck-input.swarm-claim.v1",
+  "chat_id": "chat-sol1-20260912T2305-0500",
+  "agent_name": "SOL-1-GPT",
+  "node_id": "SW-N08",
+  "parent_node": "M47_8SOL_SWARM_CONTROL_PLANE",
+  "fresh_main_sha_at_claim": "063e054c51e5214b28608ca0719969f0b827575e",
+  "base_sha": "063e054c51e5214b28608ca0719969f0b827575e",
+  "mode": "READ_ONLY_CONTROL",
+  "write_scope": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N08-EVIDENCE.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-01-LOG.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/swarm-claims/CLAIM-SW-N08.json"
+  ],
+  "paths": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N08-EVIDENCE.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-01-LOG.md"
+  ],
+  "dependencies": [
+    "M47_8SOL_SWARM_CONTROL_ACTIVE",
+    "CRAZY-WALL-SWARM-QUEUE-M47:SW-N08=READY_TO_CLAIM_AT_CLAIM_TIME"
+  ],
+  "gate_snapshot": {
+    "physical_repair_allowed": false,
+    "b05_b06_download_allowed": false,
+    "step3_allowed": false,
+    "canonical_motors": "IMMUTABLE",
+    "shared_control_writes": "SOL-0_ONLY"
+  },
+  "assertion_to_validate": "STATE/PLAN/CHECKPOINT/Handoff/Recovery/DAG can be checked for drift without rewriting shared files.",
+  "claimed_at": "2026-09-12T23:16:00-05:00",
+  "evidence_file": "SW-N08-EVIDENCE.md",
+  "evidence_commit": "83342a9b7a2d25c379705a7afb74414b6d951ab4",
+  "evidence_blob": "4ec9507c60f872cb84e2020506e33a15ffbd9c21",
+  "simulations": "3/3",
+  "refutations": "3/3",
+  "worker_verdict": "PASS_PENDING_SUPERVISOR_FANIN",
+  "release_note": "Worker scope complete; lock retained as completed ownership/evidence record. Shared reconciliation belongs to SOL-0.",
+  "released_at": "2026-09-12T23:18:00-05:00",
+  "state": "RELEASED_PASS_PENDING_SUPERVISOR_FANIN"
+}

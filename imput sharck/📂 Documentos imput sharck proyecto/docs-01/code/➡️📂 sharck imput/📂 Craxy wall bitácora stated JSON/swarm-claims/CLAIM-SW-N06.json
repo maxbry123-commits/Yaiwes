@@ -1,0 +1,75 @@
+{
+  "schema": "sharck-input.swarm-claim.v1",
+  "chat_id": "chat-sol6-20260912T2310-0500",
+  "agent_name": "SOL-6-GPT",
+  "node_id": "SW-N06",
+  "parent_node": "M47_8SOL_SWARM_CONTROL_PLANE",
+  "fresh_main_sha": "985f6312cfe850a27c26a87b54373fe456d5eba2",
+  "base_sha": "985f6312cfe850a27c26a87b54373fe456d5eba2",
+  "mode": "READ_ONLY_RESEARCH",
+  "write_scope": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N06-EVIDENCE.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-06-LOG.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/swarm-claims/CLAIM-SW-N06.json"
+  ],
+  "paths": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N06-EVIDENCE.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-06-LOG.md"
+  ],
+  "dependencies": [
+    "M47_8SOL_SWARM_CONTROL_ACTIVE",
+    "CRAZY-WALL-SWARM-QUEUE-M47:SW-N06=READY_TO_CLAIM",
+    "SW-N05 collision observed and skipped"
+  ],
+  "gate_snapshot": {
+    "physical_repair_allowed": false,
+    "b05_b06_download_allowed": false,
+    "step3_allowed": false,
+    "canonical_motors": "IMMUTABLE",
+    "shared_control_writes": "SOL-0_ONLY"
+  },
+  "assertion_to_validate": "agent/runtime candidates can be ranked by maintenance/upstream/license/overlap before any acquisition.",
+  "claimed_at": "2026-09-12T23:13:29-05:00",
+  "released_at": "2026-09-12T23:18:30-05:00",
+  "state": "RELEASED",
+  "producer_verdict": "PASS_PENDING_REVIEW",
+  "final_sha_before_release": "83342a9b7a2d25c379705a7afb74414b6d951ab4",
+  "commit_sha": "08879e015aa6d6c3049de45d5ebfb8b9e2127102",
+  "blob_sha": "d769b91efdeceae4a5ab09ee81420bf60824ad8a",
+  "tests": [
+    "OFFICIAL_UPSTREAM_RESOLUTION=PASS",
+    "LICENSE_EVIDENCE=PASS",
+    "IMMUTABLE_PIN_CAPTURE=PASS",
+    "CANONICAL_OVERLAP_CHECK=PASS",
+    "NO_PHYSICAL_MUTATION=PASS"
+  ],
+  "run_id": null,
+  "job_id": null,
+  "logs": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-06-LOG.md"
+  ],
+  "evidence": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N06-EVIDENCE.md",
+    "11 candidate/current-upstream findings",
+    "physical B03 runtime inventory readback",
+    "physical Continue manifest readback",
+    "official GitHub metadata/ref/license readbacks"
+  ],
+  "simulations": [
+    "SIM-1_ACTIVE_SMALL_NET_NEW=PASS",
+    "SIM-2_TRANSFERRED_UPSTREAM=PASS",
+    "SIM-3_EXISTING_CANONICAL_MATCHES_FRESH_HEAD=PASS"
+  ],
+  "refutations": [
+    "REFUTE-1 Continue unmaintained claim refuted",
+    "REFUTE-2 block/goose canonical-source claim refuted",
+    "REFUTE-3 sst/opencode canonical-source claim refuted"
+  ],
+  "remaining_gaps": [
+    "special-file/symlink/submodule/LFS surface not proven for NEW candidates",
+    "no acquisition or runtime integration authorized",
+    "SOL-0 supervisor fan-in required for shared source-pointer and maintenance-drift corrections"
+  ],
+  "review_required": "SOL-0 supervisor / director gate",
+  "next_free_node": "RESCAN_AFTER_RELEASE"
+}

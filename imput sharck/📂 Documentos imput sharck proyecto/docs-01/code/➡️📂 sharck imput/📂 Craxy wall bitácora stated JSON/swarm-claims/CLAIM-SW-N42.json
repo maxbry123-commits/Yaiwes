@@ -1,0 +1,22 @@
+{
+  "schema":"sharck-input.swarm-claim.v3",
+  "chat_id":"chat-sol8-20260912T2313-0500",
+  "agent_name":"SOL-8-GPT",
+  "node_id":"SW-N42",
+  "parent_node":"M54_POST_M53_EVIDENCE_CONTINUATION",
+  "fresh_main_sha":"83740cbcc0b432820c3b86d30f921fdc69c7524d",
+  "base_sha":"83740cbcc0b432820c3b86d30f921fdc69c7524d",
+  "mode":"READ_ONLY_PLUS_SANDBOX",
+  "write_scope":["SW-N42-EVIDENCE.md","SOL-SWARM-08-LOG.md","swarm-claims/CLAIM-SW-N42.json"],
+  "task":"SPACY_PRE_REPAIR_DRIFT_AND_STAGING_PREFLIGHT",
+  "state":"RELEASED",
+  "result":"PASS_PENDING_REVIEW",
+  "evidence_commit":"fc6a956af3cf2560c8d29176b1918daccd1a9014",
+  "evidence_blob":"b87dbd33f4b31e6066862d8b1cd777d29cd8add0",
+  "tests":{"source_revalidation":"2/2 PASS","drift_guard":"5/5 PASS","staging_fixture":"PASS","decoy_exclusion":"PASS","refutations":"3/3 PASS"},
+  "verified_closed":false,
+  "physical_mutation":false,
+  "downloads":0,
+  "canonical_motor_mutations":0,
+  "shared_control_writes":0
+}

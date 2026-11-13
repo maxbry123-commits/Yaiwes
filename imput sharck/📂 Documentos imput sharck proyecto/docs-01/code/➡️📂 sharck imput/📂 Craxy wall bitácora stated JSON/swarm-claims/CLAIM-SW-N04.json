@@ -1,0 +1,101 @@
+{
+  "schema": "sharck-input.swarm-claim.v1",
+  "chat_id": "chat-sol4-20260912T2308-0500",
+  "agent_name": "SOL-4-GPT",
+  "node_id": "SW-N04",
+  "parent_node": "M47_8SOL_SWARM_CONTROL_PLANE",
+  "fresh_main_sha": "8be890dce641d42d4b1fb447f838b4e143b86667",
+  "base_sha": "8be890dce641d42d4b1fb447f838b4e143b86667",
+  "pre_release_main_sha": "7ec9bec5c4839f3c57d219514048668f7cfc8608",
+  "mode": "SANDBOX_ONLY",
+  "write_scope": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N04-EVIDENCE.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-04-LOG.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/swarm-claims/CLAIM-SW-N04.json"
+  ],
+  "paths": [
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N04-EVIDENCE.md",
+    "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-04-LOG.md"
+  ],
+  "dependencies": [
+    "M47_8SOL_SWARM_CONTROL_ACTIVE",
+    "CRAZY-WALL-SWARM-QUEUE-M47:SW-N04=READY_TO_CLAIM",
+    "SW-N03 collision correctly abandoned",
+    "physical gates remain false"
+  ],
+  "gate_snapshot": {
+    "physical_repair_allowed": false,
+    "b05_b06_download_allowed": false,
+    "step3_allowed": false,
+    "canonical_motors": "IMMUTABLE",
+    "shared_control_writes": "SOL-0_ONLY"
+  },
+  "assertion_to_validate": "M25 representative coverage 3/12 components and 4/139 anomalies can be expanded safely through isolated sandbox design/tests before production authorization.",
+  "steps": [
+    "STEP_1_SYNC_VERIFY_CLAIM",
+    "STEP_2_EXECUTE_VERIFY",
+    "STEP_3_TEST_REFUTE_REPORT_RELEASE"
+  ],
+  "claimed_at": "2026-09-12T23:12:00-05:00",
+  "released_at": "2026-09-12T23:15:00-05:00",
+  "completion": {
+    "state": "PASS_PENDING_SUPERVISOR_FANIN",
+    "causal_class": "EVIDENCE_FAILURE",
+    "paths_changed": [
+      "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SW-N04-EVIDENCE.md",
+      "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/SOL-SWARM-04-LOG.md",
+      "➡️📂 sharck imput/📂 Craxy wall bitácora stated JSON/swarm-claims/CLAIM-SW-N04.json"
+    ],
+    "evidence_commit": "954507ee91eb6dfa143b7d3d6434caa62521fb69",
+    "evidence_blob": "2d8131a67a32396e1a7441db2fde330e5bf62492",
+    "report_commit": "f6faea6e4d2e602795b96d60669748796ca8aa0b",
+    "report_blob": "ff9876d18bf70eed772deb5d633b7fdea2bb4330",
+    "historical_support_run_id": 34568249222,
+    "historical_support_job_id": 103164691377,
+    "tests": [
+      "coverage arithmetic 139=4+135",
+      "batch arithmetic 135=87+39+9",
+      "12-component accounting",
+      "partial-vs-special separation",
+      "historical M25 run readback",
+      "historical workflow + Motor3 hash gate readback",
+      "worker write-scope discipline",
+      "concurrent-head non-overlap reconciliation"
+    ],
+    "simulations": [
+      "SIM-1 heritrix3+sqry ignore-heavy full-set parity",
+      "SIM-2 OpenSearch 4 missing+7 changed bytes/modes",
+      "SIM-3 heterogeneous remainder full tracked-set equality"
+    ],
+    "refutations": [
+      "REFUTE-1 known-anomaly-only pass can miss newly damaged good paths",
+      "REFUTE-2 unconstrained git add -f can overstage extras",
+      "REFUTE-3 byte equality can hide executable-mode loss"
+    ],
+    "remaining_gaps": [
+      "G-SW-N04-EXECUTION",
+      "G-SW-N04-FULLSET",
+      "G-SW-N04-MODES",
+      "G-SW-N04-PLUMBING-COMPARE",
+      "G-SW-N04-REVIEWS"
+    ],
+    "review_required": "SOL-0 supervisor fan-in; M06 ASTRA + M07 CLAUDE + M08 GROK + director gate still required for production",
+    "gate_recommendation": "KEEP_PHYSICAL_GATES_CLOSED",
+    "physical_mutation": false
+  },
+  "GOALS12_OUTPUT": {
+    "G01": "PASS",
+    "G02": "PASS",
+    "G03": "PASS",
+    "G04": "PASS",
+    "G05": "PASS",
+    "G06": "PASS",
+    "G07": "PASS",
+    "G08": "PASS",
+    "G09": "PASS_DESIGN_EVIDENCE_ONLY",
+    "G10": "PASS_3_SIMULATIONS_3_REFUTATIONS",
+    "G11": "PASS_EVIDENCE_SHA_READBACK",
+    "G12": "PASS_RELEASE_REQUESTED_NEXT_RESCAN_REQUIRED"
+  },
+  "state": "RELEASED"
+}
