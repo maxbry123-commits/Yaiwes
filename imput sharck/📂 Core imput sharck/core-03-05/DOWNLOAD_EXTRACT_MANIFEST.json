@@ -1,0 +1,43 @@
+{
+  "bundle_bytes": 19393742,
+  "bundle_sha256": "3b64f5e9d820891f3e96d45dab0711ff331d295d3274275110543ebc6c85c46a",
+  "extracted_tree": {
+    "bytes": 38681860,
+    "files": 930,
+    "sha256": "2864fe34a08fb8777618796dc5f3eb7bf6b97410c92f35ac8a57c6e367bf3536"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-03-05.bundle.zip.part-0001",
+      "sha256": "01da43617ecb7f4add523f3e17a7312ebfcdcf198b2fed3b44a4f39d8a4c54fc"
+    },
+    {
+      "bytes": 6810830,
+      "name": "core-03-05.bundle.zip.part-0002",
+      "sha256": "12d6db83d0000a900bf1b66e6ef9176f49f978b3542291354c2c365a9d73da70"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-03-05",
+  "source_bytes": 38681860,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 930,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/search/crawl4ai"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 38681860,
+    "files": 930,
+    "sha256": "2864fe34a08fb8777618796dc5f3eb7bf6b97410c92f35ac8a57c6e367bf3536"
+  }
+}
