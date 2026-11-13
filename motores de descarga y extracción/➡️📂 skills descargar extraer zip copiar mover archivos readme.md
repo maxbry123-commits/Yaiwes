@@ -73,7 +73,7 @@ Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Lo
 | `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `b758b05783910e84fc4bf889cf7ebe62f0826065` |
 | `motor_3_copy_batches.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_3_copy_batches.py` | `f7f6705770ecb1d6c2fb5da3f999eef5de2865e0` |
 | `motor_copy_root_to_repo.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_copy_root_to_repo.py` | `ca21283aae5266389d74b7a1e336882dcda80e34` |
-| `motor_4_move_batches.py` | `motores de descarga y extracción/➡️📂motor de moves archivos/motor_4_move_batches.py` | `e795bd10c3c40380c35a9b7d9c5c7ada36048ebd` |
+| `motor_4_move_batches.py` | `motores de descarga y extracción/➡️📂motor de moves archivos/motor_4_move_batches.py` | `9c681778c7d3bd7f032ee530199f39a3d14c34bc` |
 | `motor_tool_gateway.py` | `Yaiwes motor arquitecto/motor nuevo de tools para agentes/motor_tool_gateway.py` | `71047188a4f5b430313c96926247d0956f27510f` |
 
 ## 4. CONTRATO DE MOTORES (entradas obligatorias → PASS)
@@ -133,7 +133,7 @@ Reporte final SIEMPRE en este formato JSON y nada más que lo contradiga:
 
 ## 10. REGISTRO DE CAMBIOS
 
-- 2026-11-13 (owner, chat actual): paralelismo y volumen. motor_2: `WORKERS` (hasta 100 items a la vez en el mismo motor, estado bajo candado, temporales propios que se limpian al arrancar, `MIN_FREE_GIB`). engine: carril único de push por destino + `NET_SLOTS` (activos con `LOCK_DIR`), `PUSH_ATTEMPTS`, precheck del destino antes de descargar. motor_4: `MODE=git` mueve rutas dentro de un repo con un commit por lote (solo índice de carpetas, sin contenido, sin copia de trabajo, sin force) con read-back; modo disco intacto. Re-lock de los 3 en el mismo commit.
+- 2026-11-13 (owner, chat actual): paralelismo y volumen. motor_2: `WORKERS` (hasta 100 items a la vez en el mismo motor, estado bajo candado, temporales propios que se limpian al arrancar, `MIN_FREE_GIB`). engine: carril único de push por destino + `NET_SLOTS` (activos con `LOCK_DIR`), `PUSH_ATTEMPTS`, precheck del destino antes de descargar. motor_4: `MODE=git` mueve rutas dentro de un repo con un commit por lote (solo índice de carpetas; comprobado 0 contenidos descargados; sin copia de trabajo, sin force) con read-back; modo disco intacto. Re-lock de los 3 en el mismo commit.
 
 - 2026-11-13 (owner, chat actual): engine: (1) el reintento de push reconoce `remote rejected`/`cannot lock ref` (carrera con otro motor); (2) `.git/info/attributes` con `* -text -eol -filter -ident` en origen y destino para que los `.gitattributes` del árbol no alteren bytes (corrige `READBACK_TREE_HASH_GAP`). Re-lock en el mismo commit.
 

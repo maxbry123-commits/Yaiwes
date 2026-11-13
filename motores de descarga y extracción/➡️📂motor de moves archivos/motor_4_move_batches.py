@@ -23,10 +23,12 @@ MOVES_FILE = os.getenv("MOVES_FILE", "").strip()
 PUSH_ATTEMPTS = max(8, min(500, int(os.getenv("PUSH_ATTEMPTS", "30"))))
 
 
-def git(args, cwd, check=True, env=None):
-    e = dict(os.environ); e["GIT_TERMINAL_PROMPT"] = "0"; e.update(env or {})
-    p = subprocess.run(["git"] + args, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    out = p.stdout.decode("utf-8", "replace")
+def git(args, cwd, check=True, lazy=False, data=None):
+    # GIT_NO_LAZY_FETCH=1: si algun paso intentara bajar contenido de archivos, falla en vez de descargarlo. Solo fetch/push hablan con el remoto.
+    e = dict(os.environ); e["GIT_TERMINAL_PROMPT"] = "0"
+    if not lazy: e["GIT_NO_LAZY_FETCH"] = "1"
+    p = subprocess.run(["git"] + args, cwd=cwd, env=e, input=data, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = p.stdout.decode("utf-8", "surrogateescape")
     if check and p.returncode: raise RuntimeError("COMMAND_FAILED:git " + args[0] + ":" + out[-1500:])
     return p.returncode, out
 
@@ -44,7 +46,7 @@ def entry(repo, rev, path):
 
 def fetch_head(repo):
     for attempt in range(1, 7):
-        rc, out = git(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60", "fetch", "--depth=1", "--filter=blob:none", "origin", BRANCH], repo, check=False)
+        rc, out = git(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60", "fetch", "--depth=1", "--filter=blob:none", "origin", BRANCH], repo, check=False, lazy=True)
         if rc == 0: return git(["rev-parse", "FETCH_HEAD"], repo)[1].strip()
         time.sleep(min(10 * attempt, 60))
     raise RuntimeError("SOURCE_REF_GAP:" + out[-300:])
@@ -82,13 +84,18 @@ def git_mode():
                             if COLLISION_POLICY != "replace": raise RuntimeError("DESTINATION_COLLISION:" + d)
                         if de is not None: git(["rm", "-r", "-f", "-q", "--cached", "--", d], repo)
                         git(["rm", "-r", "-f", "-q", "--cached", "--", s], repo)
-                        if se[1] == "tree": git(["read-tree", "--prefix=" + d + "/", se[2]], repo)
+                        if se[1] == "tree":
+                            # se reescriben solo las entradas del indice (ruta nueva -> mismo objeto); no se toca ni se baja ningun contenido
+                            rows = [r for r in git(["ls-tree", "-r", "-z", se[2]], repo)[1].split("\0") if "\t" in r]
+                            if not rows: raise RuntimeError("EMPTY_SOURCE_TREE:" + s)
+                            info = "".join(f"{m.split()[0]} {m.split()[2]}\t{d}/{n}\0" for m, n in (r.split("\t", 1) for r in rows))
+                            git(["update-index", "-z", "--index-info"], repo, data=info.encode("utf-8", "surrogateescape"))
                         else: git(["update-index", "--add", "--cacheinfo", f"{se[0]},{se[2]},{d}"], repo)
                         plan.append((s, d, se[2], "DEST_IDENTICAL_SOURCE_REMOVED" if de is not None and de[2] == se[2] else "MOVED_VERIFIED"))
                     if not plan: results.update(local); break
                     tree = git(["write-tree", "--missing-ok"], repo)[1].strip()
                     commit = git(["commit-tree", tree, "-p", head, "-m", f"move(motor_4): {len(plan)} rutas"], repo)[1].strip()
-                    rc, out = git(["push", "origin", f"{commit}:refs/heads/{BRANCH}"], repo, check=False)
+                    rc, out = git(["push", "origin", f"{commit}:refs/heads/{BRANCH}"], repo, check=False, lazy=True)
                     if rc == 0:
                         new = fetch_head(repo)  # read-back sobre lo publicado
                         for s, d, sha, status in plan:
@@ -110,7 +117,7 @@ def git_mode():
     total = len(moves); done = len(results)
     print(json.dumps({"schema": SCHEMA, "mode": "git", "repo": REPO, "branch": BRANCH, "batch_size": BATCH_SIZE, "collision_policy": COLLISION_POLICY,
                       "total": total, "moved_or_verified": done, "failed": len(errors), "pending": total - done - len([s for s in errors if s not in results]),
-                      "commits": commits, "results": results, "errors": errors,
+                      "commits": commits, "results": results, "errors": errors, "content_downloaded": False,
                       "verdict": "VERIFIED_CLOSED" if done == total and not errors else "GAPS_PENDING"}, ensure_ascii=False, sort_keys=True))
 
 # ================= MODE=disk (original, sin cambios) =================
