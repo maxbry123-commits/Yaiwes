@@ -1,0 +1,63 @@
+{
+  "bundle_bytes": 71770677,
+  "bundle_sha256": "a04ab3ff558c1b143b48ca20c70d04fc1d76d486e7dd78f8bf8a84d72f0d2fb8",
+  "extracted_tree": {
+    "bytes": 73178463,
+    "files": 242,
+    "sha256": "01faf3709e5d2cca84e7707297d0f50b6ccb4fea3b9860cb5fa51b18ce267229"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-04-05.bundle.zip.part-0001",
+      "sha256": "e783b51c385bd3947d95ad282c6a8dc301d156207a1ef869312f01efd1cacef5"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-05.bundle.zip.part-0002",
+      "sha256": "07daef0595c1451cd7c979b1df87c1d4681b808c4fca04349215639091c4341b"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-05.bundle.zip.part-0003",
+      "sha256": "d437509d6f8a81c874493e53eadba285f7c89facced4645f65991e646a5a0a47"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-05.bundle.zip.part-0004",
+      "sha256": "b1c03e64e4497d1aa4d4395b3c0d789ea40f30ba33faa8653424e88e0e1f8706"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-05.bundle.zip.part-0005",
+      "sha256": "d1602a53abaef632dbaa622a7bc069eef547370f1581fb78bf89ec119c32199a"
+    },
+    {
+      "bytes": 8856117,
+      "name": "core-04-05.bundle.zip.part-0006",
+      "sha256": "4de98c1ac107accac095196235df7df3be82bca3d23484d01ebcbfe23e9230ba"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-05",
+  "source_bytes": 73178463,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 242,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/search/Vane"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 73178463,
+    "files": 242,
+    "sha256": "01faf3709e5d2cca84e7707297d0f50b6ccb4fea3b9860cb5fa51b18ce267229"
+  }
+}
