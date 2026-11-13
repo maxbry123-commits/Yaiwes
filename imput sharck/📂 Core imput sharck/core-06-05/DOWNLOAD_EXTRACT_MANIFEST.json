@@ -1,0 +1,43 @@
+{
+  "bundle_bytes": 14516339,
+  "bundle_sha256": "5dc5098ab70ee389f905a75cb699c4628685095e3baf64ac981272bf933636fd",
+  "extracted_tree": {
+    "bytes": 17623907,
+    "files": 47,
+    "sha256": "dd2deee037029cdb6e38ddb2fef5899a65b8568567ddc64048678cc48e5d6350"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-05.bundle.zip.part-0001",
+      "sha256": "7b42a844972d9d6c7b8438175e4414832b582d09a724e330f9d02d190ee6caf1"
+    },
+    {
+      "bytes": 1933427,
+      "name": "core-06-05.bundle.zip.part-0002",
+      "sha256": "a2befc91f0ec4fb0007d89224cc9a42da385a46f871c8b07ee4d60ad3262f10d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-05",
+  "source_bytes": 17623907,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 47,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/media-input-router/whisper"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 17623907,
+    "files": 47,
+    "sha256": "dd2deee037029cdb6e38ddb2fef5899a65b8568567ddc64048678cc48e5d6350"
+  }
+}
