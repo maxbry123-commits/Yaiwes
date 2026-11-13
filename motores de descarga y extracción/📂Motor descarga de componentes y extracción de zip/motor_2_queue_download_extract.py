@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import json, os, pathlib, subprocess, sys, time
+import concurrent.futures, json, os, pathlib, shutil, subprocess, sys, tempfile, threading, time
 
 SCHEMA = "yaiwes.frontend.download-extract-queue.v1"
 QUEUE_FILE = pathlib.Path(os.getenv("QUEUE_FILE", "queue.json")).expanduser()
@@ -13,6 +13,13 @@ LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "0"))
 ITEM_DELAY_SECONDS = float(os.getenv("ITEM_DELAY_SECONDS", "2"))
 RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "0"))
+# 2026-11-13 (owner): WORKERS = cuantos items de la cola se procesan A LA VEZ dentro de este mismo motor (1 = modo secuencial de siempre).
+# Con WORKERS>1 el engine recibe LOCK_DIR (junto al STATE_FILE, fuera de las raices): carril unico de push por destino + NET_SLOTS.
+# MIN_FREE_GIB = espacio libre minimo en la carpeta temporal antes de arrancar un item (espera; agotada la espera: INSUFFICIENT_SPACE_GAP).
+WORKERS = max(1, min(100, int(os.getenv("WORKERS", "1"))))
+MIN_FREE_GIB = float(os.getenv("MIN_FREE_GIB", "2"))
+SPACE_WAIT_SECONDS = float(os.getenv("SPACE_WAIT_SECONDS", "1800"))
+STATE_LOCK = threading.Lock()
 
 
 def load_queue():
@@ -68,6 +75,50 @@ def run_item(item):
     return payload
 
 
+def wait_space():
+    deadline = time.time() + SPACE_WAIT_SECONDS
+    while shutil.disk_usage(tempfile.gettempdir()).free < MIN_FREE_GIB * 1024 ** 3:
+        if time.time() > deadline: raise RuntimeError("INSUFFICIENT_SPACE_GAP")
+        time.sleep(5)
+
+
+def run_parallel(by_id, state):
+    """Mismo ciclo de vida por item que el modo secuencial, pero WORKERS items a la vez. El estado se guarda bajo candado."""
+    os.environ.setdefault("LOCK_DIR", str(STATE_FILE.resolve().parent / ".motor-locks"))
+    # carpeta temporal propia de este motor (junto a su STATE_FILE): lo que dejo una corrida cortada se limpia al arrancar y no llena el disco
+    tmp = STATE_FILE.resolve().parent / (".motor-tmp-" + STATE_FILE.name)
+    shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(tmp); tempfile.tempdir = str(tmp)
+    todo = [(i, x) for i, x in by_id.items()]
+    with STATE_LOCK:
+        for item_id, item in todo:
+            state["items"].setdefault(item_id, {"status": "PENDING", "attempts": 0, "slug": item["slug"], "source_repo": item["source_repo"]})
+    todo = [(i, x) for i, x in todo if state["items"][i].get("status") != "VERIFIED_CLOSED" and state["items"][i].get("attempts", 0) < MAX_RETRIES]
+    if MAX_ITEMS_PER_RUN: todo = todo[:MAX_ITEMS_PER_RUN]
+
+    def work(pair):
+        item_id, item = pair; row = state["items"][item_id]
+        while True:
+            with STATE_LOCK:
+                if row.get("status") == "VERIFIED_CLOSED" or row.get("attempts", 0) >= MAX_RETRIES: return
+                row["attempts"] = row.get("attempts", 0) + 1; row["status"] = "RUNNING"; save_state(state)
+            pause = ITEM_DELAY_SECONDS
+            try:
+                wait_space(); result = run_item(item)
+                with STATE_LOCK: row["result"] = result; row["status"] = "VERIFIED_CLOSED"; row.pop("error", None)
+            except Exception as e:
+                err = str(e).lower()
+                with STATE_LOCK: row["error"] = str(e); row["status"] = "FAILED" if row["attempts"] >= MAX_RETRIES else "RETRY_PENDING"
+                if any(k in err for k in ("rate_limit", "rate limit", "secondary rate", "429")): pause = RATE_LIMIT_COOLDOWN_SECONDS
+                elif row["status"] == "RETRY_PENDING": pause = min(5 * row["attempts"], 60)
+            with STATE_LOCK: save_state(state); write_index(state)
+            if row["status"] in ("VERIFIED_CLOSED", "FAILED"): return
+            time.sleep(pause)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        list(pool.map(work, todo))
+
+
 def balance(state):
     rows = list(state["items"].values()); total = len(rows)
     success = [r for r in rows if r.get("status") == "VERIFIED_CLOSED"]
@@ -99,7 +150,8 @@ def main():
         raise SystemExit(json.dumps({"schema": SCHEMA, "verdict": "INPUT_GAP", "detail": "QUEUE_FILE or ENGINE_PATH missing"}))
     queue = load_queue(); state = load_state(queue); by_id = {x["id"]: x for x in queue}
     processed = 0
-    progress = True
+    progress = WORKERS == 1
+    if WORKERS > 1: run_parallel(by_id, state)
     while progress:
         progress = False
         for item_id, item in by_id.items():

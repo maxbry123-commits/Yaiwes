@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import hashlib, json, os, pathlib, shutil, stat, subprocess, tempfile, time, zipfile
+import contextlib, fcntl, hashlib, json, os, pathlib, random, shutil, stat, subprocess, tempfile, time, zipfile
 
 SCHEMA='yaiwes.download-extract.v2'
 LFS_POINTER=b'version https://git-lfs.github.com/spec/v1\n'
@@ -17,6 +17,25 @@ PUBLISH=os.getenv('PUBLISH','0').lower() in {'1','true','yes'}
 def _paths(raw): return [x.strip().strip('/') for x in raw.replace('|','\n').splitlines() if x.strip().strip('/')]
 SOURCE_PATHS=_paths(os.getenv('SOURCE_PATHS',''))+(_paths(pathlib.Path(os.getenv('SOURCE_PATHS_FILE')).expanduser().read_text()) if os.getenv('SOURCE_PATHS_FILE','').strip() else [])
 SOURCE_PATHS=list(dict.fromkeys(SOURCE_PATHS))
+# 2026-11-13 (owner): paralelismo seguro para 50-100 motores a la vez. LOCK_DIR (ruta FUERA de las raices) activa:
+#  - carril unico de publicacion por destino (repo+rama): los push no chocan entre motores, sin force;
+#  - NET_SLOTS = cuantas operaciones de red git simultaneas se permiten (0 = sin limite).
+# Sin LOCK_DIR el comportamiento es el de siempre.
+LOCK_DIR=os.getenv('LOCK_DIR','').strip(); NET_SLOTS=max(0,int(os.getenv('NET_SLOTS','0'))); PUSH_ATTEMPTS=max(8,min(500,int(os.getenv('PUSH_ATTEMPTS','8'))))
+@contextlib.contextmanager
+def slot(name,n=1):
+    if not LOCK_DIR or n<1:
+        yield; return
+    d=pathlib.Path(LOCK_DIR).expanduser(); d.mkdir(parents=True,exist_ok=True); fh=None
+    while fh is None:
+        for i in random.sample(range(n),n):
+            f=open(d/f'{name}-{i}.lock','w')
+            try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); fh=f; break
+            except OSError: f.close()
+        if fh is None: time.sleep(0.2+random.random()*0.3)
+    try: yield
+    finally: fh.close()
+def net(): return slot('net',NET_SLOTS)
 OK_VERDICTS={'DRY_RUN_DOWNLOAD_EXTRACT_VERIFIED','PUBLISHED_AND_EXTRACTED_READBACK_VERIFIED','ALREADY_PRESENT_VERIFIED'}
 
 def run(argv,cwd=None,env=None,check=True):
@@ -65,9 +84,10 @@ def acquire(work):
     for ref in dict.fromkeys([SOURCE_REF,'HEAD','main','master']):
         tried.append(ref)
         for attempt in range(1,FETCH_ATTEMPTS+1):
-            ok,out=run_ok(['git','-c','http.lowSpeedLimit=1000','-c','http.lowSpeedTime=60','fetch','--depth=1','--filter=blob:none','origin',ref],d)
+            with net():
+                ok,out=run_ok(['git','-c','http.lowSpeedLimit=1000','-c','http.lowSpeedTime=60','fetch','--depth=1','--filter=blob:none','origin',ref],d)
+                if ok: run(['git','checkout','-q','--detach','FETCH_HEAD'],d)
             if ok:
-                run(['git','checkout','-q','--detach','FETCH_HEAD'],d)
                 return d,run(['git','rev-parse','HEAD'],d),ref
             last=out
             if is_rate_limited(last): time.sleep(min(120*attempt,600))
@@ -177,7 +197,7 @@ def safe_extract(bundle,dst):
 def sparse_checkout(d,repo,branch,pathspec,env):
     d.mkdir(); run(['git','init','-q'],d); run(['git','remote','add','origin',f'https://github.com/{repo}.git'],d); no_lfs(d)
     run(['git','sparse-checkout','init','--no-cone'],d); (d/'.git/info/sparse-checkout').write_text('/'+pathspec.strip('/')+'/\n')
-    run(['git','fetch','--depth=1','--filter=blob:none','origin',branch],d,env=env); run(['git','checkout','-q','-B',branch,'FETCH_HEAD'],d)
+    with net(): run(['git','fetch','--depth=1','--filter=blob:none','origin',branch],d,env=env); run(['git','checkout','-q','-B',branch,'FETCH_HEAD'],d)
 
 def publish(work,parts_dir,extracted,manifest_path,slug):
     if not DEST_REPO or not DEST_ROOT: return {'verdict':'DESTINATION_INPUT_GAP','detail':'DEST_REPO and DEST_ROOT are required when PUBLISH=1'}
@@ -193,20 +213,22 @@ def publish(work,parts_dir,extracted,manifest_path,slug):
     shutil.copy2(manifest_path,target/'DOWNLOAD_EXTRACT_MANIFEST.json')
     scan_tree(target,enforce_blob_limit=True)
     run(['git','add','--sparse','--',rel],dst); run(['git','commit','-m',f'build(download-extract): publish {slug} bundle and extracted tree'],dst)
-    run(['git','fetch','origin',DEST_BRANCH],dst,env=env); reb=run(['git','rebase',f'origin/{DEST_BRANCH}'],dst,env=env,check=False)
-    if 'CONFLICT' in reb:
-        run(['git','rebase','--abort'],dst,check=False); raise RuntimeError('NON_FAST_FORWARD_CONFLICT')
+    def sync():
+        with net(): run(['git','fetch','origin',DEST_BRANCH],dst,env=env); reb=run(['git','rebase',f'origin/{DEST_BRANCH}'],dst,env=env,check=False)
+        if 'CONFLICT' in reb:
+            run(['git','rebase','--abort'],dst,check=False); raise RuntimeError('NON_FAST_FORWARD_CONFLICT')
     push_ok=False
-    for attempt in range(1,9):
-        ok,out=run_ok(['git','push','origin',f'HEAD:{DEST_BRANCH}'],dst,env=env)
-        if ok: push_ok=True; break
-        if is_rate_limited(out): time.sleep(min(120*attempt,600))
-        elif any(k in out.lower() for k in ('non-fast-forward','fetch first','[rejected]','stale info','remote rejected','cannot lock ref')):
-            # 2026-11-13 (owner): push concurrente de otro motor = rama avanzo; se rebasa y se reintenta SIN volver a descargar (sin force)
-            run(['git','fetch','origin',DEST_BRANCH],dst,env=env); reb=run(['git','rebase',f'origin/{DEST_BRANCH}'],dst,env=env,check=False)
-            if 'CONFLICT' in reb: run(['git','rebase','--abort'],dst,check=False); raise RuntimeError('NON_FAST_FORWARD_CONFLICT')
-            time.sleep(min(2*attempt,10))
-        else: raise RuntimeError('COMMAND_FAILED:git push:'+out[-2000:])
+    # carril unico por destino: dentro del carril el push entra a la primera; los reintentos quedan para pushers externos
+    with slot('publish-'+hashlib.sha1(f'{DEST_REPO}:{DEST_BRANCH}'.lower().encode()).hexdigest()[:16]):
+        sync()
+        for attempt in range(1,PUSH_ATTEMPTS+1):
+            with net(): ok,out=run_ok(['git','push','origin',f'HEAD:{DEST_BRANCH}'],dst,env=env)
+            if ok: push_ok=True; break
+            if is_rate_limited(out): time.sleep(min(120*attempt,600))
+            elif any(k in out.lower() for k in ('non-fast-forward','fetch first','[rejected]','stale info','remote rejected','cannot lock ref')):
+                # 2026-11-13 (owner): push concurrente de otro motor = rama avanzo; se rebasa y se reintenta SIN volver a descargar (sin force)
+                sync(); time.sleep(min(2*attempt,10)+random.random())
+            else: raise RuntimeError('COMMAND_FAILED:git push:'+out[-2000:])
     if not push_ok: raise RuntimeError('PUBLISH_RATE_LIMIT_GAP')
     commit=run(['git','rev-parse','HEAD'],dst)
     rb=work/'readback'; sparse_checkout(rb,DEST_REPO,DEST_BRANCH,rel,env); rt=rb/rel; remote=json.loads((rt/'DOWNLOAD_EXTRACT_MANIFEST.json').read_text())
@@ -217,12 +239,36 @@ def publish(work,parts_dir,extracted,manifest_path,slug):
     if actual['sha256']!=remote['extracted_tree']['sha256'] or actual['files']!=remote['extracted_tree']['files']: raise RuntimeError('READBACK_TREE_HASH_GAP')
     return {'verdict':'PUBLISHED_AND_EXTRACTED_READBACK_VERIFIED','commit':commit}
 
+def precheck(work,slug):
+    """2026-11-13 (owner): antes de descargar nada, mira si el destino ya tiene este slug con su manifiesto (solo indice de carpetas + 1 fichero).
+    Si ya esta: se cierra en segundos sin volver a bajar el origen. Cualquier duda: None y sigue el camino completo de siempre."""
+    if not (PUBLISH and DEST_REPO and DEST_ROOT): return None
+    try:
+        d=work/'precheck'; d.mkdir(); run(['git','init','-q'],d); run(['git','remote','add','origin',f'https://github.com/{DEST_REPO}.git'],d); no_lfs(d)
+        rel=(pathlib.Path(DEST_ROOT)/slug).as_posix()
+        with net():
+            ok,_=run_ok(['git','fetch','--depth=1','--filter=blob:none','origin',DEST_BRANCH],d,env=git_env())
+            if not ok: return None
+            ok,out=run_ok(['git','show',f'FETCH_HEAD:{rel}/DOWNLOAD_EXTRACT_MANIFEST.json'],d,env=git_env())
+        if not ok: return None
+        m=json.loads(out)
+        if m.get('schema')!=SCHEMA or m.get('slug')!=slug or m.get('source_repo')!=SOURCE_REPO or list(m.get('source_paths') or [])!=SOURCE_PATHS or not m.get('extraction_verified'): return None
+        ok,names=run_ok(['git','ls-tree','--name-only',f'FETCH_HEAD:{rel}/_archives'],d)
+        if not ok or sorted(x for x in names.splitlines() if x)!=sorted(r['name'] for r in m['parts']): return None
+        if not run_ok(['git','rev-parse','-q','--verify',f'FETCH_HEAD:{rel}/code'],d)[0]: return None
+        return m
+    except Exception: return None
+    finally: shutil.rmtree(work/'precheck',ignore_errors=True)
+
 def main():
     t=time.time()
     if not SOURCE_REPO: raise SystemExit(json.dumps({'schema':SCHEMA,'verdict':'INPUT_GAP','detail':'SOURCE_REPO required'}))
     slug=SLUG or slug_default(SOURCE_REPO)
     with tempfile.TemporaryDirectory(prefix='yaiwes-download-extract-') as td:
-        work=pathlib.Path(td); src,commit,ref_used=acquire(work); skipped=strip_special(src); rows,src_bytes=scan_tree(src); src_tree=tree_hash(src)
+        work=pathlib.Path(td); done=precheck(work,slug)
+        if done is not None:
+            print(json.dumps({**done,'publish':{'verdict':'PUBLISHED_AND_EXTRACTED_READBACK_VERIFIED','original_verdict':'ALREADY_PRESENT_VERIFIED','detail':(pathlib.Path(DEST_ROOT)/slug).as_posix(),'has_manifest':True,'precheck':True},'elapsed_seconds':round(time.time()-t,2),'verdict':'VERIFIED_CLOSED'},ensure_ascii=False,sort_keys=True)); return
+        src,commit,ref_used=acquire(work); skipped=strip_special(src); rows,src_bytes=scan_tree(src); src_tree=tree_hash(src)
         bundle=work/f'{slug}.bundle.zip'; make_zip(rows,bundle); bsha=sha256(bundle); parts_dir=work/'parts'; parts=split_bundle(bundle,parts_dir,slug)
         rebuilt=rebuild(parts_dir,parts,bsha); extracted=work/'extracted'; safe_extract(rebuilt,extracted); ext_tree=tree_hash(extracted)
         if ext_tree!=src_tree: raise RuntimeError('SOURCE_EXTRACTED_TREE_MISMATCH')

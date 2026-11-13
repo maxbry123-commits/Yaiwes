@@ -69,11 +69,11 @@ Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Lo
 | Motor | Ruta (relativa a la raíz del repo) | Blob SHA |
 |---|---|---|
 | `motor_1_extract_only.py` | `motores de descarga y extracción/➡️📂 Motor de extracción zip/motor_1_extract_only.py` | `a52d5dc0e6ff26f75d753b848dcc1a40c5dd4500` |
-| `motor_2_queue_download_extract.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py` | `17ba7bbcd160805e8d3c0569e862f1cc2da60e70` |
-| `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `0c883932ccf267a33fcd21517f56234bbd40368a` |
+| `motor_2_queue_download_extract.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py` | `d98ba1b5313e8857d4fdf94e76bdf479483d85be` |
+| `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `b758b05783910e84fc4bf889cf7ebe62f0826065` |
 | `motor_3_copy_batches.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_3_copy_batches.py` | `f7f6705770ecb1d6c2fb5da3f999eef5de2865e0` |
 | `motor_copy_root_to_repo.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_copy_root_to_repo.py` | `ca21283aae5266389d74b7a1e336882dcda80e34` |
-| `motor_4_move_batches.py` | `motores de descarga y extracción/➡️📂motor de moves archivos/motor_4_move_batches.py` | `d1b991879c2623c4ac3f8edd73e74653f610ddb0` |
+| `motor_4_move_batches.py` | `motores de descarga y extracción/➡️📂motor de moves archivos/motor_4_move_batches.py` | `e795bd10c3c40380c35a9b7d9c5c7ada36048ebd` |
 | `motor_tool_gateway.py` | `Yaiwes motor arquitecto/motor nuevo de tools para agentes/motor_tool_gateway.py` | `71047188a4f5b430313c96926247d0956f27510f` |
 
 ## 4. CONTRATO DE MOTORES (entradas obligatorias → PASS)
@@ -81,10 +81,11 @@ Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Lo
 | Motor | Entradas | PASS |
 |---|---|---|
 | 1 extracción | `ARCHIVE_INPUT`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + failed=0 + pending=0 |
-| 2 cola descarga | `QUEUE_FILE`, `STATE_FILE`; si publish: `DEST_REPO`, `DEST_ROOT` explícitos | balance pending=0 failed=0 |
+| 2 cola descarga | `QUEUE_FILE`, `STATE_FILE`; si publish: `DEST_REPO`, `DEST_ROOT` explícitos (cada item puede llevar su propio destino); opcional `WORKERS` (1..100 items a la vez dentro del mismo motor; 1 = secuencial) | balance pending=0 failed=0 |
 | engine | `SOURCE_REPO`; opcional `SOURCE_PATHS` (rutas separadas por salto de línea o `|`) o `SOURCE_PATHS_FILE` (una ruta por línea) = solo esas rutas en zip; vacío = repo completo; `PUBLISH=1` exige `DEST_REPO`+`DEST_ROOT` | `VERIFIED_CLOSED` |
 | 3 copiar lotes/raíces | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` |
-| 4 mover lotes/raíces | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + source_remaining=0 |
+| 4 mover dentro de un repo de GitHub | `MODE=git`, `REPO`, `BRANCH`, `MOVES_FILE` (json `[{"src":"a/x","dst":"b/x"}]`); hasta `BATCH_SIZE` rutas por commit | `VERIFIED_CLOSED` + failed=0 |
+| 4 mover carpetas locales (modo antiguo) | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + source_remaining=0 |
 | copia de raíz | `SOURCE_ROOT`, `DEST_ROOT`, `DEST_REPO_NAME` | `VERIFIED_CLOSED` (17 archivos + lock) |
 | gateway | `--call` / `--workflow` / `--stdio` / `--emit-tools` | `VERIFIED_CLOSED` |
 
@@ -119,7 +120,20 @@ Una operación cierra solo con: motor correcto + entradas explícitas + veredict
 Reporte final SIEMPRE en este formato JSON y nada más que lo contradiga:
 `{"operacion": "...", "motor": "...", "destino": "...", "verdict": "VERIFIED_CLOSED|<GAP>", "evidencia": {"readback": true, "commit": "...", "blobs_verificados": N}, "pass": "100% PASS ✅|NO PASS"}`
 
+## 11. PARALELO Y VOLUMEN GRANDE (probado: 100 componentes, 50 a la vez, 0 fallos, 0 reintentos)
+
+11.1 UN solo motor 2 con `WORKERS=50` procesa 50 items de la cola a la vez. NO hace falta lanzar 50 motores sueltos. Cada item puede ir a un destino distinto (`dest_repo` / `dest_branch` / `dest_root` por item).
+11.2 Los push al mismo destino pasan por un carril único (candado en `LOCK_DIR`, junto al `STATE_FILE`): no chocan y nunca se fuerza. Si empuja alguien de fuera, el engine rebasa y reintenta (`PUSH_ATTEMPTS`).
+11.3 `NET_SLOTS=N` limita cuántas operaciones de red git van a la vez (0 = sin límite). Si el ejecutor corta conexiones simultáneas, bajar `NET_SLOTS`, no `WORKERS`.
+11.4 Reanudar = relanzar el MISMO motor con el MISMO `STATE_FILE`. Lo ya publicado se reconoce en segundos sin volver a descargar (precheck del manifiesto en destino). Los temporales de una corrida cortada se limpian solos al arrancar.
+11.5 Disco: `MIN_FREE_GIB` (default 2) espera espacio libre antes de arrancar cada item; agotada la espera: `INSUFFICIENT_SPACE_GAP`. Un componente necesita libre unas 4 veces su tamaño mientras se procesa.
+11.6 Mover dentro de un repo (`MODE=git` del motor 4) no transfiere contenido: 100 carpetas caben en UN commit. Para mover NO se reparte en muchos motores: un `MOVES_FILE` por destino.
+11.7 Límites que siguen mandando: ningún archivo ≥100 MiB, NO LFS (un puntero LFS en origen = `SOURCE_LFS_POINTER_GAP`, decide el owner), NO GitHub Actions, NO force push.
+11.8 Guía anti-alucinación e instrucciones de continuación: `maxbry123-commits/router-universal-router-inteligente-` rama `reorganizacion`, `docs/motores-colas/GUIA-ANTI-ALUCINACION.md` y `DAG-SONNET.yaml`.
+
 ## 10. REGISTRO DE CAMBIOS
+
+- 2026-11-13 (owner, chat actual): paralelismo y volumen. motor_2: `WORKERS` (hasta 100 items a la vez en el mismo motor, estado bajo candado, temporales propios que se limpian al arrancar, `MIN_FREE_GIB`). engine: carril único de push por destino + `NET_SLOTS` (activos con `LOCK_DIR`), `PUSH_ATTEMPTS`, precheck del destino antes de descargar. motor_4: `MODE=git` mueve rutas dentro de un repo con un commit por lote (solo índice de carpetas, sin contenido, sin copia de trabajo, sin force) con read-back; modo disco intacto. Re-lock de los 3 en el mismo commit.
 
 - 2026-11-13 (owner, chat actual): engine: (1) el reintento de push reconoce `remote rejected`/`cannot lock ref` (carrera con otro motor); (2) `.git/info/attributes` con `* -text -eol -filter -ident` en origen y destino para que los `.gitattributes` del árbol no alteren bytes (corrige `READBACK_TREE_HASH_GAP`). Re-lock en el mismo commit.
 
