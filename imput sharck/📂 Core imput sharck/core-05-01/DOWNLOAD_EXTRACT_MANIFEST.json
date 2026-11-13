@@ -1,0 +1,53 @@
+{
+  "bundle_bytes": 48419510,
+  "bundle_sha256": "6983be4a1ef727d170461b3fa59f6d3e291986760112fed9fd3baa729bc2e23f",
+  "extracted_tree": {
+    "bytes": 71691443,
+    "files": 4829,
+    "sha256": "78198e532af9081ac256a31a854b4cec89a75e0de6777370db21089e77c9e2cc"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-05-01.bundle.zip.part-0001",
+      "sha256": "edfe58b2170823bfe4108134d9492f0f04f8dca8868bbb070fb0ad02bd501f35"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-01.bundle.zip.part-0002",
+      "sha256": "6d32ea2c8bd8214dba0192f50fa938c73f678c7202ad56fbf64236b52242fc35"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-01.bundle.zip.part-0003",
+      "sha256": "c803852b37b22ee6ef8e2a4f095ce9f807d6204de888c9e207ca69a346155582"
+    },
+    {
+      "bytes": 10670774,
+      "name": "core-05-01.bundle.zip.part-0004",
+      "sha256": "dc942c8eef500e418e219ad058bce5b947d01dc7548e038dfcb04c359b943aab"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-01",
+  "source_bytes": 71691443,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 4829,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/orchestration/semantic-kernel"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 71691443,
+    "files": 4829,
+    "sha256": "78198e532af9081ac256a31a854b4cec89a75e0de6777370db21089e77c9e2cc"
+  }
+}
