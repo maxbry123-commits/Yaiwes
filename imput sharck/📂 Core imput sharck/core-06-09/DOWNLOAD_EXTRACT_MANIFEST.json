@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 9221221,
+  "bundle_sha256": "54e17fb65c2639958840e324c88239aa68f99ca234ba92a476aed7aba11e8820",
+  "extracted_tree": {
+    "bytes": 37336358,
+    "files": 598,
+    "sha256": "111a64295dd32c35441404caaa7cc0e72300387c4ef04cdf99bccdc9a736ad76"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 9221221,
+      "name": "core-06-09.bundle.zip.part-0001",
+      "sha256": "54e17fb65c2639958840e324c88239aa68f99ca234ba92a476aed7aba11e8820"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-09",
+  "source_bytes": 37336358,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 598,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B02-ir-evidence/tantivy"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 37336358,
+    "files": 598,
+    "sha256": "111a64295dd32c35441404caaa7cc0e72300387c4ef04cdf99bccdc9a736ad76"
+  }
+}
