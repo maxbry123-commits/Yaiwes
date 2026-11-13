@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 10664652,
+  "bundle_sha256": "d486d629ed3df40770f862445986e8c4c68f6869021141f0facf1ff0427ff76c",
+  "extracted_tree": {
+    "bytes": 17573638,
+    "files": 2298,
+    "sha256": "89452aa018d9bb2d1f6082b27b7603c2cdb542b443c726dd1c3cbefe649d3868"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 10664652,
+      "name": "core-04-02.bundle.zip.part-0001",
+      "sha256": "d486d629ed3df40770f862445986e8c4c68f6869021141f0facf1ff0427ff76c"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-02",
+  "source_bytes": 17573638,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 2298,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/media-input-router/antlr4"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 17573638,
+    "files": 2298,
+    "sha256": "89452aa018d9bb2d1f6082b27b7603c2cdb542b443c726dd1c3cbefe649d3868"
+  }
+}
