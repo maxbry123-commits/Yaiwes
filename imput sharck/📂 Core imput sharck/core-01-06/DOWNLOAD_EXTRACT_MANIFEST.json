@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 639439,
+  "bundle_sha256": "76ce2dd1ffe61af350f75548f80c4dea2b8af05028dfde966ebb93b19be4041d",
+  "extracted_tree": {
+    "bytes": 1140890,
+    "files": 229,
+    "sha256": "eb73edeb4901bda8e1ffcda3bbf124beebde7f22b4256cbf11fd54c7f29b089f"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 639439,
+      "name": "core-01-06.bundle.zip.part-0001",
+      "sha256": "76ce2dd1ffe61af350f75548f80c4dea2b8af05028dfde966ebb93b19be4041d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-01-06",
+  "source_bytes": 1140890,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 229,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/skills/mcp-skills-registry"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 1140890,
+    "files": 229,
+    "sha256": "eb73edeb4901bda8e1ffcda3bbf124beebde7f22b4256cbf11fd54c7f29b089f"
+  }
+}
