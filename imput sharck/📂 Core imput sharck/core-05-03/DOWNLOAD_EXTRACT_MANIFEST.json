@@ -1,0 +1,63 @@
+{
+  "bundle_bytes": 66431000,
+  "bundle_sha256": "786e4daa5ec1c158e8fce3af2bc68c50b990c0d7b770be8662cfc9f7f9b342d8",
+  "extracted_tree": {
+    "bytes": 77346209,
+    "files": 637,
+    "sha256": "1fedbbcbaf96fe5ab36bb4180ef0a10955374718e2823ce38888d25f10ab8d53"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-05-03.bundle.zip.part-0001",
+      "sha256": "bed0f4f813537a8af49f93d39aa382cf2f5c9117169ade36a9f18f1aa4155013"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-03.bundle.zip.part-0002",
+      "sha256": "08a6e8a8bb3d1802c01d280ec3c9dd2eb13565e74cc1b3849fd697aa9b03e176"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-03.bundle.zip.part-0003",
+      "sha256": "c90c048bb5f7a6dde2a14ff27af67480cce7dce8c343d37425b4bb4c6a88d5de"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-03.bundle.zip.part-0004",
+      "sha256": "0f8651d18eed1da6496733543589895e794c978013f49506927d4a54ae29a5ed"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-03.bundle.zip.part-0005",
+      "sha256": "08e4a9676f437941d6000836913bfce459adc767b09f3c2b296890b91a03cc12"
+    },
+    {
+      "bytes": 3516440,
+      "name": "core-05-03.bundle.zip.part-0006",
+      "sha256": "2d276987f6497ea723c4dc6f0717f5b2ceaeedc5e53bd2762dc96acd0a3a69ab"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-03",
+  "source_bytes": 77346209,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 637,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/rag/txtai"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 77346209,
+    "files": 637,
+    "sha256": "1fedbbcbaf96fe5ab36bb4180ef0a10955374718e2823ce38888d25f10ab8d53"
+  }
+}
