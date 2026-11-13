@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 34428248,
+  "bundle_sha256": "56142d4d0c4dfb542a0a0c6428e24d7b8a885a1b27f25c256635bb15f50c123c",
+  "extracted_tree": {
+    "bytes": 46177194,
+    "files": 442,
+    "sha256": "7f668440571bc4cc318271819ef9da6dd82963bfb703e2bf4198926ca7d11c5b"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-05-08.bundle.zip.part-0001",
+      "sha256": "0ebdcf4e6efcc41e41e4ae373d6c1b91d321066c51e88cfaa692d11a6854d324"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-08.bundle.zip.part-0002",
+      "sha256": "9e31fb9f1027739b60fc04100593494b114ccb61aff43451c8b9ffeb3ea452ed"
+    },
+    {
+      "bytes": 9262424,
+      "name": "core-05-08.bundle.zip.part-0003",
+      "sha256": "6c83d54c0d36a2708962a852e794b2ae503c0f6bd19a66fe347e6f673e587fb0"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-08",
+  "source_bytes": 46177194,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 442,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B01-web-research/scira"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 46177194,
+    "files": 442,
+    "sha256": "7f668440571bc4cc318271819ef9da6dd82963bfb703e2bf4198926ca7d11c5b"
+  }
+}
