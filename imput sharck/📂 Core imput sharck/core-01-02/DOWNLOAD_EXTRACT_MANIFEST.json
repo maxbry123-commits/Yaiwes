@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 2826278,
+  "bundle_sha256": "2fd704c1c7933384894a8e4ea6bbc278a868caf30b57a80cb86b58f513b07701",
+  "extracted_tree": {
+    "bytes": 6359332,
+    "files": 163,
+    "sha256": "53681026e33c1c531b1a723a0e15c4c161c51d1c384961a92dd78bf098770611"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 2826278,
+      "name": "core-01-02.bundle.zip.part-0001",
+      "sha256": "2fd704c1c7933384894a8e4ea6bbc278a868caf30b57a80cb86b58f513b07701"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-01-02",
+  "source_bytes": 6359332,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 163,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/media-input-router/msgspec"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 6359332,
+    "files": 163,
+    "sha256": "53681026e33c1c531b1a723a0e15c4c161c51d1c384961a92dd78bf098770611"
+  }
+}
