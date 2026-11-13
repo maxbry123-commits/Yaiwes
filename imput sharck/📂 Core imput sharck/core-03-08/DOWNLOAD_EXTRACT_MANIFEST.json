@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 34575344,
+  "bundle_sha256": "8047afee9e5df95771929c046fb56c21d82972bb4a1ee00e0b5ddf29d2573cb0",
+  "extracted_tree": {
+    "bytes": 38909838,
+    "files": 430,
+    "sha256": "8b693020201d4d28353e715490e67b0d51a48e0b43d712d8f9de9bf6b96b973f"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-03-08.bundle.zip.part-0001",
+      "sha256": "fb99d226b171038cfbf730749cd9abdb3a238d75ab3ee4b52dfe8a20f30bf57e"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-03-08.bundle.zip.part-0002",
+      "sha256": "9802f0cf686948172f23cd25ceded1ef1c187bc76370a2e97410ddaf2bed969b"
+    },
+    {
+      "bytes": 9409520,
+      "name": "core-03-08.bundle.zip.part-0003",
+      "sha256": "c70098468b2f9776d919cc00fe51260fd341a70a7e2c55805ae5c6064a127483"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-03-08",
+  "source_bytes": 38909838,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 430,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B01-web-research/MinerU"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 38909838,
+    "files": 430,
+    "sha256": "8b693020201d4d28353e715490e67b0d51a48e0b43d712d8f9de9bf6b96b973f"
+  }
+}
