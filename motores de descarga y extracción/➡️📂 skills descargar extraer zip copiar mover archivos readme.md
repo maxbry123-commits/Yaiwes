@@ -70,7 +70,7 @@ Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Lo
 |---|---|---|
 | `motor_1_extract_only.py` | `motores de descarga y extracción/➡️📂 Motor de extracción zip/motor_1_extract_only.py` | `a52d5dc0e6ff26f75d753b848dcc1a40c5dd4500` |
 | `motor_2_queue_download_extract.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py` | `17ba7bbcd160805e8d3c0569e862f1cc2da60e70` |
-| `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `6bddb013c525cd122564cd88cb3a29a49008a01e` |
+| `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `cf25014a43c5e6faf61c47712db90aa625278e35` |
 | `motor_3_copy_batches.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_3_copy_batches.py` | `f7f6705770ecb1d6c2fb5da3f999eef5de2865e0` |
 | `motor_copy_root_to_repo.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_copy_root_to_repo.py` | `ca21283aae5266389d74b7a1e336882dcda80e34` |
 | `motor_4_move_batches.py` | `motores de descarga y extracción/➡️📂motor de moves archivos/motor_4_move_batches.py` | `d1b991879c2623c4ac3f8edd73e74653f610ddb0` |
@@ -120,6 +120,8 @@ Reporte final SIEMPRE en este formato JSON y nada más que lo contradiga:
 `{"operacion": "...", "motor": "...", "destino": "...", "verdict": "VERIFIED_CLOSED|<GAP>", "evidencia": {"readback": true, "commit": "...", "blobs_verificados": N}, "pass": "100% PASS ✅|NO PASS"}`
 
 ## 10. REGISTRO DE CAMBIOS
+
+- 2026-11-13 (owner, chat actual): engine publish(): ante push rechazado por otro motor concurrente (non-fast-forward) hace fetch + rebase y reintenta hasta 8 veces sin volver a descargar y sin force. Re-lock del engine en el mismo commit.
 
 - 2026-11-13 (owner, chat actual): 0.9 permite edición quirúrgica del motor con autorización explícita. Engine y motor_2: descarga y zip de rutas concretas (`SOURCE_PATHS` / `SOURCE_PATHS_FILE`, y `source_paths` / `source_paths_file` por item de cola) con sparse-checkout sin bajar el resto del repo; manifiesto registra `source_paths`. Re-lock de engine y motor_2 en el mismo commit.
 

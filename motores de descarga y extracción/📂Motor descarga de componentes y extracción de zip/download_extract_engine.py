@@ -195,10 +195,15 @@ def publish(work,parts_dir,extracted,manifest_path,slug):
     if 'CONFLICT' in reb:
         run(['git','rebase','--abort'],dst,check=False); raise RuntimeError('NON_FAST_FORWARD_CONFLICT')
     push_ok=False
-    for attempt in range(1,4):
+    for attempt in range(1,9):
         ok,out=run_ok(['git','push','origin',f'HEAD:{DEST_BRANCH}'],dst,env=env)
         if ok: push_ok=True; break
         if is_rate_limited(out): time.sleep(min(120*attempt,600))
+        elif any(k in out.lower() for k in ('non-fast-forward','fetch first','[rejected]','stale info')):
+            # 2026-11-13 (owner): push concurrente de otro motor = rama avanzo; se rebasa y se reintenta SIN volver a descargar (sin force)
+            run(['git','fetch','origin',DEST_BRANCH],dst,env=env); reb=run(['git','rebase',f'origin/{DEST_BRANCH}'],dst,env=env,check=False)
+            if 'CONFLICT' in reb: run(['git','rebase','--abort'],dst,check=False); raise RuntimeError('NON_FAST_FORWARD_CONFLICT')
+            time.sleep(min(2*attempt,10))
         else: raise RuntimeError('COMMAND_FAILED:git push:'+out[-2000:])
     if not push_ok: raise RuntimeError('PUBLISH_RATE_LIMIT_GAP')
     commit=run(['git','rev-parse','HEAD'],dst)
