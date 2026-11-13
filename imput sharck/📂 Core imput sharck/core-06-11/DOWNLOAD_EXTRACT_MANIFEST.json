@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 36043919,
+  "bundle_sha256": "7d6961b571ef894e9dc294cef422c4274b52542b8148c941c1d4fe205d285ff3",
+  "extracted_tree": {
+    "bytes": 36428511,
+    "files": 182,
+    "sha256": "947b8530e387fb07efe61cde3d98cd586976388de690658de13fc733c5467bff"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-11.bundle.zip.part-0001",
+      "sha256": "6bf03dde55e2aca2d1b27a0bffe9807674bbeb84d2e7c6f5957cd5212d988af6"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-11.bundle.zip.part-0002",
+      "sha256": "b2281876bc782339b1688f789d6cb1b784ce62384abb8670ee68e1311bea6ba0"
+    },
+    {
+      "bytes": 10878095,
+      "name": "core-06-11.bundle.zip.part-0003",
+      "sha256": "9ae9feadb3baa607d35c3bbb4bfc800038c42615e85900b7f5a644e0791648e7"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-11",
+  "source_bytes": 36428511,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 182,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B10-retrieval-eval/ranx"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 36428511,
+    "files": 182,
+    "sha256": "947b8530e387fb07efe61cde3d98cd586976388de690658de13fc733c5467bff"
+  }
+}
