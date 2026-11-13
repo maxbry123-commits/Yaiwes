@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 4955581,
+  "bundle_sha256": "9b244ab205cdb668c90f04c45b02b2283beed2e7766035aa3d5cc5f6e244754e",
+  "extracted_tree": {
+    "bytes": 12322259,
+    "files": 1096,
+    "sha256": "832ad23fcc54b3dfdebe577fff5cf16a4a77674712a7c6315bb6adf38a5e3b58"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 4955581,
+      "name": "core-05-02.bundle.zip.part-0001",
+      "sha256": "9b244ab205cdb668c90f04c45b02b2283beed2e7766035aa3d5cc5f6e244754e"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-02",
+  "source_bytes": 12322259,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 1096,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/rag/faiss"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 12322259,
+    "files": 1096,
+    "sha256": "832ad23fcc54b3dfdebe577fff5cf16a4a77674712a7c6315bb6adf38a5e3b58"
+  }
+}
