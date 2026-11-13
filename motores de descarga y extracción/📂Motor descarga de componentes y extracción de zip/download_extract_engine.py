@@ -38,6 +38,8 @@ def slug_default(r): return r.rstrip('/').removesuffix('.git').split('/')[-1]
 
 def no_lfs(d):
     run(['git','config','filter.lfs.clean','cat'],d); run(['git','config','filter.lfs.smudge','cat'],d)
+    # 2026-11-13 (owner): bytes fieles - los .gitattributes del arbol (eol/text/filter) no pueden convertir contenido al extraer ni al hacer read-back
+    (pathlib.Path(d)/'.git/info').mkdir(parents=True,exist_ok=True); (pathlib.Path(d)/'.git/info/attributes').write_text('* -text -eol -filter -ident -working-tree-encoding\n')
     run(['git','config','--unset-all','filter.lfs.process'],d,check=False); run(['git','config','filter.lfs.required','false'],d)
 
 def git_env():
@@ -199,7 +201,7 @@ def publish(work,parts_dir,extracted,manifest_path,slug):
         ok,out=run_ok(['git','push','origin',f'HEAD:{DEST_BRANCH}'],dst,env=env)
         if ok: push_ok=True; break
         if is_rate_limited(out): time.sleep(min(120*attempt,600))
-        elif any(k in out.lower() for k in ('non-fast-forward','fetch first','[rejected]','stale info')):
+        elif any(k in out.lower() for k in ('non-fast-forward','fetch first','[rejected]','stale info','remote rejected','cannot lock ref')):
             # 2026-11-13 (owner): push concurrente de otro motor = rama avanzo; se rebasa y se reintenta SIN volver a descargar (sin force)
             run(['git','fetch','origin',DEST_BRANCH],dst,env=env); reb=run(['git','rebase',f'origin/{DEST_BRANCH}'],dst,env=env,check=False)
             if 'CONFLICT' in reb: run(['git','rebase','--abort'],dst,check=False); raise RuntimeError('NON_FAST_FORWARD_CONFLICT')
