@@ -1,6 +1,0 @@
--- in --
-import "strings"
--- out/relpos --
-import "strings"
--- out/norelpos --
-import "strings"

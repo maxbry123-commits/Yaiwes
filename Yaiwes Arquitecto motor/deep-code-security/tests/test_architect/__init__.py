@@ -1,1 +1,0 @@
-"""Architect phase tests."""

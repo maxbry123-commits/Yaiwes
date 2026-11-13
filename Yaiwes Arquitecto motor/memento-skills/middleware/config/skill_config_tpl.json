@@ -1,9 +1,0 @@
-{
-  "$schema": "skill_config_schema.json",
-  "version": 1,
-  "skills": {},
-  "index": {
-    "last_sync": null,
-    "sync_errors": []
-  }
-}

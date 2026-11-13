@@ -1,9 +1,0 @@
--- in --
-// A comment.
-  x: 1
--- out/relpos --
-// A comment.
-x: 1
--- out/norelpos --
-// A comment.
-x: 1

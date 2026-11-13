@@ -1,6 +1,0 @@
-{
-  "typeCheckingMode": "basic",
-  "include": ["pavoz"],
-  "venvPath": ".",
-  "venv": ".venv"
-}

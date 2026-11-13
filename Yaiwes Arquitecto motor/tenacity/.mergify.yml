@@ -1,6 +1,0 @@
-merge_protections_settings:
-  auto_merge_conditions:
-    - or:
-      - author = jd
-      - "#approved-reviews-by >= 1"
-      - author = dependabot[bot]

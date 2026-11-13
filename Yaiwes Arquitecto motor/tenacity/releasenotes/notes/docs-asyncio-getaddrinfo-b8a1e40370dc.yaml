@@ -1,3 +1,0 @@
-fixes:
-  - Use the running event loop's getaddrinfo method in the asyncio
-    documentation example instead of the nonexistent asyncio.getaddrinfo.

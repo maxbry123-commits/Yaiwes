@@ -1,7 +1,0 @@
-/target
-.env
-/logs
-*.log
-.playwright-mcp/
-learning_system.db
-

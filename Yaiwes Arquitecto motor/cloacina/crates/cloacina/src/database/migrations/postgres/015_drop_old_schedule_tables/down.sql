@@ -1,2 +1,0 @@
--- Intentionally empty: dropped tables are not restored
--- The unified schedules/schedule_executions tables serve as the replacement
