@@ -1,0 +1,53 @@
+{
+  "bundle_bytes": 48256611,
+  "bundle_sha256": "62531943c21d64a485959f4f92c027995aa723ef477f1df0fb17f1fed447c570",
+  "extracted_tree": {
+    "bytes": 66385667,
+    "files": 2775,
+    "sha256": "3d11a0dfd52985dd9327bbe6e30348dc96ff596a09c0a6c655e56a2f78ac2a52"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-04-08.bundle.zip.part-0001",
+      "sha256": "3f13efc42a7a7018398a5effe14b5110f400da29a5608e03d3ce93ef776374b1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-08.bundle.zip.part-0002",
+      "sha256": "d474dffc7eb4d6a25c7baa3ae8a36a227d59562edd69cb94b1ad6f6e40235ed1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-08.bundle.zip.part-0003",
+      "sha256": "38a5d50431b05131b6589fba5d1b346f3d8d6654c5f9060145b7b5d5918920b6"
+    },
+    {
+      "bytes": 10507875,
+      "name": "core-04-08.bundle.zip.part-0004",
+      "sha256": "a4310033c9381ceaeb774c82c07e726dec3bbb1863d8f578ac15335b9d849fc1"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-08",
+  "source_bytes": 66385667,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 2775,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B04-context-engineering/deepeval"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 66385667,
+    "files": 2775,
+    "sha256": "3d11a0dfd52985dd9327bbe6e30348dc96ff596a09c0a6c655e56a2f78ac2a52"
+  }
+}
