@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 29679463,
+  "bundle_sha256": "3922be894541c96b8862c81b019f1c44546a5162f0c7c1221c7dc46fb2e89fd7",
+  "extracted_tree": {
+    "bytes": 42476059,
+    "files": 823,
+    "sha256": "054721880631a4ffa3299d604a70acc50efe5155fcadf1afecf100ed89971fbd"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-02-09.bundle.zip.part-0001",
+      "sha256": "5cd788224a4354b6d3dde69be9e74570ae8fbb01807297b97c36a3b5f234abb1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-02-09.bundle.zip.part-0002",
+      "sha256": "52626bc6d4d9633c3e9382ecd9ce044bbb69b8d510a73d266d26474b37425451"
+    },
+    {
+      "bytes": 4513639,
+      "name": "core-02-09.bundle.zip.part-0003",
+      "sha256": "9f29e327b4a32c4d05d2a8b13acc19532c6949251adbd58b2f200f0c9ed5141d"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-02-09",
+  "source_bytes": 42476059,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 823,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/search/gpt-researcher"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 42476059,
+    "files": 823,
+    "sha256": "054721880631a4ffa3299d604a70acc50efe5155fcadf1afecf100ed89971fbd"
+  }
+}
