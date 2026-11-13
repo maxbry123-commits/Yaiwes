@@ -1,0 +1,43 @@
+{
+  "bundle_bytes": 13342997,
+  "bundle_sha256": "ec1b2ff690f91ac4f96de57d73cfb51dbd413dc75463f08fd92f162e7a97edd6",
+  "extracted_tree": {
+    "bytes": 18590516,
+    "files": 760,
+    "sha256": "2acacf3c7ace4ff745437f4fba3fa5ec85da7e7f8d849e36888daca08371dcb7"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-08.bundle.zip.part-0001",
+      "sha256": "239385a7f5a9782a402de3e1882d9444b9d98f3fff2f9a504a8b7c1f6b7d67fe"
+    },
+    {
+      "bytes": 760085,
+      "name": "core-06-08.bundle.zip.part-0002",
+      "sha256": "e4fbd52748be51bee4e2264d54257d3cfbb825b7a870170ccbf230d47c015730"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-08",
+  "source_bytes": 18590516,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 760,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B02-ir-evidence/pyserini"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 18590516,
+    "files": 760,
+    "sha256": "2acacf3c7ace4ff745437f4fba3fa5ec85da7e7f8d849e36888daca08371dcb7"
+  }
+}
