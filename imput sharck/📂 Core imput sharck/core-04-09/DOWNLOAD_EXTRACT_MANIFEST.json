@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 1526006,
+  "bundle_sha256": "ca9ee6ed97479dfbc772588dbcc193b064172392cad72e37a4620fc90722cf06",
+  "extracted_tree": {
+    "bytes": 3017919,
+    "files": 337,
+    "sha256": "8c6491d234c5b39185e9e757955a2fa92de332eb300492c5195f1fd51e09f941"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1526006,
+      "name": "core-04-09.bundle.zip.part-0001",
+      "sha256": "ca9ee6ed97479dfbc772588dbcc193b064172392cad72e37a4620fc90722cf06"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-09",
+  "source_bytes": 3017919,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 337,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B04-context-engineering/hf-mcp-server"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 3017919,
+    "files": 337,
+    "sha256": "8c6491d234c5b39185e9e757955a2fa92de332eb300492c5195f1fd51e09f941"
+  }
+}
