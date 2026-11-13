@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 29600538,
+  "bundle_sha256": "b51688f64edd7395832276dc8822eaa9954f42208a3d483ddc8a30455f8f7205",
+  "extracted_tree": {
+    "bytes": 53020559,
+    "files": 326,
+    "sha256": "c0fc636e171054cbeabaf299cffa1820dfb97ea12ed302c5b7444e95b5cf76f9"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-03.bundle.zip.part-0001",
+      "sha256": "3ab07d8e6160e8058eadf7d183347f5e3f7710a4a16bca1fe540297db6bf7287"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-03.bundle.zip.part-0002",
+      "sha256": "43699f871c98422523d7154b3d008ee877c5a455d6a61f09515db2db020ff95d"
+    },
+    {
+      "bytes": 4434714,
+      "name": "core-06-03.bundle.zip.part-0003",
+      "sha256": "bcf0e0235c4e700f95554a91885ce7cdbdfe5b45fad051f34da9005b0497f209"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-03",
+  "source_bytes": 53020559,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 326,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/media-input-router/guidance"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 53020559,
+    "files": 326,
+    "sha256": "c0fc636e171054cbeabaf299cffa1820dfb97ea12ed302c5b7444e95b5cf76f9"
+  }
+}
