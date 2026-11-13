@@ -1,0 +1,63 @@
+{
+  "bundle_bytes": 69678946,
+  "bundle_sha256": "4e86c37a4dd482cc23ff0f09ed4f33dbbbbdc56526e3b5e10066571365d6faa5",
+  "extracted_tree": {
+    "bytes": 130159550,
+    "files": 10862,
+    "sha256": "a194717ee17a67416e486dc900c29a3177c20482832af5a2af71c9e032d93b05"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-02-07.bundle.zip.part-0001",
+      "sha256": "4a2762bf6140889caa13f526f9d919e06b81b60ad8fff23de1b3e186c260d771"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-02-07.bundle.zip.part-0002",
+      "sha256": "7dc8db075f9f7ad73a178b6277dce24b4254e7378a1269fc2111231012899cbb"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-02-07.bundle.zip.part-0003",
+      "sha256": "4732ba188fe86af4c68bcd0d47e7d81370430b065acd3e72633ccd45acb97cad"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-02-07.bundle.zip.part-0004",
+      "sha256": "58b4766e0a342489cfb47b56cd36ac9dd5e2d2aa225e6831be22a2d8af5f06f8"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-02-07.bundle.zip.part-0005",
+      "sha256": "28bea9dce2bd05c229ac8e7752af5e807ec3ad94d2f54598a5ac026db11f186b"
+    },
+    {
+      "bytes": 6764386,
+      "name": "core-02-07.bundle.zip.part-0006",
+      "sha256": "829015a9f8790e979cf994d74275cf398cc0fa7a0173561e258ac12661b350ed"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-02-07",
+  "source_bytes": 130159550,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 10862,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/rag/haystack"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 130159550,
+    "files": 10862,
+    "sha256": "a194717ee17a67416e486dc900c29a3177c20482832af5a2af71c9e032d93b05"
+  }
+}
