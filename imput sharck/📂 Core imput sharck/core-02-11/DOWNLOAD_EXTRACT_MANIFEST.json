@@ -1,0 +1,48 @@
+{
+  "bundle_bytes": 28228443,
+  "bundle_sha256": "0d5b8bb5d87449bab9f22c8b5f7af241c9534c4dd8250797f27763ad78b42d68",
+  "extracted_tree": {
+    "bytes": 139019496,
+    "files": 2799,
+    "sha256": "5efe104b02edc067a220c2329ee3751bebfd1e75329522603645bd6c0e9f6776"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-02-11.bundle.zip.part-0001",
+      "sha256": "fab1e676b4722c96d02b94c11bacdfcb824fd3da07874eadad5a294f1859b3f7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-02-11.bundle.zip.part-0002",
+      "sha256": "c21a7f2f5b0a43cc390fb309bf2b43b46007b9dbf3e679779e820a9b94be76c8"
+    },
+    {
+      "bytes": 3062619,
+      "name": "core-02-11.bundle.zip.part-0003",
+      "sha256": "46e52d6521f41547b45162eebcd0083112244c23d5af2517789eb8eff16583c0"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-02-11",
+  "source_bytes": 139019496,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 2799,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B03-code-runtime/sqry"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 139019496,
+    "files": 2799,
+    "sha256": "5efe104b02edc067a220c2329ee3751bebfd1e75329522603645bd6c0e9f6776"
+  }
+}
