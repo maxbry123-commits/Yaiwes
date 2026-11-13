@@ -12,6 +12,11 @@ SOURCE_REPO=os.getenv('SOURCE_REPO','').strip(); SOURCE_REF=os.getenv('SOURCE_RE
 SLUG=os.getenv('SLUG','').strip(); DEST_REPO=os.getenv('DEST_REPO','').strip()
 DEST_BRANCH=os.getenv('DEST_BRANCH','main').strip() or 'main'; DEST_ROOT=os.getenv('DEST_ROOT','').strip().strip('/')
 PUBLISH=os.getenv('PUBLISH','0').lower() in {'1','true','yes'}
+# 2026-11-13 (autorizado por el owner, chat actual): opcion 1 = SOURCE_PATHS (rutas separadas por salto de linea o '|');
+# opcion 2 = SOURCE_PATHS_FILE (fichero con una ruta por linea). Vacias = repo completo (comportamiento anterior intacto).
+def _paths(raw): return [x.strip().strip('/') for x in raw.replace('|','\n').splitlines() if x.strip().strip('/')]
+SOURCE_PATHS=_paths(os.getenv('SOURCE_PATHS',''))+(_paths(pathlib.Path(os.getenv('SOURCE_PATHS_FILE')).expanduser().read_text()) if os.getenv('SOURCE_PATHS_FILE','').strip() else [])
+SOURCE_PATHS=list(dict.fromkeys(SOURCE_PATHS))
 OK_VERDICTS={'DRY_RUN_DOWNLOAD_EXTRACT_VERIFIED','PUBLISHED_AND_EXTRACTED_READBACK_VERIFIED','ALREADY_PRESENT_VERIFIED'}
 
 def run(argv,cwd=None,env=None,check=True):
@@ -50,6 +55,10 @@ def run_ok(argv,cwd=None,env=None):
 def acquire(work):
     """Descarga con recuperacion: reintentos por ref con backoff, deteccion de rate-limit y corte de transferencias colgadas."""
     d=work/'source'; d.mkdir(); run(['git','init','-q'],d); run(['git','remote','add','origin',repo_url(SOURCE_REPO)+'.git'],d); no_lfs(d)
+    if SOURCE_PATHS:
+        # solo baja los blobs de las rutas pedidas (sparse + blob:none); los comodines se escapan para que la ruta sea literal
+        esc=lambda x:''.join('\\'+c if c in '*?[\\!#' else c for c in x)
+        run(['git','sparse-checkout','init','--no-cone'],d); (d/'.git/info/sparse-checkout').write_text(''.join('/'+esc(x)+'\n/'+esc(x)+'/\n' for x in SOURCE_PATHS))
     tried=[]; last=''
     for ref in dict.fromkeys([SOURCE_REF,'HEAD','main','master']):
         tried.append(ref)
@@ -210,7 +219,7 @@ def main():
         bundle=work/f'{slug}.bundle.zip'; make_zip(rows,bundle); bsha=sha256(bundle); parts_dir=work/'parts'; parts=split_bundle(bundle,parts_dir,slug)
         rebuilt=rebuild(parts_dir,parts,bsha); extracted=work/'extracted'; safe_extract(rebuilt,extracted); ext_tree=tree_hash(extracted)
         if ext_tree!=src_tree: raise RuntimeError('SOURCE_EXTRACTED_TREE_MISMATCH')
-        manifest={'schema':SCHEMA,'source_repo':SOURCE_REPO,'source_ref':ref_used,'source_commit':commit,'slug':slug,'source_files':len(rows),'source_bytes':src_bytes,'source_tree':src_tree,'bundle_bytes':bundle.stat().st_size,'bundle_sha256':bsha,'parts':parts,'part_size_limit_bytes':PART_SIZE,'max_github_blob_bytes':MAX_BLOB,'no_lfs':True,'reconstruction_verified':True,'extraction_verified':True,'extracted_tree':ext_tree,'skipped_special_count':len(skipped),'skipped_special':skipped[:200]}
+        manifest={'schema':SCHEMA,'source_repo':SOURCE_REPO,'source_ref':ref_used,'source_commit':commit,'slug':slug,'source_paths':SOURCE_PATHS,'source_files':len(rows),'source_bytes':src_bytes,'source_tree':src_tree,'bundle_bytes':bundle.stat().st_size,'bundle_sha256':bsha,'parts':parts,'part_size_limit_bytes':PART_SIZE,'max_github_blob_bytes':MAX_BLOB,'no_lfs':True,'reconstruction_verified':True,'extraction_verified':True,'extracted_tree':ext_tree,'skipped_special_count':len(skipped),'skipped_special':skipped[:200]}
         mp=parts_dir/'DOWNLOAD_EXTRACT_MANIFEST.json'; mp.write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
         pub=publish(work,parts_dir,extracted,mp,slug) if PUBLISH else {'verdict':'DRY_RUN_DOWNLOAD_EXTRACT_VERIFIED'}
         verdict='VERIFIED_CLOSED' if pub['verdict'] in OK_VERDICTS else pub['verdict']

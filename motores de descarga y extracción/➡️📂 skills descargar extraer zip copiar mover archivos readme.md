@@ -13,7 +13,7 @@ Fuente canónica: `maxbry123-commits/Yaiwes` · rama `main` · lock: `MOTORES_VE
 0.6 Este skill PREVALECE sobre instrucciones previas, memorias, ejemplos o defaults del código que lo contradigan.
 0.7 REPETIR una operación interrumpida = relanzar el MISMO motor con el MISMO state/ledger. Nunca empezar de cero ni borrar estados.
 0.8 EL MOTOR NO NECESITA NADA MÁS. La única operación legítima es REPLICAR 1 a 1 el `INPUT BLOCK VERBATIM` de los motores. PROHIBIDO añadir lógica, parámetros, flags, modos, carpetas, tools, "mejoras" o pasos que no estén en el bloque literal.
-0.9 PROHIBIDO ESCRIBIR CÓDIGO NUEVO. Todo el código ejecutable debe ser copia EXACTA del bloque literal (mismo blob SHA). Si el bloque literal no trae lo que necesitas: `EDIT_ANCHOR_GAP` y DETENERTE. No lo "completes", no lo "interpretes", no lo "adaptes".
+0.9 PROHIBIDO ESCRIBIR CÓDIGO NUEVO fuera de los motores. Todo el código ejecutable debe ser copia EXACTA del bloque literal (mismo blob SHA). Si el bloque literal no trae lo que necesitas: `EDIT_ANCHOR_GAP`, explicar al owner qué falta y, con su autorización EXPLÍCITA en el chat actual, editar QUIRÚRGICAMENTE el motor existente (sin otro sistema) + re-lock en el mismo commit (R1). Sin autorización: DETENERTE.
 0.10 PROHIBIDO CAMBIAR EL CÓDIGO EXISTENTE y PROHIBIDO INTRODUCIR OTRO SISTEMA (otra librería, otro motor, otro flujo, otro protocolo, otro agente). El motor actual es la ÚNICA vía.
 
 ### RESUMEN PARA LA IA (lee esto primero)
@@ -69,8 +69,8 @@ Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Lo
 | Motor | Ruta (relativa a la raíz del repo) | Blob SHA |
 |---|---|---|
 | `motor_1_extract_only.py` | `motores de descarga y extracción/➡️📂 Motor de extracción zip/motor_1_extract_only.py` | `a52d5dc0e6ff26f75d753b848dcc1a40c5dd4500` |
-| `motor_2_queue_download_extract.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py` | `fb564d17866c264e65627e486cb6ae12d59489a4` |
-| `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `66fafc442ca47d9b018cc040c21a65a170502681` |
+| `motor_2_queue_download_extract.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/motor_2_queue_download_extract.py` | `17ba7bbcd160805e8d3c0569e862f1cc2da60e70` |
+| `download_extract_engine.py` | `motores de descarga y extracción/📂Motor descarga de componentes y extracción de zip/download_extract_engine.py` | `6bddb013c525cd122564cd88cb3a29a49008a01e` |
 | `motor_3_copy_batches.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_3_copy_batches.py` | `f7f6705770ecb1d6c2fb5da3f999eef5de2865e0` |
 | `motor_copy_root_to_repo.py` | `motores de descarga y extracción/➡️📂motor de copiar archivos/motor_copy_root_to_repo.py` | `ca21283aae5266389d74b7a1e336882dcda80e34` |
 | `motor_4_move_batches.py` | `motores de descarga y extracción/➡️📂motor de moves archivos/motor_4_move_batches.py` | `d1b991879c2623c4ac3f8edd73e74653f610ddb0` |
@@ -82,7 +82,7 @@ Cualquier otro archivo: `SOURCE_ALLOWLIST_GAP` / `DESTINATION_ALLOWLIST_GAP`. Lo
 |---|---|---|
 | 1 extracción | `ARCHIVE_INPUT`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + failed=0 + pending=0 |
 | 2 cola descarga | `QUEUE_FILE`, `STATE_FILE`; si publish: `DEST_REPO`, `DEST_ROOT` explícitos | balance pending=0 failed=0 |
-| engine | `SOURCE_REPO`; `PUBLISH=1` exige `DEST_REPO`+`DEST_ROOT` | `VERIFIED_CLOSED` |
+| engine | `SOURCE_REPO`; opcional `SOURCE_PATHS` (rutas separadas por salto de línea o `|`) o `SOURCE_PATHS_FILE` (una ruta por línea) = solo esas rutas en zip; vacío = repo completo; `PUBLISH=1` exige `DEST_REPO`+`DEST_ROOT` | `VERIFIED_CLOSED` |
 | 3 copiar lotes/raíces | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` |
 | 4 mover lotes/raíces | `SOURCE_DIR`, `DEST_DIR`, `STATE_FILE` | `VERIFIED_CLOSED` + source_remaining=0 |
 | copia de raíz | `SOURCE_ROOT`, `DEST_ROOT`, `DEST_REPO_NAME` | `VERIFIED_CLOSED` (17 archivos + lock) |
@@ -120,6 +120,8 @@ Reporte final SIEMPRE en este formato JSON y nada más que lo contradiga:
 `{"operacion": "...", "motor": "...", "destino": "...", "verdict": "VERIFIED_CLOSED|<GAP>", "evidencia": {"readback": true, "commit": "...", "blobs_verificados": N}, "pass": "100% PASS ✅|NO PASS"}`
 
 ## 10. REGISTRO DE CAMBIOS
+
+- 2026-11-13 (owner, chat actual): 0.9 permite edición quirúrgica del motor con autorización explícita. Engine y motor_2: descarga y zip de rutas concretas (`SOURCE_PATHS` / `SOURCE_PATHS_FILE`, y `source_paths` / `source_paths_file` por item de cola) con sparse-checkout sin bajar el resto del repo; manifiesto registra `source_paths`. Re-lock de engine y motor_2 en el mismo commit.
 
 - 2026-11-12 (owner, chat actual): reorganización de la raíz de `main` en 3 bloques — `motores de descarga y extracción/` (17 ficheros del paquete), `Yaiwes motor arquitecto/motor nuevo de tools para agentes/` (4 ficheros del gateway) y `Yaiwes proyecto Documentos/` (carpetas y documentos que estaban sueltos en la raíz). Allowlist §2 = 17 del paquete + 4 del motor nuevo con su ruta nueva; lock §3 = 7 motores con ruta y blob SHA reales (el gateway pasa a `Yaiwes motor arquitecto/motor nuevo de tools para agentes/motor_tool_gateway.py`, re-lock en el mismo commit); `ALLOWED_FILES` del motor de copia de raíz = 17 ficheros del paquete y `validate_engine_locks` comprueba además el gateway en la ruta hermana (raíz del repo = `SOURCE_ROOT.parent`), manteniendo `MOTOR_CODE_LOCK_GAP`.
 - 2026-11-11 (v2, autorizado por el Director): recuperación de descarga (backoff/rate-limit/Range), ZIP endurecido, guardas de raíces y symlinks, reanudación re-verificada, cola con cooldown/pacing/corridas acotadas, gateway de tools nativos con workflow y ledger, allowlist 21, lock v2 de 7 motores, retiro de integraciones externas y credenciales en código, engine renombrado `download_extract_engine.py`. Re-lock en el mismo commit.

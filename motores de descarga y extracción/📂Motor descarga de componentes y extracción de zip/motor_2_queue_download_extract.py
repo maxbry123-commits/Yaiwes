@@ -49,6 +49,9 @@ def run_item(item):
         "DEST_BRANCH": item.get("dest_branch", env.get("DEST_BRANCH", "main")),
         "DEST_ROOT": item.get("dest_root", env.get("DEST_ROOT", "")),
         "PUBLISH": "1" if item.get("publish") else "0",
+        # 2026-11-13 (owner): rutas por item (lista o texto); vacio = repo completo
+        "SOURCE_PATHS": "\n".join(item["source_paths"]) if isinstance(item.get("source_paths"), list) else str(item.get("source_paths", env.get("SOURCE_PATHS", ""))),
+        "SOURCE_PATHS_FILE": str(item.get("source_paths_file", env.get("SOURCE_PATHS_FILE", ""))),
     })
     p = subprocess.run([sys.executable, str(ENGINE_PATH)], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
