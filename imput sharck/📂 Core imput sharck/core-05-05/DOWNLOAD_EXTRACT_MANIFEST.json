@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 377657,
+  "bundle_sha256": "4d5d90bd020291d01122034ac01c667b2ffc2e3bb114f7038721de29d455c868",
+  "extracted_tree": {
+    "bytes": 798965,
+    "files": 20,
+    "sha256": "c16d325eff77788ed9b91b3fe43d1f4ebdd31358e3372a71fc03739ae4c474fb"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 377657,
+      "name": "core-05-05.bundle.zip.part-0001",
+      "sha256": "4d5d90bd020291d01122034ac01c667b2ffc2e3bb114f7038721de29d455c868"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-05",
+  "source_bytes": 798965,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 20,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/search/local-deep-researcher"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 798965,
+    "files": 20,
+    "sha256": "c16d325eff77788ed9b91b3fe43d1f4ebdd31358e3372a71fc03739ae4c474fb"
+  }
+}
