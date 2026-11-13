@@ -1,0 +1,53 @@
+{
+  "bundle_bytes": 49844289,
+  "bundle_sha256": "127bdc4d93f5e153ef24ce70df7e2cdf382b9f9a44cc73e54f4787028f6e862f",
+  "extracted_tree": {
+    "bytes": 108305972,
+    "files": 8499,
+    "sha256": "709672331ce7a2766d469bc9eab97429bee75b8793b04cb9d3ada8ae3096848a"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-05-06.bundle.zip.part-0001",
+      "sha256": "f81a615cb119f0ff479e2423b40988da3fc7df28f6e3af4b388a392f2547cacf"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-06.bundle.zip.part-0002",
+      "sha256": "4f5595b4179a10cdb4ee0d4c974efac57b1edd5d2166b93c38885398b6f286b5"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-05-06.bundle.zip.part-0003",
+      "sha256": "4e556362098c6b891b4c1d87b3b1cfb8599899d06e5260c1e514201f6a014feb"
+    },
+    {
+      "bytes": 12095553,
+      "name": "core-05-06.bundle.zip.part-0004",
+      "sha256": "920fdde548247ed0835ce3edb5ef5f852bee348894eb94d0976bbe06be374b50"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-06",
+  "source_bytes": 108305972,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 8499,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/skills/ToolUniverse"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 108305972,
+    "files": 8499,
+    "sha256": "709672331ce7a2766d469bc9eab97429bee75b8793b04cb9d3ada8ae3096848a"
+  }
+}
