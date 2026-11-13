@@ -1,0 +1,53 @@
+{
+  "bundle_bytes": 42360208,
+  "bundle_sha256": "fd5c25a880a6fdc3f601bf64a74b0e3de2ad5c83cd00c72e9e301b182bc80bd5",
+  "extracted_tree": {
+    "bytes": 63890326,
+    "files": 3128,
+    "sha256": "f376291f3ed62b22e6972c3d8dc7967dc3ac57453bdefc3aaab8596e1b16e03d"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-04-03.bundle.zip.part-0001",
+      "sha256": "2ebcbae205eb1f960229c532ac97810a173fce1da75064c2a1b8acc97fe67617"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-03.bundle.zip.part-0002",
+      "sha256": "c0385172220cdcf7f02c7acbeac0e1a7af9fe5df317727c1ef4117590fb24b0a"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-04-03.bundle.zip.part-0003",
+      "sha256": "c9a655bea120a3d68883b036c7a550b3e8b9966451dd7b3f8d5eefdc1c692843"
+    },
+    {
+      "bytes": 4611472,
+      "name": "core-04-03.bundle.zip.part-0004",
+      "sha256": "e2c390d078bdc58bd7eb89b1c73fcc0a690486a40118e6f0c7d70620a885acbe"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-03",
+  "source_bytes": 63890326,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 3128,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/rag/langchain"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 63890326,
+    "files": 3128,
+    "sha256": "f376291f3ed62b22e6972c3d8dc7967dc3ac57453bdefc3aaab8596e1b16e03d"
+  }
+}
