@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 1919353,
+  "bundle_sha256": "9f1adf8af25ce12fa01104b0d994a346741e27508b29eeba473aa045a6972724",
+  "extracted_tree": {
+    "bytes": 3291827,
+    "files": 186,
+    "sha256": "ad9fda27cb2281e8d5fb1e1bcad648f7df14fd51bf52ad593d270de98733c896"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 1919353,
+      "name": "core-05-12.bundle.zip.part-0001",
+      "sha256": "9f1adf8af25ce12fa01104b0d994a346741e27508b29eeba473aa045a6972724"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-05-12",
+  "source_bytes": 3291827,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 186,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B03-code-runtime/smolagents"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 3291827,
+    "files": 186,
+    "sha256": "ad9fda27cb2281e8d5fb1e1bcad648f7df14fd51bf52ad593d270de98733c896"
+  }
+}
