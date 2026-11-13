@@ -1,0 +1,38 @@
+{
+  "bundle_bytes": 281420,
+  "bundle_sha256": "01357cd82b2416f9952938e99640f8e8c822c0864cc785f65d5690da768f9f21",
+  "extracted_tree": {
+    "bytes": 562779,
+    "files": 95,
+    "sha256": "4ac3dd6dd1be372a33aa61c7334fa48403e99644f2f964694c871b38c31e1950"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 281420,
+      "name": "core-04-11.bundle.zip.part-0001",
+      "sha256": "01357cd82b2416f9952938e99640f8e8c822c0864cc785f65d5690da768f9f21"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-04-11",
+  "source_bytes": 562779,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 95,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B10-retrieval-eval/ir_measures"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 562779,
+    "files": 95,
+    "sha256": "4ac3dd6dd1be372a33aa61c7334fa48403e99644f2f964694c871b38c31e1950"
+  }
+}
