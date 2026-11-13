@@ -1,0 +1,88 @@
+{
+  "bundle_bytes": 128259634,
+  "bundle_sha256": "0614b0d3af07613a566ddd90c22f98c62d1f1b3837703f698a9c1bc252dfe56a",
+  "extracted_tree": {
+    "bytes": 200950384,
+    "files": 7588,
+    "sha256": "3f69802f5eac119fa6f684efd70cd2f0b81da11b3d3c33c50532f2e6d0bff8be"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0001",
+      "sha256": "d33c0834e28175614c97e6a97ffd61d879a55b173690826ba21c8fd8363856d4"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0002",
+      "sha256": "fccd5203d4e7f264f52b411d120fa0a050fc38caa7804fff51a48654269b9ce1"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0003",
+      "sha256": "d89c6cc7b85b94284e07f9b0c820e3e2c16c67480d97135a1b851bc3d36003c7"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0004",
+      "sha256": "9bbcfb934143d8e18e2a727bd0b5ae8c9b661755f9204e135eae2f1edb172ebb"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0005",
+      "sha256": "e641c1d316603a6f58168cd8014dffb48724f739f98ad753f6216adafedbd827"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0006",
+      "sha256": "1a68157d9ae737851d50b65fef50902f89fd70d1c45e0528bdcb357d360d1756"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0007",
+      "sha256": "93306f5ffecf1b92d19746e8d773ac8f114c84b061e8ec112ad3a142cf868b7c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0008",
+      "sha256": "b9ad57a4d3e1cb12e33ace3ea7919982a470f3dbe557a4835b38693d5c92e33d"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0009",
+      "sha256": "5b65091bfa98b5eecacfd915f68e03cae0f7a19009686020d80000ad7af65e3c"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-06-07.bundle.zip.part-0010",
+      "sha256": "cf3894020e06f392ae204a78862038f405a5150a33a74136bd66bef84e217db9"
+    },
+    {
+      "bytes": 2430514,
+      "name": "core-06-07.bundle.zip.part-0011",
+      "sha256": "a846a06aa5db26fbb35b47439e9ab7c4d1fe59cd44b1752386f3ed53cc718a26"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-07",
+  "source_bytes": 200950384,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 7588,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 sharck imput/\ud83d\udcc2 input sharck code principal/\ud83d\udcc2 componentes open source/B02-ir-evidence/lucene"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 200950384,
+    "files": 7588,
+    "sha256": "3f69802f5eac119fa6f684efd70cd2f0b81da11b3d3c33c50532f2e6d0bff8be"
+  }
+}
