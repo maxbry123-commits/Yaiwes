@@ -1,0 +1,58 @@
+{
+  "bundle_bytes": 52671839,
+  "bundle_sha256": "322bc4ec186984cbc0aaaaa5c88707651f7265fb4ad3eab4953bb715664f0e5f",
+  "extracted_tree": {
+    "bytes": 76743314,
+    "files": 2657,
+    "sha256": "6aa5095bbac3990261f272d20a7b6c117981617747c2532a88549997598c0adb"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-03-06.bundle.zip.part-0001",
+      "sha256": "a7893fafa9d886a7fcc68a115e6301c695b77a86b315528b0bdff5db5c3d0573"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-03-06.bundle.zip.part-0002",
+      "sha256": "3cc0247bb17cf3cd5beb65a13b5cc083da9f26680a84e37998605981da0acd34"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-03-06.bundle.zip.part-0003",
+      "sha256": "8df9139ddbc031b0cbc015b74581188aabf4ee0bc6cd639e7b1c83bb45d678d2"
+    },
+    {
+      "bytes": 12582912,
+      "name": "core-03-06.bundle.zip.part-0004",
+      "sha256": "faacef08ef153162e0899f6194236f105bb865d0a0cc763796951310934bca95"
+    },
+    {
+      "bytes": 2340191,
+      "name": "core-03-06.bundle.zip.part-0005",
+      "sha256": "faf624543659a93f092a6f5114874cff7d05c19664bff236f0d4d66e88e5d787"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-03-06",
+  "source_bytes": 76743314,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 2657,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/search/deer-flow"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 76743314,
+    "files": 2657,
+    "sha256": "6aa5095bbac3990261f272d20a7b6c117981617747c2532a88549997598c0adb"
+  }
+}
