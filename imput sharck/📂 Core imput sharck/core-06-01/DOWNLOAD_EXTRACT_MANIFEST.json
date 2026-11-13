@@ -1,0 +1,43 @@
+{
+  "bundle_bytes": 16292379,
+  "bundle_sha256": "8637ba96e06e76243931df92f5910ceaa0e8efb69e7edb1e8c6a893247dcd759",
+  "extracted_tree": {
+    "bytes": 38400998,
+    "files": 7586,
+    "sha256": "ec4e3856e32760ae855c053708e0954ba4412a0707e399801c6f3cc6ce08f6d1"
+  },
+  "extraction_verified": true,
+  "max_github_blob_bytes": 99614720,
+  "no_lfs": true,
+  "part_size_limit_bytes": 12582912,
+  "parts": [
+    {
+      "bytes": 12582912,
+      "name": "core-06-01.bundle.zip.part-0001",
+      "sha256": "26832c53c797dfa8b5bf24a68fde04991576ab7056d602700c0f2f8f320bfda2"
+    },
+    {
+      "bytes": 3709467,
+      "name": "core-06-01.bundle.zip.part-0002",
+      "sha256": "d6c972bfa8a32804b79e3cf701c9b045107018c32eb092423ac60ba4ff593827"
+    }
+  ],
+  "reconstruction_verified": true,
+  "schema": "yaiwes.download-extract.v2",
+  "skipped_special": [],
+  "skipped_special_count": 0,
+  "slug": "core-06-01",
+  "source_bytes": 38400998,
+  "source_commit": "e41839332b0091bf7e8787fa95dd394845f6b8dd",
+  "source_files": 7586,
+  "source_paths": [
+    "\u27a1\ufe0f\ud83d\udcc2 Shack imput/\ud83d\udcc2 Componentes para integraci\u00f3n sharck imput/code/pyright"
+  ],
+  "source_ref": "main",
+  "source_repo": "maxbry123-commits/osquestador-auditor",
+  "source_tree": {
+    "bytes": 38400998,
+    "files": 7586,
+    "sha256": "ec4e3856e32760ae855c053708e0954ba4412a0707e399801c6f3cc6ce08f6d1"
+  }
+}
